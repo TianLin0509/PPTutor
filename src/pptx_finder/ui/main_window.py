@@ -362,7 +362,9 @@ class MainWindow(QMainWindow):
     def _shutdown(self) -> None:
         if self._indexer is not None:
             self._indexer.stop()
-            self._indexer.wait(3000)
+            self._indexer.wait(5000)
         if self._owns_render:
             self._render.stop()
-            self._render.wait(3000)
+            if not self._render.wait(8000):  # COM 退出可能稍慢
+                self._render.terminate()
+                self._render.wait(2000)

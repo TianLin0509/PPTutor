@@ -9,6 +9,10 @@ wheels/
 # Virtual environments
 .venv
 
+# pptx-finder demo data & screenshots
+demo_decks/
+artifacts/
+
 # pptx-finder runtime / cache / test artifacts
 *.db
 *.db-wal
