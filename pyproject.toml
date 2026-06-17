@@ -1,7 +1,7 @@
 [project]
 name = "pptx-finder"
 version = "0.1.0"
-description = "Add your description here"
+description = "本地 PPTX 内容搜索与预览助手（搜内容定位页 / 版本归组 / 托盘常驻）"
 readme = "README.md"
 authors = [
     { name = "Lin Tian", email = "17210720082@fudan.edu.cn" }
@@ -29,4 +29,14 @@ dev = [
     "pytest>=9.1.0",
     "pytest-qt>=4.5.0",
     "python-pptx>=1.0.2",
+]
+
+[tool.pytest.ini_options]
+addopts = "-p no:faulthandler"
+testpaths = ["tests"]
+markers = [
+    "slow: 真实 PowerPoint COM 等较慢测试（用 -m 'not slow' 跳过）",
+]
+filterwarnings = [
+    "ignore::SyntaxWarning",
 ]
