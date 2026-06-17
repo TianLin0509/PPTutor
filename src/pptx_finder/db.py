@@ -1,0 +1,133 @@
+"""SQLite 索引库：schema + 读写原语。
+
+并发模型：WAL 模式下允许多读 + 单写。索引线程持有写连接，搜索用各自读连接。
+"""
+from __future__ import annotations
+
+import sqlite3
+from pathlib import Path
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS files(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  path TEXT UNIQUE NOT NULL,
+  name TEXT NOT NULL,
+  ext TEXT NOT NULL,
+  size INTEGER NOT NULL,
+  mtime REAL NOT NULL,
+  content_hash TEXT,
+  page_count INTEGER DEFAULT 0,
+  status TEXT DEFAULT 'ok',
+  error TEXT DEFAULT '',
+  indexed_at REAL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_files_name ON files(name);
+CREATE VIRTUAL TABLE IF NOT EXISTS pages_fts USING fts5(
+  content, file_id UNINDEXED, page_no UNINDEXED
+);
+CREATE TABLE IF NOT EXISTS pages_raw(
+  file_id INTEGER NOT NULL,
+  page_no INTEGER NOT NULL,
+  raw_text TEXT,
+  PRIMARY KEY(file_id, page_no)
+);
+CREATE TABLE IF NOT EXISTS minhash(
+  file_id INTEGER PRIMARY KEY,
+  sig BLOB,
+  page_hashes TEXT,
+  group_id INTEGER
+);
+CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
+"""
+
+
+def connect(db_path: str | Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(str(db_path), check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    return conn
+
+
+def init_db(conn: sqlite3.Connection) -> None:
+    conn.executescript(SCHEMA)
+    conn.commit()
+
+
+def get_file_by_path(conn: sqlite3.Connection, path: str) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM files WHERE path=?", (path,)).fetchone()
+
+
+def all_indexed(conn: sqlite3.Connection) -> dict[str, sqlite3.Row]:
+    """path -> row，用于增量比对。"""
+    return {r["path"]: r for r in conn.execute("SELECT * FROM files").fetchall()}
+
+
+def upsert_file(
+    conn: sqlite3.Connection,
+    *,
+    path: str,
+    name: str,
+    ext: str,
+    size: int,
+    mtime: float,
+    content_hash: str,
+    page_count: int,
+    status: str,
+    error: str,
+    indexed_at: float,
+) -> int:
+    cur = conn.execute(
+        """
+        INSERT INTO files(path,name,ext,size,mtime,content_hash,page_count,status,error,indexed_at)
+        VALUES(:path,:name,:ext,:size,:mtime,:content_hash,:page_count,:status,:error,:indexed_at)
+        ON CONFLICT(path) DO UPDATE SET
+          name=excluded.name, ext=excluded.ext, size=excluded.size, mtime=excluded.mtime,
+          content_hash=excluded.content_hash, page_count=excluded.page_count,
+          status=excluded.status, error=excluded.error, indexed_at=excluded.indexed_at
+        RETURNING id
+        """,
+        dict(path=path, name=name, ext=ext, size=size, mtime=mtime,
+             content_hash=content_hash, page_count=page_count, status=status,
+             error=error, indexed_at=indexed_at),
+    )
+    return cur.fetchone()[0]
+
+
+def replace_pages(conn: sqlite3.Connection, file_id: int, pages: list[tuple[int, str, str]]) -> None:
+    """pages: [(page_no, raw_text, tokenized_content)]。先清旧页再写。"""
+    conn.execute("DELETE FROM pages_fts WHERE file_id=?", (file_id,))
+    conn.execute("DELETE FROM pages_raw WHERE file_id=?", (file_id,))
+    for page_no, raw, tok in pages:
+        conn.execute(
+            "INSERT INTO pages_fts(content,file_id,page_no) VALUES(?,?,?)",
+            (tok, file_id, page_no),
+        )
+        conn.execute(
+            "INSERT INTO pages_raw(file_id,page_no,raw_text) VALUES(?,?,?)",
+            (file_id, page_no, raw),
+        )
+
+
+def touch_stat(conn: sqlite3.Connection, file_id: int, size: int, mtime: float, indexed_at: float) -> None:
+    conn.execute(
+        "UPDATE files SET size=?, mtime=?, indexed_at=? WHERE id=?",
+        (size, mtime, indexed_at, file_id),
+    )
+
+
+def delete_file(conn: sqlite3.Connection, path: str) -> None:
+    row = get_file_by_path(conn, path)
+    if not row:
+        return
+    fid = row["id"]
+    conn.execute("DELETE FROM pages_fts WHERE file_id=?", (fid,))
+    conn.execute("DELETE FROM pages_raw WHERE file_id=?", (fid,))
+    conn.execute("DELETE FROM minhash WHERE file_id=?", (fid,))
+    conn.execute("DELETE FROM files WHERE id=?", (fid,))
+
+
+def stats(conn: sqlite3.Connection) -> dict:
+    fc = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+    pc = conn.execute("SELECT COUNT(*) FROM pages_raw").fetchone()[0]
+    return {"file_count": fc, "page_count": pc}
