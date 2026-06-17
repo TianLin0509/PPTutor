@@ -61,6 +61,11 @@ class ResultItem(QWidget):
         badge = QLabel(badge_txt)
         badge.setStyleSheet(f"color:{color}; font-size:12px;")
         top.addWidget(badge)
+        if r.group_id is not None:
+            vtxt = "📚 版本组" + ("　★ 最新版" if r.is_latest else "")
+            vlbl = QLabel(vtxt)
+            vlbl.setStyleSheet("color:#ff9f0a; font-size:12px;")
+            top.addWidget(vlbl)
         top.addStretch(1)
         lay.addLayout(top)
 

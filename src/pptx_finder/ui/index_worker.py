@@ -32,6 +32,11 @@ class IndexWorker(QThread):
                 workers=self._workers,
                 stop_event=self._stop,
             )
+            try:
+                from .. import cluster
+                cluster.compute_groups(conn)  # 版本归组（后台，失败不影响搜索）
+            except Exception:  # noqa: BLE001
+                pass
         except Exception as e:  # noqa: BLE001 索引线程兜底，不让异常杀进程
             summary = {"error": str(e)}
         finally:

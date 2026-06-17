@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import sqlite3
+from collections import defaultdict
 
+from . import cluster
 from .models import FileResult, SearchHit
 from .text_tokenize import build_fts_match, normalize, parse_query
 
@@ -72,6 +74,8 @@ def search(conn: sqlite3.Connection, query: str, scope: str | None = None,
     if not file_ids:
         return []
 
+    gmap = cluster.group_map(conn)  # file_id -> group_id（仅多成员版本组）
+
     rows: dict[int, sqlite3.Row] = {}
     qmarks = ",".join("?" * len(file_ids))
     for r in conn.execute(f"SELECT * FROM files WHERE id IN ({qmarks})", tuple(file_ids)):
@@ -124,7 +128,32 @@ def search(conn: sqlite3.Connection, query: str, scope: str | None = None,
             file_id=row["id"], path=row["path"], name=row["name"], ext=row["ext"],
             mtime=row["mtime"], page_count=row["page_count"], status=row["status"],
             score=score, name_hit=name_hit, hits=hits,
+            group_id=gmap.get(row["id"]),
         ))
 
     results.sort(key=lambda r: r.score, reverse=True)
-    return results[:limit]
+
+    # 版本组内标记“最新版”：文件名含 终稿/定稿/final/最终 优先，否则修改时间最新
+    members: dict[int, list[FileResult]] = defaultdict(list)
+    for r in results:
+        if r.group_id is not None:
+            members[r.group_id].append(r)
+    for ms in members.values():
+        def _latest_key(r: FileResult):
+            n = r.name.lower()
+            kw = any(k in n for k in ("终稿", "定稿", "final", "最终"))
+            return (kw, r.mtime)
+        max(ms, key=_latest_key).is_latest = True
+
+    # 同组聚集：组按其最高分成员首次出现的位置排列，组内按分降序
+    grouped: dict[str, list[FileResult]] = defaultdict(list)
+    order: list[str] = []
+    for r in results:
+        key = f"g{r.group_id}" if r.group_id is not None else f"s{r.file_id}"
+        if key not in grouped:
+            order.append(key)
+        grouped[key].append(r)
+    final: list[FileResult] = []
+    for key in order:
+        final.extend(grouped[key])
+    return final[:limit]
