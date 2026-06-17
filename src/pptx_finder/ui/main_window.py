@@ -315,8 +315,14 @@ class MainWindow(QMainWindow):
             self._toast("找不到所在文件夹")
 
     def _act_goto(self) -> None:
-        if self._cur:
-            actions.open_at_page(self._cur.path, self._current_page())
+        if not self._cur:
+            return
+        page = self._current_page()
+        opened, jumped = actions.open_at_page(self._cur.path, page)
+        if not opened:
+            self._toast("文件已移动或删除")
+        elif not jumped:
+            self._toast(f"已打开，但未能自动跳到第 {page} 页")
 
     def _on_activate(self, _item) -> None:
         self._act_goto()
@@ -352,8 +358,8 @@ class MainWindow(QMainWindow):
             if summary and "deleted" in summary:
                 extra = f"（新增/更新 {summary.get('indexed', 0)}，移除 {summary.get('deleted', 0)}）"
             self.status_label.setText(f"索引就绪：{s['file_count']} 个文件 · {s['page_count']} 页{extra}")
-        except Exception:  # noqa: BLE001
-            self.status_label.setText("就绪")
+        except Exception as e:  # noqa: BLE001
+            self.status_label.setText(f"数据库读取异常：{e}")
 
     # ---------- 生命周期 ----------
     def closeEvent(self, e):  # noqa: N802

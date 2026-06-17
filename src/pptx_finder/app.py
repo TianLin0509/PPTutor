@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import ctypes
+import logging
 import multiprocessing
 import sys
 
@@ -79,6 +80,9 @@ def _toggle_window(win: MainWindow) -> None:
 
 def main() -> int:
     multiprocessing.freeze_support()  # PyInstaller 下多进程必需
+    from .logging_setup import configure_logging
+    configure_logging()
+    log = logging.getLogger(__name__)
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     icon = _make_icon()
@@ -115,7 +119,6 @@ def main() -> int:
     win.show()
 
     # 全局热键
-    filt = None
     try:
         mods, vk = _parse_hotkey(GLOBAL_HOTKEY)
         if vk is not None:
@@ -124,8 +127,11 @@ def main() -> int:
                 filt = _HotkeyFilter(HOTKEY_ID, lambda: _toggle_window(win))
                 app.installNativeEventFilter(filt)
                 app._hotkey_filter = filt  # 防 GC
-    except Exception:  # noqa: BLE001
-        pass
+            else:
+                log.warning("RegisterHotKey failed (maybe taken): %s", GLOBAL_HOTKEY)
+                win.status_label.setText(f"全局热键 {GLOBAL_HOTKEY} 注册失败（可能被其他程序占用）")
+    except Exception as e:  # noqa: BLE001
+        log.warning("hotkey setup error: %s", e)
 
     return app.exec()
 

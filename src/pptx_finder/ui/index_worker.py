@@ -1,11 +1,14 @@
 """后台索引线程：在 QThread 里跑 update_index，进度经信号回主线程。"""
 from __future__ import annotations
 
+import logging
 import threading
 
 from PySide6.QtCore import QThread, Signal
 
 from .. import db, indexer
+
+log = logging.getLogger(__name__)
 
 
 class IndexWorker(QThread):
@@ -35,8 +38,8 @@ class IndexWorker(QThread):
             try:
                 from .. import cluster
                 cluster.compute_groups(conn)  # 版本归组（后台，失败不影响搜索）
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as e:  # noqa: BLE001
+                log.warning("compute_groups failed: %s", e)
         except Exception as e:  # noqa: BLE001 索引线程兜底，不让异常杀进程
             summary = {"error": str(e)}
         finally:

@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import logging
 import os
 import threading
 from pathlib import Path
@@ -14,6 +15,8 @@ from pathlib import Path
 import xxhash
 
 from .config import cache_dir
+
+log = logging.getLogger(__name__)
 
 _lock = threading.Lock()
 _state = threading.local()
@@ -70,14 +73,16 @@ def render_page(
                 return None
             pres.Slides(page_no).Export(str(out), "PNG", width, height)
             return out if (out.exists() and out.stat().st_size > 0) else None
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            log.warning("render_page failed path=%s page=%s: %s", path, page_no, e)
+            _state.app = None  # 丢弃可能已损坏的 COM 实例，下次重建干净实例
             return None
         finally:
             if pres is not None:
                 try:
                     pres.Close()
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception as e:  # noqa: BLE001
+                    log.debug("pres.Close failed: %s", e)
 
 
 def shutdown() -> None:
@@ -87,8 +92,8 @@ def shutdown() -> None:
         return
     try:
         app.Quit()
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as e:  # noqa: BLE001
+        log.debug("app.Quit failed: %s", e)
     _state.app = None
     try:
         import pythoncom

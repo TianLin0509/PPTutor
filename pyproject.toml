@@ -26,6 +26,7 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
+    "pyinstaller>=6.21.0",
     "pytest>=9.1.0",
     "pytest-qt>=4.5.0",
     "python-pptx>=1.0.2",

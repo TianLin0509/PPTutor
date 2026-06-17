@@ -1,12 +1,15 @@
 """检索：FTS5 内容命中 + 文件名命中，按相关度+修改时间排序，生成高亮片段。"""
 from __future__ import annotations
 
+import logging
 import sqlite3
 from collections import defaultdict
 
 from . import cluster
 from .models import FileResult, SearchHit
 from .text_tokenize import build_fts_match, normalize, parse_query
+
+log = logging.getLogger(__name__)
 
 # 排序权重
 W_REL = 0.60      # 内容相关度（bm25）
@@ -54,12 +57,16 @@ def search(conn: sqlite3.Connection, query: str, scope: str | None = None,
     # 内容命中：file_id -> [(page_no, rank)]
     content: dict[int, list[tuple[int, float]]] = {}
     if match:
-        for r in conn.execute(
-            "SELECT file_id, page_no, bm25(pages_fts) AS rank "
-            "FROM pages_fts WHERE pages_fts MATCH ? ORDER BY rank",
-            (match,),
-        ):
-            content.setdefault(r["file_id"], []).append((r["page_no"], r["rank"]))
+        try:
+            for r in conn.execute(
+                "SELECT file_id, page_no, bm25(pages_fts) AS rank "
+                "FROM pages_fts WHERE pages_fts MATCH ? ORDER BY rank",
+                (match,),
+            ):
+                content.setdefault(r["file_id"], []).append((r["page_no"], r["rank"]))
+        except sqlite3.OperationalError as e:
+            # FTS5 语法异常（特殊字符/不成对引号等）→ 放弃内容命中，仍保留文件名命中
+            log.warning("FTS match failed query=%r match=%r: %s", query, match, e)
 
     # 文件名命中：name 包含所有普通词（AND）
     name_hits: set[int] = set()

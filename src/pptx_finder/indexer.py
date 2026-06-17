@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 import time
@@ -22,6 +23,8 @@ from . import db
 from .config import MAX_PARSE_SIZE, PPT_EXT
 from .parser import parse_pptx
 from .text_tokenize import tokenize
+
+log = logging.getLogger(__name__)
 
 ProgressCb = Callable[[int, int, str], None]
 COMMIT_EVERY = 50
@@ -130,7 +133,8 @@ def index_file_list(
         try:
             _write_filename_only(conn, p)
             summary["skipped_ppt"] += 1
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            log.warning("ppt register failed %s: %s", p, e)
             summary["errors"] += 1
         tick(str(p))
 
@@ -146,7 +150,8 @@ def index_file_list(
                     summary["indexed"] += 1
                 else:
                     summary["errors"] += 1
-            except Exception:  # noqa: BLE001 单文件失败不中断
+            except Exception as e:  # noqa: BLE001 单文件失败不中断
+                log.warning("index failed %s: %s", p, e)
                 summary["errors"] += 1
             tick(str(p))
             if done % COMMIT_EVERY == 0:
@@ -165,7 +170,8 @@ def index_file_list(
                         summary["indexed"] += 1
                     else:
                         summary["errors"] += 1
-                except Exception:  # noqa: BLE001
+                except Exception as e:  # noqa: BLE001
+                    log.warning("index failed %s: %s", futs[fut], e)
                     summary["errors"] += 1
                 tick(str(futs[fut]))
                 if done % COMMIT_EVERY == 0:

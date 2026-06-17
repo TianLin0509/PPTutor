@@ -8,12 +8,15 @@
 """
 from __future__ import annotations
 
+import logging
 import posixpath
 import zipfile
 
 from lxml import etree
 
 from .models import ParsedDeck, SlidePage
+
+log = logging.getLogger(__name__)
 
 A_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
 P_NS = "http://schemas.openxmlformats.org/presentationml/2006/main"
@@ -126,7 +129,8 @@ def _parse_zip(zf: zipfile.ZipFile, deck: ParsedDeck) -> ParsedDeck:
         if slide_part:
             try:
                 pages.append(_parse_slide(zf, slide_part, i))
-            except Exception:  # noqa: BLE001 单页失败不毁整份
+            except Exception as e:  # noqa: BLE001 单页失败不毁整份
+                log.warning("slide parse failed page=%s part=%s: %s", i, slide_part, e)
                 pages.append(SlidePage(page_no=i))
         else:
             pages.append(SlidePage(page_no=i))

@@ -76,3 +76,11 @@ def test_ranking_recency(tmp_path):
 def test_empty_query(tmp_path):
     conn, _ = _build(tmp_path, {"a.pptx": ["x"]})
     assert search.search(conn, "   ") == []
+
+
+def test_fts_special_chars_no_crash(tmp_path):
+    """含 FTS5 特殊语义/不配对引号的查询不应抛异常（回归：曾抛 OperationalError）。"""
+    conn, _ = _build(tmp_path, {"a.pptx": ["正常内容 测试方案"]})
+    for q in ['"', 'AND', 'foo*(', 'a OR', '""', '(((', '* NEAR']:
+        res = search.search(conn, q)
+        assert isinstance(res, list)
