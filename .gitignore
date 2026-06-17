@@ -1,0 +1,20 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# pptx-finder runtime / cache / test artifacts
+*.db
+*.db-wal
+*.db-shm
+cache/
+.pytest_cache/
+.ruff_cache/
+tests/_generated/
+.coverage

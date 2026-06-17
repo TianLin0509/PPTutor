@@ -1,0 +1,48 @@
+"""路径、扫描排除规则、常量。"""
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+APP_NAME = "pptx-finder"
+
+
+def data_dir() -> Path:
+    """应用数据目录。可用 PPTX_FINDER_DATA_DIR 覆盖（测试隔离用）。"""
+    base = os.environ.get("PPTX_FINDER_DATA_DIR")
+    if not base:
+        local = os.environ.get("LOCALAPPDATA") or str(Path.home())
+        base = os.path.join(local, APP_NAME)
+    p = Path(base)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def db_path() -> Path:
+    return data_dir() / "index.db"
+
+
+def cache_dir() -> Path:
+    p = data_dir() / "cache"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+# 扫描时排除的目录名（小写，按路径片段匹配）——减少无效 IO 与噪音
+EXCLUDE_DIR_NAMES: set[str] = {
+    "windows", "program files", "program files (x86)", "programdata",
+    "$recycle.bin", "system volume information", "appdata",
+    "node_modules", ".git", "__pycache__", ".venv", "venv", "env",
+    "$winreagent", "recovery", "msocache", "intel", "perflogs",
+}
+
+# 支持的扩展名
+PPTX_EXT = ".pptx"
+PPT_EXT = ".ppt"
+SUPPORTED_EXTS = (PPTX_EXT, PPT_EXT)
+
+# 超过此大小跳过解析（仍可文件名命中）
+MAX_PARSE_SIZE = 200 * 1024 * 1024  # 200MB
+
+# 全局唤起热键
+GLOBAL_HOTKEY = "Ctrl+Alt+P"
