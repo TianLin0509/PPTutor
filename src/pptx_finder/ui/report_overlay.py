@@ -2,16 +2,18 @@
 
 - 文案格式化纯函数（human_bytes / redmansion_equiv / hour_label）便于单测。
 - 跟随主题（tok 传入），用内联样式而非全局 QSS（不依赖 theme 模块，互不冲突）。
-- 导出 PNG：grab 完整卡片面板存图，方便发同事群。
-- Esc / 点遮罩关闭。
+- 给定 conn 时 header 提供「全部 / 本年」年度切换；导出 PNG；Esc / 点遮罩关闭。
 """
 from __future__ import annotations
+
+from datetime import datetime
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea, QVBoxLayout, QWidget,
 )
 
+from .. import stats
 from .heatmap import HeatmapWidget
 
 _RED_MANSION_CHARS = 730_000  # 《红楼梦》约 73 万字
@@ -43,19 +45,41 @@ def hour_label(h: int) -> str:
     return f"深夜{h}点"
 
 
+def _this_year() -> int:
+    return datetime.now().year
+
+
 # ---------- 浮层 ----------
 
 class ReportOverlay(QWidget):
-    """半透明遮罩 + 居中卡片。card 自然高度（导出完整），显示时套滚动区限高。"""
+    """半透明遮罩 + 居中卡片。给定 conn 时支持年度切换（重算重建内容）。"""
 
-    def __init__(self, report, tok, parent=None):
+    def __init__(self, report, tok, parent=None, *, conn=None):
         super().__init__(parent)
         self._tok = tok
+        self._conn = conn
+        self.current_report = report
+        self.current_year = report.scope_year
         self.setObjectName("reportOverlay")
         self.setAttribute(Qt.WA_StyledBackground, True)
         self.setStyleSheet("#reportOverlay{background:rgba(0,0,0,0.42);}")
 
-        self._card = self._build_card(report, tok)
+        self._card = QFrame()
+        self._card.setObjectName("repCard")
+        self._card.setFixedWidth(480)
+        self._card.setStyleSheet(
+            f"#repCard{{background:{tok['win']};border:1px solid {tok['bd']};border-radius:16px;}}")
+        self._card_lay = QVBoxLayout(self._card)
+        self._card_lay.setContentsMargins(24, 20, 24, 24)
+        self._card_lay.setSpacing(13)
+
+        self._build_header()
+        self._content = QWidget()
+        self._content_lay = QVBoxLayout(self._content)
+        self._content_lay.setContentsMargins(0, 0, 0, 0)
+        self._content_lay.setSpacing(13)
+        self._card_lay.addWidget(self._content)
+        self._fill_content()
 
         scroll = QScrollArea()
         scroll.setWidget(self._card)
@@ -65,32 +89,37 @@ class ReportOverlay(QWidget):
         scroll.setFixedWidth(self._card.width() + 18)
         scroll.setMaximumHeight(700)
         scroll.setStyleSheet("background:transparent;")
-        self._scroll = scroll
 
         outer = QVBoxLayout(self)
         outer.addWidget(scroll, alignment=Qt.AlignCenter)
-
         if parent is not None:
             self.setGeometry(parent.rect())
 
     # ---- 构建 ----
-    def _build_card(self, report, tok) -> QFrame:
-        card = QFrame()
-        card.setObjectName("repCard")
-        card.setFixedWidth(480)
-        card.setStyleSheet(
-            f"#repCard{{background:{tok['win']};border:1px solid {tok['bd']};border-radius:16px;}}")
-        lay = QVBoxLayout(card)
-        lay.setContentsMargins(24, 20, 24, 24)
-        lay.setSpacing(13)
-
-        # 标题行 + 导出 / 关闭
+    def _build_header(self) -> None:
+        tok = self._tok
         head = QHBoxLayout()
-        scope = report.scope_year if report.scope_year else "全部历史"
-        title = QLabel(f"🎞️ 我的胶片报告 · {scope}")
-        title.setStyleSheet(
+        self._title = QLabel("🎞️ 我的胶片报告")
+        self._title.setStyleSheet(
             f"font-size:17px;font-weight:700;color:{tok['ink1']};background:transparent;border:none;")
-        head.addWidget(title, 1)
+        head.addWidget(self._title, 1)
+
+        # 年度切换（仅当给定 conn 可重算时）
+        if self._conn is not None:
+            self._all_btn = QPushButton("全部")
+            self._year_btn = QPushButton("本年")
+            chip_css = (
+                f"QPushButton{{background:{tok['field']};color:{tok['ink3']};border:1px solid {tok['bd']};"
+                f"border-radius:980px;padding:3px 11px;font-size:12px;}}"
+                f"QPushButton:checked{{background:rgba({tok['hl_r']},{tok['hl_g']},{tok['hl_b']},0.16);"
+                f"color:{tok['acc']};border-color:{tok['acc']};}}")
+            for b, yr in ((self._all_btn, None), (self._year_btn, _this_year())):
+                b.setCheckable(True)
+                b.setCursor(Qt.PointingHandCursor)
+                b.setStyleSheet(chip_css)
+                b.clicked.connect(lambda _=False, y=yr: self.switch_year(y))
+                head.addWidget(b)
+
         self.export_btn = QPushButton("导出图片")
         self.export_btn.setStyleSheet(
             f"QPushButton{{background:{tok['acc']};color:{tok['acctext']};border:none;"
@@ -102,14 +131,32 @@ class ReportOverlay(QWidget):
             f"QPushButton{{background:transparent;color:{tok['ink3']};border:none;font-size:15px;}}")
         self.close_btn.clicked.connect(self.close)
         head.addWidget(self.close_btn)
-        lay.addLayout(head)
+        self._card_lay.addLayout(head)
 
-        # 总览
+    def switch_year(self, year: int | None) -> None:
+        self.current_year = year
+        if self._conn is not None:
+            self.current_report = stats.build_report(self._conn, year=year)
+        self._fill_content()
+
+    def _fill_content(self) -> None:
+        while self._content_lay.count():
+            it = self._content_lay.takeAt(0)
+            if it.widget():
+                it.widget().deleteLater()
+        report = self.current_report
+        tok = self._tok
+
+        scope = f"{self.current_year} 年" if self.current_year else "全部历史"
+        if self._conn is not None:
+            self._all_btn.setChecked(self.current_year is None)
+            self._year_btn.setChecked(self.current_year is not None)
+
         sc = report.scale
         overview = QLabel(
-            f"{report.deck_count} 份胶片　·　{sc.total_chars:,} 字　·　{human_bytes(sc.total_bytes)}")
+            f"{scope}　·　{report.deck_count} 份胶片　·　{sc.total_chars:,} 字　·　{human_bytes(sc.total_bytes)}")
         overview.setStyleSheet(f"color:{tok['ink3']};background:transparent;border:none;font-size:12.5px;")
-        lay.addWidget(overview)
+        self._content_lay.addWidget(overview)
 
         # 🔥 肝度（含热力图）
         n = report.night
@@ -119,12 +166,12 @@ class ReportOverlay(QWidget):
         ]
         if n.latest_name:
             nlines.append(f"最晚一次 <b>{hour_label(n.latest_hour)}</b> 改了《{n.latest_name}》")
-        liver = self._section("🔥 肝度", nlines, tok)
+        liver = self._section("🔥 肝度", nlines)
         liver.layout().addWidget(HeatmapWidget(
             report.heatmap,
             accent=(int(tok["hl_r"]), int(tok["hl_g"]), int(tok["hl_b"])),
             empty=tok["field"], ink=tok["ink3"]))
-        lay.addWidget(liver)
+        self._content_lay.addWidget(liver)
 
         # 😅 改版名场面
         d = report.drama
@@ -135,7 +182,7 @@ class ReportOverlay(QWidget):
             f"终版诅咒：<b>{d.final_curse_count}</b> 份名带「最终/final/vN」（{d.final_curse_ratio:.0%}）")
         if d.zombie_name:
             dlines.append(f"僵尸胶片：《{d.zombie_name}》吃灰最久")
-        lay.addWidget(self._section("😅 改版名场面", dlines, tok))
+        self._content_lay.addWidget(self._section("😅 改版名场面", dlines))
 
         # 📊 规模仓鼠
         slines = []
@@ -143,7 +190,7 @@ class ReportOverlay(QWidget):
             slines.append(f"最长：《{sc.longest_name}》<b>{sc.longest_pages}</b> 页")
         slines.append(f"累计码字 {sc.total_chars:,} ≈ <b>{redmansion_equiv(sc.total_chars)}</b>")
         slines.append(f"磁盘占用 <b>{human_bytes(sc.total_bytes)}</b>")
-        lay.addWidget(self._section("📊 规模仓鼠", slines, tok))
+        self._content_lay.addWidget(self._section("📊 规模仓鼠", slines))
 
         # 🏅 人格称号
         p = report.persona
@@ -152,12 +199,12 @@ class ReportOverlay(QWidget):
             f"<span style='font-size:18px;font-weight:700;color:{tok['acc']};'>{p.title}</span>",
             f"副标签：{badge}",
         ]
-        lay.addWidget(self._section("🏅 你的称号", plines, tok))
+        self._content_lay.addWidget(self._section("🏅 你的称号", plines))
 
-        card.adjustSize()
-        return card
+        self._card.adjustSize()
 
-    def _section(self, title: str, html_lines: list[str], tok) -> QFrame:
+    def _section(self, title: str, html_lines: list[str]) -> QFrame:
+        tok = self._tok
         f = QFrame()
         f.setStyleSheet(
             f"background:{tok['canvas']};border:1px solid {tok['bd']};border-radius:12px;")
@@ -188,7 +235,6 @@ class ReportOverlay(QWidget):
             super().keyPressEvent(e)
 
     def mousePressEvent(self, e):  # noqa: N802
-        # 点击遮罩空白（不在卡片/滚动区内）即关闭
         if self.childAt(e.position().toPoint()) is None:
             self.close()
         super().mousePressEvent(e)

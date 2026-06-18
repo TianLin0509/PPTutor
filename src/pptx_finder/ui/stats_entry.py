@@ -15,7 +15,7 @@ from .report_overlay import ReportOverlay
 
 def _open_report(mw) -> None:
     report = stats.build_report(mw._conn, year=None)
-    ov = ReportOverlay(report, theme.tok(mw._theme), parent=mw)
+    ov = ReportOverlay(report, theme.tok(mw._theme), parent=mw, conn=mw._conn)
     ov.setGeometry(mw.rect())
     ov.show()
     ov.raise_()

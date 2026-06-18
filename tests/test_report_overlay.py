@@ -47,3 +47,25 @@ def test_overlay_constructs_and_exports_png(qtbot, tmp_path):
     out = tmp_path / "report.png"
     assert ov.export_png(str(out)) is True
     assert out.exists() and out.stat().st_size > 0
+
+
+def test_overlay_year_switch_rebuilds_report(qtbot, tmp_path):
+    conn = db.connect(tmp_path / "i.db")
+    db.init_db(conn)
+    db.upsert_file(conn, path="/a.pptx", name="a.pptx", ext=".pptx", size=1000,
+                   mtime=_ts(2026, 6, 1, 2), content_hash="h", page_count=5,
+                   status="ok", error="", indexed_at=0)
+    db.upsert_file(conn, path="/b.pptx", name="b.pptx", ext=".pptx", size=1000,
+                   mtime=_ts(2020, 1, 1, 2), content_hash="h", page_count=5,
+                   status="ok", error="", indexed_at=0)
+    conn.commit()
+    report = stats.build_report(conn, year=None)
+    ov = ro.ReportOverlay(report, theme.tok("cloud"), conn=conn)
+    qtbot.addWidget(ov)
+    assert ov.current_report.deck_count == 2     # 全部历史
+    ov.switch_year(2026)
+    assert ov.current_year == 2026
+    assert ov.current_report.deck_count == 1     # 仅 2026 那份
+    ov.switch_year(None)
+    assert ov.current_year is None
+    assert ov.current_report.deck_count == 2
