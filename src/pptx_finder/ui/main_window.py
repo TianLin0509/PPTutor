@@ -292,6 +292,10 @@ class MainWindow(QMainWindow):
         self.status.addPermanentWidget(kb)
         self.status.addPermanentWidget(self.hotkey_label)
 
+        # 趣味统计「我的胶片报告」入口（非侵入注入，逻辑全在 stats_entry）
+        from .stats_entry import install_stats_entry
+        install_stats_entry(self)
+
     def _build_preview(self) -> QWidget:
         panel = QWidget()
         panel.setObjectName("previewPanel")
