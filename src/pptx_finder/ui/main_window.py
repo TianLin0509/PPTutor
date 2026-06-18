@@ -363,7 +363,9 @@ class MainWindow(QMainWindow):
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setFrameShape(QFrame.NoFrame)
-        self.image_label = QLabel("← 选中左侧结果查看预览")
+        self.image_label = QLabel(
+            '<div style="font-size:30px">🔎</div>'
+            '<div style="color:#888;font-size:13px;margin-top:12px">选中左侧结果，预览命中页</div>')
         self.image_label.setObjectName("previewImage")
         self.image_label.setAlignment(Qt.AlignCenter)
         self.scroll.setWidget(self.image_label)
@@ -636,7 +638,10 @@ class MainWindow(QMainWindow):
             return
         if not png or not os.path.exists(png):
             self.image_label.setPixmap(QPixmap())
-            self.image_label.setText("无法预览此页，可直接点「打开文件」查看")
+            self.image_label.setText(
+                '<div style="font-size:30px">📄</div>'
+                '<div style="color:#888;font-size:13px;margin-top:12px">此页暂时无法预览<br>'
+                '点「打开文件」直接查看</div>')
             self._cur_pixmap = None
             return
         pm = QPixmap(png)
