@@ -183,6 +183,7 @@ class MainWindow(QMainWindow):
         self._cur: FileResult | None = None
         self._cur_item_widget: ResultItem | None = None
         self._hit_idx = 0
+        self._view_page = 1  # 当前预览页（原始页序，滚轮可脱离命中页自由翻）
         self._req_id = 0
         self._cur_pixmap: QPixmap | None = None
         self._to_tray_on_close = False
@@ -333,6 +334,9 @@ class MainWindow(QMainWindow):
         self.image_label.setObjectName("previewImage")
         self.image_label.setAlignment(Qt.AlignCenter)
         self.scroll.setWidget(self.image_label)
+        # 预览区滚轮 = 按原始页序翻页（看前几页判断是不是要找的 PPT）
+        self.scroll.viewport().installEventFilter(self)
+        self.image_label.installEventFilter(self)
         lay.addWidget(self.scroll, 1)
 
         # 命中页缩略图条
@@ -474,6 +478,7 @@ class MainWindow(QMainWindow):
             return
         self._cur = self._results[idx]
         self._hit_idx = 0
+        self._view_page = self._current_page()  # 初始定位首个命中页（无命中=第1页）
         w = self.result_list.itemWidget(cur)
         if isinstance(w, ResultItem):
             w.set_selected(True, self.isActiveWindow())
@@ -509,33 +514,59 @@ class MainWindow(QMainWindow):
 
     def _goto_hit(self, i: int) -> None:
         self._hit_idx = i
+        if self._cur and self._cur.hits:
+            self._view_page = self._cur.hits[i].page_no
         self._request_preview()
 
     def _step_hit(self, delta: int) -> None:
         if not self._cur or not self._cur.hits:
             return
         self._hit_idx = max(0, min(len(self._cur.hits) - 1, self._hit_idx + delta))
+        self._view_page = self._cur.hits[self._hit_idx].page_no
         self._request_preview()
 
     def _request_preview(self) -> None:
         if not self._cur:
             return
-        page = self._current_page()
-        n = len(self._cur.hits) if self._cur.hits else 0
-        if n:
-            self.page_label.setText(f"命中 {self._hit_idx + 1}/{n}　第 {page} 页")
-            self.prev_btn.setEnabled(self._hit_idx > 0)
-            self.next_btn.setEnabled(self._hit_idx < n - 1)
+        page = self._view_page
+        hits = self._cur.hits or []
+        total = self._cur.page_count or 0
+        n = len(hits)
+        hit_pages = {h.page_no for h in hits}
+        # 页码：第 X / 共 N 页（滚轮可在原始页序间自由翻；命中页加标记）
+        if total:
+            tag = "　·　命中页" if page in hit_pages else ""
+            self.page_label.setText(f"第 {page} / {total} 页{tag}")
         else:
             self.page_label.setText(f"第 {page} 页")
-            self.prev_btn.setEnabled(False)
-            self.next_btn.setEnabled(False)
+        # 上/下「命中页」按钮：在命中页之间跳
+        self.prev_btn.setEnabled(n > 0 and self._hit_idx > 0)
+        self.next_btn.setEnabled(n > 0 and self._hit_idx < n - 1)
+        # 缩略图高亮：当前页正好是某命中页就点亮它
         for i, b in enumerate(self._thumb_btns):
-            b.setChecked(i == self._hit_idx)
+            b.setChecked(i < n and hits[i].page_no == page)
         self.image_label.setPixmap(QPixmap())
         self.image_label.setText("渲染中…")
         self._req_id += 1
         self._render.request(self._req_id, self._cur.path, page, cache_key=None)
+
+    def _wheel_page(self, delta_y: int) -> None:
+        """预览区滚轮：按原始页序上下翻页（向上滚=上一页，向下滚=下一页）。"""
+        if not self._cur:
+            return
+        total = self._cur.page_count or 0
+        if total <= 0:
+            return  # .ppt / 未解析，页数未知，不翻页
+        new = self._view_page + (-1 if delta_y > 0 else 1)
+        new = max(1, min(total, new))
+        if new == self._view_page:
+            return
+        self._view_page = new
+        for i, h in enumerate(self._cur.hits or []):
+            if h.page_no == new:
+                self._hit_idx = i  # 翻到命中页时同步，让上/下命中页按钮接续
+                break
+        self._request_preview()
 
     def _on_rendered(self, req_id: int, png: str) -> None:
         if req_id != self._req_id:
@@ -568,6 +599,9 @@ class MainWindow(QMainWindow):
 
     # ---------- 键盘 ----------
     def eventFilter(self, obj, ev):  # noqa: N802
+        if ev.type() == QEvent.Wheel and obj in (self.image_label, self.scroll.viewport()):
+            self._wheel_page(ev.angleDelta().y())
+            return True
         if obj is self.search_box and ev.type() == QEvent.KeyPress:
             k = ev.key()
             if k in (Qt.Key_Down, Qt.Key_Up):
@@ -618,7 +652,7 @@ class MainWindow(QMainWindow):
     def _act_goto(self) -> None:
         if not self._cur:
             return
-        page = self._current_page()
+        page = self._view_page
         opened, jumped = actions.open_at_page(self._cur.path, page)
         if not opened:
             self._toast("文件已移动或删除")

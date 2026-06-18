@@ -1,10 +1,13 @@
-"""索引构建：多进程并行解析 + 增量更新 + 进度回调。
+"""索引构建：流式扫描 + 两阶段渐进 + 并行解析（walk 与解析流水线化）。
 
-提速要点（spec §4）：
-- 解析(解压+XML)与 jieba 分词都在 worker 进程并行完成，主进程只负责写 SQLite（单写者）。
-- 增量：以 (size, mtime) 快筛；内容 hash 复核避免 Office 重置 mtime 造成的误判。
-- 边建边可搜：每批提交事务，UI 可立即搜索已入库部分。
-- 可中断：stop_event 协作式停止。
+设计（v0.3 优化）：
+- 免首次全量 hash：用 (size, mtime) 派生轻量标识判断变化，不读文件内容
+  （首次索引没有旧记录可比，读全量纯属浪费 IO）。
+- 两阶段渐进：阶段 1 流式登记文件名（status=pending，秒级可按名搜）；
+  阶段 2 并行解析内容、升级为 ok。
+- 流水线：边扫描边登记、边投递解析，walk 的磁盘 IO 与解析的 CPU 重叠。
+- 边建边可搜：扫描期定期提交，已登记的文件名立即可被搜索命中。
+- 可中断：stop_event 协作式停止；进程池退出时取消未完成任务。
 """
 from __future__ import annotations
 
@@ -13,11 +16,14 @@ import os
 import sqlite3
 import time
 from collections.abc import Callable, Iterable
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    ProcessPoolExecutor,
+    as_completed,
+    wait,
+)
 from pathlib import Path
 from typing import Any
-
-import xxhash
 
 from . import db
 from .config import MAX_PARSE_SIZE, PPT_EXT, ext_path
@@ -28,18 +34,20 @@ log = logging.getLogger(__name__)
 
 ProgressCb = Callable[[int, int, str], None]
 COMMIT_EVERY = 50
+SCAN_COMMIT_EVERY = 200  # 扫描期每登记这么多就提交一次，让文件名尽快可搜
 
 
-def _file_hash(path: str) -> str:
-    h = xxhash.xxh64()
-    with open(ext_path(path), "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
+def _stat_hash(size: int, mtime: float) -> str:
+    """(size, mtime) 派生的轻量变更标识——不读文件内容。"""
+    return f"{mtime}:{size}"
 
 
 def _index_one(path: str) -> dict[str, Any]:
-    """worker：解析 + 逐页分词 + 内容 hash。返回可 pickle 的紧凑结果。"""
+    """worker：解压 + 提取文本 + 逐页分词。返回可 pickle 的紧凑结果。
+
+    不读全量算 hash（首次索引无旧记录可比，纯属浪费 IO）；
+    变更检测交给上层 (size, mtime) 快筛。
+    """
     st = os.stat(ext_path(path))
     res: dict[str, Any] = {
         "path": path,
@@ -47,7 +55,7 @@ def _index_one(path: str) -> dict[str, Any]:
         "ext": os.path.splitext(path)[1].lower(),
         "size": st.st_size,
         "mtime": st.st_mtime,
-        "content_hash": "",
+        "content_hash": _stat_hash(st.st_size, st.st_mtime),
         "status": "ok",
         "error": "",
         "page_count": 0,
@@ -55,40 +63,40 @@ def _index_one(path: str) -> dict[str, Any]:
     }
     if st.st_size > MAX_PARSE_SIZE:
         res["status"] = "too_large"
-        res["content_hash"] = f"size:{st.st_size}"  # 避免读大文件，仅按大小判变化
         return res
-
-    res["content_hash"] = _file_hash(path)
     deck = parse_pptx(path)
     res["status"] = deck.status
     res["error"] = deck.error
     res["page_count"] = deck.page_count
     if deck.status == "ok":
-        pages = []
-        for pg in deck.pages:
-            raw = pg.raw_text
-            pages.append((pg.page_no, raw, tokenize(raw)))
-        res["pages"] = pages
+        res["pages"] = [
+            (pg.page_no, pg.raw_text, tokenize(pg.raw_text)) for pg in deck.pages
+        ]
     return res
 
 
+def _register_pending(conn: sqlite3.Connection, path: Path, st: os.stat_result) -> None:
+    """阶段 1：仅登记文件名（status=pending，不解析内容），文件名立即可搜。
+
+    增量重解析时覆盖旧记录并清空旧页（旧内容先消失，解析完再补新内容）。
+    """
+    fid = db.upsert_file(
+        conn,
+        path=str(path), name=path.name, ext=path.suffix.lower(), size=st.st_size,
+        mtime=st.st_mtime, content_hash=_stat_hash(st.st_size, st.st_mtime),
+        page_count=0, status="pending", error="", indexed_at=time.time(),
+    )
+    db.replace_pages(conn, fid, [])
+
+
 def _write_result(conn: sqlite3.Connection, res: dict[str, Any]) -> None:
-    now = time.time()
-    existing = db.get_file_by_path(conn, res["path"])
-    # 内容未变（hash 同 + 状态同）→ 仅刷新 stat，跳过重写页
-    if (
-        existing
-        and existing["content_hash"] == res["content_hash"]
-        and existing["status"] == res["status"]
-    ):
-        db.touch_stat(conn, existing["id"], res["size"], res["mtime"], now)
-        return
+    """阶段 2：写入解析结果（覆盖阶段 1 的 pending 占位 / 旧内容）。"""
     fid = db.upsert_file(
         conn,
         path=res["path"], name=res["name"], ext=res["ext"], size=res["size"],
         mtime=res["mtime"], content_hash=res["content_hash"],
         page_count=res["page_count"], status=res["status"], error=res["error"],
-        indexed_at=now,
+        indexed_at=time.time(),
     )
     db.replace_pages(conn, fid, res["pages"])
 
@@ -96,88 +104,13 @@ def _write_result(conn: sqlite3.Connection, res: dict[str, Any]) -> None:
 def _write_filename_only(conn: sqlite3.Connection, path: Path) -> None:
     """.ppt 旧格式：仅登记文件名，不解析内容。"""
     st = path.stat()
-    now = time.time()
     fid = db.upsert_file(
         conn,
         path=str(path), name=path.name, ext=path.suffix.lower(), size=st.st_size,
         mtime=st.st_mtime, content_hash=f"size:{st.st_size}", page_count=0,
-        status="filename_only", error="", indexed_at=now,
+        status="filename_only", error="", indexed_at=time.time(),
     )
     db.replace_pages(conn, fid, [])
-
-
-def index_file_list(
-    conn: sqlite3.Connection,
-    paths: list[Path],
-    progress_cb: ProgressCb | None = None,
-    workers: int | None = None,
-    stop_event: Any = None,
-) -> dict[str, int]:
-    """索引给定文件列表。workers=1 时内联执行（便于测试/调试）。"""
-    summary = {"indexed": 0, "errors": 0, "skipped_ppt": 0}
-    pptx = [p for p in paths if p.suffix.lower() != PPT_EXT]
-    ppt = [p for p in paths if p.suffix.lower() == PPT_EXT]
-    total = len(pptx) + len(ppt)
-    done = 0
-
-    def tick(cur: str) -> None:
-        nonlocal done
-        done += 1
-        if progress_cb:
-            progress_cb(done, total, cur)
-
-    # .ppt：文件名登记
-    for p in ppt:
-        if stop_event is not None and stop_event.is_set():
-            break
-        try:
-            _write_filename_only(conn, p)
-            summary["skipped_ppt"] += 1
-        except Exception as e:  # noqa: BLE001
-            log.warning("ppt register failed %s: %s", p, e)
-            summary["errors"] += 1
-        tick(str(p))
-
-    # .pptx：解析（并行或内联）
-    if workers == 1:
-        for p in pptx:
-            if stop_event is not None and stop_event.is_set():
-                break
-            try:
-                res = _index_one(str(p))
-                _write_result(conn, res)
-                if res["status"] in ("ok", "filename_only", "too_large"):
-                    summary["indexed"] += 1
-                else:
-                    summary["errors"] += 1
-            except Exception as e:  # noqa: BLE001 单文件失败不中断
-                log.warning("index failed %s: %s", p, e)
-                summary["errors"] += 1
-            tick(str(p))
-            if done % COMMIT_EVERY == 0:
-                conn.commit()
-    else:
-        max_workers = workers or min(os.cpu_count() or 4, 8)
-        with ProcessPoolExecutor(max_workers=max_workers) as ex:
-            futs = {ex.submit(_index_one, str(p)): p for p in pptx}
-            for fut in as_completed(futs):
-                if stop_event is not None and stop_event.is_set():
-                    break
-                try:
-                    res = fut.result()
-                    _write_result(conn, res)
-                    if res["status"] in ("ok", "filename_only", "too_large"):
-                        summary["indexed"] += 1
-                    else:
-                        summary["errors"] += 1
-                except Exception as e:  # noqa: BLE001
-                    log.warning("index failed %s: %s", futs[fut], e)
-                    summary["errors"] += 1
-                tick(str(futs[fut]))
-                if done % COMMIT_EVERY == 0:
-                    conn.commit()
-    conn.commit()
-    return summary
 
 
 def update_index(
@@ -188,41 +121,123 @@ def update_index(
     stop_event: Any = None,
     scan_iter: Iterable[Path] | None = None,
 ) -> dict[str, int]:
-    """全量/增量更新：扫描 roots，与库比对，索引新增/变更，删除已消失文件。"""
+    """增量更新：流式扫描 → 即时登记文件名 → 并行解析补全内容。
+
+    progress_cb(done, total, cur)：total<0 = 扫描阶段（文件名渐进可搜），
+    total>=0 = 内容解析阶段（done/total）。
+    """
     from .scanner import iter_ppt_files
 
     existing = db.all_indexed(conn)
     seen: set[str] = set()
-    to_index: list[Path] = []
-
+    summary = {"indexed": 0, "errors": 0, "skipped_ppt": 0, "deleted": 0}
     source = scan_iter if scan_iter is not None else iter_ppt_files(roots)
-    for p in source:
-        sp = str(p)
-        seen.add(sp)
-        if progress_cb and len(seen) % 200 == 0:
-            progress_cb(0, -1, f"已发现 {len(seen)} 个文件")  # total<0 表示扫描阶段
-        row = existing.get(sp)
-        if row is None:
-            to_index.append(p)
-            continue
-        try:
-            st = p.stat()
-        except OSError:
-            continue
-        # (size, mtime) 快筛：任一变化即重索引
-        if int(st.st_size) != int(row["size"]) or abs(st.st_mtime - row["mtime"]) > 1e-6:
-            to_index.append(p)
 
-    # 删除磁盘上已消失的文件
-    deleted = 0
-    for path in list(existing.keys()):
-        if path not in seen:
-            db.delete_file(conn, path)
-            deleted += 1
-    if deleted:
+    inline = workers == 1
+    max_workers = workers or min(os.cpu_count() or 4, 8)
+    ex = None if inline else ProcessPoolExecutor(max_workers=max_workers)
+    futs: dict[Any, Path] = {}
+    total = 0  # 需解析的 .pptx 数（随扫描增长）
+    done = 0
+
+    def stopped() -> bool:
+        return stop_event is not None and stop_event.is_set()
+
+    def write_done(fut) -> None:
+        nonlocal done
+        p = futs.pop(fut)
+        try:
+            _write_result(conn, fut.result())
+            summary["indexed"] += 1
+        except Exception as e:  # noqa: BLE001 单文件失败不中断批量
+            log.warning("index failed %s: %s", p, e)
+            summary["errors"] += 1
+        done += 1
+        if progress_cb:
+            progress_cb(done, total, str(p))
+        if done % COMMIT_EVERY == 0:
+            conn.commit()
+
+    try:
+        # ---- 阶段 1：流式扫描 + 即时登记文件名（并行路径同时投递解析）----
+        for p in source:
+            if stopped():
+                break
+            sp = str(p)
+            seen.add(sp)
+            if len(seen) % SCAN_COMMIT_EVERY == 0:
+                conn.commit()  # 已登记的文件名落盘 → 立即可搜
+                if progress_cb:
+                    progress_cb(0, -1, f"已发现 {len(seen)} 个文件")
+            row = existing.get(sp)
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            # (size, mtime) 快筛；status=pending 视为「上次没解析完」需重做
+            unchanged = (
+                row is not None
+                and int(st.st_size) == int(row["size"])
+                and abs(st.st_mtime - row["mtime"]) <= 1e-6
+                and row["status"] != "pending"
+            )
+            if unchanged:
+                continue
+            if p.suffix.lower() == PPT_EXT:
+                try:
+                    _write_filename_only(conn, p)
+                    summary["skipped_ppt"] += 1
+                except Exception as e:  # noqa: BLE001
+                    log.warning("ppt register failed %s: %s", p, e)
+                    summary["errors"] += 1
+                continue
+            # .pptx
+            total += 1
+            if inline:
+                try:
+                    _write_result(conn, _index_one(sp))
+                    summary["indexed"] += 1
+                except Exception as e:  # noqa: BLE001
+                    log.warning("index failed %s: %s", p, e)
+                    summary["errors"] += 1
+                done += 1
+                if progress_cb:
+                    progress_cb(done, total, sp)
+                if done % COMMIT_EVERY == 0:
+                    conn.commit()
+            else:
+                _register_pending(conn, p, st)  # 先登记文件名（秒级可搜）
+                futs[ex.submit(_index_one, sp)] = p
+                for f in [f for f in list(futs) if f.done()]:  # 非阻塞收割
+                    write_done(f)
+                if len(futs) >= max_workers * 4:  # 背压：防积压内存膨胀
+                    fin, _ = wait(list(futs), return_when=FIRST_COMPLETED)
+                    for f in fin:
+                        write_done(f)
         conn.commit()
 
-    summary = index_file_list(conn, to_index, progress_cb, workers, stop_event)
-    summary["deleted"] = deleted
+        # ---- 删除磁盘上已消失的文件 ----
+        for path in list(existing.keys()):
+            if stopped():
+                break
+            if path not in seen:
+                db.delete_file(conn, path)
+                summary["deleted"] += 1
+        if summary["deleted"]:
+            conn.commit()
+
+        # ---- 阶段 2 收尾：收割剩余解析 ----
+        if not inline and futs:
+            for fut in as_completed(list(futs)):
+                if stopped():
+                    break
+                write_done(fut)
+        conn.commit()
+    finally:
+        if ex is not None:
+            ex.shutdown(wait=not stopped(), cancel_futures=stopped())
+
+    if progress_cb:
+        progress_cb(total, total, "完成")  # 进度走满
     summary["scanned"] = len(seen)
     return summary

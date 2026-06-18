@@ -110,3 +110,43 @@ def test_index_progress_three_states(qtbot, tmp_path):
     win._on_index_done({"indexed": 1, "deleted": 0})
     assert "索引就绪" in win.status_label.text()
     assert win.pct_label.text() == ""
+
+
+# ---- 预览滚轮翻原始页 ----
+def test_wheel_browses_original_pages(qtbot, tmp_path):
+    docs = tmp_path / "wd"
+    docs.mkdir()
+    fx.make_pptx(docs / "多页.pptx", [
+        {"body": "封面 标题页"},
+        {"body": "目录 概览"},
+        {"body": "正文 算力 集群 部署"},
+        {"body": "总结 致谢"},
+    ])
+    conn = db.connect(tmp_path / "w.db")
+    db.init_db(conn)
+    indexer.update_index(conn, [str(docs)], workers=1)
+    win = MainWindow(conn=conn, render_worker=_Stub(), do_index=False)
+    qtbot.addWidget(win)
+    win.search_box.setText("算力")
+    win._do_search()
+    win.result_list.setCurrentRow(0)
+    assert win._cur.page_count == 4
+    assert win._view_page == 3            # 初始定位命中页（第 3 页）
+    win._wheel_page(-120)                 # 向下滚 → 第 4 页
+    assert win._view_page == 4
+    win._wheel_page(-120)                 # 已到末页，不越界
+    assert win._view_page == 4
+    win._wheel_page(120)                  # 向上滚回翻 4→3→2→1
+    win._wheel_page(120)
+    win._wheel_page(120)
+    assert win._view_page == 1
+    win._wheel_page(120)                  # 已到首页，不越界
+    assert win._view_page == 1
+
+
+def test_wheel_noop_when_no_selection(qtbot, tmp_path):
+    conn = _mk(tmp_path)
+    win = MainWindow(conn=conn, render_worker=_Stub(), do_index=False)
+    qtbot.addWidget(win)
+    win._wheel_page(-120)                 # 无选中时不应崩、不改页
+    assert win._view_page == 1

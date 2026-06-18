@@ -108,3 +108,35 @@ def test_parallel_workers(tmp_path):
     assert summary["indexed"] == 3
     assert db.stats(conn)["file_count"] == 3
     assert len(_fts_files(conn, "并行解析测试")) == 3
+
+
+def test_two_stage_filename_searchable_before_content(tmp_path):
+    """两阶段渐进：文件名先可搜，内容解析后才可搜。"""
+    from pptx_finder import search as sm
+    docs = tmp_path / "d"
+    docs.mkdir()
+    p = docs / "算力方案报告.pptx"
+    _mk(p, ["昇腾 集群 部署"])
+    conn = db.connect(tmp_path / "i.db")
+    db.init_db(conn)
+    # 阶段 1：仅登记文件名（pending）
+    indexer._register_pending(conn, p, p.stat())
+    conn.commit()
+    r1 = sm.search(conn, "算力方案")
+    assert r1 and r1[0].name_hit          # 文件名立即可搜
+    assert not sm.search(conn, "昇腾")    # 内容此时还搜不到
+    # 阶段 2：解析升级
+    indexer._write_result(conn, indexer._index_one(str(p)))
+    conn.commit()
+    r2 = sm.search(conn, "昇腾")
+    assert r2 and r2[0].hits              # 内容现在可搜
+
+
+def test_index_one_uses_lightweight_hash(tmp_path):
+    """免全量 hash：content_hash 用 size:mtime 派生（不读文件内容）。"""
+    p = tmp_path / "x.pptx"
+    _mk(p, ["内容"])
+    res = indexer._index_one(str(p))
+    assert res["status"] == "ok"
+    assert ":" in res["content_hash"]     # mtime:size 派生
+    assert str(res["size"]) in res["content_hash"]
