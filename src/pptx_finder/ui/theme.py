@@ -181,6 +181,7 @@ def tok(theme: str) -> dict[str, str]:
 
 
 def highlight_css(theme: str) -> str:
-    """结果片段命中词的半透明底（荧光笔效果，不变色不加粗）。"""
+    """结果片段命中词高亮：荧光底 + 加粗 + 强调色，搜索命中一眼可见。"""
     t = tok(theme)
-    return f"background:rgba({t['hl_r']},{t['hl_g']},{t['hl_b']},{t['hl_a']});border-radius:3px;"
+    return (f"background:rgba({t['hl_r']},{t['hl_g']},{t['hl_b']},{t['hl_a']});"
+            f"border-radius:3px;font-weight:700;color:{t['accd']};padding:0 1px;")
