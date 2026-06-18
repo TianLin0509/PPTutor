@@ -18,7 +18,7 @@ import time
 from collections.abc import Callable, Iterable
 from concurrent.futures import (
     FIRST_COMPLETED,
-    ProcessPoolExecutor,
+    ThreadPoolExecutor,
     as_completed,
     wait,
 )
@@ -135,7 +135,9 @@ def update_index(
 
     inline = workers == 1
     max_workers = workers or min(os.cpu_count() or 4, 8)
-    ex = None if inline else ProcessPoolExecutor(max_workers=max_workers)
+    if not inline:
+        tokenize("预热")  # 主线程先触发 jieba 词典加载，避免多线程首次并发竞态
+    ex = None if inline else ThreadPoolExecutor(max_workers=max_workers)
     futs: dict[Any, Path] = {}
     total = 0  # 需解析的 .pptx 数（随扫描增长）
     done = 0
