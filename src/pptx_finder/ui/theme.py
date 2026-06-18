@@ -145,7 +145,7 @@ QPushButton#navBtn:disabled { color: $ink4; }
 /* 状态栏 */
 QStatusBar#statusBar { background: $panel2; border-top: 1px solid $bd; color: $ink3; }
 QStatusBar#statusBar QLabel { color: $ink3; font-size: 12px; background: transparent; }
-QLabel#kbd { color: $ink2; background: $field; border: 1px solid $bd; border-radius: 4px; padding: 1px 5px; font-size: 11px; }
+QLabel#kbd { color: $ink1; background: $field; border: 1px solid $bd2; border-radius: 5px; padding: 2px 6px; font-size: 11px; font-weight: 600; }
 
 /* 索引进度条 + 百分比 + 就绪绿点 */
 QProgressBar#indexBar { background: $bd2; border: none; border-radius: 4px; max-height: 7px; min-height: 7px; }
