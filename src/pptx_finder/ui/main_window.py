@@ -10,7 +10,7 @@ import html
 import json
 import os
 
-from PySide6.QtCore import QEvent, QMimeData, Qt, QTimer, QUrl
+from PySide6.QtCore import QEvent, QMimeData, QPropertyAnimation, Qt, QTimer, QUrl
 from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget,
@@ -466,6 +466,14 @@ class MainWindow(QMainWindow):
     def showEvent(self, e):  # noqa: N802
         super().showEvent(e)
         self._apply_titlebar_theme()  # 窗口显示后系统标题栏才接受深色属性
+        if not getattr(self, "_did_fade", False):
+            self._did_fade = True
+            self.setWindowOpacity(0.0)
+            self._fade = QPropertyAnimation(self, b"windowOpacity", self)
+            self._fade.setDuration(200)
+            self._fade.setStartValue(0.0)
+            self._fade.setEndValue(1.0)
+            self._fade.start()
 
     def _apply_titlebar_theme(self) -> None:
         """Windows 系统标题栏深浅跟随风格（深色风格→深色标题栏，消除白条割裂）。"""
