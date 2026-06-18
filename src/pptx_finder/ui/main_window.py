@@ -239,7 +239,7 @@ class MainWindow(QMainWindow):
         self.theme_btn = QPushButton()
         self.theme_btn.setObjectName("ghost")
         self.theme_btn.setMinimumHeight(42)
-        self.theme_btn.clicked.connect(self._toggle_theme)
+        self.theme_btn.clicked.connect(self._show_theme_menu)
         bar.addWidget(self.theme_btn)
         tl.addLayout(bar)
         root.addWidget(top)
@@ -413,15 +413,28 @@ class MainWindow(QMainWindow):
         app = QApplication.instance()
         if app is not None:
             app.setStyleSheet(theme.build_qss(name))
-        self.theme_btn.setText("🌙 深色" if name == "cloud" else "☀ 云白")
+        self.theme_btn.setText(f"🎨 {dict(theme.THEMES).get(name, name)}")
         if persist:
             _save_theme(name)
         if self._results:
             self._render_results(self._results)
             self.result_list.setCurrentRow(0)
 
+    def _show_theme_menu(self) -> None:
+        """顶栏风格按钮 → 弹出风格菜单（当前风格打勾）。"""
+        menu = QMenu(self)
+        for name, label in theme.THEMES:
+            act = menu.addAction(label)
+            act.setCheckable(True)
+            act.setChecked(name == self._theme)
+            act.triggered.connect(lambda _=False, n=name: self._apply_theme(n))
+        menu.exec(self.theme_btn.mapToGlobal(self.theme_btn.rect().bottomLeft()))
+
     def _toggle_theme(self) -> None:
-        self._apply_theme("raycast" if self._theme == "cloud" else "cloud")
+        """循环切到下一个风格（保留的快捷切换入口）。"""
+        names = [n for n, _ in theme.THEMES]
+        i = names.index(self._theme) if self._theme in names else 0
+        self._apply_theme(names[(i + 1) % len(names)])
 
     # ---------- 搜索 ----------
     def _do_search(self) -> None:

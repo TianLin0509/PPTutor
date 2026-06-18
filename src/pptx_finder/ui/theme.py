@@ -22,7 +22,40 @@ TOKENS: dict[str, dict[str, str]] = {
         acc="#6E9BF0", accd="#5B8DEF", acctext="#10131A", grn="#46C77E",
         scroll="#33333B", scrollh="#44444E", hl_r="110", hl_g="155", hl_b="240", hl_a="0.26",
     ),
+    # —— 深空影院：深黑 + 胶片暖金 + 电蓝 ——
+    "cinema": dict(
+        win="#0E0E12", canvas="#121217", field="#1A1A22", hover="#1E1E28",
+        sel="#2A2520", selblur="#1C1C24", ink1="#F2EFE8", ink2="#C8C4BA",
+        ink3="#8A8780", ink4="#5C5950", bd="#26262E", bd2="#33333C",
+        acc="#E3B572", accd="#C8954A", acctext="#1A1206", grn="#5FD39A",
+        scroll="#33333C", scrollh="#44444E", hl_r="227", hl_g="181", hl_b="114", hl_a="0.18",
+    ),
+    # —— 莫兰迪奶油：低饱和暖色 + 鼠尾草绿 ——
+    "morandi": dict(
+        win="#F0EBE2", canvas="#EAE4D8", field="#F7F2EA", hover="#EDE6D9",
+        sel="#E3DDCC", selblur="#ECE6DA", ink1="#4A4138", ink2="#6B5D4F",
+        ink3="#9B8E7D", ink4="#B3A896", bd="#E0D7C6", bd2="#D5CAB5",
+        acc="#9CAF88", accd="#7E9268", acctext="#FFFFFF", grn="#9CAF88",
+        scroll="#D5CAB5", scrollh="#C4B89F", hl_r="156", hl_g="175", hl_b="136", hl_a="0.22",
+    ),
+    # —— 极光玻璃：深紫 + 紫青粉 ——
+    "aurora": dict(
+        win="#0F0C1D", canvas="#14112A", field="#1C1838", hover="#221E40",
+        sel="#2A2450", selblur="#1E1A3A", ink1="#F0EEFC", ink2="#C8C2E8",
+        ink3="#9890C0", ink4="#6A6298", bd="#2A2548", bd2="#383158",
+        acc="#A855F7", accd="#9333EA", acctext="#FFFFFF", grn="#34D399",
+        scroll="#383158", scrollh="#4A4170", hl_r="168", hl_g="85", hl_b="247", hl_a="0.24",
+    ),
 }
+
+# 风格顺序 + 中文标签（用于顶栏风格切换菜单）
+THEMES: list[tuple[str, str]] = [
+    ("cloud", "云白极简"),
+    ("raycast", "深色经典"),
+    ("cinema", "深空影院"),
+    ("morandi", "莫兰迪奶油"),
+    ("aurora", "极光玻璃"),
+]
 
 _QSS = Template("""
 * { font-family: "Microsoft YaHei UI", "Segoe UI", "PingFang SC", sans-serif; }

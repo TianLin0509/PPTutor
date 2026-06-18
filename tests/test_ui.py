@@ -141,7 +141,6 @@ def test_theme_toggle(qtbot, tmp_path):
     conn = _index(tmp_path)
     win = MainWindow(conn=conn, render_worker=StubRender(), do_index=False)
     qtbot.addWidget(win)
-    t0 = win._theme
+    win._apply_theme("cloud")
     win._toggle_theme()
-    assert win._theme != t0
-    assert win._theme in ("cloud", "raycast")
+    assert win._theme == "raycast"   # 循环切到下一个风格（cloud → raycast）
