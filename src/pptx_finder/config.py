@@ -46,3 +46,15 @@ MAX_PARSE_SIZE = 200 * 1024 * 1024  # 200MB
 
 # 全局唤起热键
 GLOBAL_HOTKEY = "Ctrl+Alt+P"
+
+
+def ext_path(path: str) -> str:
+    r"""Windows 上对超长路径(>260)加 \\?\ 前缀，避免 [Errno 22] 打不开。"""
+    if os.name != "nt":
+        return path
+    p = os.path.abspath(path)
+    if len(p) < 250 or p.startswith("\\\\?\\"):
+        return p
+    if p.startswith("\\\\"):  # UNC 网络路径
+        return "\\\\?\\UNC\\" + p[2:]
+    return "\\\\?\\" + p

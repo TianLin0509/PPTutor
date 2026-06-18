@@ -345,8 +345,11 @@ class MainWindow(QMainWindow):
         self._indexer.start()
 
     def _on_index_progress(self, done: int, total: int, cur: str) -> None:
-        name = os.path.basename(cur)
-        self.status_label.setText(f"索引中… {done}/{total}　{name}")
+        if total < 0:
+            self.status_label.setText(f"扫描磁盘中… {cur}（可边扫边搜）")
+        else:
+            name = os.path.basename(cur)
+            self.status_label.setText(f"索引中… {done}/{total}　{name}")
 
     def _on_index_done(self, summary: dict) -> None:
         self._refresh_status(summary)

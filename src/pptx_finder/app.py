@@ -12,6 +12,7 @@ import sys
 
 from PySide6.QtCore import QAbstractNativeEventFilter, Qt
 from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPixmap
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
 from .config import GLOBAL_HOTKEY
@@ -67,6 +68,15 @@ class _HotkeyFilter(QAbstractNativeEventFilter):
         return False, 0
 
 
+SINGLETON_NAME = "pptx-finder-singleton-v1"
+
+
+def _show_window(win: MainWindow) -> None:
+    win.showNormal()
+    win.raise_()
+    win.activateWindow()
+
+
 def _toggle_window(win: MainWindow) -> None:
     if win.isVisible() and not win.isMinimized() and win.isActiveWindow():
         win.hide()
@@ -84,12 +94,33 @@ def main() -> int:
     configure_logging()
     log = logging.getLogger(__name__)
     app = QApplication(sys.argv)
+
+    # 单实例：已有实例在跑则通知其显示窗口并退出本实例（防重复全盘索引、数据库抢锁）
+    probe = QLocalSocket()
+    probe.connectToServer(SINGLETON_NAME)
+    if probe.waitForConnected(200):
+        probe.write(b"show")
+        probe.flush()
+        probe.waitForBytesWritten(300)
+        log.info("another instance already running; activated it, exiting")
+        return 0
+    QLocalServer.removeServer(SINGLETON_NAME)
+    singleton_server = QLocalServer()
+    singleton_server.listen(SINGLETON_NAME)
+
     app.setQuitOnLastWindowClosed(False)
     icon = _make_icon()
     app.setWindowIcon(icon)
 
     win = MainWindow(do_index=True)
     win._to_tray_on_close = True
+
+    def _on_singleton_conn() -> None:
+        sock = singleton_server.nextPendingConnection()
+        if sock is not None:
+            sock.readyRead.connect(lambda: _show_window(win))
+    singleton_server.newConnection.connect(_on_singleton_conn)
+    app._singleton_server = singleton_server  # 防 GC
 
     # 托盘
     tray = QSystemTrayIcon(icon, app)
@@ -129,7 +160,7 @@ def main() -> int:
                 app._hotkey_filter = filt  # 防 GC
             else:
                 log.warning("RegisterHotKey failed (maybe taken): %s", GLOBAL_HOTKEY)
-                win.status_label.setText(f"全局热键 {GLOBAL_HOTKEY} 注册失败（可能被其他程序占用）")
+                win.hotkey_label.setText(f"⚠ 热键 {GLOBAL_HOTKEY} 被占用")
     except Exception as e:  # noqa: BLE001
         log.warning("hotkey setup error: %s", e)
 

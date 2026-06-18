@@ -14,6 +14,7 @@ import zipfile
 
 from lxml import etree
 
+from .config import ext_path
 from .models import ParsedDeck, SlidePage
 
 log = logging.getLogger(__name__)
@@ -81,7 +82,7 @@ def parse_pptx(path: str) -> ParsedDeck:
     """解析一个 .pptx，返回 ParsedDeck。任何异常都转成 status 而非抛出。"""
     deck = ParsedDeck(path=path)
     try:
-        with open(path, "rb") as f:
+        with open(ext_path(path), "rb") as f:
             head = f.read(8)
     except OSError as e:
         deck.status = "error"
@@ -93,7 +94,7 @@ def parse_pptx(path: str) -> ParsedDeck:
         return deck
 
     try:
-        with zipfile.ZipFile(path) as zf:
+        with zipfile.ZipFile(ext_path(path)) as zf:
             return _parse_zip(zf, deck)
     except zipfile.BadZipFile:
         deck.status = "error"

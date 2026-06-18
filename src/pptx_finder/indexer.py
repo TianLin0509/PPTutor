@@ -20,7 +20,7 @@ from typing import Any
 import xxhash
 
 from . import db
-from .config import MAX_PARSE_SIZE, PPT_EXT
+from .config import MAX_PARSE_SIZE, PPT_EXT, ext_path
 from .parser import parse_pptx
 from .text_tokenize import tokenize
 
@@ -32,7 +32,7 @@ COMMIT_EVERY = 50
 
 def _file_hash(path: str) -> str:
     h = xxhash.xxh64()
-    with open(path, "rb") as f:
+    with open(ext_path(path), "rb") as f:
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
@@ -40,7 +40,7 @@ def _file_hash(path: str) -> str:
 
 def _index_one(path: str) -> dict[str, Any]:
     """worker：解析 + 逐页分词 + 内容 hash。返回可 pickle 的紧凑结果。"""
-    st = os.stat(path)
+    st = os.stat(ext_path(path))
     res: dict[str, Any] = {
         "path": path,
         "name": os.path.basename(path),
@@ -199,6 +199,8 @@ def update_index(
     for p in source:
         sp = str(p)
         seen.add(sp)
+        if progress_cb and len(seen) % 200 == 0:
+            progress_cb(0, -1, f"已发现 {len(seen)} 个文件")  # total<0 表示扫描阶段
         row = existing.get(sp)
         if row is None:
             to_index.append(p)
