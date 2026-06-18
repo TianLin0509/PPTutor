@@ -266,7 +266,12 @@ class MainWindow(QMainWindow):
         split.setStretchFactor(0, 5)
         split.setStretchFactor(1, 6)
         split.setSizes([520, 660])
-        root.addWidget(split, 1)
+        wrap = QWidget()
+        wrap.setObjectName("contentWrap")
+        wl = QVBoxLayout(wrap)
+        wl.setContentsMargins(16, 6, 16, 10)  # 中间内容区四周留白，不贴窗口边
+        wl.addWidget(split)
+        root.addWidget(wrap, 1)
 
         self.setCentralWidget(central)
 
@@ -407,6 +412,22 @@ class MainWindow(QMainWindow):
         self.meta_label.setText("　·　".join(parts))
 
     # ---------- 主题 ----------
+    def showEvent(self, e):  # noqa: N802
+        super().showEvent(e)
+        self._apply_titlebar_theme()  # 窗口显示后系统标题栏才接受深色属性
+
+    def _apply_titlebar_theme(self) -> None:
+        """Windows 系统标题栏深浅跟随风格（深色风格→深色标题栏，消除白条割裂）。"""
+        try:
+            import ctypes
+            dark = self._theme in ("raycast", "cinema", "aurora")
+            val = ctypes.c_int(1 if dark else 0)
+            # DWMWA_USE_IMMERSIVE_DARK_MODE = 20（Win10 20H1+）
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                int(self.winId()), 20, ctypes.byref(val), ctypes.sizeof(val))
+        except Exception:  # noqa: BLE001 非 Windows / 旧系统静默跳过
+            pass
+
     def _apply_theme(self, name: str, persist: bool = True) -> None:
         self._theme = name
         self._tok = theme.tok(name)
@@ -419,6 +440,7 @@ class MainWindow(QMainWindow):
         if self._results:
             self._render_results(self._results)
             self.result_list.setCurrentRow(0)
+        self._apply_titlebar_theme()
 
     def _show_theme_menu(self) -> None:
         """顶栏风格按钮 → 弹出风格菜单（当前风格打勾）。"""
