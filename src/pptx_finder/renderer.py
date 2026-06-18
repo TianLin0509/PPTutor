@@ -49,16 +49,19 @@ def render_page(
     path: str,
     page_no: int,
     cache_key: str | None = None,
-    width: int = 1280,
-    height: int = 720,
+    long_edge: int = 2560,
 ) -> Path | None:
-    """导出 path 第 page_no 页（1-based）为 PNG，返回缓存路径；失败返回 None。"""
+    """导出 path 第 page_no 页（1-based）为高清 PNG，返回缓存路径；失败返回 None。
+
+    long_edge 为长边像素，高度按 slide 实际宽高比自适应（兼容 16:9 / 4:3）。
+    缓存文件名含 long_edge，提分辨率后旧低清缓存自动失效。
+    """
     path = os.path.abspath(path)
     if cache_key is None:
         cache_key = default_cache_key(path)
         if cache_key is None:
             return None
-    out = cache_dir() / f"{cache_key}_{page_no}.png"
+    out = cache_dir() / f"{cache_key}_{page_no}_{long_edge}.png"
     if out.exists() and out.stat().st_size > 0:
         return out
     if not os.path.exists(path):
@@ -71,6 +74,15 @@ def render_page(
             pres = app.Presentations.Open(path, ReadOnly=1, WithWindow=0)
             if page_no < 1 or page_no > int(pres.Slides.Count):
                 return None
+            # 按 slide 实际宽高比算输出像素，避免非 16:9 被拉伸
+            try:
+                sw = float(pres.PageSetup.SlideWidth)
+                sh = float(pres.PageSetup.SlideHeight)
+                ratio = sh / sw if sw else 9 / 16
+            except Exception:  # noqa: BLE001
+                ratio = 9 / 16
+            width = long_edge
+            height = max(1, int(round(width * ratio)))
             pres.Slides(page_no).Export(str(out), "PNG", width, height)
             return out if (out.exists() and out.stat().st_size > 0) else None
         except Exception as e:  # noqa: BLE001

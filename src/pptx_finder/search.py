@@ -133,8 +133,8 @@ def search(conn: sqlite3.Connection, query: str, scope: str | None = None,
         )
         results.append(FileResult(
             file_id=row["id"], path=row["path"], name=row["name"], ext=row["ext"],
-            mtime=row["mtime"], page_count=row["page_count"], status=row["status"],
-            score=score, name_hit=name_hit, hits=hits,
+            mtime=row["mtime"], size=row["size"], page_count=row["page_count"],
+            status=row["status"], score=score, name_hit=name_hit, hits=hits,
             group_id=gmap.get(row["id"]),
         ))
 

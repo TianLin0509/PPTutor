@@ -5,11 +5,12 @@
 """
 from __future__ import annotations
 
+import datetime
 import html
 import json
 import os
 
-from PySide6.QtCore import QEvent, Qt, QTimer
+from PySide6.QtCore import QEvent, QMimeData, Qt, QTimer, QUrl
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget,
@@ -49,6 +50,38 @@ def _highlight(snippet: str, hlcss: str) -> str:
     return s
 
 
+def _fmt_mtime(ts: float) -> str:
+    """修改时间：同年 'MM-DD HH:MM'，跨年 'YYYY-MM-DD'。"""
+    try:
+        dt = datetime.datetime.fromtimestamp(ts)
+    except (OSError, OverflowError, ValueError):
+        return ""
+    if dt.year == datetime.datetime.now().year:
+        return dt.strftime("%m-%d %H:%M")
+    return dt.strftime("%Y-%m-%d")
+
+
+def _fmt_size(n: int) -> str:
+    """字节数转人类可读：'2.3 MB' / '456 KB' / '18 B'。"""
+    if not n or n <= 0:
+        return ""
+    f = float(n)
+    for u in ("B", "KB", "MB", "GB"):
+        if f < 1024:
+            return f"{int(f)} {u}" if u == "B" else f"{f:.1f} {u}"
+        f /= 1024
+    return f"{f:.1f} TB"
+
+
+def _elide_middle(s: str, maxlen: int = 72) -> str:
+    """路径过长时中间省略，保留盘符与文件名两端。"""
+    if len(s) <= maxlen:
+        return s
+    head = (maxlen - 1) * 2 // 3
+    tail = maxlen - 1 - head
+    return s[:head] + "…" + s[-tail:]
+
+
 class ResultItem(QWidget):
     """单条结果：文件名(SemiBold) + 命中页胶囊 + 版本/最新徽章 + 高亮片段 + 路径(mono灰)。"""
 
@@ -58,52 +91,55 @@ class ResultItem(QWidget):
         self._tok = tok
         self._sel = False
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(13, 9, 12, 10)
-        lay.setSpacing(3)
+        lay.setContentsMargins(14, 9, 12, 9)
+        lay.setSpacing(4)
 
+        # 第 1 行：文件名 + 命中页徽章（P1 / P3 P8，最多 3 个）
         row = QHBoxLayout()
-        row.setSpacing(8)
+        row.setSpacing(6)
         fn = QLabel(html.escape(r.name))
         fn.setStyleSheet(f"font-size:14px;font-weight:600;color:{tok['ink1']};background:transparent;")
         fn.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         row.addWidget(fn, 1)
 
         if r.hits:
-            pages = "、".join(str(h.page_no) for h in r.hits[:6])
-            more = "…" if len(r.hits) > 6 else ""
-            pg = QLabel(f"命中 {len(r.hits)} 页 · 第 {pages}{more} 页")
-            pg.setStyleSheet(
-                f"font-size:11px;font-weight:600;color:{tok['accd']};"
-                f"background:rgba({tok['hl_r']},{tok['hl_g']},{tok['hl_b']},0.14);"
-                "border-radius:6px;padding:2px 8px;")
-            row.addWidget(pg, 0)
+            for h in r.hits[:3]:
+                pg = QLabel(f"P{h.page_no}")
+                pg.setStyleSheet(
+                    f"font-size:11px;font-weight:700;color:{tok['acc']};"
+                    f"background:rgba({tok['hl_r']},{tok['hl_g']},{tok['hl_b']},0.15);"
+                    "border-radius:6px;padding:1px 7px;")
+                row.addWidget(pg, 0)
         elif r.name_hit:
-            pg = QLabel("文件名命中")
-            pg.setStyleSheet(f"font-size:11px;font-weight:600;color:{tok['grn']};background:transparent;")
-            row.addWidget(pg, 0)
-
+            nh = QLabel("文件名命中")
+            nh.setStyleSheet(
+                f"font-size:10.5px;font-weight:700;color:{tok['grn']};"
+                f"border:1px solid {tok['bd2']};border-radius:6px;padding:1px 7px;background:transparent;")
+            row.addWidget(nh, 0)
         if r.status == "filename_only":
             ext = QLabel(".ppt")
-            ext.setStyleSheet(f"font-size:10.5px;color:{tok['ink4']};border:1px solid {tok['bd2']};border-radius:5px;padding:1px 6px;background:transparent;")
+            ext.setStyleSheet(f"font-size:10px;color:{tok['ink4']};border:1px solid {tok['bd2']};border-radius:5px;padding:1px 6px;background:transparent;")
             row.addWidget(ext, 0)
-        if r.group_id is not None:
-            vg = QLabel("★ 最新版" if r.is_latest else "版本")
-            col = tok["grn"] if r.is_latest else tok["ink3"]
-            vg.setStyleSheet(f"font-size:10.5px;font-weight:600;color:{col};border:1px solid {tok['bd2']};border-radius:5px;padding:1px 7px;background:transparent;")
-            row.addWidget(vg, 0)
         lay.addLayout(row)
 
+        # 第 2 行：高亮片段（内容命中）/ 老格式说明（.ppt）
         if r.hits and r.hits[0].snippet:
             sn = QLabel(_highlight(r.hits[0].snippet, hlcss))
             sn.setTextFormat(Qt.RichText)
-            sn.setStyleSheet(f"font-size:12.5px;color:{tok['ink2']};background:transparent;")
+            sn.setStyleSheet(f"font-size:12px;color:{tok['ink2']};background:transparent;")
             sn.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
             lay.addWidget(sn)
+        elif r.status == "filename_only":
+            sub = QLabel("老格式 · 仅文件名搜索与预览")
+            sub.setStyleSheet(f"font-size:11.5px;color:{tok['ink4']};background:transparent;")
+            lay.addWidget(sub)
 
-        pa = QLabel(html.escape(r.path))
-        pa.setStyleSheet(f'font-size:11px;color:{tok["ink4"]};font-family:"Cascadia Code","Consolas",monospace;background:transparent;')
-        pa.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        lay.addWidget(pa)
+        # 第 3 行：修改时间（显式体现新旧）
+        tm = _fmt_mtime(r.mtime)
+        if tm:
+            t = QLabel(tm)
+            t.setStyleSheet(f"font-size:11px;color:{tok['ink3']};background:transparent;")
+            lay.addWidget(t)
         self._apply("normal", True)
 
     def enterEvent(self, e):  # noqa: N802
@@ -134,7 +170,7 @@ class MainWindow(QMainWindow):
     def __init__(self, conn=None, render_worker=None, do_index=True,
                  roots: list[str] | None = None, workers: int | None = None):
         super().__init__()
-        self.setWindowTitle("pptx-finder · PPTX 查询助手   v0.2.0")
+        self.setWindowTitle("pptx-finder · PPTX 查询助手   v0.3.0")
         self.resize(1180, 760)
 
         self._theme = _load_theme()
@@ -208,13 +244,23 @@ class MainWindow(QMainWindow):
         root.addWidget(top)
 
         split = QSplitter(Qt.Horizontal)
+        left = QWidget()
+        left.setObjectName("listPane")
+        ll = QVBoxLayout(left)
+        ll.setContentsMargins(0, 0, 0, 0)
+        ll.setSpacing(0)
+        self.result_count = QLabel("")
+        self.result_count.setObjectName("listHead")
+        self.result_count.hide()
+        ll.addWidget(self.result_count)
         self.result_list = QListWidget()
         self.result_list.setObjectName("resultList")
         self.result_list.currentItemChanged.connect(self._on_select)
         self.result_list.itemActivated.connect(self._on_activate)
         self.result_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.result_list.customContextMenuRequested.connect(self._context_menu)
-        split.addWidget(self.result_list)
+        ll.addWidget(self.result_list, 1)
+        split.addWidget(left)
         split.addWidget(self._build_preview())
         split.setStretchFactor(0, 5)
         split.setStretchFactor(1, 6)
@@ -228,9 +274,16 @@ class MainWindow(QMainWindow):
         self.index_bar = QProgressBar()
         self.index_bar.setObjectName("indexBar")
         self.index_bar.setTextVisible(False)
-        self.index_bar.setFixedWidth(120)
+        self.index_bar.setFixedWidth(200)
         self.index_bar.hide()
         self.status.addWidget(self.index_bar)
+        self.pct_label = QLabel("")
+        self.pct_label.setObjectName("pctLabel")
+        self.status.addWidget(self.pct_label)
+        self.status_dot = QLabel("●")
+        self.status_dot.setObjectName("statusDot")
+        self.status_dot.hide()
+        self.status.addWidget(self.status_dot)
         self.status_label = QLabel("准备中…")
         self.status.addWidget(self.status_label)
         kb = QLabel('<span id="kbd"> ↑↓ </span> 选择　<span id="kbd"> ↵ </span> 打开　<span id="kbd"> Esc </span> 收起')
@@ -246,9 +299,28 @@ class MainWindow(QMainWindow):
         lay.setContentsMargins(12, 10, 12, 12)
         lay.setSpacing(8)
 
-        self.preview_title = QLabel("预览")
-        self.preview_title.setObjectName("previewHead")
-        lay.addWidget(self.preview_title)
+        # 顶栏：完整路径（可复制）+ 文件元信息（大小·页数·修改时间）
+        head = QWidget()
+        head.setObjectName("previewHeadBar")
+        hv = QVBoxLayout(head)
+        hv.setContentsMargins(2, 0, 2, 4)
+        hv.setSpacing(5)
+        pr = QHBoxLayout()
+        pr.setSpacing(8)
+        self.path_label = QLabel("← 选中左侧结果查看预览")
+        self.path_label.setObjectName("pathLabel")
+        self.path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        pr.addWidget(self.path_label, 1)
+        self.copy_path_btn = QPushButton("复制路径")
+        self.copy_path_btn.setObjectName("linkBtn")
+        self.copy_path_btn.clicked.connect(self._act_copy_path)
+        self.copy_path_btn.hide()
+        pr.addWidget(self.copy_path_btn, 0)
+        hv.addLayout(pr)
+        self.meta_label = QLabel("")
+        self.meta_label.setObjectName("metaLabel")
+        hv.addWidget(self.meta_label)
+        lay.addWidget(head)
 
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
@@ -289,7 +361,10 @@ class MainWindow(QMainWindow):
         self.open_btn.clicked.connect(self._act_open)
         self.folder_btn = QPushButton("打开文件夹")
         self.folder_btn.clicked.connect(self._act_folder)
-        for b in (self.goto_btn, self.open_btn, self.folder_btn):
+        self.clip_btn = QPushButton("复制到剪贴板")
+        self.clip_btn.setToolTip("复制文件到剪贴板，可直接粘贴到邮件 / 聊天 / 资源管理器")
+        self.clip_btn.clicked.connect(self._act_copy_clipboard)
+        for b in (self.goto_btn, self.open_btn, self.folder_btn, self.clip_btn):
             b.setMinimumHeight(38)
             ops.addWidget(b)
         lay.addLayout(ops)
@@ -297,8 +372,31 @@ class MainWindow(QMainWindow):
         return panel
 
     def _set_ops_enabled(self, on: bool) -> None:
-        for w in (self.goto_btn, self.open_btn, self.folder_btn, self.prev_btn, self.next_btn):
+        for w in (self.goto_btn, self.open_btn, self.folder_btn, self.clip_btn,
+                  self.prev_btn, self.next_btn):
             w.setEnabled(on)
+
+    def _update_preview_header(self, r: FileResult | None) -> None:
+        """预览顶栏：完整路径（可复制）+ 大小·页数·修改时间。"""
+        if r is None:
+            self.path_label.setText("← 选中左侧结果查看预览")
+            self.path_label.setToolTip("")
+            self.meta_label.setText("")
+            self.copy_path_btn.hide()
+            return
+        self.path_label.setText(_elide_middle(r.path))
+        self.path_label.setToolTip(r.path)
+        self.copy_path_btn.show()
+        parts = []
+        sz = _fmt_size(r.size)
+        if sz:
+            parts.append(sz)
+        if r.page_count:
+            parts.append(f"共 {r.page_count} 页")
+        tm = _fmt_mtime(r.mtime)
+        if tm:
+            parts.append(f"修改于 {tm}")
+        self.meta_label.setText("　·　".join(parts))
 
     # ---------- 主题 ----------
     def _apply_theme(self, name: str, persist: bool = True) -> None:
@@ -324,7 +422,8 @@ class MainWindow(QMainWindow):
             self.result_list.clear()
             self._results = []
             self._cur = None
-            self.preview_title.setText("预览")
+            self.result_count.hide()
+            self._update_preview_header(None)
             self._set_ops_enabled(False)
             return
         results = search_mod.search(self._conn, query)
@@ -335,9 +434,12 @@ class MainWindow(QMainWindow):
             results = [r for r in results if r.hits]
         self._results = results
         self._render_results(results)
-        self.preview_title.setText(f"预览　·　命中 {len(results)} 个文件")
+        self.result_count.setText(f"命中 {len(results)} 个文件")
+        self.result_count.show()
         if results:
             self.result_list.setCurrentRow(0)
+        else:
+            self._update_preview_header(None)
 
     def _render_results(self, results: list[FileResult]) -> None:
         self.result_list.clear()
@@ -360,6 +462,7 @@ class MainWindow(QMainWindow):
         if cur is None:
             self._cur = None
             self._cur_item_widget = None
+            self._update_preview_header(None)
             self._set_ops_enabled(False)
             return
         idx = cur.data(Qt.UserRole)
@@ -371,6 +474,7 @@ class MainWindow(QMainWindow):
         if isinstance(w, ResultItem):
             w.set_selected(True, self.isActiveWindow())
         self._cur_item_widget = w
+        self._update_preview_header(self._cur)
         self._set_ops_enabled(True)
         self._populate_thumbs()
         self._request_preview()
@@ -490,6 +594,23 @@ class MainWindow(QMainWindow):
         if self._cur and not actions.open_folder(self._cur.path):
             self._toast("找不到所在文件夹")
 
+    def _act_copy_path(self) -> None:
+        if self._cur:
+            QApplication.clipboard().setText(self._cur.path)
+            self._toast("已复制完整路径")
+
+    def _act_copy_clipboard(self) -> None:
+        """复制文件本体到剪贴板（Windows CF_HDROP），可粘贴到邮件 / 聊天 / 资源管理器。"""
+        if not self._cur:
+            return
+        if not os.path.exists(self._cur.path):
+            self._toast("文件已移动或删除")
+            return
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(self._cur.path)])
+        QApplication.clipboard().setMimeData(mime)
+        self._toast("已复制文件到剪贴板，可粘贴到邮件 / 聊天")
+
     def _act_goto(self) -> None:
         if not self._cur:
             return
@@ -536,20 +657,26 @@ class MainWindow(QMainWindow):
         self._indexer.finished_index.connect(self._on_index_done)
         self.index_bar.setRange(0, 0)
         self.index_bar.show()
+        self.status_dot.hide()
         self.status_label.setText(f"开始索引：{', '.join(roots)}")
         self._indexer.start()
 
     def _on_index_progress(self, done: int, total: int, cur: str) -> None:
+        self.status_dot.hide()
+        self.index_bar.show()
         if total < 0:
-            self.index_bar.setRange(0, 0)  # busy
-            self.status_label.setText(f"扫描磁盘中… {cur}（可边扫边搜）")
+            self.index_bar.setRange(0, 0)  # busy：进度条来回流动（扫描，总数未知）
+            self.pct_label.setText("")
+            self.status_label.setText(f"扫描磁盘中…　{cur}（可边扫边搜）")
         else:
             self.index_bar.setRange(0, max(1, total))
             self.index_bar.setValue(done)
-            self.status_label.setText(f"索引中… {done}/{total}　{os.path.basename(cur)}")
+            self.pct_label.setText(f"{int(done / max(1, total) * 100)}%")
+            self.status_label.setText(f"正在索引内容　{done}/{total}　·　{os.path.basename(cur)}")
 
     def _on_index_done(self, summary: dict) -> None:
         self.index_bar.hide()
+        self.pct_label.setText("")
         self._refresh_status(summary)
 
     def _refresh_status(self, summary: dict | None = None) -> None:
@@ -558,8 +685,10 @@ class MainWindow(QMainWindow):
             extra = ""
             if summary and "deleted" in summary:
                 extra = f"（更新 {summary.get('indexed', 0)}，移除 {summary.get('deleted', 0)}）"
+            self.status_dot.show()
             self.status_label.setText(f"索引就绪：{s['file_count']} 个文件 · {s['page_count']} 页{extra}")
         except Exception as e:  # noqa: BLE001
+            self.status_dot.hide()
             self.status_label.setText(f"数据库读取异常：{e}")
 
     # ---------- 生命周期 ----------

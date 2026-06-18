@@ -28,6 +28,7 @@ def main() -> int:
     app = QApplication(sys.argv)
     conn = db.connect(str(db_path()))  # 真实库
     win = MainWindow(conn=conn, do_index=False)  # 不重新索引，直接用现有数据
+    win._apply_theme("cloud", persist=False)  # 第一张强制云白（不污染用户主题）
     win.resize(1180, 740)
     win.show()
 

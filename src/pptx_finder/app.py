@@ -35,17 +35,24 @@ def _parse_hotkey(spec: str) -> tuple[int, int | None]:
 
 
 def _make_icon() -> QIcon:
+    from .config import resource_path
+    logo = resource_path("assets", "logo.png")
+    if logo.exists():
+        ic = QIcon(str(logo))
+        if not ic.isNull():
+            return ic
+    # 回退：资源缺失时画一个蓝底 P
     pm = QPixmap(64, 64)
     pm.fill(Qt.transparent)
-    p = QPainter(pm)
-    p.setRenderHint(QPainter.Antialiasing)
-    p.setBrush(QColor("#0071e3"))
-    p.setPen(Qt.NoPen)
-    p.drawRoundedRect(4, 4, 56, 56, 14, 14)
-    p.setPen(QColor("white"))
-    p.setFont(QFont("Arial", 30, QFont.Bold))
-    p.drawText(pm.rect(), Qt.AlignCenter, "P")
-    p.end()
+    painter = QPainter(pm)
+    painter.setRenderHint(QPainter.Antialiasing)
+    painter.setBrush(QColor("#0A84FF"))
+    painter.setPen(Qt.NoPen)
+    painter.drawRoundedRect(4, 4, 56, 56, 14, 14)
+    painter.setPen(QColor("white"))
+    painter.setFont(QFont("Arial", 30, QFont.Bold))
+    painter.drawText(pm.rect(), Qt.AlignCenter, "P")
+    painter.end()
     return QIcon(pm)
 
 

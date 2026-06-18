@@ -64,6 +64,7 @@ class FileResult:
     name: str
     ext: str
     mtime: float
+    size: int
     page_count: int
     status: str
     score: float

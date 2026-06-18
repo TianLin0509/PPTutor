@@ -2,9 +2,19 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 APP_NAME = "pptx-finder"
+
+
+def resource_path(*parts: str) -> Path:
+    """资源文件路径，兼容 PyInstaller 打包(_MEIPASS)与源码运行。"""
+    base = getattr(sys, "_MEIPASS", None)
+    if base:
+        return Path(base).joinpath(*parts)
+    # 源码：项目根（config.py 在 src/pptx_finder/ 下，上溯三级）
+    return Path(__file__).resolve().parents[2].joinpath(*parts)
 
 
 def data_dir() -> Path:

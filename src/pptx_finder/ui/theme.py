@@ -74,8 +74,16 @@ QListWidget#resultList::item:selected { background: transparent; }
 
 /* 预览区 */
 QWidget#previewPanel { background: $win; }
+QWidget#previewHeadBar { background: $win; }
 QLabel#previewImage { background: $field; border: 1px solid $bd; border-radius: 9px; }
-QLabel#previewHead { color: $ink3; font-size: 13px; }
+QLabel#pathLabel { color: $ink2; font-size: 12px; font-family: "Cascadia Code","Consolas",monospace; }
+QLabel#metaLabel { color: $ink3; font-size: 11.5px; }
+QPushButton#linkBtn { background: transparent; border: 1px solid $bd2; border-radius: 7px; padding: 2px 10px; color: $acc; font-size: 11.5px; font-weight: 600; }
+QPushButton#linkBtn:hover { border-color: $acc; }
+
+/* 左侧列表头（命中计数） */
+QWidget#listPane { background: $canvas; }
+QLabel#listHead { color: $ink3; font-size: 11.5px; font-weight: 600; padding: 8px 12px 6px; background: $canvas; }
 
 /* 缩略图按钮 */
 QToolButton#thumb { background: $field; border: 1px solid $bd; border-radius: 5px; padding: 0; }
@@ -91,9 +99,11 @@ QStatusBar#statusBar { background: $canvas; border-top: 1px solid $bd; color: $i
 QStatusBar#statusBar QLabel { color: $ink3; font-size: 12px; }
 QLabel#kbd { color: $ink2; background: $field; border: 1px solid $bd; border-radius: 4px; padding: 1px 5px; font-family: "Cascadia Code","Consolas",monospace; font-size: 11px; }
 
-/* 进度条 */
-QProgressBar#indexBar { background: $bd2; border: none; border-radius: 3px; max-height: 5px; min-height: 5px; }
-QProgressBar#indexBar::chunk { background: $grn; border-radius: 3px; }
+/* 索引进度条 + 百分比 + 就绪绿点 */
+QProgressBar#indexBar { background: $bd2; border: none; border-radius: 4px; max-height: 7px; min-height: 7px; }
+QProgressBar#indexBar::chunk { background: $acc; border-radius: 4px; }
+QLabel#pctLabel { color: $acc; font-size: 12px; font-weight: 700; padding: 0 4px; }
+QLabel#statusDot { color: $grn; font-size: 13px; padding: 0 2px 0 4px; }
 
 /* 分隔条 */
 QSplitter::handle { background: $bd; } QSplitter::handle:horizontal { width: 1px; }
