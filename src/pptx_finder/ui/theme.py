@@ -1,0 +1,128 @@
+"""双主题 QSS：② 云白极简（默认） / ④ Raycast 深色。
+
+落地调研结论：三级背景阶梯 + 1px 发丝边框替代重阴影 + 克制单一强调色 +
+焦点/失焦双态选中（active/inactive）+ 中文字重层级。
+"""
+from __future__ import annotations
+
+from string import Template
+
+TOKENS: dict[str, dict[str, str]] = {
+    "cloud": dict(
+        win="#FFFFFF", canvas="#FBFCFD", field="#F4F6F9", hover="#EEF1F5",
+        sel="#E7F0FF", selblur="#EDEFF2", ink1="#1D1D1F", ink2="#494B50",
+        ink3="#6E6E73", ink4="#A0A4AB", bd="#E9EBEF", bd2="#E0E3E8",
+        acc="#0A84FF", accd="#0A66D6", acctext="#FFFFFF", grn="#1A8F3C",
+        scroll="#D2D6DD", scrollh="#BCC2CC", hl_r="10", hl_g="132", hl_b="255", hl_a="0.16",
+    ),
+    "raycast": dict(
+        win="#161619", canvas="#1C1C21", field="#26262D", hover="#24242B",
+        sel="#2E2E38", selblur="#222229", ink1="#F2F2F4", ink2="#C6C6CC",
+        ink3="#8A8A92", ink4="#5C5C64", bd="#2A2A31", bd2="#33333B",
+        acc="#6E9BF0", accd="#5B8DEF", acctext="#10131A", grn="#46C77E",
+        scroll="#33333B", scrollh="#44444E", hl_r="110", hl_g="155", hl_b="240", hl_a="0.26",
+    ),
+}
+
+_QSS = Template("""
+* { font-family: "Microsoft YaHei UI", "Segoe UI", "PingFang SC", sans-serif; }
+QWidget { background: $win; color: $ink1; font-size: 13px; }
+QMainWindow, QWidget#central { background: $win; }
+QToolTip { background: $field; color: $ink1; border: 1px solid $bd; }
+
+/* 顶栏 */
+QWidget#topBar { background: $win; }
+
+/* 搜索框 */
+QLineEdit#searchBox {
+  background: $field; border: 1.5px solid $bd; border-radius: 9px;
+  padding: 0 12px; font-size: 15px; color: $ink1; selection-background-color: $acc;
+}
+QLineEdit#searchBox:focus { border-color: $acc; }
+
+/* 模式下拉 */
+QComboBox {
+  background: $field; border: 1px solid $bd; border-radius: 7px; padding: 4px 10px; color: $ink2;
+}
+QComboBox:hover { border-color: $bd2; }
+QComboBox::drop-down { border: none; width: 18px; }
+QComboBox QAbstractItemView {
+  background: $win; border: 1px solid $bd; border-radius: 8px; padding: 4px;
+  selection-background-color: $sel; selection-color: $ink1; outline: 0;
+}
+
+/* 按钮 */
+QPushButton {
+  background: $field; border: 1px solid $bd; border-radius: 7px; padding: 7px 14px; color: $ink1;
+}
+QPushButton:hover { background: $hover; }
+QPushButton:disabled { color: $ink4; }
+QPushButton#primary { background: $acc; border: 1px solid $acc; color: $acctext; font-weight: 600; }
+QPushButton#primary:hover { background: $accd; }
+QPushButton#ghost { background: transparent; border: none; color: $ink3; padding: 5px 8px; }
+QPushButton#ghost:hover { background: $hover; color: $ink1; }
+
+/* 筛选 chip */
+QPushButton#chip { background: $field; border: 1px solid $bd; border-radius: 980px; padding: 4px 12px; color: $ink3; font-size: 12px; }
+QPushButton#chip:hover { border-color: $bd2; color: $ink2; }
+QPushButton#chip:checked { background: rgba($hl_r,$hl_g,$hl_b,0.16); border-color: $acc; color: $accd; }
+
+/* 结果列表 */
+QListWidget#resultList { background: $canvas; border: none; outline: 0; padding: 6px 4px; }
+QListWidget#resultList::item { border: none; margin: 0; padding: 0; background: transparent; }
+QListWidget#resultList::item:selected { background: transparent; }
+
+/* 预览区 */
+QWidget#previewPanel { background: $win; }
+QLabel#previewImage { background: $field; border: 1px solid $bd; border-radius: 9px; }
+QLabel#previewHead { color: $ink3; font-size: 13px; }
+
+/* 缩略图按钮 */
+QToolButton#thumb { background: $field; border: 1px solid $bd; border-radius: 5px; padding: 0; }
+QToolButton#thumb:hover { border-color: $bd2; }
+QToolButton#thumb:checked { border: 2px solid $acc; }
+
+/* 命中页导航 */
+QPushButton#navBtn { background: $field; border: 1px solid $bd; border-radius: 6px; padding: 4px 12px; color: $ink2; font-size: 12px; }
+QPushButton#navBtn:disabled { color: $ink4; }
+
+/* 状态栏 */
+QStatusBar#statusBar { background: $canvas; border-top: 1px solid $bd; color: $ink3; }
+QStatusBar#statusBar QLabel { color: $ink3; font-size: 12px; }
+QLabel#kbd { color: $ink2; background: $field; border: 1px solid $bd; border-radius: 4px; padding: 1px 5px; font-family: "Cascadia Code","Consolas",monospace; font-size: 11px; }
+
+/* 进度条 */
+QProgressBar#indexBar { background: $bd2; border: none; border-radius: 3px; max-height: 5px; min-height: 5px; }
+QProgressBar#indexBar::chunk { background: $grn; border-radius: 3px; }
+
+/* 分隔条 */
+QSplitter::handle { background: $bd; } QSplitter::handle:horizontal { width: 1px; }
+QSplitter::handle:hover { background: $acc; }
+
+/* 滚动条 */
+QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
+QScrollBar::handle:vertical { background: $scroll; border-radius: 4px; min-height: 28px; }
+QScrollBar::handle:vertical:hover { background: $scrollh; }
+QScrollBar::add-line, QScrollBar::sub-line { height: 0; }
+QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
+
+/* 右键菜单 */
+QMenu { background: $win; border: 1px solid $bd; border-radius: 8px; padding: 5px; }
+QMenu::item { padding: 6px 22px 6px 12px; border-radius: 6px; color: $ink1; font-size: 12.5px; }
+QMenu::item:selected { background: $hover; }
+QMenu::separator { height: 1px; background: $bd; margin: 4px 6px; }
+""")
+
+
+def build_qss(theme: str) -> str:
+    return _QSS.substitute(TOKENS.get(theme, TOKENS["cloud"]))
+
+
+def tok(theme: str) -> dict[str, str]:
+    return TOKENS.get(theme, TOKENS["cloud"])
+
+
+def highlight_css(theme: str) -> str:
+    """结果片段命中词的半透明底（荧光笔效果，不变色不加粗）。"""
+    t = tok(theme)
+    return f"background:rgba({t['hl_r']},{t['hl_g']},{t['hl_b']},{t['hl_a']});border-radius:3px;"

@@ -45,10 +45,19 @@ def main() -> int:
 
     out = ROOT / "artifacts"
     out.mkdir(exist_ok=True)
-    shot = out / "verify_real.png"
-    win.grab().save(str(shot))
-    print("预览已渲染:", "是" if win._cur_pixmap is not None else "否")
-    print("截图:", shot)
+    win.grab().save(str(out / "verify_cloud.png"))
+    print("云白②预览:", "是" if win._cur_pixmap is not None else "否")
+
+    # 切 Raycast 深色（不持久化），验证双主题落地
+    win._apply_theme("raycast", persist=False)
+    for _ in range(40):
+        pump(500)
+        if win._cur_pixmap is not None:
+            break
+    pump(600)
+    win.grab().save(str(out / "verify_raycast.png"))
+    print("Raycast④ 截图完成")
+
     win._shutdown()
     app.quit()
     return 0
