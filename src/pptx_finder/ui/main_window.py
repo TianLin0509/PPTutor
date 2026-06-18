@@ -198,7 +198,7 @@ class ResultItem(QWidget):
             bg = t["sel"] if active else t["selblur"]
             bar = t["acc"] if active else t["ink4"]
         elif state == "hover":
-            bg, bar = t["hover"], "transparent"
+            bg, bar = t["hover"], t["bd2"]
         else:
             bg, bar = "transparent", "transparent"
         self.setStyleSheet(f"ResultItem{{background:{bg};border-radius:{t['radius']}px;border-left:3px solid {bar};}}")
