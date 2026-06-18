@@ -124,7 +124,7 @@ QListWidget#resultList::item:selected { background: transparent; }
 QWidget#previewPanel { background: $panel; }
 QWidget#previewHeadBar { background: $panel; }
 QLabel#previewImage { background: $field; border: 1px solid $bd; border-radius: ${radius}px; }
-QLabel#pathLabel { color: $ink2; font-size: 12px; font-family: "Cascadia Code","Consolas",monospace; }
+QLabel#pathLabel { color: $ink2; font-size: 12px; }
 QLabel#metaLabel { color: $ink3; font-size: 11.5px; }
 QPushButton#linkBtn { background: transparent; border: 1px solid $bd2; border-radius: 7px; padding: 2px 10px; color: $acc; font-size: 11.5px; font-weight: 600; }
 QPushButton#linkBtn:hover { border-color: $acc; }
@@ -145,7 +145,7 @@ QPushButton#navBtn:disabled { color: $ink4; }
 /* 状态栏 */
 QStatusBar#statusBar { background: $panel2; border-top: 1px solid $bd; color: $ink3; }
 QStatusBar#statusBar QLabel { color: $ink3; font-size: 12px; background: transparent; }
-QLabel#kbd { color: $ink2; background: $field; border: 1px solid $bd; border-radius: 4px; padding: 1px 5px; font-family: "Cascadia Code","Consolas",monospace; font-size: 11px; }
+QLabel#kbd { color: $ink2; background: $field; border: 1px solid $bd; border-radius: 4px; padding: 1px 5px; font-size: 11px; }
 
 /* 索引进度条 + 百分比 + 就绪绿点 */
 QProgressBar#indexBar { background: $bd2; border: none; border-radius: 4px; max-height: 7px; min-height: 7px; }
