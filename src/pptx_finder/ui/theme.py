@@ -1,7 +1,11 @@
-"""双主题 QSS：② 云白极简（默认） / ④ Raycast 深色。
+"""多风格 QSS：云白极简 / 深色经典 / 深空影院 / 莫兰迪奶油 / 极光玻璃。
 
-落地调研结论：三级背景阶梯 + 1px 发丝边框替代重阴影 + 克制单一强调色 +
-焦点/失焦双态选中（active/inactive）+ 中文字重层级。
+每套风格用一份颜色 + 氛围 + 圆角 token；_QSS 模板参数化生成。
+- base：QWidget 全局底色（深空/极光用 transparent，让 appbg 渐变透出）
+- appbg：主窗背景（可为 qlineargradient / qradialgradient 渐变）
+- panel/panel2：顶栏预览 / 列表状态栏背景（深空/极光用半透明 rgba 透出 appbg）
+- radius：基础圆角（莫兰迪用大圆角）
+win 保持纯色（report_overlay 卡片背景依赖它，不可为渐变/透明）。
 """
 from __future__ import annotations
 
@@ -14,6 +18,7 @@ TOKENS: dict[str, dict[str, str]] = {
         ink3="#6E6E73", ink4="#A0A4AB", bd="#E9EBEF", bd2="#E0E3E8",
         acc="#0A84FF", accd="#0A66D6", acctext="#FFFFFF", grn="#1A8F3C",
         scroll="#D2D6DD", scrollh="#BCC2CC", hl_r="10", hl_g="132", hl_b="255", hl_a="0.16",
+        base="#FFFFFF", appbg="#FFFFFF", panel="#FFFFFF", panel2="#FBFCFD", radius="9",
     ),
     "raycast": dict(
         win="#161619", canvas="#1C1C21", field="#26262D", hover="#24242B",
@@ -21,30 +26,40 @@ TOKENS: dict[str, dict[str, str]] = {
         ink3="#8A8A92", ink4="#5C5C64", bd="#2A2A31", bd2="#33333B",
         acc="#6E9BF0", accd="#5B8DEF", acctext="#10131A", grn="#46C77E",
         scroll="#33333B", scrollh="#44444E", hl_r="110", hl_g="155", hl_b="240", hl_a="0.26",
+        base="#161619", appbg="#161619", panel="#161619", panel2="#1C1C21", radius="9",
     ),
-    # —— 深空影院：深黑 + 胶片暖金 + 电蓝 ——
+    # —— 深空影院：深黑 + 胶片暖金 + 电蓝；appbg 暖金角落微光，面板半透明 ——
     "cinema": dict(
         win="#0E0E12", canvas="#121217", field="#1A1A22", hover="#1E1E28",
         sel="#2A2520", selblur="#1C1C24", ink1="#F2EFE8", ink2="#C8C4BA",
         ink3="#8A8780", ink4="#5C5950", bd="#26262E", bd2="#33333C",
         acc="#E3B572", accd="#C8954A", acctext="#1A1206", grn="#5FD39A",
         scroll="#33333C", scrollh="#44444E", hl_r="227", hl_g="181", hl_b="114", hl_a="0.18",
+        base="transparent",
+        appbg=("qradialgradient(cx:0.16, cy:0.0, radius:1.05, fx:0.16, fy:0.0, "
+               "stop:0 #1c1611, stop:0.45 #0E0E12, stop:1 #0a0a0d)"),
+        panel="rgba(20,20,26,0.62)", panel2="rgba(14,14,18,0.6)", radius="10",
     ),
-    # —— 莫兰迪奶油：低饱和暖色 + 鼠尾草绿 ——
+    # —— 莫兰迪奶油：低饱和暖色 + 鼠尾草绿；纯色 + 大圆角 ——
     "morandi": dict(
         win="#F0EBE2", canvas="#EAE4D8", field="#F7F2EA", hover="#EDE6D9",
         sel="#E3DDCC", selblur="#ECE6DA", ink1="#4A4138", ink2="#6B5D4F",
         ink3="#9B8E7D", ink4="#B3A896", bd="#E0D7C6", bd2="#D5CAB5",
         acc="#9CAF88", accd="#7E9268", acctext="#FFFFFF", grn="#9CAF88",
         scroll="#D5CAB5", scrollh="#C4B89F", hl_r="156", hl_g="175", hl_b="136", hl_a="0.22",
+        base="#F0EBE2", appbg="#F0EBE2", panel="#F7F2EA", panel2="#EAE4D8", radius="16",
     ),
-    # —— 极光玻璃：深紫 + 紫青粉 ——
+    # —— 极光玻璃：深紫 + 紫青粉；appbg 极光流光，面板半透明透出 ——
     "aurora": dict(
         win="#0F0C1D", canvas="#14112A", field="#1C1838", hover="#221E40",
         sel="#2A2450", selblur="#1E1A3A", ink1="#F0EEFC", ink2="#C8C2E8",
         ink3="#9890C0", ink4="#6A6298", bd="#2A2548", bd2="#383158",
         acc="#A855F7", accd="#9333EA", acctext="#FFFFFF", grn="#34D399",
         scroll="#383158", scrollh="#4A4170", hl_r="168", hl_g="85", hl_b="247", hl_a="0.24",
+        base="transparent",
+        appbg=("qlineargradient(x1:0, y1:0, x2:1, y2:1, "
+               "stop:0 #2b1054, stop:0.38 #100c20, stop:0.66 #0b1a2e, stop:1 #281044)"),
+        panel="rgba(24,20,46,0.6)", panel2="rgba(17,14,36,0.58)", radius="12",
     ),
 }
 
@@ -59,16 +74,16 @@ THEMES: list[tuple[str, str]] = [
 
 _QSS = Template("""
 * { font-family: "Microsoft YaHei UI", "Segoe UI", "PingFang SC", sans-serif; }
-QWidget { background: $win; color: $ink1; font-size: 13px; }
-QMainWindow, QWidget#central { background: $win; }
+QWidget { background: $base; color: $ink1; font-size: 13px; }
+QMainWindow, QWidget#central { background: $appbg; }
 QToolTip { background: $field; color: $ink1; border: 1px solid $bd; }
 
 /* 顶栏 */
-QWidget#topBar { background: $win; }
+QWidget#topBar { background: $panel; }
 
 /* 搜索框 */
 QLineEdit#searchBox {
-  background: $field; border: 1.5px solid $bd; border-radius: 9px;
+  background: $field; border: 1.5px solid $bd; border-radius: ${radius}px;
   padding: 0 12px; font-size: 15px; color: $ink1; selection-background-color: $acc;
 }
 QLineEdit#searchBox:focus { border-color: $acc; }
@@ -101,22 +116,22 @@ QPushButton#chip:hover { border-color: $bd2; color: $ink2; }
 QPushButton#chip:checked { background: rgba($hl_r,$hl_g,$hl_b,0.16); border-color: $acc; color: $accd; }
 
 /* 结果列表 */
-QListWidget#resultList { background: $canvas; border: none; outline: 0; padding: 6px 4px; }
+QListWidget#resultList { background: $panel2; border: none; outline: 0; padding: 6px 4px; }
 QListWidget#resultList::item { border: none; margin: 0; padding: 0; background: transparent; }
 QListWidget#resultList::item:selected { background: transparent; }
 
 /* 预览区 */
-QWidget#previewPanel { background: $win; }
-QWidget#previewHeadBar { background: $win; }
-QLabel#previewImage { background: $field; border: 1px solid $bd; border-radius: 9px; }
+QWidget#previewPanel { background: $panel; }
+QWidget#previewHeadBar { background: $panel; }
+QLabel#previewImage { background: $field; border: 1px solid $bd; border-radius: ${radius}px; }
 QLabel#pathLabel { color: $ink2; font-size: 12px; font-family: "Cascadia Code","Consolas",monospace; }
 QLabel#metaLabel { color: $ink3; font-size: 11.5px; }
 QPushButton#linkBtn { background: transparent; border: 1px solid $bd2; border-radius: 7px; padding: 2px 10px; color: $acc; font-size: 11.5px; font-weight: 600; }
 QPushButton#linkBtn:hover { border-color: $acc; }
 
 /* 左侧列表头（命中计数） */
-QWidget#listPane { background: $canvas; }
-QLabel#listHead { color: $ink3; font-size: 11.5px; font-weight: 600; padding: 8px 12px 6px; background: $canvas; }
+QWidget#listPane { background: $panel2; }
+QLabel#listHead { color: $ink3; font-size: 11.5px; font-weight: 600; padding: 8px 12px 6px; background: transparent; }
 
 /* 缩略图按钮 */
 QToolButton#thumb { background: $field; border: 1px solid $bd; border-radius: 5px; padding: 0; }
@@ -128,15 +143,15 @@ QPushButton#navBtn { background: $field; border: 1px solid $bd; border-radius: 6
 QPushButton#navBtn:disabled { color: $ink4; }
 
 /* 状态栏 */
-QStatusBar#statusBar { background: $canvas; border-top: 1px solid $bd; color: $ink3; }
-QStatusBar#statusBar QLabel { color: $ink3; font-size: 12px; }
+QStatusBar#statusBar { background: $panel2; border-top: 1px solid $bd; color: $ink3; }
+QStatusBar#statusBar QLabel { color: $ink3; font-size: 12px; background: transparent; }
 QLabel#kbd { color: $ink2; background: $field; border: 1px solid $bd; border-radius: 4px; padding: 1px 5px; font-family: "Cascadia Code","Consolas",monospace; font-size: 11px; }
 
 /* 索引进度条 + 百分比 + 就绪绿点 */
 QProgressBar#indexBar { background: $bd2; border: none; border-radius: 4px; max-height: 7px; min-height: 7px; }
 QProgressBar#indexBar::chunk { background: $acc; border-radius: 4px; }
-QLabel#pctLabel { color: $acc; font-size: 12px; font-weight: 700; padding: 0 4px; }
-QLabel#statusDot { color: $grn; font-size: 13px; padding: 0 2px 0 4px; }
+QLabel#pctLabel { color: $acc; font-size: 12px; font-weight: 700; padding: 0 4px; background: transparent; }
+QLabel#statusDot { color: $grn; font-size: 13px; padding: 0 2px 0 4px; background: transparent; }
 
 /* 分隔条 */
 QSplitter::handle { background: $bd; } QSplitter::handle:horizontal { width: 1px; }

@@ -9,6 +9,8 @@ REQUIRED = {
     "ink1", "ink2", "ink3", "ink4", "bd", "bd2",
     "acc", "accd", "acctext", "grn", "scroll", "scrollh",
     "hl_r", "hl_g", "hl_b", "hl_a",
+    # 阶段2：氛围背景 + 面板透出 + 圆角
+    "base", "appbg", "panel", "panel2", "radius",
 }
 EXPECTED = ["cloud", "raycast", "cinema", "morandi", "aurora"]
 

@@ -163,14 +163,14 @@ class ResultItem(QWidget):
             bg, bar = t["hover"], "transparent"
         else:
             bg, bar = "transparent", "transparent"
-        self.setStyleSheet(f"ResultItem{{background:{bg};border-radius:9px;border-left:3px solid {bar};}}")
+        self.setStyleSheet(f"ResultItem{{background:{bg};border-radius:{t['radius']}px;border-left:3px solid {bar};}}")
 
 
 class MainWindow(QMainWindow):
     def __init__(self, conn=None, render_worker=None, do_index=True,
                  roots: list[str] | None = None, workers: int | None = None):
         super().__init__()
-        self.setWindowTitle("pptx-finder · PPTX 查询助手   v0.3.0")
+        self.setWindowTitle("pptx-finder · PPTX 查询助手   v0.4.0")
         self.resize(1180, 760)
 
         self._theme = _load_theme()
