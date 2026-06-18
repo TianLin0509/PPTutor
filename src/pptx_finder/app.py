@@ -9,6 +9,7 @@ import ctypes
 import logging
 import multiprocessing
 import sys
+import threading
 
 from PySide6.QtCore import QAbstractNativeEventFilter, Qt
 from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPixmap
@@ -17,6 +18,7 @@ from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
 from .config import GLOBAL_HOTKEY
 from .ui.main_window import MainWindow
+from .versioning.manager import VersionManager
 
 WM_HOTKEY = 0x0312
 _MODS = {"CTRL": 0x0002, "CONTROL": 0x0002, "ALT": 0x0001, "SHIFT": 0x0004, "WIN": 0x0008}
@@ -122,6 +124,11 @@ def main() -> int:
     win = MainWindow(do_index=True)
     win._to_tray_on_close = True
 
+    # 版本管理：后台守护（保存即自动版本 / 离线补记 / 监听），不阻塞启动
+    version_mgr = VersionManager()
+    app._version_manager = version_mgr  # 防 GC
+    threading.Thread(target=version_mgr.start, daemon=True).start()
+
     def _on_singleton_conn() -> None:
         sock = singleton_server.nextPendingConnection()
         if sock is not None:
@@ -135,16 +142,38 @@ def main() -> int:
     menu = QMenu()
     act_show = QAction("显示主窗口", app)
     act_show.triggered.connect(lambda: _toggle_window(win))
+
+    win._version_windows = []  # 防 GC 已打开的版本窗口
+
+    def _open_version_mgr() -> None:
+        from .ui.version_window import VersionWindow
+        w = VersionWindow(version_mgr)
+        win._version_windows.append(w)
+        w.show()
+        w.raise_()
+        w.activateWindow()
+
+    def _open_settings() -> None:
+        from .ui.settings_dialog import SettingsDialog
+        SettingsDialog(version_mgr, win).exec()
+
+    act_versions = QAction("版本管理…", app)
+    act_versions.triggered.connect(_open_version_mgr)
+    act_settings = QAction("设置…", app)
+    act_settings.triggered.connect(_open_settings)
     act_quit = QAction("退出", app)
 
     def _real_quit() -> None:
         win._to_tray_on_close = False
         win._shutdown()
+        version_mgr.stop()
         tray.hide()
         app.quit()
 
     act_quit.triggered.connect(_real_quit)
     menu.addAction(act_show)
+    menu.addAction(act_versions)
+    menu.addAction(act_settings)
     menu.addSeparator()
     menu.addAction(act_quit)
     tray.setContextMenu(menu)
