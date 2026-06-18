@@ -11,7 +11,7 @@ import json
 import os
 
 from PySide6.QtCore import QEvent, QMimeData, Qt, QTimer, QUrl
-from PySide6.QtGui import QPixmap
+from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMainWindow, QMenu, QProgressBar, QPushButton, QScrollArea,
@@ -24,6 +24,28 @@ from ..models import FileResult
 from . import theme
 from .index_worker import IndexWorker
 from .render_worker import RenderWorker
+
+
+def _make_icon(draw, color: str = "#8A8A8A", size: int = 18) -> QIcon:
+    pm = QPixmap(size, size)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    pen = QPen(QColor(color), 1.7)
+    pen.setCapStyle(Qt.RoundCap)
+    p.setPen(pen)
+    p.setBrush(Qt.NoBrush)
+    draw(p)
+    p.end()
+    return QIcon(pm)
+
+
+def _icon_search() -> QIcon:
+    return _make_icon(lambda p: (p.drawEllipse(3, 3, 8, 8), p.drawLine(10, 10, 15, 15)))
+
+
+def _icon_clear() -> QIcon:
+    return _make_icon(lambda p: (p.drawLine(5, 5, 13, 13), p.drawLine(13, 5, 5, 13)))
 
 
 def _load_theme() -> str:
@@ -228,7 +250,13 @@ class MainWindow(QMainWindow):
         self.search_box.setObjectName("searchBox")
         self.search_box.setPlaceholderText("输入你记得的文字 / 文件名…（多词空格=同时含，\"引号\"=精确短语）")
         self.search_box.setMinimumHeight(42)
+        self.search_box.addAction(_icon_search(), QLineEdit.LeadingPosition)
+        self._clear_act = self.search_box.addAction(_icon_clear(), QLineEdit.TrailingPosition)
+        self._clear_act.setVisible(False)
+        self._clear_act.setToolTip("清空")
+        self._clear_act.triggered.connect(self.search_box.clear)
         self.search_box.textChanged.connect(lambda: self._debounce.start())
+        self.search_box.textChanged.connect(lambda t: self._clear_act.setVisible(bool(t)))
         self.search_box.installEventFilter(self)
         bar.addWidget(self.search_box, 1)
         self.mode = QComboBox()
