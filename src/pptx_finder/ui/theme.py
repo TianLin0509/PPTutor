@@ -165,8 +165,8 @@ QScrollBar::add-line, QScrollBar::sub-line { height: 0; }
 QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
 
 /* 右键菜单 */
-QMenu { background: $win; border: 1px solid $bd; border-radius: 8px; padding: 5px; }
-QMenu::item { padding: 6px 22px 6px 12px; border-radius: 6px; color: $ink1; font-size: 12.5px; }
+QMenu { background: $win; border: 1px solid $bd2; border-radius: 11px; padding: 6px; }
+QMenu::item { padding: 7px 24px 7px 14px; border-radius: 7px; color: $ink1; font-size: 12.5px; }
 QMenu::item:selected { background: $hover; }
 QMenu::separator { height: 1px; background: $bd; margin: 4px 6px; }
 """)
