@@ -48,6 +48,22 @@ def _icon_clear() -> QIcon:
     return _make_icon(lambda p: (p.drawLine(5, 5, 13, 13), p.drawLine(13, 5, 5, 13)))
 
 
+def _app_logo() -> QPixmap:
+    """品牌 logo：胶片帧（暖金）+ 搜索镜（电蓝），固定品牌色，深浅主题通用。"""
+    pm = QPixmap(26, 26)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setBrush(Qt.NoBrush)
+    p.setPen(QPen(QColor("#E3B572"), 2))
+    p.drawRoundedRect(3, 5, 18, 15, 4, 4)
+    p.setPen(QPen(QColor("#5D9BFF"), 2))
+    p.drawEllipse(8, 9, 7, 7)
+    p.drawLine(13, 14, 18, 19)
+    p.end()
+    return pm
+
+
 def _load_theme() -> str:
     try:
         p = data_dir() / "ui.json"
@@ -246,6 +262,11 @@ class MainWindow(QMainWindow):
         tl.setSpacing(0)
         bar = QHBoxLayout()
         bar.setSpacing(10)
+        logo = QLabel()
+        logo.setObjectName("appLogo")
+        logo.setPixmap(_app_logo())
+        logo.setToolTip("pptx-finder")
+        bar.addWidget(logo)
         self.search_box = QLineEdit()
         self.search_box.setObjectName("searchBox")
         self.search_box.setPlaceholderText("输入你记得的文字 / 文件名…（多词空格=同时含，\"引号\"=精确短语）")
