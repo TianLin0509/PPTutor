@@ -977,15 +977,15 @@ class MainWindow(QMainWindow):
         if self.detail_panel.isHidden() or self._cur is None:
             return
         r = self._cur
+        # 全盘 lazy：无「纳管」概念——有版本就展示，无版本则提示「改存即自动留版」
         if self._version_mgr is not None:
             try:
                 versions = self._version_mgr.list_versions(r.path)
-                managed = self._version_mgr.is_managed(r.path)
             except Exception:  # noqa: BLE001
-                versions, managed = [], False
+                versions = []
         else:
-            versions, managed = [], False
-        self.detail_panel.update_for(r, versions, managed)
+            versions = []
+        self.detail_panel.update_for(r, versions)
         try:
             self.detail_panel.set_outline(db.page_titles(self._conn, r.file_id))
         except Exception:  # noqa: BLE001

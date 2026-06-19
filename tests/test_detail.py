@@ -50,7 +50,7 @@ def test_page_titles(tmp_path):
 def test_detail_meta_shows_pages(qtbot):
     dp = DetailPanel(theme.tok("raycast"))
     qtbot.addWidget(dp)
-    dp.update_for(_fr(page_count=12), versions=[], managed=False)
+    dp.update_for(_fr(page_count=12), versions=[])
     assert "12" in dp._meta_label.text()
 
 
@@ -59,15 +59,17 @@ def test_detail_version_nodes(qtbot):
     qtbot.addWidget(dp)
     versions = [{"version_id": "v3", "ts": 3000, "page_count": 24},
                 {"version_id": "v2", "ts": 2000, "page_count": 22}]
-    dp.update_for(_fr(), versions, managed=True)
+    dp.update_for(_fr(), versions)
     assert len(dp._version_nodes) == 2
 
 
-def test_detail_unmanaged_no_nodes(qtbot):
+def test_detail_no_version_no_nodes(qtbot):
     dp = DetailPanel(theme.tok("raycast"))
     qtbot.addWidget(dp)
-    dp.update_for(_fr(), versions=[], managed=False)
+    dp.update_for(_fr(), versions=[])
     assert len(dp._version_nodes) == 0
+    # 新文案：无版本提示「改存即留」，不再提「在设置里加目录」
+    assert "无需任何设置" in dp._version_box.itemAt(0).widget().text()
 
 
 def test_detail_outline_click_emits_page(qtbot):

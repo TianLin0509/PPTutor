@@ -1,7 +1,7 @@
 """选中文件详情抽屉：版本时间线（恢复/导出）+ 大纲（点击跳页）+ 文件信息。
 
-版本数据经 version_mgr.list_versions(path)/is_managed(path)（只读，不改其代码）。
-未纳入版本库的文件显式提示，不留白。
+全盘 lazy 版本管理：无「纳管」概念——有版本就展示，没版本则提示「改存即自动留版」。
+版本数据经 version_mgr.list_versions(path)（只读）。
 """
 from __future__ import annotations
 
@@ -96,7 +96,7 @@ class DetailPanel(QWidget):
             if it.widget():
                 it.widget().deleteLater()
 
-    def update_for(self, r, versions: list, managed: bool) -> None:
+    def update_for(self, r, versions: list) -> None:
         self._path = r.path
         # —— 文件信息 ——
         parts = []
@@ -105,19 +105,13 @@ class DetailPanel(QWidget):
             parts.append(f"大小　{sz}")
         if r.page_count:
             parts.append(f"页数　{r.page_count} 页")
-        parts.append("受管　" + ("已纳入版本库" if managed else "未纳入"))
+        parts.append("版本　" + (f"{len(versions)} 版" if versions else "暂无"))
         self._meta_label.setText("\n".join(parts))
         # —— 版本时间线 ——
         self._clear(self._version_box)
         self._version_nodes = []
-        if not managed:
-            tip = QLabel("未纳入版本库\n在设置里把目录加入管理后，保存即自动留版")
-            tip.setObjectName("detailMuted")
-            tip.setWordWrap(True)
-            self._version_box.addWidget(tip)
-            return
         if not versions:
-            tip = QLabel("暂无历史版本（下次保存后出现）")
+            tip = QLabel("还没有历史版本\n用 PowerPoint 改一改、保存一下，就会自动留版本——全盘自动，无需任何设置")
             tip.setObjectName("detailMuted")
             tip.setWordWrap(True)
             self._version_box.addWidget(tip)
