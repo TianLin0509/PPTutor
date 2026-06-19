@@ -10,15 +10,15 @@ import html
 import json
 import os
 
-from PySide6.QtCore import QEvent, QMimeData, QPropertyAnimation, Qt, QTimer, QUrl
+from PySide6.QtCore import QEvent, QMimeData, QPropertyAnimation, Qt, QStringListModel, QTimer, QUrl
 from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QFrame, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+    QApplication, QComboBox, QCompleter, QFrame, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMainWindow, QMenu, QProgressBar, QPushButton, QScrollArea,
     QSizePolicy, QSplitter, QToolButton, QVBoxLayout, QWidget,
 )
 
-from .. import actions, db, search as search_mod
+from .. import actions, db, history, search as search_mod
 from ..config import GLOBAL_HOTKEY, data_dir, db_path as cfg_db_path
 from ..models import FileResult
 from . import theme
@@ -334,6 +334,12 @@ class MainWindow(QMainWindow):
         self.search_box.textChanged.connect(lambda: self._debounce.start())
         self.search_box.textChanged.connect(lambda t: self._clear_act.setVisible(bool(t)))
         self.search_box.installEventFilter(self)
+        self._history_model = QStringListModel(self)
+        self._completer = QCompleter(self._history_model, self)
+        self._completer.setCompletionMode(QCompleter.UnfilteredPopupCompletion)
+        self._completer.setCaseSensitivity(Qt.CaseInsensitive)
+        self.search_box.setCompleter(self._completer)
+        self._completer.popup().setObjectName("historyPopup")
         bar.addWidget(self.search_box, 1)
         self.mode = QComboBox()
         self.mode.addItems(["全部", "仅文件名", "仅内容"])
@@ -588,6 +594,9 @@ class MainWindow(QMainWindow):
         self._apply_theme(names[(i + 1) % len(names)])
 
     # ---------- 搜索 ----------
+    def _refresh_history_model(self) -> None:
+        self._history_model.setStringList(history.load_history(limit=10))
+
     def _do_search(self) -> None:
         query = self.search_box.text().strip()
         if not query:
@@ -900,6 +909,10 @@ class MainWindow(QMainWindow):
         if ev.type() == QEvent.Wheel and obj in (self.image_label, self.scroll.viewport()):
             self._wheel_page(ev.angleDelta().y())
             return True
+        if obj is self.search_box and ev.type() == QEvent.FocusIn and not self.search_box.text():
+            self._refresh_history_model()
+            if self._history_model.stringList():
+                self._completer.complete()
         if obj is self.search_box and ev.type() == QEvent.KeyPress:
             k = ev.key()
             if k in (Qt.Key_Down, Qt.Key_Up):
@@ -950,6 +963,10 @@ class MainWindow(QMainWindow):
     def _act_goto(self) -> None:
         if not self._cur:
             return
+        q = self.search_box.text().strip()
+        if q:
+            history.add_history(q)
+            self._refresh_history_model()
         page = self._view_page
         opened, jumped = actions.open_at_page(self._cur.path, page)
         if not opened:

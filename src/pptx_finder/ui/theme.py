@@ -138,6 +138,11 @@ QComboBox#sortCombo { background: transparent; border: 1px solid $bd; border-rad
 QComboBox#sortCombo:hover { border-color: $bd2; color: $ink2; }
 QComboBox#sortCombo QAbstractItemView { background: $win; border: 1px solid $bd; border-radius: 8px; selection-background-color: $sel; selection-color: $ink1; }
 
+/* 搜索历史下拉 */
+QListView#historyPopup { background: $win; border: 1px solid $bd2; border-radius: 8px; padding: 4px; outline: 0; color: $ink1; }
+QListView#historyPopup::item { padding: 6px 12px; border-radius: 6px; }
+QListView#historyPopup::item:selected { background: $sel; color: $ink1; }
+
 /* 零结果引导面板 */
 QWidget#emptyHint { background: $panel2; }
 QLabel#emptyIcon { font-size: 38px; background: transparent; }
