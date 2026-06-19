@@ -85,7 +85,8 @@ def test_filename_mode_and_multi_term(qtbot, tmp_path):
     assert win.result_list.count() == 0
 
 
-def test_empty_clears(qtbot, tmp_path):
+def test_empty_shows_recent(qtbot, tmp_path):
+    """清空搜索 → 展示最近修改的文件（默认视图），不再是空白。"""
     conn = _index(tmp_path)
     win = MainWindow(conn=conn, render_worker=StubRender(), do_index=False)
     qtbot.addWidget(win)
@@ -94,7 +95,8 @@ def test_empty_clears(qtbot, tmp_path):
     assert win.result_list.count() == 1
     win.search_box.setText("")
     win._do_search()
-    assert win.result_list.count() == 0
+    assert win.result_list.count() == 2          # 索引里 2 个文件，都列为最近
+    assert win._showing_recent is True
 
 
 def test_instant_search_debounce(qtbot, tmp_path):

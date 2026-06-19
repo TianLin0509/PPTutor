@@ -132,3 +132,19 @@ def stats(conn: sqlite3.Connection) -> dict:
     fc = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
     pc = conn.execute("SELECT COUNT(*) FROM pages_raw").fetchone()[0]
     return {"file_count": fc, "page_count": pc}
+
+
+def recent_files(conn: sqlite3.Connection, limit: int = 20) -> list:
+    """最近修改的文件（空查询默认视图）。返回无命中片段的 FileResult，按 mtime 降序。"""
+    from .models import FileResult
+    rows = conn.execute(
+        "SELECT * FROM files ORDER BY mtime DESC LIMIT ?", (limit,)
+    ).fetchall()
+    return [
+        FileResult(
+            file_id=r["id"], path=r["path"], name=r["name"], ext=r["ext"],
+            mtime=r["mtime"], size=r["size"], page_count=r["page_count"],
+            status=r["status"], score=0.0, name_hit=False, hits=[],
+        )
+        for r in rows
+    ]

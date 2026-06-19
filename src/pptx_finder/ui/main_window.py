@@ -218,6 +218,7 @@ class MainWindow(QMainWindow):
         db.init_db(self._conn)
 
         self._results: list[FileResult] = []
+        self._showing_recent = False  # 当前是否为「空查询默认视图（最近文件）」
         self._cur: FileResult | None = None
         self._cur_item_widget: ResultItem | None = None
         self._hit_idx = 0
@@ -523,13 +524,9 @@ class MainWindow(QMainWindow):
     def _do_search(self) -> None:
         query = self.search_box.text().strip()
         if not query:
-            self.result_list.clear()
-            self._results = []
-            self._cur = None
-            self.result_count.hide()
-            self._update_preview_header(None)
-            self._set_ops_enabled(False)
+            self._show_recent()
             return
+        self._showing_recent = False
         results = search_mod.search(self._conn, query)
         m = self.mode.currentText()
         if m == "仅文件名":
@@ -544,6 +541,23 @@ class MainWindow(QMainWindow):
             self.result_list.setCurrentRow(0)
         else:
             self._update_preview_header(None)
+
+    def _show_recent(self) -> None:
+        """空查询默认视图：列最近修改的 PPTX，打开即点（零输入也有内容）。"""
+        recents = db.recent_files(self._conn, limit=20)
+        self._results = recents
+        self._cur = None
+        self._showing_recent = bool(recents)
+        if recents:
+            self._render_results(recents)
+            self.result_count.setText(f"最近修改 · {len(recents)} 个文件")
+            self.result_count.show()
+            self.result_list.setCurrentRow(0)
+        else:
+            self.result_list.clear()
+            self.result_count.hide()
+            self._update_preview_header(None)
+            self._set_ops_enabled(False)
 
     def _render_results(self, results: list[FileResult]) -> None:
         self.result_list.clear()
