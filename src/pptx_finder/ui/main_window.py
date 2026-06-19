@@ -132,6 +132,15 @@ def _empty_suggestions(query: str, mode: str) -> list[str]:
     return s
 
 
+def _sort_results(results: list, key: str) -> list:
+    """结果排序：relevance 保持原序 / recent 按 mtime 降序 / name 按文件名升序。"""
+    if key == "recent":
+        return sorted(results, key=lambda r: r.mtime, reverse=True)
+    if key == "name":
+        return sorted(results, key=lambda r: r.name.lower())
+    return list(results)
+
+
 class ResultItem(QWidget):
     """单条结果：文件名(SemiBold) + 命中页胶囊 + 版本/最新徽章 + 高亮片段 + 路径(mono灰)。"""
 
@@ -230,6 +239,7 @@ class MainWindow(QMainWindow):
         db.init_db(self._conn)
 
         self._results: list[FileResult] = []
+        self._results_raw: list[FileResult] = []  # 排序前原始序（relevance 基准）
         self._showing_recent = False  # 当前是否为「空查询默认视图（最近文件）」
         self._cur: FileResult | None = None
         self._cur_item_widget: ResultItem | None = None
@@ -312,10 +322,22 @@ class MainWindow(QMainWindow):
         ll = QVBoxLayout(left)
         ll.setContentsMargins(0, 0, 0, 0)
         ll.setSpacing(0)
+        self.list_head = QWidget()
+        self.list_head.setObjectName("listHeadBar")
+        hr = QHBoxLayout(self.list_head)
+        hr.setContentsMargins(12, 6, 8, 4)
+        hr.setSpacing(8)
         self.result_count = QLabel("")
         self.result_count.setObjectName("listHead")
-        self.result_count.hide()
-        ll.addWidget(self.result_count)
+        hr.addWidget(self.result_count, 1)
+        self.sort_combo = QComboBox()
+        self.sort_combo.setObjectName("sortCombo")
+        self.sort_combo.addItems(["相关度", "最近修改", "文件名"])
+        self.sort_combo.setToolTip("结果排序方式")
+        self.sort_combo.currentIndexChanged.connect(self._on_sort_changed)
+        hr.addWidget(self.sort_combo, 0)
+        self.list_head.hide()
+        ll.addWidget(self.list_head)
         self.result_list = QListWidget()
         self.result_list.setObjectName("resultList")
         self.result_list.currentItemChanged.connect(self._on_select)
@@ -512,8 +534,8 @@ class MainWindow(QMainWindow):
         self.theme_btn.setText(f"🎨 {dict(theme.THEMES).get(name, name)}")
         if persist:
             _save_theme(name)
-        if self._results:
-            self._render_results(self._results)
+        if self._results_raw:
+            self._apply_sort_render()
             self.result_list.setCurrentRow(0)
         self._apply_titlebar_theme()
 
@@ -546,14 +568,14 @@ class MainWindow(QMainWindow):
             results = [r for r in results if r.name_hit]
         elif m == "仅内容":
             results = [r for r in results if r.hits]
-        self._results = results
-        self._render_results(results)
+        self._results_raw = results
+        self._apply_sort_render()
         if results:
             self.result_count.setText(f"命中 {len(results)} 个文件")
-            self.result_count.show()
+            self.list_head.show()
             self.result_list.setCurrentRow(0)
         else:
-            self.result_count.hide()
+            self.list_head.hide()
             self._update_preview_header(None)
             self._set_ops_enabled(False)
             self._show_empty_hint(query)
@@ -561,17 +583,17 @@ class MainWindow(QMainWindow):
     def _show_recent(self) -> None:
         """空查询默认视图：列最近修改的 PPTX，打开即点（零输入也有内容）。"""
         recents = db.recent_files(self._conn, limit=20)
-        self._results = recents
+        self._results_raw = recents
         self._cur = None
         self._showing_recent = bool(recents)
         if recents:
-            self._render_results(recents)
+            self._apply_sort_render()
             self.result_count.setText(f"最近修改 · {len(recents)} 个文件")
-            self.result_count.show()
+            self.list_head.show()
             self.result_list.setCurrentRow(0)
         else:
             self.result_list.clear()
-            self.result_count.hide()
+            self.list_head.hide()
             self._update_preview_header(None)
             self._set_ops_enabled(False)
 
@@ -632,6 +654,20 @@ class MainWindow(QMainWindow):
         elif key == "filename":
             self.mode.setCurrentText("仅文件名")
         self._do_search()
+
+    def _sort_key(self) -> str:
+        return {"相关度": "relevance", "最近修改": "recent", "文件名": "name"}.get(
+            self.sort_combo.currentText(), "relevance")
+
+    def _apply_sort_render(self) -> None:
+        self._results = _sort_results(self._results_raw, self._sort_key())
+        self._render_results(self._results)
+
+    def _on_sort_changed(self) -> None:
+        if self._results_raw:
+            self._apply_sort_render()
+            if self._results:
+                self.result_list.setCurrentRow(0)
 
     def _render_results(self, results: list[FileResult]) -> None:
         self._hide_empty_hint()

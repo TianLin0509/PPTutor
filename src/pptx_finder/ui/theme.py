@@ -131,7 +131,11 @@ QPushButton#linkBtn:hover { border-color: $acc; }
 
 /* 左侧列表头（命中计数） */
 QWidget#listPane { background: $panel2; }
-QLabel#listHead { color: $ink3; font-size: 11.5px; font-weight: 600; padding: 8px 12px 6px; background: transparent; }
+QWidget#listHeadBar { background: $panel2; }
+QLabel#listHead { color: $ink3; font-size: 11.5px; font-weight: 600; background: transparent; }
+QComboBox#sortCombo { background: transparent; border: 1px solid $bd; border-radius: 6px; padding: 2px 8px; color: $ink3; font-size: 11.5px; }
+QComboBox#sortCombo:hover { border-color: $bd2; color: $ink2; }
+QComboBox#sortCombo QAbstractItemView { background: $win; border: 1px solid $bd; border-radius: 8px; selection-background-color: $sel; selection-color: $ink1; }
 
 /* 零结果引导面板 */
 QWidget#emptyHint { background: $panel2; }
