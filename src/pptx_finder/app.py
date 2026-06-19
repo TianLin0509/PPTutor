@@ -184,6 +184,7 @@ def main() -> int:
     tray.show()
 
     win.show()
+    win.maybe_show_welcome()  # 首次运行弹欢迎引导
 
     # 全局热键
     try:

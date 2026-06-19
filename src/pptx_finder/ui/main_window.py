@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
 )
 
 from .. import actions, db, history, search as search_mod
-from ..config import GLOBAL_HOTKEY, data_dir, db_path as cfg_db_path
+from ..config import GLOBAL_HOTKEY, data_dir, db_path as cfg_db_path, is_first_run, mark_welcomed
 from ..models import FileResult
 from . import theme
 from .index_worker import IndexWorker
@@ -303,6 +303,7 @@ class MainWindow(QMainWindow):
         else:
             self._refresh_status()
         self._show_recent()  # 启动即列最近文件（① 默认视图，无需先输入再清空）
+        self._welcome = None  # 首次欢迎覆盖层（app.py 在 show 后调 maybe_show_welcome）
 
     # ---------- UI ----------
     def _build_ui(self) -> None:
@@ -941,11 +942,36 @@ class MainWindow(QMainWindow):
             self.image_label.setPixmap(scaled)
             self.image_label.resize(scaled.size())
 
+    def maybe_show_welcome(self) -> None:
+        """首次运行时弹欢迎覆盖层（app.py 在 win.show() 后调用）。"""
+        if not is_first_run() or self._welcome is not None:
+            return
+        from .welcome_overlay import WelcomeOverlay
+        ov = WelcomeOverlay(
+            self,
+            on_start=self._dismiss_welcome,
+            on_pick_theme=self._apply_theme,
+            current_theme=self._theme)
+        ov.move(0, 0)
+        ov.resize(self.size())
+        ov.show()
+        ov.raise_()
+        self._welcome = ov
+
+    def _dismiss_welcome(self) -> None:
+        mark_welcomed()
+        if self._welcome is not None:
+            self._welcome.hide()
+            self._welcome.deleteLater()
+            self._welcome = None
+
     def resizeEvent(self, e):  # noqa: N802
         super().resizeEvent(e)
         self._update_pixmap()
         if getattr(self, "_toast_label", None) is not None and self._toast_label.isVisible():
             self._reposition_toast()
+        if getattr(self, "_welcome", None) is not None:
+            self._welcome.resize(self.size())
 
     def changeEvent(self, e):  # noqa: N802
         if e.type() == QEvent.ActivationChange and self._cur_item_widget is not None:
@@ -1109,6 +1135,8 @@ class MainWindow(QMainWindow):
     def _on_index_progress(self, done: int, total: int, cur: str) -> None:
         self.status_dot.hide()
         self.index_bar.show()
+        if getattr(self, "_welcome", None) is not None and done > 0:
+            self._welcome.update_progress(done)
         if total < 0:
             self.index_bar.setRange(0, 0)  # busy：进度条来回流动（扫描，总数未知）
             self.pct_label.setText("")

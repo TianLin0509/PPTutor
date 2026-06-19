@@ -38,6 +38,19 @@ def cache_dir() -> Path:
     return p
 
 
+def is_first_run() -> bool:
+    """首次运行（尚未看过欢迎引导）。"""
+    return not (data_dir() / "welcomed.flag").exists()
+
+
+def mark_welcomed() -> None:
+    """记录已看过欢迎引导，之后启动不再弹。"""
+    try:
+        (data_dir() / "welcomed.flag").write_text("1", encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 # 扫描时排除的目录名（小写，按路径片段匹配）——减少无效 IO 与噪音
 EXCLUDE_DIR_NAMES: set[str] = {
     "windows", "program files", "program files (x86)", "programdata",
