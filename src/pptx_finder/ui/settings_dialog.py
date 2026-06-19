@@ -5,6 +5,9 @@
 """
 from __future__ import annotations
 
+import os
+import threading
+
 from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,
@@ -12,6 +15,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QListWidget,
+    QMessageBox,
     QPushButton,
     QVBoxLayout,
 )
@@ -62,10 +66,24 @@ class SettingsDialog(QDialog):
 
     def _add(self) -> None:
         d = QFileDialog.getExistingDirectory(self, "选择要做版本管理的文件夹")
-        if d:
-            self._mgr.add_root(d)
-            self._mgr.restart_watcher()
-            self._refresh()
+        if not d:
+            return
+        ad = os.path.abspath(d)
+        # 大目录保护：禁止整盘根目录（会把全盘 PPTX 都纳入，极慢且占满磁盘、卡死界面）
+        if ad == os.path.splitdrive(ad)[0] + os.sep:
+            QMessageBox.warning(
+                self, "请选具体文件夹",
+                "不要选择整个磁盘根目录——会把全盘 PPTX 都纳入版本管理，"
+                "极慢且占用大量空间。\n\n请选择某个具体的工作目录（如某项目 / 方案文件夹）。",
+            )
+            return
+        # 仅登记 + 起监听（快，立即生效）；首版基线放后台建，绝不阻塞界面
+        self._mgr.register_root(ad)
+        self._mgr.restart_watcher()
+        self._refresh()
+        threading.Thread(
+            target=self._mgr.catch_up_root, args=(ad,), daemon=True
+        ).start()
 
     def _remove(self) -> None:
         it = self.root_list.currentItem()

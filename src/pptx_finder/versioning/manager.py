@@ -46,11 +46,17 @@ class VersionManager:
         with self._lock:
             return store.list_roots(self._conn)
 
-    def add_root(self, path: str) -> None:
+    def register_root(self, path: str) -> None:
+        """只登记受管目录（快，不遍历）；首版基线由调用方另行 catch_up（UI 场景务必放后台）。"""
         path = os.path.abspath(path)
         with self._lock:
             store.add_root(self._conn, path, _now())
-        self.catch_up_root(path)  # 纳入即对现有 .pptx 建首版（内部各自加锁）
+
+    def add_root(self, path: str) -> None:
+        """登记 + 同步建首版基线。大目录会很慢，UI 入口请改用
+        register_root + 后台 catch_up_root（见 settings_dialog._add）。"""
+        self.register_root(path)
+        self.catch_up_root(path)  # 对现有 .pptx 建首版（内部各自加锁）
 
     def remove_root(self, path: str) -> None:
         with self._lock:

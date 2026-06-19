@@ -23,6 +23,20 @@ def test_add_root_catches_up_existing(tmp_path):
     assert len(mgr.list_versions(str(docs / "b.pptx"))) == 1
 
 
+def test_register_root_no_catchup_until_called(tmp_path):
+    """register_root 只登记、不建版——UI 入口防卡死的关键（catch_up 放后台另调）。"""
+    docs = tmp_path / "d"
+    docs.mkdir()
+    p = docs / "a.pptx"
+    fx.make_pptx(p, [{"body": "算力"}])
+    mgr = _mgr()
+    mgr.register_root(str(docs))
+    assert str(docs) in mgr.list_roots()       # 已登记
+    assert mgr.list_versions(str(p)) == []      # 但未建首版（不遍历、不阻塞）
+    mgr.catch_up_root(str(docs))                # 显式（后台）补记后才有
+    assert len(mgr.list_versions(str(p))) == 1
+
+
 def test_save_creates_version_and_skips_unchanged(tmp_path):
     docs = tmp_path / "d"
     docs.mkdir()
