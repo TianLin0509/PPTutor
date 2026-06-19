@@ -24,6 +24,7 @@ from ..models import FileResult
 from . import theme
 from .index_worker import IndexWorker
 from .render_worker import RenderWorker
+from .thumb_worker import ThumbWorker
 
 
 def _make_icon(draw, color: str = "#8A8A8A", size: int = 18) -> QIcon:
@@ -173,16 +174,41 @@ def group_by_time(results: list, now_ts: float) -> list:
     return [(label, buckets[label]) for label in order]
 
 
+def _thumb_placeholder(tok: dict) -> QPixmap:
+    """缩略图占位：幻灯片样子（顶部色条 + 内容线），真实图渲染好后替换。"""
+    pm = QPixmap(74, 55)
+    pm.fill(QColor(tok["field"]))
+    p = QPainter(pm)
+    p.fillRect(0, 0, 74, 13, QColor(tok["bd2"]))
+    p.setPen(QPen(QColor(tok["ink4"]), 2))
+    p.drawLine(9, 27, 52, 27)
+    p.drawLine(9, 37, 40, 37)
+    p.end()
+    return pm
+
+
 class ResultItem(QWidget):
-    """单条结果：文件名(SemiBold) + 命中页胶囊 + 版本/最新徽章 + 高亮片段 + 路径(mono灰)。"""
+    """单条结果卡片：左缩略图(首页/命中页) + 右(文件名 + 命中页胶囊 + 高亮片段 + mtime)。"""
 
     def __init__(self, r: FileResult, tok: dict, hlcss: str):
         super().__init__()
         self.setAttribute(Qt.WA_StyledBackground, True)
         self._tok = tok
         self._sel = False
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(14, 9, 12, 9)
+        self.path = r.path
+        self.thumb_page = r.hits[0].page_no if r.hits else 1
+
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(11, 9, 12, 9)
+        outer.setSpacing(11)
+        self._thumb = QLabel()
+        self._thumb.setObjectName("cardThumb")
+        self._thumb.setFixedSize(74, 55)
+        self._thumb.setAlignment(Qt.AlignCenter)
+        self._thumb.setPixmap(_thumb_placeholder(tok))
+        outer.addWidget(self._thumb, 0, Qt.AlignTop)
+        lay = QVBoxLayout()
+        lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(4)
 
         # 第 1 行：文件名 + 命中页徽章（P1 / P3 P8，最多 3 个）
@@ -231,7 +257,12 @@ class ResultItem(QWidget):
             t = QLabel(tm)
             t.setStyleSheet(f"font-size:11px;color:{tok['ink3']};background:transparent;")
             lay.addWidget(t)
+        outer.addLayout(lay, 1)
         self._apply("normal", True)
+
+    def set_thumbnail(self, pm: QPixmap) -> None:
+        if pm is not None and not pm.isNull():
+            self._thumb.setPixmap(pm.scaled(74, 55, Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
     def enterEvent(self, e):  # noqa: N802
         if not self._sel:
@@ -258,7 +289,7 @@ class ResultItem(QWidget):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, conn=None, render_worker=None, do_index=True,
+    def __init__(self, conn=None, render_worker=None, thumb_worker=None, do_index=True,
                  roots: list[str] | None = None, workers: int | None = None):
         super().__init__()
         self.setWindowTitle("pptx-finder · PPTX 查询助手   v0.4.3")
@@ -288,6 +319,14 @@ class MainWindow(QMainWindow):
         self._owns_render = render_worker is None
         if self._owns_render:
             self._render.start()
+
+        self._thumb = thumb_worker or ThumbWorker(self)
+        self._thumb.thumb_rendered.connect(self._on_thumb)
+        self._owns_thumb = thumb_worker is None
+        if self._owns_thumb and do_index:
+            self._thumb.start()  # 测试 do_index=False 不起真渲染线程
+        self._thumb_cache: dict[tuple[str, int], QPixmap] = {}
+        self._thumb_items: dict[tuple[str, int], ResultItem] = {}
 
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
@@ -717,6 +756,8 @@ class MainWindow(QMainWindow):
     def _render_results(self, results: list[FileResult]) -> None:
         self._hide_empty_hint()
         self.result_list.clear()
+        self._thumb.clear()        # 丢弃上一批未渲完的缩略图请求
+        self._thumb_items.clear()
         hlcss = theme.highlight_css(self._theme)
         if self._should_group_by_time():
             now_ts = datetime.datetime.now().timestamp()
@@ -745,6 +786,28 @@ class MainWindow(QMainWindow):
         item.setSizeHint(w.sizeHint())
         self.result_list.addItem(item)
         self.result_list.setItemWidget(item, w)
+        self._request_thumb(w, idx)
+
+    def _request_thumb(self, w: ResultItem, idx: int) -> None:
+        """结果卡片缩略图：命中缓存直接用，否则仅为首屏前若干个发起渲染。"""
+        key = (w.path, w.thumb_page)
+        self._thumb_items[key] = w
+        cached = self._thumb_cache.get(key)
+        if cached is not None:
+            w.set_thumbnail(cached)
+        elif idx < 24:  # 只渲首屏可见的，避免一次渲 50 张拖慢
+            self._thumb.request(w.path, w.thumb_page)
+
+    def _on_thumb(self, path: str, page: int, png: str) -> None:
+        if not png or not os.path.exists(png):
+            return
+        pm = QPixmap(png)
+        if pm.isNull():
+            return
+        self._thumb_cache[(path, page)] = pm
+        w = self._thumb_items.get((path, page))
+        if w is not None:
+            w.set_thumbnail(pm)
 
     def _add_section_header(self, label: str) -> None:
         item = QListWidgetItem()
@@ -1179,6 +1242,11 @@ class MainWindow(QMainWindow):
         if self._indexer is not None:
             self._indexer.stop()
             self._indexer.wait(5000)
+        if self._owns_thumb:
+            self._thumb.stop()
+            if not self._thumb.wait(6000):
+                self._thumb.terminate()
+                self._thumb.wait(1500)
         if self._owns_render:
             self._render.stop()
             if not self._render.wait(8000):

@@ -151,6 +151,9 @@ QLabel#emptyTip { color: $ink3; font-size: 12px; background: transparent; }
 QPushButton#suggBtn { background: $field; border: 1px solid $bd2; border-radius: 8px; padding: 7px 18px; color: $acc; font-size: 12.5px; font-weight: 600; }
 QPushButton#suggBtn:hover { border-color: $acc; background: $hover; }
 
+/* 结果卡片缩略图 */
+QLabel#cardThumb { background: $field; border: 1px solid $bd; border-radius: 5px; }
+
 /* 缩略图按钮 */
 QToolButton#thumb { background: $field; border: 1px solid $bd; border-radius: 5px; padding: 0; }
 QToolButton#thumb:hover { border-color: $bd2; }
