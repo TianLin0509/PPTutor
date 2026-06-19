@@ -134,6 +134,16 @@ QWidget#listPane { background: $panel2; }
 QWidget#listHeadBar { background: $panel2; }
 QLabel#sectionHead { color: $ink3; font-size: 11px; font-weight: 700; padding: 9px 12px 4px; background: transparent; }
 
+/* facet 筛选抽屉（08） */
+QWidget#facetPanel { background: $panel2; }
+QWidget#facetHeadBar { background: $panel; border-bottom: 1px solid $bd; }
+QLabel#facetHead { color: $ink2; font-size: 12px; font-weight: 600; background: transparent; }
+QPushButton#facetClear { background: transparent; border: none; color: $acc; font-size: 11px; }
+QLabel#facetDim { color: $ink4; font-size: 10.5px; font-weight: 700; padding: 8px 0 2px; background: transparent; }
+QPushButton#facetChip { background: $field; border: 1px solid $bd2; border-radius: 7px; padding: 5px 11px; color: $ink2; font-size: 11.5px; text-align: left; }
+QPushButton#facetChip:hover { border-color: $acc; }
+QPushButton#facetChip:checked { background: rgba($hl_r,$hl_g,$hl_b,0.16); border-color: $acc; color: $acc; font-weight: 600; }
+
 /* 详情抽屉（07：版本时间线 / 大纲 / 文件信息） */
 QWidget#detailPanel { background: $panel2; }
 QLabel#detailHead { color: $ink2; font-size: 12px; font-weight: 600; padding: 9px 13px; border-bottom: 1px solid $bd; background: $panel; }

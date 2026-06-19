@@ -26,6 +26,7 @@ from .index_worker import IndexWorker
 from .render_worker import RenderWorker
 from .thumb_worker import ThumbWorker
 from .detail_panel import DetailPanel
+from .facet_panel import FacetPanel
 
 
 def _make_icon(draw, color: str = "#8A8A8A", size: int = 18) -> QIcon:
@@ -173,6 +174,53 @@ def group_by_time(results: list, now_ts: float) -> list:
             order.append(label)
         buckets[label].append(r)
     return [(label, buckets[label]) for label in order]
+
+
+def _page_bucket(pc: int) -> str:
+    if pc <= 10:
+        return "1-10"
+    if pc <= 30:
+        return "10-30"
+    return "30+"
+
+
+def _folder_of(path: str) -> str:
+    d = os.path.basename(os.path.dirname(path))
+    return d or path
+
+
+def _facet_type(r) -> str:
+    return "pptx" if (r.ext or "").lower() == ".pptx" else "ppt"
+
+
+def facet_counts(results: list, now_ts: float) -> dict:
+    """按维度聚合数量：time/type/page/folder → [(bucket, count)]（保持出现顺序）。"""
+    dims: dict[str, dict] = {"time": {}, "type": {}, "page": {}, "folder": {}}
+
+    def bump(d, k):
+        d[k] = d.get(k, 0) + 1
+
+    for r in results:
+        bump(dims["time"], _time_bucket(r.mtime, now_ts))
+        bump(dims["type"], _facet_type(r))
+        bump(dims["page"], _page_bucket(r.page_count or 0))
+        bump(dims["folder"], _folder_of(r.path))
+    return {k: list(v.items()) for k, v in dims.items()}
+
+
+def facet_filter(results: list, filters: dict, now_ts: float) -> list:
+    """多维 AND 过滤；某维度未选=不限该维度。"""
+    def ok(r):
+        if filters.get("time") and _time_bucket(r.mtime, now_ts) not in filters["time"]:
+            return False
+        if filters.get("type") and _facet_type(r) not in filters["type"]:
+            return False
+        if filters.get("page") and _page_bucket(r.page_count or 0) not in filters["page"]:
+            return False
+        if filters.get("folder") and _folder_of(r.path) not in filters["folder"]:
+            return False
+        return True
+    return [r for r in results if ok(r)]
 
 
 def _thumb_placeholder(tok: dict) -> QPixmap:
@@ -329,6 +377,7 @@ class MainWindow(QMainWindow):
         self._thumb_cache: dict[tuple[str, int], QPixmap] = {}
         self._thumb_items: dict[tuple[str, int], ResultItem] = {}
         self._version_mgr = version_mgr  # 版本管理（app.py 注入，详情面板用；可 None）
+        self._facet_filters: dict[str, set] = {}  # 当前 facet 筛选（08）
 
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
@@ -390,6 +439,13 @@ class MainWindow(QMainWindow):
         self.mode.setMinimumHeight(42)
         self.mode.currentIndexChanged.connect(self._do_search)
         bar.addWidget(self.mode)
+        self.facet_btn = QPushButton("筛选")
+        self.facet_btn.setObjectName("ghost")
+        self.facet_btn.setMinimumHeight(42)
+        self.facet_btn.setCheckable(True)
+        self.facet_btn.setToolTip("按时间 / 类型 / 页数 / 文件夹 筛选")
+        self.facet_btn.clicked.connect(self._toggle_facet)
+        bar.addWidget(self.facet_btn)
         self.theme_btn = QPushButton()
         self.theme_btn.setObjectName("ghost")
         self.theme_btn.setMinimumHeight(42)
@@ -435,6 +491,10 @@ class MainWindow(QMainWindow):
         self.result_list.customContextMenuRequested.connect(self._context_menu)
         ll.addWidget(self.result_list, 1)
         self._build_empty_hint(ll)
+        self.facet_panel = FacetPanel(self._tok)
+        self.facet_panel.filters_changed.connect(self._apply_facet)
+        self.facet_panel.hide()
+        split.addWidget(self.facet_panel)
         split.addWidget(left)
         split.addWidget(self._build_preview())
         self.detail_panel = DetailPanel(self._tok)
@@ -443,10 +503,11 @@ class MainWindow(QMainWindow):
         self.detail_panel.page_requested.connect(self._act_goto_page)
         self.detail_panel.hide()
         split.addWidget(self.detail_panel)
-        split.setStretchFactor(0, 5)
-        split.setStretchFactor(1, 6)
-        split.setStretchFactor(2, 0)
-        split.setSizes([520, 660, 0])
+        split.setStretchFactor(0, 0)
+        split.setStretchFactor(1, 5)
+        split.setStretchFactor(2, 6)
+        split.setStretchFactor(3, 0)
+        split.setSizes([0, 520, 660, 0])
         self._split = split
         wrap = QWidget()
         wrap.setObjectName("contentWrap")
@@ -670,6 +731,7 @@ class MainWindow(QMainWindow):
         elif m == "仅内容":
             results = [r for r in results if r.hits]
         self._results_raw = results
+        self._refresh_facets()
         self._apply_sort_render()
         if results:
             self.result_count.setText(f"命中 {len(results)} 个文件")
@@ -688,6 +750,7 @@ class MainWindow(QMainWindow):
         self._cur = None
         self._showing_recent = bool(recents)
         if recents:
+            self._refresh_facets()
             self._apply_sort_render()
             self.result_count.setText(f"最近修改 · {len(recents)} 个文件")
             self.list_head.show()
@@ -761,7 +824,10 @@ class MainWindow(QMainWindow):
             self.sort_combo.currentText(), "relevance")
 
     def _apply_sort_render(self) -> None:
-        self._results = _sort_results(self._results_raw, self._sort_key())
+        base = self._results_raw
+        if self._facet_filters:
+            base = facet_filter(base, self._facet_filters, datetime.datetime.now().timestamp())
+        self._results = _sort_results(base, self._sort_key())
         self._render_results(self._results)
 
     def _on_sort_changed(self) -> None:
@@ -875,15 +941,37 @@ class MainWindow(QMainWindow):
         self._request_preview()
         self._update_detail()
 
+    def _relayout_split(self) -> None:
+        f = 180 if not self.facet_panel.isHidden() else 0
+        d = 286 if not self.detail_panel.isHidden() else 0
+        avail = max(560, self.width() - f - d - 24)
+        self._split.setSizes([f, int(avail * 0.44), int(avail * 0.56), d])
+
+    def _toggle_facet(self) -> None:
+        self.facet_panel.setHidden(not self.facet_panel.isHidden())
+        self.facet_btn.setChecked(not self.facet_panel.isHidden())
+        self._relayout_split()
+
+    def _apply_facet(self, filters: dict) -> None:
+        self._facet_filters = filters
+        self._apply_sort_render()
+        if self._results:
+            self._select_first()
+
+    def _refresh_facets(self) -> None:
+        """新结果集时重算各维度数量并重置选中。"""
+        self._facet_filters = {}
+        self.facet_panel.update_counts(
+            facet_counts(self._results_raw, datetime.datetime.now().timestamp()), keep=False)
+
     def _toggle_detail(self) -> None:
         if self.detail_panel.isHidden():
             self.detail_panel.show()
-            self._split.setSizes([440, 510, 280])
             self._update_detail()
         else:
             self.detail_panel.hide()
-            self._split.setSizes([520, 660, 0])
         self.detail_btn.setChecked(not self.detail_panel.isHidden())
+        self._relayout_split()
 
     def _update_detail(self) -> None:
         if self.detail_panel.isHidden() or self._cur is None:
