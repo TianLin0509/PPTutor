@@ -25,6 +25,7 @@ from . import theme
 from .index_worker import IndexWorker
 from .render_worker import RenderWorker
 from .thumb_worker import ThumbWorker
+from .detail_panel import DetailPanel
 
 
 def _make_icon(draw, color: str = "#8A8A8A", size: int = 18) -> QIcon:
@@ -289,8 +290,8 @@ class ResultItem(QWidget):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, conn=None, render_worker=None, thumb_worker=None, do_index=True,
-                 roots: list[str] | None = None, workers: int | None = None):
+    def __init__(self, conn=None, render_worker=None, thumb_worker=None, version_mgr=None,
+                 do_index=True, roots: list[str] | None = None, workers: int | None = None):
         super().__init__()
         self.setWindowTitle("pptx-finder · PPTX 查询助手   v0.4.3")
         self.resize(1180, 760)
@@ -327,6 +328,7 @@ class MainWindow(QMainWindow):
             self._thumb.start()  # 测试 do_index=False 不起真渲染线程
         self._thumb_cache: dict[tuple[str, int], QPixmap] = {}
         self._thumb_items: dict[tuple[str, int], ResultItem] = {}
+        self._version_mgr = version_mgr  # 版本管理（app.py 注入，详情面板用；可 None）
 
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
@@ -393,6 +395,13 @@ class MainWindow(QMainWindow):
         self.theme_btn.setMinimumHeight(42)
         self.theme_btn.clicked.connect(self._show_theme_menu)
         bar.addWidget(self.theme_btn)
+        self.detail_btn = QPushButton("详情")
+        self.detail_btn.setObjectName("ghost")
+        self.detail_btn.setMinimumHeight(42)
+        self.detail_btn.setCheckable(True)
+        self.detail_btn.setToolTip("显示/隐藏 版本时间线 · 大纲 · 文件信息")
+        self.detail_btn.clicked.connect(self._toggle_detail)
+        bar.addWidget(self.detail_btn)
         tl.addLayout(bar)
         root.addWidget(top)
 
@@ -428,9 +437,17 @@ class MainWindow(QMainWindow):
         self._build_empty_hint(ll)
         split.addWidget(left)
         split.addWidget(self._build_preview())
+        self.detail_panel = DetailPanel(self._tok)
+        self.detail_panel.restore_requested.connect(self._act_restore_version)
+        self.detail_panel.export_requested.connect(self._act_export_version)
+        self.detail_panel.page_requested.connect(self._act_goto_page)
+        self.detail_panel.hide()
+        split.addWidget(self.detail_panel)
         split.setStretchFactor(0, 5)
         split.setStretchFactor(1, 6)
-        split.setSizes([520, 660])
+        split.setStretchFactor(2, 0)
+        split.setSizes([520, 660, 0])
+        self._split = split
         wrap = QWidget()
         wrap.setObjectName("contentWrap")
         wl = QVBoxLayout(wrap)
@@ -855,6 +872,57 @@ class MainWindow(QMainWindow):
         self._update_preview_header(self._cur)
         self._set_ops_enabled(True)
         self._populate_thumbs()
+        self._request_preview()
+        self._update_detail()
+
+    def _toggle_detail(self) -> None:
+        if self.detail_panel.isHidden():
+            self.detail_panel.show()
+            self._split.setSizes([440, 510, 280])
+            self._update_detail()
+        else:
+            self.detail_panel.hide()
+            self._split.setSizes([520, 660, 0])
+        self.detail_btn.setChecked(not self.detail_panel.isHidden())
+
+    def _update_detail(self) -> None:
+        if self.detail_panel.isHidden() or self._cur is None:
+            return
+        r = self._cur
+        if self._version_mgr is not None:
+            try:
+                versions = self._version_mgr.list_versions(r.path)
+                managed = self._version_mgr.is_managed(r.path)
+            except Exception:  # noqa: BLE001
+                versions, managed = [], False
+        else:
+            versions, managed = [], False
+        self.detail_panel.update_for(r, versions, managed)
+        try:
+            self.detail_panel.set_outline(db.page_titles(self._conn, r.file_id))
+        except Exception:  # noqa: BLE001
+            self.detail_panel.set_outline([])
+
+    def _act_restore_version(self, path: str, version_id: str) -> None:
+        if self._version_mgr is None:
+            return
+        ok = self._version_mgr.restore_to(path, version_id)
+        self._toast("已恢复到该版本（当前内容已自动留底）" if ok else "恢复失败")
+        self._update_detail()
+
+    def _act_export_version(self, path: str, version_id: str) -> None:
+        if self._version_mgr is None:
+            return
+        from PySide6.QtWidgets import QFileDialog
+        base = os.path.splitext(os.path.basename(path))[0]
+        dest, _f = QFileDialog.getSaveFileName(self, "导出此版本", base + "_导出.pptx", "PowerPoint (*.pptx)")
+        if dest:
+            self._toast("已导出" if self._version_mgr.export(path, version_id, dest) else "导出失败")
+
+    def _act_goto_page(self, page_no: int) -> None:
+        if not self._cur:
+            return
+        self._view_page = page_no
         self._request_preview()
 
     def _current_page(self) -> int:

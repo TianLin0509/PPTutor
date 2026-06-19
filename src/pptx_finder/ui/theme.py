@@ -133,6 +133,24 @@ QPushButton#linkBtn:hover { border-color: $acc; }
 QWidget#listPane { background: $panel2; }
 QWidget#listHeadBar { background: $panel2; }
 QLabel#sectionHead { color: $ink3; font-size: 11px; font-weight: 700; padding: 9px 12px 4px; background: transparent; }
+
+/* 详情抽屉（07：版本时间线 / 大纲 / 文件信息） */
+QWidget#detailPanel { background: $panel2; }
+QLabel#detailHead { color: $ink2; font-size: 12px; font-weight: 600; padding: 9px 13px; border-bottom: 1px solid $bd; background: $panel; }
+QLabel#detailSecT { color: $ink3; font-size: 11px; font-weight: 700; background: transparent; }
+QLabel#detailMeta { color: $ink3; font-size: 11.5px; background: transparent; }
+QLabel#detailMuted { color: $ink4; font-size: 11.5px; background: transparent; }
+QWidget#verNode { border-left: 2px solid $bd2; }
+QLabel#verLatest { color: $acc; font-size: 12px; font-weight: 700; background: transparent; }
+QLabel#verTitle { color: $ink2; font-size: 12px; font-weight: 600; background: transparent; }
+QLabel#verTs { color: $ink4; font-size: 10.5px; background: transparent; }
+QLabel#verUp { color: $grn; font-size: 10px; font-weight: 700; background: transparent; }
+QLabel#verDn { color: #ff7a6b; font-size: 10px; font-weight: 700; background: transparent; }
+QPushButton#verBtn { background: transparent; border: 1px solid $bd2; border-radius: 5px; padding: 2px 9px; color: $ink2; font-size: 11px; }
+QPushButton#verBtn:hover { border-color: $acc; color: $acc; }
+QPushButton#verBtnPri { background: $acc; border: 1px solid $acc; border-radius: 5px; padding: 2px 9px; color: $acctext; font-size: 11px; font-weight: 600; }
+QPushButton#outlineItem { background: transparent; border: none; text-align: left; padding: 4px 6px; color: $ink2; font-size: 11.5px; border-radius: 5px; }
+QPushButton#outlineItem:hover { background: $hover; color: $acc; }
 QLabel#listHead { color: $ink3; font-size: 11.5px; font-weight: 600; background: transparent; }
 QComboBox#sortCombo { background: transparent; border: 1px solid $bd; border-radius: 6px; padding: 2px 8px; color: $ink3; font-size: 11.5px; }
 QComboBox#sortCombo:hover { border-color: $bd2; color: $ink2; }

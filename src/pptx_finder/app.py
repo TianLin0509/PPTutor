@@ -127,6 +127,7 @@ def main() -> int:
     # 版本管理：后台守护（保存即自动版本 / 离线补记 / 监听），不阻塞启动
     version_mgr = VersionManager()
     app._version_manager = version_mgr  # 防 GC
+    win._version_mgr = version_mgr  # 详情面板版本时间线数据源
     threading.Thread(target=version_mgr.start, daemon=True).start()
 
     def _on_singleton_conn() -> None:

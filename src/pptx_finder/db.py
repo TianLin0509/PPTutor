@@ -148,3 +148,16 @@ def recent_files(conn: sqlite3.Connection, limit: int = 20) -> list:
         )
         for r in rows
     ]
+
+
+def page_titles(conn: sqlite3.Connection, file_id: int, limit: int = 40) -> list:
+    """每页首行作大纲标题（近似，用已索引的 raw_text）。返回 [(page_no, title)]。"""
+    rows = conn.execute(
+        "SELECT page_no, raw_text FROM pages_raw WHERE file_id=? ORDER BY page_no LIMIT ?",
+        (file_id, limit),
+    ).fetchall()
+    out = []
+    for r in rows:
+        first = ((r["raw_text"] or "").strip().split("\n", 1)[0]).strip()[:38]
+        out.append((r["page_no"], first or f"第 {r['page_no']} 页"))
+    return out
