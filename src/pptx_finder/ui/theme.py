@@ -133,6 +133,14 @@ QPushButton#linkBtn:hover { border-color: $acc; }
 QWidget#listPane { background: $panel2; }
 QLabel#listHead { color: $ink3; font-size: 11.5px; font-weight: 600; padding: 8px 12px 6px; background: transparent; }
 
+/* 零结果引导面板 */
+QWidget#emptyHint { background: $panel2; }
+QLabel#emptyIcon { font-size: 38px; background: transparent; }
+QLabel#emptyTitle { color: $ink2; font-size: 15px; font-weight: 600; background: transparent; }
+QLabel#emptyTip { color: $ink3; font-size: 12px; background: transparent; }
+QPushButton#suggBtn { background: $field; border: 1px solid $bd2; border-radius: 8px; padding: 7px 18px; color: $acc; font-size: 12.5px; font-weight: 600; }
+QPushButton#suggBtn:hover { border-color: $acc; background: $hover; }
+
 /* 缩略图按钮 */
 QToolButton#thumb { background: $field; border: 1px solid $bd; border-radius: 5px; padding: 0; }
 QToolButton#thumb:hover { border-color: $bd2; }

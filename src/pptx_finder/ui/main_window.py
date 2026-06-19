@@ -120,6 +120,18 @@ def _elide_middle(s: str, maxlen: int = 72) -> str:
     return s[:head] + "…" + s[-tail:]
 
 
+def _empty_suggestions(query: str, mode: str) -> list[str]:
+    """零结果时适用的补救建议 key：去引号 / 减词 / 改搜文件名。"""
+    s = []
+    if any(q in query for q in ('"', '“', '”')):
+        s.append("unquote")
+    if len(query.split()) > 1:
+        s.append("fewer")
+    if mode != "仅文件名":
+        s.append("filename")
+    return s
+
+
 class ResultItem(QWidget):
     """单条结果：文件名(SemiBold) + 命中页胶囊 + 版本/最新徽章 + 高亮片段 + 路径(mono灰)。"""
 
@@ -311,6 +323,7 @@ class MainWindow(QMainWindow):
         self.result_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.result_list.customContextMenuRequested.connect(self._context_menu)
         ll.addWidget(self.result_list, 1)
+        self._build_empty_hint(ll)
         split.addWidget(left)
         split.addWidget(self._build_preview())
         split.setStretchFactor(0, 5)
@@ -535,12 +548,15 @@ class MainWindow(QMainWindow):
             results = [r for r in results if r.hits]
         self._results = results
         self._render_results(results)
-        self.result_count.setText(f"命中 {len(results)} 个文件")
-        self.result_count.show()
         if results:
+            self.result_count.setText(f"命中 {len(results)} 个文件")
+            self.result_count.show()
             self.result_list.setCurrentRow(0)
         else:
+            self.result_count.hide()
             self._update_preview_header(None)
+            self._set_ops_enabled(False)
+            self._show_empty_hint(query)
 
     def _show_recent(self) -> None:
         """空查询默认视图：列最近修改的 PPTX，打开即点（零输入也有内容）。"""
@@ -559,7 +575,66 @@ class MainWindow(QMainWindow):
             self._update_preview_header(None)
             self._set_ops_enabled(False)
 
+    def _build_empty_hint(self, parent_layout) -> None:
+        """零结果引导面板（默认隐藏，零结果时覆盖结果列表位置）。"""
+        self.empty_hint = QWidget()
+        self.empty_hint.setObjectName("emptyHint")
+        v = QVBoxLayout(self.empty_hint)
+        v.setAlignment(Qt.AlignCenter)
+        v.setSpacing(11)
+        icon = QLabel("🔍")
+        icon.setObjectName("emptyIcon")
+        icon.setAlignment(Qt.AlignCenter)
+        v.addWidget(icon)
+        self._empty_query_label = QLabel("没找到")
+        self._empty_query_label.setObjectName("emptyTitle")
+        self._empty_query_label.setAlignment(Qt.AlignCenter)
+        self._empty_query_label.setWordWrap(True)
+        v.addWidget(self._empty_query_label)
+        tip = QLabel("换个说法试试")
+        tip.setObjectName("emptyTip")
+        tip.setAlignment(Qt.AlignCenter)
+        v.addWidget(tip)
+        self._sugg_btns: dict[str, QPushButton] = {}
+        for key, text in (("unquote", "去掉引号再搜"), ("fewer", "只用第一个词"), ("filename", "改搜文件名")):
+            b = QPushButton(text)
+            b.setObjectName("suggBtn")
+            b.clicked.connect(lambda _=False, k=key: self._apply_suggestion(k))
+            v.addWidget(b, 0, Qt.AlignCenter)
+            self._sugg_btns[key] = b
+        self.empty_hint.hide()
+        parent_layout.addWidget(self.empty_hint, 1)
+
+    def _show_empty_hint(self, query: str) -> None:
+        """零结果引导：列表让位，给「没找到 + 可点建议」。"""
+        self.result_list.hide()
+        self._empty_query_label.setText(f"没找到「{query}」")
+        sugg = _empty_suggestions(query, self.mode.currentText())
+        for key, btn in self._sugg_btns.items():
+            btn.setVisible(key in sugg)
+        self.empty_hint.show()
+
+    def _hide_empty_hint(self) -> None:
+        if getattr(self, "empty_hint", None) is not None:
+            self.empty_hint.hide()
+            self.result_list.show()
+
+    def _apply_suggestion(self, key: str) -> None:
+        q = self.search_box.text()
+        if key == "unquote":
+            for ch in ('"', '“', '”'):
+                q = q.replace(ch, "")
+            self.search_box.setText(q)
+        elif key == "fewer":
+            parts = q.split()
+            if parts:
+                self.search_box.setText(parts[0])
+        elif key == "filename":
+            self.mode.setCurrentText("仅文件名")
+        self._do_search()
+
     def _render_results(self, results: list[FileResult]) -> None:
+        self._hide_empty_hint()
         self.result_list.clear()
         hlcss = theme.highlight_css(self._theme)
         for i, r in enumerate(results):
