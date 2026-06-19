@@ -208,7 +208,7 @@ class MainWindow(QMainWindow):
     def __init__(self, conn=None, render_worker=None, do_index=True,
                  roots: list[str] | None = None, workers: int | None = None):
         super().__init__()
-        self.setWindowTitle("pptx-finder · PPTX 查询助手   v0.4.0")
+        self.setWindowTitle("pptx-finder · PPTX 查询助手   v0.4.1")
         self.resize(1180, 760)
 
         self._theme = _load_theme()
