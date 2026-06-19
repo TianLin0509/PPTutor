@@ -40,6 +40,7 @@ class SettingsDialog(QDialog):
 
         btns = QHBoxLayout()
         add = QPushButton("添加文件夹…")
+        add.setObjectName("primary")
         add.clicked.connect(self._add)
         rm = QPushButton("移除所选")
         rm.clicked.connect(self._remove)

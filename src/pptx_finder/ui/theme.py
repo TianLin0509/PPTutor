@@ -169,6 +169,24 @@ QMenu { background: $win; border: 1px solid $bd2; border-radius: 11px; padding: 
 QMenu::item { padding: 7px 24px 7px 14px; border-radius: 7px; color: $ink1; font-size: 12.5px; }
 QMenu::item:selected { background: $hover; }
 QMenu::separator { height: 1px; background: $bd; margin: 4px 6px; }
+
+/* —— 次级窗口（版本管理 / 设置）通用控件：复用主体配色语言，5 套主题自动适配 ——
+   主窗的 #searchBox / #resultList 因 id 选择器优先级更高，外观不受这些裸规则影响 */
+QLineEdit {
+  background: $field; border: 1.5px solid $bd; border-radius: 7px;
+  padding: 5px 10px; color: $ink1; selection-background-color: $acc;
+}
+QLineEdit:focus { border-color: $acc; }
+QListWidget {
+  background: $field; border: 1px solid $bd; border-radius: ${radius}px;
+  outline: 0; padding: 4px;
+}
+QListWidget::item { color: $ink1; padding: 7px 9px; border-radius: 6px; }
+QListWidget::item:hover { background: $hover; }
+QListWidget::item:selected { background: $sel; color: $ink1; }
+QCheckBox { color: $ink1; spacing: 7px; background: transparent; }
+QCheckBox::indicator { width: 16px; height: 16px; border: 1.5px solid $bd2; border-radius: 5px; background: $field; }
+QCheckBox::indicator:checked { background: $acc; border-color: $acc; }
 """)
 
 

@@ -77,6 +77,7 @@ class VersionWindow(QWidget):
         rl.addWidget(self.ver_list, 1)
         ops = QHBoxLayout()
         self.btn_restore = QPushButton("恢复此版本（覆盖当前）")
+        self.btn_restore.setObjectName("primary")
         self.btn_restore.clicked.connect(self._restore)
         self.btn_export = QPushButton("导出此版本…")
         self.btn_export.clicked.connect(self._export)
