@@ -187,6 +187,13 @@ QListWidget::item:selected { background: $sel; color: $ink1; }
 QCheckBox { color: $ink1; spacing: 7px; background: transparent; }
 QCheckBox::indicator { width: 16px; height: 16px; border: 1.5px solid $bd2; border-radius: 5px; background: $field; }
 QCheckBox::indicator:checked { background: $acc; border-color: $acc; }
+
+/* 浮层 Toast（操作反馈，中下方淡入淡出；固定深色胶囊 + 主题色左缘，5 风格都醒目） */
+QLabel#toast {
+  background: rgba(28,28,32,0.96); color: #F2EFE8;
+  border: 1px solid rgba(255,255,255,0.12); border-left: 3px solid $acc;
+  border-radius: 9px; padding: 9px 18px; font-size: 13px; font-weight: 500;
+}
 """)
 
 

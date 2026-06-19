@@ -13,7 +13,7 @@ import os
 from PySide6.QtCore import QEvent, QMimeData, QPropertyAnimation, Qt, QTimer, QUrl
 from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+    QApplication, QComboBox, QFrame, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMainWindow, QMenu, QProgressBar, QPushButton, QScrollArea,
     QSizePolicy, QSplitter, QToolButton, QVBoxLayout, QWidget,
 )
@@ -350,6 +350,8 @@ class MainWindow(QMainWindow):
         # 趣味统计「我的胶片报告」入口（非侵入注入，逻辑全在 stats_entry）
         from .stats_entry import install_stats_entry
         install_stats_entry(self)
+
+        self._init_toast()
 
     def _build_preview(self) -> QWidget:
         panel = QWidget()
@@ -688,6 +690,8 @@ class MainWindow(QMainWindow):
     def resizeEvent(self, e):  # noqa: N802
         super().resizeEvent(e)
         self._update_pixmap()
+        if getattr(self, "_toast_label", None) is not None and self._toast_label.isVisible():
+            self._reposition_toast()
 
     def changeEvent(self, e):  # noqa: N802
         if e.type() == QEvent.ActivationChange and self._cur_item_widget is not None:
@@ -776,8 +780,45 @@ class MainWindow(QMainWindow):
         menu.addAction("复制文件名", lambda: QApplication.clipboard().setText(r.name))
         menu.exec(self.result_list.mapToGlobal(pos))
 
+    def _init_toast(self) -> None:
+        """中下方浮层提示：一次性操作反馈不再污染状态栏。"""
+        self._toast_label = QLabel(self)
+        self._toast_label.setObjectName("toast")
+        self._toast_label.setAlignment(Qt.AlignCenter)
+        self._toast_label.hide()
+        self._toast_fx = QGraphicsOpacityEffect(self._toast_label)
+        self._toast_label.setGraphicsEffect(self._toast_fx)
+        self._toast_fade = QPropertyAnimation(self._toast_fx, b"opacity", self)
+        self._toast_fade.setDuration(160)
+        self._toast_timer = QTimer(self)
+        self._toast_timer.setSingleShot(True)
+        self._toast_timer.timeout.connect(self._hide_toast)
+
+    def _reposition_toast(self) -> None:
+        lbl = self._toast_label
+        x = (self.width() - lbl.width()) // 2
+        y = self.height() - lbl.height() - 64  # 悬于状态栏上方
+        lbl.move(max(8, x), max(8, y))
+
     def _toast(self, msg: str) -> None:
-        self.status_label.setText(msg)
+        lbl = self._toast_label
+        lbl.setText(msg)
+        lbl.adjustSize()
+        self._reposition_toast()
+        lbl.show()
+        lbl.raise_()
+        self._toast_fade.stop()
+        self._toast_fade.setStartValue(self._toast_fx.opacity())
+        self._toast_fade.setEndValue(1.0)
+        self._toast_fade.start()
+        self._toast_timer.start(1800)
+
+    def _hide_toast(self) -> None:
+        self._toast_fade.stop()
+        self._toast_fade.setStartValue(self._toast_fx.opacity())
+        self._toast_fade.setEndValue(0.0)
+        self._toast_fade.start()
+        QTimer.singleShot(200, self._toast_label.hide)
 
     # ---------- 索引 ----------
     def _start_indexing(self, roots: list[str] | None, workers: int | None) -> None:
