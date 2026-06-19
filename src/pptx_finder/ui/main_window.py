@@ -426,6 +426,7 @@ class MainWindow(QMainWindow):
         install_stats_entry(self)
 
         self._init_toast()
+        self._init_spinner()
 
     def _build_preview(self) -> QWidget:
         panel = QWidget()
@@ -827,6 +828,27 @@ class MainWindow(QMainWindow):
         self._view_page = self._cur.hits[self._hit_idx].page_no
         self._request_preview()
 
+    def _init_spinner(self) -> None:
+        self._spin_idx = 0
+        self._spin_timer = QTimer(self)
+        self._spin_timer.timeout.connect(self._tick_spinner)
+
+    def _tick_spinner(self) -> None:
+        ch = "◐◓◑◒"[self._spin_idx % 4]
+        self._spin_idx += 1
+        self.image_label.setPixmap(QPixmap())
+        self.image_label.setText(
+            f'<div style="font-size:30px;color:#9a968c">{ch}</div>'
+            '<div style="color:#888;font-size:13px;margin-top:12px">正在渲染预览…</div>')
+
+    def _start_spinner(self) -> None:
+        self._spin_idx = 0
+        self._tick_spinner()
+        self._spin_timer.start(90)
+
+    def _stop_spinner(self) -> None:
+        self._spin_timer.stop()
+
     def _request_preview(self) -> None:
         if not self._cur:
             return
@@ -847,8 +869,7 @@ class MainWindow(QMainWindow):
         # 缩略图高亮：当前页正好是某命中页就点亮它
         for i, b in enumerate(self._thumb_btns):
             b.setChecked(i < n and hits[i].page_no == page)
-        self.image_label.setPixmap(QPixmap())
-        self.image_label.setText("渲染中…")
+        self._start_spinner()
         self._req_id += 1
         self._render.request(self._req_id, self._cur.path, page, cache_key=None)
 
@@ -873,6 +894,7 @@ class MainWindow(QMainWindow):
     def _on_rendered(self, req_id: int, png: str) -> None:
         if req_id != self._req_id:
             return
+        self._stop_spinner()
         if not png or not os.path.exists(png):
             self.image_label.setPixmap(QPixmap())
             self.image_label.setText(
