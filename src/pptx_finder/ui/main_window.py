@@ -279,6 +279,7 @@ class MainWindow(QMainWindow):
         self._view_page = 1  # 当前预览页（原始页序，滚轮可脱离命中页自由翻）
         self._req_id = 0
         self._cur_pixmap: QPixmap | None = None
+        self._zoom = 1.0  # 预览缩放：1.0=适配窗口，>1 放大看细节
         self._to_tray_on_close = False
         self._thumb_btns: list[QToolButton] = []
 
@@ -852,6 +853,7 @@ class MainWindow(QMainWindow):
     def _request_preview(self) -> None:
         if not self._cur:
             return
+        self._zoom = 1.0
         page = self._view_page
         hits = self._cur.hits or []
         total = self._cur.page_count or 0
@@ -891,6 +893,19 @@ class MainWindow(QMainWindow):
                 break
         self._request_preview()
 
+    def _zoom_by(self, factor: float) -> None:
+        if self._cur_pixmap is None:
+            return
+        self._zoom = max(1.0, min(5.0, self._zoom * factor))
+        self._update_pixmap()
+
+    def _toggle_zoom(self) -> None:
+        if self._cur_pixmap is None:
+            return
+        self._zoom = 1.0 if self._zoom > 1.0 else 2.0
+        self._update_pixmap()
+        self._toast("原尺寸放大 · 再双击还原" if self._zoom > 1.0 else "已适配窗口")
+
     def _on_rendered(self, req_id: int, png: str) -> None:
         if req_id != self._req_id:
             return
@@ -911,9 +926,19 @@ class MainWindow(QMainWindow):
         if self._cur_pixmap is None:
             return
         vp = self.scroll.viewport().size()
+        fitted = self._cur_pixmap.scaled(
+            vp.width() - 6, vp.height() - 6, Qt.KeepAspectRatio, Qt.SmoothTransformation)
         self.image_label.setText("")
-        self.image_label.setPixmap(self._cur_pixmap.scaled(
-            vp.width() - 6, vp.height() - 6, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        if self._zoom <= 1.0:
+            self.scroll.setWidgetResizable(True)
+            self.image_label.setPixmap(fitted)
+        else:
+            self.scroll.setWidgetResizable(False)
+            scaled = self._cur_pixmap.scaled(
+                int(fitted.width() * self._zoom), int(fitted.height() * self._zoom),
+                Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.image_label.setPixmap(scaled)
+            self.image_label.resize(scaled.size())
 
     def resizeEvent(self, e):  # noqa: N802
         super().resizeEvent(e)
@@ -928,8 +953,15 @@ class MainWindow(QMainWindow):
 
     # ---------- 键盘 ----------
     def eventFilter(self, obj, ev):  # noqa: N802
-        if ev.type() == QEvent.Wheel and obj in (self.image_label, self.scroll.viewport()):
-            self._wheel_page(ev.angleDelta().y())
+        et = ev.type()
+        if et in (QEvent.Wheel, QEvent.MouseButtonDblClick) and obj in (self.image_label, self.scroll.viewport()):
+            if et == QEvent.Wheel:
+                if ev.modifiers() & Qt.ControlModifier:
+                    self._zoom_by(1.15 if ev.angleDelta().y() > 0 else 1 / 1.15)
+                else:
+                    self._wheel_page(ev.angleDelta().y())
+            else:
+                self._toggle_zoom()
             return True
         if obj is self.search_box and ev.type() == QEvent.FocusIn and not self.search_box.text():
             self._refresh_history_model()
