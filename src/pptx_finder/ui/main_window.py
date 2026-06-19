@@ -10,8 +10,8 @@ import html
 import json
 import os
 
-from PySide6.QtCore import QEvent, QMimeData, Qt, QTimer, QUrl
-from PySide6.QtGui import QPixmap
+from PySide6.QtCore import QEvent, QMimeData, QPropertyAnimation, Qt, QTimer, QUrl
+from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMainWindow, QMenu, QProgressBar, QPushButton, QScrollArea,
@@ -24,6 +24,44 @@ from ..models import FileResult
 from . import theme
 from .index_worker import IndexWorker
 from .render_worker import RenderWorker
+
+
+def _make_icon(draw, color: str = "#8A8A8A", size: int = 18) -> QIcon:
+    pm = QPixmap(size, size)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    pen = QPen(QColor(color), 1.7)
+    pen.setCapStyle(Qt.RoundCap)
+    p.setPen(pen)
+    p.setBrush(Qt.NoBrush)
+    draw(p)
+    p.end()
+    return QIcon(pm)
+
+
+def _icon_search() -> QIcon:
+    return _make_icon(lambda p: (p.drawEllipse(3, 3, 8, 8), p.drawLine(10, 10, 15, 15)))
+
+
+def _icon_clear() -> QIcon:
+    return _make_icon(lambda p: (p.drawLine(5, 5, 13, 13), p.drawLine(13, 5, 5, 13)))
+
+
+def _app_logo() -> QPixmap:
+    """品牌 logo：胶片帧（暖金）+ 搜索镜（电蓝），固定品牌色，深浅主题通用。"""
+    pm = QPixmap(26, 26)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setBrush(Qt.NoBrush)
+    p.setPen(QPen(QColor("#E3B572"), 2))
+    p.drawRoundedRect(3, 5, 18, 15, 4, 4)
+    p.setPen(QPen(QColor("#5D9BFF"), 2))
+    p.drawEllipse(8, 9, 7, 7)
+    p.drawLine(13, 14, 18, 19)
+    p.end()
+    return pm
 
 
 def _load_theme() -> str:
@@ -160,7 +198,7 @@ class ResultItem(QWidget):
             bg = t["sel"] if active else t["selblur"]
             bar = t["acc"] if active else t["ink4"]
         elif state == "hover":
-            bg, bar = t["hover"], "transparent"
+            bg, bar = t["hover"], t["bd2"]
         else:
             bg, bar = "transparent", "transparent"
         self.setStyleSheet(f"ResultItem{{background:{bg};border-radius:{t['radius']}px;border-left:3px solid {bar};}}")
@@ -170,7 +208,7 @@ class MainWindow(QMainWindow):
     def __init__(self, conn=None, render_worker=None, do_index=True,
                  roots: list[str] | None = None, workers: int | None = None):
         super().__init__()
-        self.setWindowTitle("pptx-finder · PPTX 查询助手   v0.4.0")
+        self.setWindowTitle("pptx-finder · PPTX 查询助手   v0.4.1")
         self.resize(1180, 760)
 
         self._theme = _load_theme()
@@ -224,11 +262,22 @@ class MainWindow(QMainWindow):
         tl.setSpacing(0)
         bar = QHBoxLayout()
         bar.setSpacing(10)
+        logo = QLabel()
+        logo.setObjectName("appLogo")
+        logo.setPixmap(_app_logo())
+        logo.setToolTip("pptx-finder")
+        bar.addWidget(logo)
         self.search_box = QLineEdit()
         self.search_box.setObjectName("searchBox")
         self.search_box.setPlaceholderText("输入你记得的文字 / 文件名…（多词空格=同时含，\"引号\"=精确短语）")
         self.search_box.setMinimumHeight(42)
+        self.search_box.addAction(_icon_search(), QLineEdit.LeadingPosition)
+        self._clear_act = self.search_box.addAction(_icon_clear(), QLineEdit.TrailingPosition)
+        self._clear_act.setVisible(False)
+        self._clear_act.setToolTip("清空")
+        self._clear_act.triggered.connect(self.search_box.clear)
         self.search_box.textChanged.connect(lambda: self._debounce.start())
+        self.search_box.textChanged.connect(lambda t: self._clear_act.setVisible(bool(t)))
         self.search_box.installEventFilter(self)
         bar.addWidget(self.search_box, 1)
         self.mode = QComboBox()
@@ -266,7 +315,12 @@ class MainWindow(QMainWindow):
         split.setStretchFactor(0, 5)
         split.setStretchFactor(1, 6)
         split.setSizes([520, 660])
-        root.addWidget(split, 1)
+        wrap = QWidget()
+        wrap.setObjectName("contentWrap")
+        wl = QVBoxLayout(wrap)
+        wl.setContentsMargins(16, 6, 16, 10)  # 中间内容区四周留白，不贴窗口边
+        wl.addWidget(split)
+        root.addWidget(wrap, 1)
 
         self.setCentralWidget(central)
 
@@ -330,7 +384,9 @@ class MainWindow(QMainWindow):
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setFrameShape(QFrame.NoFrame)
-        self.image_label = QLabel("← 选中左侧结果查看预览")
+        self.image_label = QLabel(
+            '<div style="font-size:30px">🔎</div>'
+            '<div style="color:#888;font-size:13px;margin-top:12px">选中左侧结果，预览命中页</div>')
         self.image_label.setObjectName("previewImage")
         self.image_label.setAlignment(Qt.AlignCenter)
         self.scroll.setWidget(self.image_label)
@@ -407,6 +463,30 @@ class MainWindow(QMainWindow):
         self.meta_label.setText("　·　".join(parts))
 
     # ---------- 主题 ----------
+    def showEvent(self, e):  # noqa: N802
+        super().showEvent(e)
+        self._apply_titlebar_theme()  # 窗口显示后系统标题栏才接受深色属性
+        if not getattr(self, "_did_fade", False):
+            self._did_fade = True
+            self.setWindowOpacity(0.0)
+            self._fade = QPropertyAnimation(self, b"windowOpacity", self)
+            self._fade.setDuration(200)
+            self._fade.setStartValue(0.0)
+            self._fade.setEndValue(1.0)
+            self._fade.start()
+
+    def _apply_titlebar_theme(self) -> None:
+        """Windows 系统标题栏深浅跟随风格（深色风格→深色标题栏，消除白条割裂）。"""
+        try:
+            import ctypes
+            dark = self._theme in ("raycast", "cinema", "aurora")
+            val = ctypes.c_int(1 if dark else 0)
+            # DWMWA_USE_IMMERSIVE_DARK_MODE = 20（Win10 20H1+）
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                int(self.winId()), 20, ctypes.byref(val), ctypes.sizeof(val))
+        except Exception:  # noqa: BLE001 非 Windows / 旧系统静默跳过
+            pass
+
     def _apply_theme(self, name: str, persist: bool = True) -> None:
         self._theme = name
         self._tok = theme.tok(name)
@@ -419,6 +499,7 @@ class MainWindow(QMainWindow):
         if self._results:
             self._render_results(self._results)
             self.result_list.setCurrentRow(0)
+        self._apply_titlebar_theme()
 
     def _show_theme_menu(self) -> None:
         """顶栏风格按钮 → 弹出风格菜单（当前风格打勾）。"""
@@ -586,7 +667,10 @@ class MainWindow(QMainWindow):
             return
         if not png or not os.path.exists(png):
             self.image_label.setPixmap(QPixmap())
-            self.image_label.setText("无法预览此页，可直接点「打开文件」查看")
+            self.image_label.setText(
+                '<div style="font-size:30px">📄</div>'
+                '<div style="color:#888;font-size:13px;margin-top:12px">此页暂时无法预览<br>'
+                '点「打开文件」直接查看</div>')
             self._cur_pixmap = None
             return
         pm = QPixmap(png)

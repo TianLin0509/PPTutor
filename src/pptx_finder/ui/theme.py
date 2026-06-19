@@ -124,7 +124,7 @@ QListWidget#resultList::item:selected { background: transparent; }
 QWidget#previewPanel { background: $panel; }
 QWidget#previewHeadBar { background: $panel; }
 QLabel#previewImage { background: $field; border: 1px solid $bd; border-radius: ${radius}px; }
-QLabel#pathLabel { color: $ink2; font-size: 12px; font-family: "Cascadia Code","Consolas",monospace; }
+QLabel#pathLabel { color: $ink2; font-size: 12px; }
 QLabel#metaLabel { color: $ink3; font-size: 11.5px; }
 QPushButton#linkBtn { background: transparent; border: 1px solid $bd2; border-radius: 7px; padding: 2px 10px; color: $acc; font-size: 11.5px; font-weight: 600; }
 QPushButton#linkBtn:hover { border-color: $acc; }
@@ -145,7 +145,7 @@ QPushButton#navBtn:disabled { color: $ink4; }
 /* 状态栏 */
 QStatusBar#statusBar { background: $panel2; border-top: 1px solid $bd; color: $ink3; }
 QStatusBar#statusBar QLabel { color: $ink3; font-size: 12px; background: transparent; }
-QLabel#kbd { color: $ink2; background: $field; border: 1px solid $bd; border-radius: 4px; padding: 1px 5px; font-family: "Cascadia Code","Consolas",monospace; font-size: 11px; }
+QLabel#kbd { color: $ink1; background: $field; border: 1px solid $bd2; border-radius: 5px; padding: 2px 6px; font-size: 11px; font-weight: 600; }
 
 /* 索引进度条 + 百分比 + 就绪绿点 */
 QProgressBar#indexBar { background: $bd2; border: none; border-radius: 4px; max-height: 7px; min-height: 7px; }
@@ -165,8 +165,8 @@ QScrollBar::add-line, QScrollBar::sub-line { height: 0; }
 QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
 
 /* 右键菜单 */
-QMenu { background: $win; border: 1px solid $bd; border-radius: 8px; padding: 5px; }
-QMenu::item { padding: 6px 22px 6px 12px; border-radius: 6px; color: $ink1; font-size: 12.5px; }
+QMenu { background: $win; border: 1px solid $bd2; border-radius: 11px; padding: 6px; }
+QMenu::item { padding: 7px 24px 7px 14px; border-radius: 7px; color: $ink1; font-size: 12.5px; }
 QMenu::item:selected { background: $hover; }
 QMenu::separator { height: 1px; background: $bd; margin: 4px 6px; }
 """)
@@ -181,6 +181,7 @@ def tok(theme: str) -> dict[str, str]:
 
 
 def highlight_css(theme: str) -> str:
-    """结果片段命中词的半透明底（荧光笔效果，不变色不加粗）。"""
+    """结果片段命中词高亮：荧光底 + 加粗 + 强调色，搜索命中一眼可见。"""
     t = tok(theme)
-    return f"background:rgba({t['hl_r']},{t['hl_g']},{t['hl_b']},{t['hl_a']});border-radius:3px;"
+    return (f"background:rgba({t['hl_r']},{t['hl_g']},{t['hl_b']},{t['hl_a']});"
+            f"border-radius:3px;font-weight:700;color:{t['accd']};padding:0 1px;")
