@@ -1,6 +1,9 @@
-"""版本管理编排：纳管目录 / 监听保存 / 离线补记 / 会话折叠 / 配额 / 恢复 / 找回 / 跨版本搜。
+"""版本管理编排：全盘监听保存事件 → 谁变管谁 → 首次修改即建 v1。
 
-零操作负担：用户只管把目录加入管理，其余全自动。
+零操作负担：装了就全自动，不需选目录、不扫描存量（死 PPT 永不进库、绝不卡死）。
+只有两种 PPTX 进入管理：① 运行后新建的 ② 运行后被改存的老文件
+（改后这一版作为第一版，之前的历史不追踪——本来也没数据）。
+
 线程安全：watcher 子线程与 UI 主线程都经本类访问同一 SQLite 连接，
 所有 conn 操作用 RLock 串行（SQLite 单连接非线程安全）。
 """
@@ -27,50 +30,20 @@ def _sid(ts: float) -> str:
     return "s" + datetime.datetime.fromtimestamp(ts).strftime("%Y%m%d-%H%M")
 
 
-def _under(path: str, root: str) -> bool:
-    try:
-        return os.path.commonpath([os.path.abspath(path), os.path.abspath(root)]) == os.path.abspath(root)
-    except ValueError:  # 不同盘符
-        return False
-
-
 class VersionManager:
     def __init__(self, conn=None):
         self._conn = conn or store.connect(vault.db_path())
         store.init_db(self._conn)
-        self._lock = threading.RLock()  # 可重入：restore/catch_up 内部还会调 snapshot
+        self._lock = threading.RLock()  # 可重入：restore 内部还会调 snapshot
         self._watcher = None
 
-    # ---------- 受管目录 ----------
-    def list_roots(self) -> list[str]:
-        with self._lock:
-            return store.list_roots(self._conn)
-
-    def register_root(self, path: str) -> None:
-        """只登记受管目录（快，不遍历）；首版基线由调用方另行 catch_up（UI 场景务必放后台）。"""
-        path = os.path.abspath(path)
-        with self._lock:
-            store.add_root(self._conn, path, _now())
-
-    def add_root(self, path: str) -> None:
-        """登记 + 同步建首版基线。大目录会很慢，UI 入口请改用
-        register_root + 后台 catch_up_root（见 settings_dialog._add）。"""
-        self.register_root(path)
-        self.catch_up_root(path)  # 对现有 .pptx 建首版（内部各自加锁）
-
-    def remove_root(self, path: str) -> None:
-        with self._lock:
-            store.remove_root(self._conn, os.path.abspath(path))
-
-    def is_managed(self, path: str) -> bool:
-        path = os.path.abspath(path)
-        return any(_under(path, r) for r in self.list_roots())
-
-    # ---------- 快照（保存触发 / 手动 / 补记 共用） ----------
+    # ---------- 快照（保存触发 / 手动补录 共用） ----------
     def snapshot_now(self, path: str) -> str | None:
+        """对 path 当前内容拍快照。第一次见到该文件 → 建 v1；内容没变则跳过（返回 None）。
+
+        无「受管目录」概念：任何 .pptx 的保存都记录——这正是「谁变管谁」。
+        """
         if os.path.splitext(path)[1].lower() != PPTX_EXT:
-            return None
-        if not self.is_managed(path):
             return None
         with self._lock:
             sid = self._session_id(path)
@@ -86,15 +59,16 @@ class VersionManager:
             return latest["session_id"] or _sid(latest["ts"])
         return _sid(now)
 
-    # ---------- 离线补记 ----------
-    def catch_up_root(self, root: str) -> None:
-        for p in iter_ppt_files([root]):
-            if p.suffix.lower() == PPTX_EXT:
-                self.snapshot_now(str(p))  # 内容没变 vault 内部会跳过
+    def catch_up_root(self, root: str) -> int:
+        """把某目录下现存 .pptx 各建一版——手动补录 / 测试用。
 
-    def catch_up_all(self) -> None:
-        for r in self.list_roots():
-            self.catch_up_root(r)
+        生产流程靠 watcher 实时触发，绝不自动调用此方法（避免遍历卡死）。
+        """
+        n = 0
+        for p in iter_ppt_files([root]):
+            if p.suffix.lower() == PPTX_EXT and self.snapshot_now(str(p)):
+                n += 1
+        return n
 
     # ---------- 查询（供 UI，全部加锁） ----------
     def list_docs(self):
@@ -175,22 +149,15 @@ class VersionManager:
 
     # ---------- 监听生命周期 ----------
     def start(self) -> None:
-        """应用启动调用：离线补记 + 标记已删 + 起实时监听。"""
-        self.catch_up_all()
+        """应用启动：标记已删 + 起全盘实时监听。不扫描任何存量，绝不卡。"""
         self.scan_deleted()
         self._start_watcher()
 
     def _start_watcher(self) -> None:
         self._stop_watcher()
-        roots = self.list_roots()
-        if not roots:
-            return
-        from .watcher import VaultWatcher
-        self._watcher = VaultWatcher(roots, self.snapshot_now)
+        from .watcher import VaultWatcher, default_watch_paths
+        self._watcher = VaultWatcher(default_watch_paths(), self.snapshot_now)
         self._watcher.start()
-
-    def restart_watcher(self) -> None:
-        self._start_watcher()
 
     def _stop_watcher(self) -> None:
         if self._watcher is not None:

@@ -32,8 +32,6 @@ def main() -> int:
     p = work / "算力方案.pptx"
 
     mgr = VersionManager()
-    if str(work) not in mgr.list_roots():
-        mgr.add_root(str(work))
 
     # 造一段演示历史（3 版），首次运行才造
     if not mgr.list_versions(str(p)):

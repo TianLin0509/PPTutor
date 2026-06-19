@@ -1,4 +1,7 @@
-"""manager 编排测试（不起 watchdog 实时监听，单测逻辑；实时监听走 E2E）。"""
+"""manager 编排测试（不起 watchdog 实时监听，单测逻辑；实时监听走 E2E）。
+
+新架构：谁变管谁——任何 .pptx 保存即 snapshot_now，第一次见到该文件就建 v1。
+"""
 from __future__ import annotations
 
 import fixtures_gen as fx
@@ -12,79 +15,59 @@ def _mgr():
     return VersionManager()
 
 
-def test_add_root_catches_up_existing(tmp_path):
+def test_snapshot_any_pptx_builds_v1(tmp_path):
+    """谁变管谁：任何 .pptx 保存都建版本，无需预先登记目录（第一次=v1）。"""
+    p = tmp_path / "a.pptx"
+    fx.make_pptx(p, [{"body": "算力 集群"}])
+    mgr = _mgr()
+    assert mgr.snapshot_now(str(p))            # 第一次见 → v1
+    assert len(mgr.list_versions(str(p))) == 1
+    assert mgr.snapshot_now(str(p)) is None     # 没变 → 跳过
+
+
+def test_catch_up_root_builds_versions(tmp_path):
+    """手动补录：把目录现存 .pptx 各建一版（测试 / 补录用，生产靠 watcher 不自动调）。"""
     docs = tmp_path / "d"
     docs.mkdir()
-    fx.make_pptx(docs / "a.pptx", [{"body": "算力 集群"}])
+    fx.make_pptx(docs / "a.pptx", [{"body": "算力"}])
     fx.make_pptx(docs / "b.pptx", [{"body": "周报"}])
     mgr = _mgr()
-    mgr.add_root(str(docs))
+    assert mgr.catch_up_root(str(docs)) == 2
     assert len(mgr.list_versions(str(docs / "a.pptx"))) == 1
     assert len(mgr.list_versions(str(docs / "b.pptx"))) == 1
 
 
-def test_register_root_no_catchup_until_called(tmp_path):
-    """register_root 只登记、不建版——UI 入口防卡死的关键（catch_up 放后台另调）。"""
-    docs = tmp_path / "d"
-    docs.mkdir()
-    p = docs / "a.pptx"
-    fx.make_pptx(p, [{"body": "算力"}])
-    mgr = _mgr()
-    mgr.register_root(str(docs))
-    assert str(docs) in mgr.list_roots()       # 已登记
-    assert mgr.list_versions(str(p)) == []      # 但未建首版（不遍历、不阻塞）
-    mgr.catch_up_root(str(docs))                # 显式（后台）补记后才有
-    assert len(mgr.list_versions(str(p))) == 1
-
-
 def test_save_creates_version_and_skips_unchanged(tmp_path):
-    docs = tmp_path / "d"
-    docs.mkdir()
-    p = docs / "a.pptx"
+    p = tmp_path / "a.pptx"
     fx.make_pptx(p, [{"body": "v1"}])
     mgr = _mgr()
-    mgr.add_root(str(docs))                       # 首版
-    assert mgr.snapshot_now(str(p)) is None        # 没变 → 跳过
+    assert mgr.snapshot_now(str(p))             # 首版
+    assert mgr.snapshot_now(str(p)) is None      # 没变 → 跳过
     fx.make_pptx(p, [{"body": "v2 改了"}])
-    assert mgr.snapshot_now(str(p))                # 变了 → 记
+    assert mgr.snapshot_now(str(p))              # 变了 → 记
     assert len(mgr.list_versions(str(p))) == 2
 
 
-def test_unmanaged_path_ignored(tmp_path):
-    docs = tmp_path / "d"
-    docs.mkdir()
-    outside = tmp_path / "outside.pptx"
-    fx.make_pptx(outside, [{"body": "x"}])
-    mgr = _mgr()
-    mgr.add_root(str(docs))
-    assert mgr.snapshot_now(str(outside)) is None   # 不在受管目录
-
-
 def test_restore_old_keeps_current(tmp_path):
-    docs = tmp_path / "d"
-    docs.mkdir()
-    p = docs / "a.pptx"
+    p = tmp_path / "a.pptx"
     fx.make_pptx(p, [{"body": "原始 OLDX"}])
     mgr = _mgr()
-    mgr.add_root(str(docs))
+    mgr.snapshot_now(str(p))
     v1 = mgr.list_versions(str(p))[0]["version_id"]
     fx.make_pptx(p, [{"body": "改后 NEWX"}])
     mgr.snapshot_now(str(p))
-    # 恢复 v1（覆盖原文件）→ 恢复前会先把当前(NEWX)也留一版
+    # 恢复 v1（覆盖原文件）→ 恢复前会先把当前(NEWX)也留一版（已是最新则跳过）
     assert mgr.restore_to(str(p), v1)
     txt = "".join(pg.raw_text for pg in parse_pptx(str(p)).pages)
     assert "OLDX" in txt
-    # 当前已是最新版(NEWX)，恢复前留底因内容未变自动跳过 → 仍是 v1 + NEWX
     assert len(mgr.list_versions(str(p))) == 2
 
 
 def test_search_history_finds_deleted_content(tmp_path):
-    docs = tmp_path / "d"
-    docs.mkdir()
-    p = docs / "a.pptx"
+    p = tmp_path / "a.pptx"
     fx.make_pptx(p, [{"body": "含 区块链 论述"}])
     mgr = _mgr()
-    mgr.add_root(str(docs))
+    mgr.snapshot_now(str(p))
     fx.make_pptx(p, [{"body": "换成 数据库 主题"}])
     mgr.snapshot_now(str(p))
     hits = mgr.search_history("区块链")
@@ -92,12 +75,10 @@ def test_search_history_finds_deleted_content(tmp_path):
 
 
 def test_recover_deleted_file(tmp_path):
-    docs = tmp_path / "d"
-    docs.mkdir()
-    p = docs / "a.pptx"
+    p = tmp_path / "a.pptx"
     fx.make_pptx(p, [{"body": "重要内容 KEEPME"}])
     mgr = _mgr()
-    mgr.add_root(str(docs))
+    mgr.snapshot_now(str(p))
     did = vault.doc_id_for(str(p))
     p.unlink()                       # 误删原文件
     assert mgr.scan_deleted() == 1   # 标记 deleted

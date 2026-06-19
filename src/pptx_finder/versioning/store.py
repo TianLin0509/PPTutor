@@ -1,7 +1,8 @@
 """版本库元数据存储：独立 SQLite（vault/versions.db），不碰主索引库。
 
-表：managed_roots（受管目录）/ managed_docs（受管文档）/ versions（版本记录）
+表：managed_docs（受管文档，即被监听到改过的文件）/ versions（版本记录）
    / version_pages_fts（历史版本逐页文本，供跨版本内容搜索）。
+无「受管目录」表——全盘监听、谁变管谁，不需要预先登记目录。
 """
 from __future__ import annotations
 
@@ -9,9 +10,6 @@ import sqlite3
 from pathlib import Path
 
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS managed_roots(
-  path TEXT PRIMARY KEY, added_at REAL DEFAULT 0
-);
 CREATE TABLE IF NOT EXISTS managed_docs(
   doc_id TEXT PRIMARY KEY, path TEXT NOT NULL, status TEXT DEFAULT 'active',
   latest_version_id TEXT DEFAULT '', created_at REAL DEFAULT 0, updated_at REAL DEFAULT 0
@@ -40,21 +38,6 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
     conn.commit()
-
-
-# ---- 受管目录 ----
-def add_root(conn, path: str, ts: float) -> None:
-    conn.execute("INSERT OR IGNORE INTO managed_roots(path, added_at) VALUES(?,?)", (path, ts))
-    conn.commit()
-
-
-def remove_root(conn, path: str) -> None:
-    conn.execute("DELETE FROM managed_roots WHERE path=?", (path,))
-    conn.commit()
-
-
-def list_roots(conn) -> list[str]:
-    return [r["path"] for r in conn.execute("SELECT path FROM managed_roots ORDER BY added_at")]
 
 
 # ---- 受管文档 ----

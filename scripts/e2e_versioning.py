@@ -42,11 +42,15 @@ def main() -> int:
     fx.make_pptx(p, [{"body": "封面 算力方案"}, {"body": "第二页 量子计算 章节"}])
 
     mgr = VersionManager()
-    mgr.add_root(str(work))
-    check("纳管目录后自动建首版", len(mgr.list_versions(str(p))) == 1)
+    mgr.catch_up_root(str(work))  # 补录现存文件建首版
+    check("补录建首版", len(mgr.list_versions(str(p))) == 1)
 
     did = vault.doc_id_for(str(p))
-    mgr.start()  # 起真实 watcher（watchdog 后台线程）
+    # 新架构 watcher 走全盘 default_watch_paths（不含 Temp）；E2E 用隔离目录，
+    # 直接对该目录起 watcher 验证「改存 → 自动快照」链路
+    from pptx_finder.versioning.watcher import VaultWatcher
+    watcher = VaultWatcher([str(work)], mgr.snapshot_now)
+    watcher.start()
     try:
         # 模拟用户改内容后保存（覆盖原文件 = 真实文件系统事件）
         fx.make_pptx(p, [{"body": "封面 算力方案 v2"}, {"body": "第二页 改成 经典计算"}])
@@ -57,7 +61,7 @@ def main() -> int:
         time.sleep(2.8)
         check("再次保存累积到 3 版", len(mgr.list_versions(str(p))) == 3)
     finally:
-        mgr.stop()  # 停 watcher，后续用 API 验证（避免监听干扰）
+        watcher.stop()  # 停 watcher，后续用 API 验证（避免监听干扰）
 
     vers = mgr.list_versions(str(p))  # ts 降序
     v_first = vers[-1]["version_id"]

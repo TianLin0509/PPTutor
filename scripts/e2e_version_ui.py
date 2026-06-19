@@ -39,7 +39,7 @@ def main() -> int:
     fx.make_pptx(p, [{"body": "封面"}, {"body": "量子计算 章节"}])
 
     mgr = VersionManager()
-    mgr.add_root(str(work))  # v1
+    mgr.snapshot_now(str(p))  # v1
     fx.make_pptx(p, [{"body": "封面 v2"}, {"body": "经典计算"}])
     mgr.snapshot_now(str(p))  # v2
     fx.make_pptx(p, [{"body": "终稿"}, {"body": "终稿内容"}])
