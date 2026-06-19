@@ -994,6 +994,14 @@ class MainWindow(QMainWindow):
     def _act_restore_version(self, path: str, version_id: str) -> None:
         if self._version_mgr is None:
             return
+        # 恢复要覆盖原文件——若正被 PowerPoint 打开会写失败，提前给明确提示而非笼统「恢复失败」
+        if os.path.exists(path):
+            try:
+                with open(path, "r+b"):
+                    pass
+            except OSError:
+                self._toast("无法恢复：该文件正被 PowerPoint 打开，请先关闭它再恢复")
+                return
         ok = self._version_mgr.restore_to(path, version_id)
         self._toast("已恢复到该版本（当前内容已自动留底）" if ok else "恢复失败")
         self._update_detail()
