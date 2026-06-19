@@ -45,3 +45,12 @@ def test_empty_query_shows_recent(qtbot, tmp_path):
     assert len(win._results) == 2              # 空查询 → 展示最近文件（result_list 含分组头）
     assert win._showing_recent is True
     assert win._results[0].name == "b.pptx"    # 最新在前
+
+
+def test_startup_shows_recent_without_typing(qtbot, tmp_path):
+    """打开 app（未输入任何词、未手动触发搜索）即应自动列最近文件。"""
+    conn = _index_with_mtimes(tmp_path, [("a.pptx", 1_000_000), ("b.pptx", 2_000_000)])
+    win = MainWindow(conn=conn, render_worker=StubRender(), do_index=False)
+    qtbot.addWidget(win)
+    assert win._showing_recent is True         # 启动即默认视图，无需先输入再清空
+    assert len(win._results) == 2

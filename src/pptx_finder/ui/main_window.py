@@ -261,7 +261,7 @@ class MainWindow(QMainWindow):
     def __init__(self, conn=None, render_worker=None, do_index=True,
                  roots: list[str] | None = None, workers: int | None = None):
         super().__init__()
-        self.setWindowTitle("pptx-finder · PPTX 查询助手   v0.4.2")
+        self.setWindowTitle("pptx-finder · PPTX 查询助手   v0.4.3")
         self.resize(1180, 760)
 
         self._theme = _load_theme()
@@ -302,6 +302,7 @@ class MainWindow(QMainWindow):
             self._start_indexing(roots, workers)
         else:
             self._refresh_status()
+        self._show_recent()  # 启动即列最近文件（① 默认视图，无需先输入再清空）
 
     # ---------- UI ----------
     def _build_ui(self) -> None:
@@ -1122,6 +1123,8 @@ class MainWindow(QMainWindow):
         self.index_bar.hide()
         self.pct_label.setText("")
         self._refresh_status(summary)
+        if not self.search_box.text().strip():
+            self._show_recent()  # 索引完成后刷新最近（用户还没开始搜时，纳入新索引的文件）
 
     def _refresh_status(self, summary: dict | None = None) -> None:
         try:
