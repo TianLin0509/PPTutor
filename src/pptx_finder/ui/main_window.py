@@ -141,6 +141,38 @@ def _sort_results(results: list, key: str) -> list:
     return list(results)
 
 
+def _time_bucket(mtime: float, now_ts: float) -> str:
+    """按 mtime 归入时间桶：今天 / 昨天 / 本周 / 本月 / 更早。"""
+    now = datetime.datetime.fromtimestamp(now_ts)
+    try:
+        dt = datetime.datetime.fromtimestamp(mtime)
+    except (OSError, OverflowError, ValueError):
+        return "更早"
+    d = (now.date() - dt.date()).days
+    if d <= 0:
+        return "今天"
+    if d == 1:
+        return "昨天"
+    if d < 7:
+        return "本周"
+    if d < 30:
+        return "本月"
+    return "更早"
+
+
+def group_by_time(results: list, now_ts: float) -> list:
+    """按 mtime 分时间桶，保持输入顺序。返回 [(label, [items]), ...]。"""
+    buckets: dict[str, list] = {}
+    order: list[str] = []
+    for r in results:
+        label = _time_bucket(r.mtime, now_ts)
+        if label not in buckets:
+            buckets[label] = []
+            order.append(label)
+        buckets[label].append(r)
+    return [(label, buckets[label]) for label in order]
+
+
 class ResultItem(QWidget):
     """单条结果：文件名(SemiBold) + 命中页胶囊 + 版本/最新徽章 + 高亮片段 + 路径(mono灰)。"""
 
@@ -536,7 +568,7 @@ class MainWindow(QMainWindow):
             _save_theme(name)
         if self._results_raw:
             self._apply_sort_render()
-            self.result_list.setCurrentRow(0)
+            self._select_first()
         self._apply_titlebar_theme()
 
     def _show_theme_menu(self) -> None:
@@ -573,7 +605,7 @@ class MainWindow(QMainWindow):
         if results:
             self.result_count.setText(f"命中 {len(results)} 个文件")
             self.list_head.show()
-            self.result_list.setCurrentRow(0)
+            self._select_first()
         else:
             self.list_head.hide()
             self._update_preview_header(None)
@@ -590,7 +622,7 @@ class MainWindow(QMainWindow):
             self._apply_sort_render()
             self.result_count.setText(f"最近修改 · {len(recents)} 个文件")
             self.list_head.show()
-            self.result_list.setCurrentRow(0)
+            self._select_first()
         else:
             self.result_list.clear()
             self.list_head.hide()
@@ -667,20 +699,60 @@ class MainWindow(QMainWindow):
         if self._results_raw:
             self._apply_sort_render()
             if self._results:
-                self.result_list.setCurrentRow(0)
+                self._select_first()
 
     def _render_results(self, results: list[FileResult]) -> None:
         self._hide_empty_hint()
         self.result_list.clear()
         hlcss = theme.highlight_css(self._theme)
-        for i, r in enumerate(results):
-            item = QListWidgetItem()
-            item.setData(Qt.UserRole, i)
-            item.setToolTip(r.path)
-            w = ResultItem(r, self._tok, hlcss)
-            item.setSizeHint(w.sizeHint())
-            self.result_list.addItem(item)
-            self.result_list.setItemWidget(item, w)
+        if self._should_group_by_time():
+            now_ts = datetime.datetime.now().timestamp()
+            idx = 0
+            for label, items in group_by_time(results, now_ts):
+                self._add_section_header(f"{label} · {len(items)}")
+                for r in items:
+                    self._add_result_item(idx, r, hlcss)
+                    idx += 1
+        else:
+            for i, r in enumerate(results):
+                self._add_result_item(i, r, hlcss)
+
+    def _should_group_by_time(self) -> bool:
+        """时间分组仅在「时间序」下生效：最近修改排序，或空查询默认视图。"""
+        key = self._sort_key()
+        if key == "recent":
+            return True
+        return self._showing_recent and key == "relevance"
+
+    def _add_result_item(self, idx: int, r: FileResult, hlcss: str) -> None:
+        item = QListWidgetItem()
+        item.setData(Qt.UserRole, idx)
+        item.setToolTip(r.path)
+        w = ResultItem(r, self._tok, hlcss)
+        item.setSizeHint(w.sizeHint())
+        self.result_list.addItem(item)
+        self.result_list.setItemWidget(item, w)
+
+    def _add_section_header(self, label: str) -> None:
+        item = QListWidgetItem()
+        item.setData(Qt.UserRole, None)
+        item.setFlags(Qt.NoItemFlags)  # 分组头：不可选不可交互
+        lbl = QLabel(label)
+        lbl.setObjectName("sectionHead")
+        item.setSizeHint(lbl.sizeHint())
+        self.result_list.addItem(item)
+        self.result_list.setItemWidget(item, lbl)
+
+    def _first_selectable_row(self) -> int:
+        for i in range(self.result_list.count()):
+            if self.result_list.item(i).data(Qt.UserRole) is not None:
+                return i
+        return -1
+
+    def _select_first(self) -> None:
+        row = self._first_selectable_row()
+        if row >= 0:
+            self.result_list.setCurrentRow(row)
 
     # ---------- 选择 / 预览 ----------
     def _on_select(self, cur: QListWidgetItem | None, prev: QListWidgetItem | None = None) -> None:

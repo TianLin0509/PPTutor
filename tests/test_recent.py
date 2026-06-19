@@ -42,6 +42,6 @@ def test_empty_query_shows_recent(qtbot, tmp_path):
     qtbot.addWidget(win)
     win.search_box.setText("")
     win._do_search()
-    assert win.result_list.count() == 2        # 空查询 → 展示最近文件（不再空白）
+    assert len(win._results) == 2              # 空查询 → 展示最近文件（result_list 含分组头）
     assert win._showing_recent is True
     assert win._results[0].name == "b.pptx"    # 最新在前

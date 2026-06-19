@@ -95,7 +95,7 @@ def test_empty_shows_recent(qtbot, tmp_path):
     assert win.result_list.count() == 1
     win.search_box.setText("")
     win._do_search()
-    assert win.result_list.count() == 2          # 索引里 2 个文件，都列为最近
+    assert len(win._results) == 2                # 索引 2 个文件（result_list 含时间分组头）
     assert win._showing_recent is True
 
 
