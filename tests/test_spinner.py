@@ -12,7 +12,10 @@ def test_spinner_active_and_text(qtbot, tmp_path):
     qtbot.addWidget(win)
     win._start_spinner()
     assert win._spin_timer.isActive()
-    assert "正在渲染" in win.image_label.text()
+    assert "PowerPoint" in win.image_label.text()        # 首次预览说明（P2-1）
+    win._preview_hinted = True
+    win._tick_spinner()
+    assert "正在渲染" in win.image_label.text()            # 之后恢复常规文案
 
 
 def test_spinner_stops(qtbot, tmp_path):

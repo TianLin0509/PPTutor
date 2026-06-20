@@ -51,6 +51,18 @@ def mark_welcomed() -> None:
         pass
 
 
+def is_version_intro_done() -> bool:
+    """是否已做过「版本管理首次告知」（首次后台留版时弹一次聚光灯，之后永久静默）。"""
+    return (data_dir() / "version_intro.flag").exists()
+
+
+def mark_version_intro_done() -> None:
+    try:
+        (data_dir() / "version_intro.flag").write_text("1", encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 # 扫描时排除的目录名（小写，按路径片段匹配）——减少无效 IO 与噪音
 EXCLUDE_DIR_NAMES: set[str] = {
     "windows", "program files", "program files (x86)", "programdata",

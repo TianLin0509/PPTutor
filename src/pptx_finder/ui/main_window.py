@@ -8,6 +8,7 @@ from __future__ import annotations
 import datetime
 import html
 import json
+import logging
 import os
 
 from PySide6.QtCore import QEvent, QMimeData, QPropertyAnimation, Qt, QStringListModel, QTimer, QUrl
@@ -27,6 +28,8 @@ from .render_worker import RenderWorker
 from .thumb_worker import ThumbWorker
 from .detail_panel import DetailPanel
 from .facet_panel import FacetPanel
+
+_log = logging.getLogger(__name__)
 
 
 def _make_icon(draw, color: str = "#8A8A8A", size: int = 18) -> QIcon:
@@ -458,6 +461,10 @@ class MainWindow(QMainWindow):
         self.detail_btn.setToolTip("显示/隐藏 版本时间线 · 大纲 · 文件信息")
         self.detail_btn.clicked.connect(self._toggle_detail)
         bar.addWidget(self.detail_btn)
+        self._detail_dot = QLabel("●", self.detail_btn)  # 有版本时右上角红点
+        self._detail_dot.setObjectName("navDot")
+        self._detail_dot.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self._detail_dot.hide()
         tl.addLayout(bar)
         root.addWidget(top)
 
@@ -535,6 +542,10 @@ class MainWindow(QMainWindow):
         self.status.addWidget(self.status_dot)
         self.status_label = QLabel("准备中…")
         self.status.addWidget(self.status_label)
+        self.version_shield = QLabel("")
+        self.version_shield.setObjectName("verShield")
+        self.version_shield.hide()  # 有版本后才显示
+        self.status.addPermanentWidget(self.version_shield)
         kb = QLabel('<span id="kbd"> ↑↓ </span> 选择　<span id="kbd"> ↵ </span> 打开　<span id="kbd"> Esc </span> 收起')
         kb.setTextFormat(Qt.RichText)
         self.hotkey_label = QLabel(f"全局热键 {GLOBAL_HOTKEY}")
@@ -665,12 +676,15 @@ class MainWindow(QMainWindow):
         self._apply_titlebar_theme()  # 窗口显示后系统标题栏才接受深色属性
         if not getattr(self, "_did_fade", False):
             self._did_fade = True
-            self.setWindowOpacity(0.0)
-            self._fade = QPropertyAnimation(self, b"windowOpacity", self)
-            self._fade.setDuration(200)
-            self._fade.setStartValue(0.0)
-            self._fade.setEndValue(1.0)
-            self._fade.start()
+            from .spotlight import animations_enabled
+            if animations_enabled():  # 尊重系统「减弱动态效果」，关则直接显示
+                self.setWindowOpacity(0.0)
+                self._fade = QPropertyAnimation(self, b"windowOpacity", self)
+                self._fade.setDuration(200)
+                self._fade.setStartValue(0.0)
+                self._fade.setEndValue(1.0)
+                self._fade.start()
+        self._maybe_show_version_intro()  # 有「首次留版」待告知且窗口已露脸则补弹
 
     def _apply_titlebar_theme(self) -> None:
         """Windows 系统标题栏深浅跟随风格（深色风格→深色标题栏，消除白条割裂）。"""
@@ -760,6 +774,7 @@ class MainWindow(QMainWindow):
             self.list_head.hide()
             self._update_preview_header(None)
             self._set_ops_enabled(False)
+            self._show_start_hint()
 
     def _build_empty_hint(self, parent_layout) -> None:
         """零结果引导面板（默认隐藏，零结果时覆盖结果列表位置）。"""
@@ -768,19 +783,19 @@ class MainWindow(QMainWindow):
         v = QVBoxLayout(self.empty_hint)
         v.setAlignment(Qt.AlignCenter)
         v.setSpacing(11)
-        icon = QLabel("🔍")
-        icon.setObjectName("emptyIcon")
-        icon.setAlignment(Qt.AlignCenter)
-        v.addWidget(icon)
+        self._empty_icon = QLabel("🔍")
+        self._empty_icon.setObjectName("emptyIcon")
+        self._empty_icon.setAlignment(Qt.AlignCenter)
+        v.addWidget(self._empty_icon)
         self._empty_query_label = QLabel("没找到")
         self._empty_query_label.setObjectName("emptyTitle")
         self._empty_query_label.setAlignment(Qt.AlignCenter)
         self._empty_query_label.setWordWrap(True)
         v.addWidget(self._empty_query_label)
-        tip = QLabel("换个说法试试")
-        tip.setObjectName("emptyTip")
-        tip.setAlignment(Qt.AlignCenter)
-        v.addWidget(tip)
+        self._empty_tip = QLabel("换个说法试试")
+        self._empty_tip.setObjectName("emptyTip")
+        self._empty_tip.setAlignment(Qt.AlignCenter)
+        v.addWidget(self._empty_tip)
         self._sugg_btns: dict[str, QPushButton] = {}
         for key, text in (("unquote", "去掉引号再搜"), ("fewer", "只用第一个词"), ("filename", "改搜文件名")):
             b = QPushButton(text)
@@ -794,10 +809,22 @@ class MainWindow(QMainWindow):
     def _show_empty_hint(self, query: str) -> None:
         """零结果引导：列表让位，给「没找到 + 可点建议」。"""
         self.result_list.hide()
+        self._empty_icon.setText("🔍")
+        self._empty_tip.setText("换个说法试试")
         self._empty_query_label.setText(f"没找到「{query}」")
         sugg = _empty_suggestions(query, self.mode.currentText())
         for key, btn in self._sugg_btns.items():
             btn.setVisible(key in sugg)
+        self.empty_hint.show()
+
+    def _show_start_hint(self) -> None:
+        """无最近文件（刚装 / 还在索引）时的起步引导，复用 emptyHint 容器（隐藏建议按钮）。"""
+        self.result_list.hide()
+        self._empty_icon.setText("📂")
+        self._empty_query_label.setText("还在整理你的 PPT…")
+        self._empty_tip.setText("索引好后这里会列出最近文件；现在就能在上方搜索框直接搜你写过的字")
+        for btn in self._sugg_btns.values():
+            btn.hide()
         self.empty_hint.show()
 
     def _hide_empty_hint(self) -> None:
@@ -940,6 +967,7 @@ class MainWindow(QMainWindow):
         self._populate_thumbs()
         self._request_preview()
         self._update_detail()
+        self._refresh_detail_dot()
 
     def _relayout_split(self) -> None:
         f = 180 if not self.facet_panel.isHidden() else 0
@@ -968,10 +996,28 @@ class MainWindow(QMainWindow):
         if self.detail_panel.isHidden():
             self.detail_panel.show()
             self._update_detail()
+            self._maybe_hint_detail_versions()
         else:
             self.detail_panel.hide()
         self.detail_btn.setChecked(not self.detail_panel.isHidden())
         self._relayout_split()
+        self._refresh_detail_dot()
+
+    def _maybe_hint_detail_versions(self) -> None:
+        """首次展开详情且当前文件有历史版本时，提示「这里能一键回到历史版本」。"""
+        if getattr(self, "_detail_opened_once", False):
+            return
+        self._detail_opened_once = True
+        cur = getattr(self, "_cur", None)
+        if cur is None or self._version_mgr is None:
+            return
+        try:
+            has = bool(self._version_mgr.list_versions(cur.path))
+        except Exception:  # noqa: BLE001
+            _log.warning("list_versions failed in detail hint", exc_info=True)
+            has = False
+        if has:
+            self._toast("💡 这里能一键回到任意历史版本")
 
     def _update_detail(self) -> None:
         if self.detail_panel.isHidden() or self._cur is None:
@@ -1002,9 +1048,24 @@ class MainWindow(QMainWindow):
             except OSError:
                 self._toast("无法恢复：该文件正被 PowerPoint 打开，请先关闭它再恢复")
                 return
+        if not self._confirm_restore():
+            return
         ok = self._version_mgr.restore_to(path, version_id)
-        self._toast("已恢复到该版本（当前内容已自动留底）" if ok else "恢复失败")
+        self._toast("✓ 已恢复到该版本（当前内容已自动留底，不会丢）" if ok else "恢复失败")
         self._update_detail()
+
+    def _confirm_restore(self) -> bool:
+        """恢复前友好确认：强调「会自动留底、随时切回」，降低破坏性操作的心理负担。"""
+        from PySide6.QtWidgets import QMessageBox
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("恢复到这个版本？")
+        box.setText("会用这个历史版本覆盖当前文件。")
+        box.setInformativeText("别担心——覆盖前会自动把当前内容也留一版，之后随时能再切回来。")
+        yes = box.addButton("恢复", QMessageBox.AcceptRole)
+        box.addButton("取消", QMessageBox.RejectRole)
+        box.exec()
+        return box.clickedButton() is yes
 
     def _act_export_version(self, path: str, version_id: str) -> None:
         if self._version_mgr is None:
@@ -1066,10 +1127,14 @@ class MainWindow(QMainWindow):
     def _tick_spinner(self) -> None:
         ch = "◐◓◑◒"[self._spin_idx % 4]
         self._spin_idx += 1
+        accent = self._tok.get("acc", "#0A84FF")
+        sub = self._tok.get("ink3", "#888")
+        msg = ("首次预览要唤起 PowerPoint，稍等几秒…"
+               if not getattr(self, "_preview_hinted", False) else "正在渲染预览…")
         self.image_label.setPixmap(QPixmap())
         self.image_label.setText(
-            f'<div style="font-size:30px;color:#9a968c">{ch}</div>'
-            '<div style="color:#888;font-size:13px;margin-top:12px">正在渲染预览…</div>')
+            f'<div style="font-size:30px;color:{accent}">{ch}</div>'
+            f'<div style="color:{sub};font-size:13px;margin-top:12px">{msg}</div>')
 
     def _start_spinner(self) -> None:
         self._spin_idx = 0
@@ -1149,6 +1214,7 @@ class MainWindow(QMainWindow):
             return
         pm = QPixmap(png)
         self._cur_pixmap = pm if not pm.isNull() else None
+        self._preview_hinted = True  # 首次预览已成功，之后不再提「唤起 PowerPoint」
         self._update_pixmap()
 
     def _update_pixmap(self) -> None:
@@ -1191,6 +1257,7 @@ class MainWindow(QMainWindow):
             self._welcome.hide()
             self._welcome.deleteLater()
             self._welcome = None
+        QTimer.singleShot(350, self._show_search_coach)  # 谢幕后引导搜索框
 
     def resizeEvent(self, e):  # noqa: N802
         super().resizeEvent(e)
@@ -1342,6 +1409,92 @@ class MainWindow(QMainWindow):
         self._toast_fade.start()
         QTimer.singleShot(200, self._toast_label.hide)
 
+    # ---------- 版本管理存在感（P0-1：日常静默盾牌 + 仅首次告知） ----------
+    def refresh_version_shield(self) -> None:
+        """状态栏「版本保护」盾牌：显示已守护文件数，日常静默的存在感。"""
+        if getattr(self, "version_shield", None) is None or self._version_mgr is None:
+            return
+        try:
+            n = len(self._version_mgr.list_docs())
+        except Exception:  # noqa: BLE001
+            n = 0
+        if n > 0:
+            self.version_shield.setText(f"🛡️ 版本保护 · {n}")
+            self.version_shield.setToolTip(f"已为 {n} 个你改过的 PPT 自动留底，改崩了能找回")
+            self.version_shield.show()
+        else:
+            self.version_shield.hide()
+
+    def _refresh_detail_dot(self) -> None:
+        """选中文件有历史版本时，详情按钮亮红点；本 session 首次发现时呼吸一次引导。"""
+        has = False
+        if self._version_mgr is not None and getattr(self, "_cur", None) is not None:
+            try:
+                has = bool(self._version_mgr.list_versions(self._cur.path))
+            except Exception:  # noqa: BLE001
+                has = False
+        if has and self.detail_panel.isHidden():  # 详情已打开就不用红点再提示
+            self._detail_dot.move(self.detail_btn.width() - 14, 5)
+            self._detail_dot.show()
+            self._detail_dot.raise_()
+            # 首次发现 + 窗口可见时才呼吸引导（隐藏到托盘时不浪费动画，留到下次再试）
+            if not getattr(self, "_detail_hint_done", False) and self.isVisible():
+                self._detail_hint_done = True
+                from .spotlight import attention_pulse
+                attention_pulse(self.detail_btn,
+                                color=self._tok.get("acc", "#0A84FF"), cycles=2)
+        else:
+            self._detail_dot.hide()
+
+    def on_version_snapshot(self, path: str, version_id: str) -> None:
+        """后台留版事件（经 VersionBridge 队列信号，已切回主线程）。"""
+        self.refresh_version_shield()
+        cur = getattr(self, "_cur", None)
+        if cur is not None and cur.path == path:
+            self._update_detail()  # 正看着这个文件 → 刷新版本时间线
+            self._refresh_detail_dot()
+        self._pending_version_intro = True
+        self._maybe_show_version_intro()
+
+    def _maybe_show_version_intro(self) -> None:
+        """首次留版 + 主窗已露脸时，弹一次聚光灯告知「版本保护」，之后永久静默。"""
+        if not getattr(self, "_pending_version_intro", False):
+            return
+        from ..config import is_version_intro_done, mark_version_intro_done
+        if is_version_intro_done():
+            self._pending_version_intro = False
+            return
+        if (not self.isVisible() or self.isMinimized()
+                or getattr(self, "_welcome", None) is not None):
+            return  # 窗口没露脸 / 欢迎页还在 → 等下次 showEvent 补弹
+        self._show_spotlight(
+            self.detail_btn,
+            "已自动给你改过的 PPT 留了底 🛡️\n"
+            "改崩了、想找回旧版，点这里「详情」就能一键回到任意历史版本。")
+        mark_version_intro_done()
+        self._pending_version_intro = False
+
+    def _show_spotlight(self, target, text: str) -> None:
+        """统一弹聚光灯引导：先关旧的再弹新的，避免叠加 / 泄漏。"""
+        old = getattr(self, "_spotlight", None)
+        if old is not None:
+            try:
+                old.hide()
+                old.deleteLater()
+            except RuntimeError:
+                pass  # widget C++ 对象已销毁——AttributeError 等类型错误故意不吞
+        from .spotlight import SpotlightOverlay
+        self._spotlight = SpotlightOverlay(self.centralWidget(), target, text, tok=self._tok)
+
+    def _show_search_coach(self) -> None:
+        """首次欢迎页谢幕后，聚光灯引导搜索框（一生一次，随欢迎页 flag）。"""
+        if not self.isVisible() or self.isMinimized() or self._welcome is not None:
+            return
+        self._show_spotlight(
+            self.search_box,
+            "在这里输入你 PPT 里写过的字 →\n"
+            "记得哪页写过什么，就能搜出它在哪个文件、第几页。")
+
     # ---------- 索引 ----------
     def _start_indexing(self, roots: list[str] | None, workers: int | None) -> None:
         from ..scanner import fixed_drives
@@ -1380,6 +1533,15 @@ class MainWindow(QMainWindow):
         self._refresh_status(summary)
         if not self.search_box.text().strip():
             self._show_recent()  # 索引完成后刷新最近（用户还没开始搜时，纳入新索引的文件）
+        if not getattr(self, "_index_celebrated", False):  # 首次索引就绪，庆祝一次
+            self._index_celebrated = True
+            try:
+                n = db.stats(self._conn)["file_count"]
+            except Exception:  # noqa: BLE001
+                _log.warning("db.stats failed for index celebration", exc_info=True)
+                n = 0
+            if n > 0 and self.isVisible() and not self.isMinimized():
+                self._toast(f"✓ 已整理好 {n} 个 PPT，搜搜看你写过的字吧")
 
     def _refresh_status(self, summary: dict | None = None) -> None:
         try:

@@ -18,6 +18,7 @@ from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
 from .config import GLOBAL_HOTKEY
 from .ui.main_window import MainWindow
+from .ui.version_bridge import VersionBridge
 from .versioning.manager import VersionManager
 
 WM_HOTKEY = 0x0312
@@ -125,9 +126,14 @@ def main() -> int:
     win._to_tray_on_close = True
 
     # 版本管理：后台守护（保存即自动版本 / 离线补记 / 监听），不阻塞启动
-    version_mgr = VersionManager()
+    # 留版事件经 VersionBridge 跨线程信号送回 UI 主线程（更新盾牌 / 首次告知）
+    bridge = VersionBridge()
+    app._version_bridge = bridge  # 防 GC
+    version_mgr = VersionManager(on_snapshot=bridge.emit_snapshot)
     app._version_manager = version_mgr  # 防 GC
     win._version_mgr = version_mgr  # 详情面板版本时间线数据源
+    bridge.snapshotted.connect(win.on_version_snapshot)
+    win.refresh_version_shield()  # 启动即显示已守护文件数
     threading.Thread(target=version_mgr.start, daemon=True).start()
 
     def _on_singleton_conn() -> None:

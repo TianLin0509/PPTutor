@@ -1,0 +1,17 @@
+"""跨线程版本事件桥：watcher 子线程留版 → Qt 队列信号 → UI 主线程槽。
+
+VersionManager 不依赖 Qt（保持 versioning 子系统纯净）；它只回调 emit_snapshot，
+本桥把回调转成 Qt 信号——signal 在主线程创建，子线程 emit 自动走 QueuedConnection，
+线程安全地把事件投递到 UI 主线程，无需手写锁或轮询。
+"""
+from __future__ import annotations
+
+from PySide6.QtCore import QObject, Signal
+
+
+class VersionBridge(QObject):
+    snapshotted = Signal(str, str)  # (path, version_id)
+
+    def emit_snapshot(self, path: str, version_id: str) -> None:
+        """供 VersionManager.on_snapshot 回调（可能在 watcher 子线程被调用）。"""
+        self.snapshotted.emit(path, version_id)

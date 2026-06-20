@@ -107,6 +107,7 @@ QPushButton:hover { background: $hover; }
 QPushButton:disabled { color: $ink4; }
 QPushButton#primary { background: $acc; border: 1px solid $acc; color: $acctext; font-weight: 600; }
 QPushButton#primary:hover { background: $accd; }
+QPushButton#primary:pressed { background: $accd; padding-top: 8px; padding-bottom: 6px; }
 QPushButton#ghost { background: transparent; border: none; color: $ink3; padding: 5px 8px; }
 QPushButton#ghost:hover { background: $hover; color: $ink1; }
 
@@ -195,6 +196,8 @@ QPushButton#navBtn:disabled { color: $ink4; }
 QStatusBar#statusBar { background: $panel2; border-top: 1px solid $bd; color: $ink3; }
 QStatusBar#statusBar QLabel { color: $ink3; font-size: 12px; background: transparent; }
 QLabel#kbd { color: $ink1; background: $field; border: 1px solid $bd2; border-radius: 5px; padding: 2px 6px; font-size: 11px; font-weight: 600; }
+QLabel#verShield { color: $grn; font-size: 11.5px; font-weight: 600; background: transparent; padding: 0 6px; }
+QLabel#navDot { color: #ff453a; font-size: 13px; font-weight: 700; background: transparent; }
 
 /* 索引进度条 + 百分比 + 就绪绿点 */
 QProgressBar#indexBar { background: $bd2; border: none; border-radius: 4px; max-height: 7px; min-height: 7px; }

@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import datetime
+import logging
 import os
 import threading
 
@@ -31,17 +32,19 @@ def _sid(ts: float) -> str:
 
 
 class VersionManager:
-    def __init__(self, conn=None):
+    def __init__(self, conn=None, on_snapshot=None):
         self._conn = conn or store.connect(vault.db_path())
         store.init_db(self._conn)
         self._lock = threading.RLock()  # 可重入：restore 内部还会调 snapshot
         self._watcher = None
+        self._on_snapshot = on_snapshot  # 留版成功回调(path, vid)，watcher 子线程触发
 
     # ---------- 快照（保存触发 / 手动补录 共用） ----------
-    def snapshot_now(self, path: str) -> str | None:
+    def snapshot_now(self, path: str, notify: bool = True) -> str | None:
         """对 path 当前内容拍快照。第一次见到该文件 → 建 v1；内容没变则跳过（返回 None）。
 
         无「受管目录」概念：任何 .pptx 的保存都记录——这正是「谁变管谁」。
+        notify=True 时留版成功会触发 on_snapshot 回调（恢复留底等内部调用传 False）。
         """
         if os.path.splitext(path)[1].lower() != PPTX_EXT:
             return None
@@ -50,7 +53,14 @@ class VersionManager:
             vid = vault.snapshot(self._conn, path, sid)
             if vid:
                 self._enforce_quota(vault.doc_id_for(path))
-            return vid
+        # 锁外回调：避免回调里重入访问 conn；UI 侧自行把事件 marshal 回主线程
+        if vid and notify and self._on_snapshot is not None:
+            try:
+                self._on_snapshot(path, vid)
+            except Exception:  # noqa: BLE001
+                logging.getLogger(__name__).warning(
+                    "on_snapshot callback raised", exc_info=True)
+        return vid
 
     def _session_id(self, path: str) -> str:
         latest = store.latest_version(self._conn, vault.doc_id_for(path))
@@ -98,7 +108,7 @@ class VersionManager:
             did = vault.doc_id_for(path)
             target = dest or path
             if target == path and os.path.exists(path):
-                self.snapshot_now(path)
+                self.snapshot_now(path, notify=False)  # 恢复前留底，不当作用户改存通知
             return vault.rebuild_to(did, version_id, target)
 
     def export(self, path: str, version_id: str, dest: str) -> bool:
