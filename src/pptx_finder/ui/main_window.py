@@ -24,6 +24,7 @@ from ..config import GLOBAL_HOTKEY, data_dir, db_path as cfg_db_path, is_first_r
 from ..models import FileResult
 from . import theme
 from .index_worker import IndexWorker
+from .live_indexer import LiveIndexer
 from .render_worker import RenderWorker
 from .thumb_worker import ThumbWorker
 from .detail_panel import DetailPanel
@@ -344,7 +345,7 @@ class MainWindow(QMainWindow):
     def __init__(self, conn=None, render_worker=None, thumb_worker=None, version_mgr=None,
                  do_index=True, roots: list[str] | None = None, workers: int | None = None):
         super().__init__()
-        self.setWindowTitle("pptx-finder · PPTX 查询助手   v0.7.0")
+        self.setWindowTitle("pptx-finder · PPTX 查询助手   v0.7.1")
         self.resize(1180, 760)
 
         self._theme = _load_theme()
@@ -392,6 +393,13 @@ class MainWindow(QMainWindow):
         self._apply_theme(self._theme, persist=False)
 
         self._indexer: IndexWorker | None = None
+        # 实时索引后台线程：保存事件不在主线程 parse/写库（防 UI 冻结）。
+        # do_index=False 的测试无此线程，走 _index_file_live 的同步兜底。
+        self._live: LiveIndexer | None = None
+        if do_index:
+            self._live = LiveIndexer(self._db_path)
+            self._live.indexed.connect(self._on_live_indexed)
+            self._live.start()
         # 已有索引就秒开（运行中靠 watcher 实时增量 + 托盘「重新扫描」兜底）；
         # 只有首次（索引为空）才全量建库——不再每次重开都全盘扫。
         if do_index and self._index_is_empty():
@@ -1553,7 +1561,15 @@ class MainWindow(QMainWindow):
             return True
 
     def _index_file_live(self, path: str) -> None:
-        """watcher 捕获保存 → 实时把这一个文件并入搜索索引（无需重扫全盘）。已在主线程。"""
+        """watcher 捕获保存 → 把这一个文件并入搜索索引（无需重扫全盘）。
+
+        生产（有后台 live 线程）：仅入队即返回，**绝不在主线程 parse/写库**——
+        否则会抢后台 IndexWorker 的 SQLite 写锁（最长等 8s）把 UI 顶成「未响应」。
+        无 live 线程（do_index=False 测试）：同步兜底，保持可测。
+        """
+        if self._live is not None:
+            self._live.submit(path)  # 后台线程 parse+写库，完成经 indexed 信号回主线程
+            return
         from .. import indexer
         try:
             ok = indexer.index_single(self._conn, path)
@@ -1561,9 +1577,16 @@ class MainWindow(QMainWindow):
             _log.warning("live index failed %s", path, exc_info=True)
             return
         if ok:
-            self._refresh_status()                  # 更新「索引就绪 N 文件」计数
-            if self.search_box.text().strip():
-                self._do_search()                   # 正在搜就纳入新文件刷新结果
+            self._after_live_index()
+
+    def _on_live_indexed(self, path: str) -> None:
+        """后台 live 线程索引完一个文件（信号已切回主线程）→ 刷新状态/结果。"""
+        self._after_live_index()
+
+    def _after_live_index(self) -> None:
+        self._refresh_status()                  # 更新「索引就绪 N 文件」计数
+        if self.search_box.text().strip():
+            self._do_search()                   # 正在搜就纳入新文件刷新结果
 
     def _start_indexing(self, roots: list[str] | None, workers: int | None) -> None:
         if self._indexer is not None and self._indexer.isRunning():
@@ -1638,6 +1661,9 @@ class MainWindow(QMainWindow):
 
     def _shutdown(self) -> None:
         self._render_gen += 1  # 作废仍在流入的分批渲染，回调触达已销毁控件前先止住
+        if self._live is not None:
+            self._live.stop()
+            self._live.wait(3000)
         if self._indexer is not None:
             self._indexer.stop()
             self._indexer.wait(5000)

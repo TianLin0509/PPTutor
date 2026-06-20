@@ -5,6 +5,7 @@ import fixtures_gen as fx
 from test_ui import StubRender, _index
 
 from pptx_finder import db, indexer, search
+from pptx_finder.ui.live_indexer import LiveIndexer
 from pptx_finder.ui.main_window import MainWindow
 
 
@@ -53,3 +54,29 @@ def test_index_is_empty_on_blank_db(qtbot, tmp_path):
     win = MainWindow(conn=conn, render_worker=StubRender(), do_index=False)
     qtbot.addWidget(win)
     assert win._index_is_empty() is True
+
+
+def test_live_indexer_async_off_main_thread(qtbot, tmp_path):
+    """LiveIndexer：submit 入队 → 后台线程索引 → indexed 信号 → 文件可搜。
+
+    这是 UI 冻结修复的核心——实时索引在后台串行线程跑，主线程绝不 parse/写库。
+    """
+    docs = tmp_path / "d"
+    docs.mkdir()
+    dbp = tmp_path / "i.db"
+    conn = db.connect(dbp)
+    db.init_db(conn)
+    indexer.update_index(conn, [str(docs)], workers=1)  # 空基线
+    fx.make_pptx(docs / "异步LT.pptx", [{"body": "异步索引内容ABC"}])
+
+    li = LiveIndexer(str(dbp))
+    li.start()
+    try:
+        with qtbot.waitSignal(li.indexed, timeout=5000):
+            li.submit(str(docs / "异步LT.pptx"))  # 主线程仅入队
+    finally:
+        li.stop()
+        li.wait(3000)
+
+    conn2 = db.connect(dbp)  # 新连接读后台已提交的数据
+    assert any("异步LT" in r.name for r in search.search(conn2, "异步索引内容ABC"))
