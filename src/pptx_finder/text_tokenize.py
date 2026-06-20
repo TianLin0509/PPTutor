@@ -1,6 +1,6 @@
 """分词与归一化:基础召回 = 字级索引(FTS5 召回候选)+ 原文验证(精度)。
 
-- 中文逐字、英文/数字整词(单字母信息量太低,按词避免召回爆炸)。
+- 中文逐字、英文/数字整词 + 长英数补字符 trigram(子串召回,不退化成按单字母→不召回爆炸)。
 - 归一化:全半角(NFKC)+ 繁→简(OpenCC,装了才生效)+ 大小写(casefold)。
 - normalize 刻意保留标点——供 search 用原文做「连续子串」精确验证。
 - 写入索引与查询必须用同一套,否则搜不到。
@@ -45,14 +45,36 @@ def normalize(text: str) -> str:
     return text.casefold()
 
 
+_TRI_MIN = 3  # 英数 token 长度 ≥ 此值才补字符 trigram（供子串召回）
+
+
+def _base_tokens(text: str) -> list[str]:
+    """基础切词:中文逐字、连续英文/数字整词。"""
+    return _TOKEN_RE.findall(normalize(text))
+
+
+def _trigrams(tok: str) -> list[str]:
+    return [tok[i:i + 3] for i in range(len(tok) - 2)]
+
+
 def to_chars(text: str) -> str:
-    """字级切词:中文逐字、英文数字整词,空格分隔。供 FTS5 索引 + 查询召回。"""
-    return " ".join(_TOKEN_RE.findall(normalize(text)))
+    """基础切词(中文逐字、英数整词),空格分隔。"""
+    return " ".join(_base_tokens(text))
 
 
 def tokenize(text: str) -> str:
-    """索引建库用(indexer 调此名)。基础召回 = 字级。"""
-    return to_chars(text)
+    """索引建库用(indexer 调此名)。基础 token + 长英数 token 的字符 trigram。
+
+    trigram 追加在所有基础 token **之后**——让 GPT4 能子串命中 GPT4Turbo（英文/数字
+    片段搜索），同时不打断中文/词在前段的相邻位置，phrase 子串匹配（如「明硕」）不受影响。
+    精度仍由 search 的原文验证兜底（trigram 只负责把候选召回出来）。
+    """
+    base = _base_tokens(text)
+    tris: list[str] = []
+    for t in base:
+        if len(t) >= _TRI_MIN and t.isascii():
+            tris.extend(_trigrams(t))
+    return " ".join(base + tris)
 
 
 def parse_query(query: str) -> tuple[list[str], list[str]]:
@@ -65,10 +87,15 @@ def parse_query(query: str) -> tuple[list[str], list[str]]:
 
 
 def char_match(word: str) -> str:
-    """单个词 → FTS5 字级相邻短语(子串)。单 token 直接匹配,多 token 要求相邻。"""
-    toks = to_chars(word).split()
+    """单个查询词 → FTS5 MATCH。
+    纯英数且 ≥3:用字符 trigram AND（子串召回,如 GPT4 命中 GPT4Turbo,配原文验证保精度）；
+    其余（含中文/短英数）:相邻短语（位置相邻 = 子串）。
+    """
+    toks = _base_tokens(word)
     if not toks:
         return ""
+    if len(toks) == 1 and toks[0].isascii() and len(toks[0]) >= _TRI_MIN:
+        return " AND ".join(f'"{g}"' for g in _trigrams(toks[0]))  # 子串召回
     if len(toks) == 1:
         return f'"{toks[0]}"'
     return '"' + " ".join(toks) + '"'  # phrase:位置相邻 = 子串

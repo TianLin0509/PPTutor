@@ -64,6 +64,19 @@ def test_fancy_quote_phrase(tmp_path):
         assert "p.pptx" in _names(search.search(conn, q)), q
 
 
+# B03 英文/数字连写子串：≥3 字符片段经 trigram 召回 + 原文验证命中
+def test_alnum_substring_trigram(tmp_path):
+    conn = _build(tmp_path, {"m.pptx": ["发布 GPT4Turbo 与 FY2026Q1 规格"]})
+    for q in ["GPT4", "Turbo", "2026", "FY2026"]:
+        assert "m.pptx" in _names(search.search(conn, q)), q
+
+
+# B03 精度：gpt 与 4 被分开 → 搜 gpt4 不该误中（trigram 召回但原文验证拦下）
+def test_alnum_substring_precision(tmp_path):
+    conn = _build(tmp_path, {"sep.pptx": ["gpt version 4 方案"]})
+    assert "sep.pptx" not in _names(search.search(conn, "gpt4"))
+
+
 # B06 facet 筛到 0：计数不留陈旧值 + 显示空状态提示
 def test_facet_zero_empty_state(qtbot, tmp_path):
     conn = _build(tmp_path, {"甲.pptx": ["通用词内容"], "乙.pptx": ["通用词内容"]})

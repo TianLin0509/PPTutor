@@ -14,7 +14,7 @@ log = logging.getLogger(__name__)
 # 启动发现版本不符就清空内容、走全量重建——否则「原文里有、却怎么都搜不到」。
 # 也兼作"强制重建"开关：v0.7.0 首启重扫会冻结 UI，多数人的库停在残缺态（部分文件 +
 # 已盖 v2 标记 → 不会自动重扫）；2→3 让修复版（重扫已不冻结）自动重建这些残缺库。
-INDEX_VERSION = "3"
+INDEX_VERSION = "4"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS files(
