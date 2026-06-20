@@ -7,7 +7,7 @@ from collections import defaultdict
 
 from . import cluster
 from .models import FileResult, SearchHit
-from .text_tokenize import build_fts_match, normalize, parse_query
+from .text_tokenize import build_fts_match, char_match, normalize, parse_query
 
 log = logging.getLogger(__name__)
 
@@ -46,12 +46,59 @@ def _snippet(conn: sqlite3.Connection, file_id: int, page_no: int,
     return ("…" if start > 0 else "") + seg + ("…" if end < len(raw) else "")
 
 
+def _raw_contains(conn, fid: int, page: int, nw: str) -> bool:
+    """原文验证：归一化后的页原文里有没有这个连续子串（尊重标点，保证精度）。"""
+    row = conn.execute(
+        "SELECT raw_text FROM pages_raw WHERE file_id=? AND page_no=?", (fid, page)
+    ).fetchone()
+    return bool(row and row["raw_text"] and nw in normalize(row["raw_text"]))
+
+
+def _recall(conn, words: list[str]) -> dict[int, list[tuple[int, float]]]:
+    """每词字级 FTS5 召回 + 原文验证 → {file_id: [(page, rank)]}。
+
+    多词：同页（所有词都在）优先；无同页时放宽到「同一文件不同页」，低相关排后。
+    """
+    word_hits: list[dict[tuple[int, int], float]] = []
+    for w in words:
+        m = char_match(w)
+        hits: dict[tuple[int, int], float] = {}
+        if m:
+            nw = normalize(w)
+            try:
+                for r in conn.execute(
+                    "SELECT file_id, page_no, bm25(pages_fts) AS rank "
+                    "FROM pages_fts WHERE pages_fts MATCH ? ORDER BY rank", (m,)):
+                    key = (r["file_id"], r["page_no"])
+                    if key not in hits and _raw_contains(conn, r["file_id"], r["page_no"], nw):
+                        hits[key] = r["rank"]  # FTS5 召回 + 原文确认连续子串
+            except sqlite3.OperationalError as e:
+                log.warning("FTS match failed %r: %s", m, e)
+        word_hits.append(hits)
+    if not word_hits:
+        return {}
+    content: dict[int, list[tuple[int, float]]] = {}
+    common = set(word_hits[0])
+    for wh in word_hits[1:]:
+        common &= set(wh)
+    for fid, pg in common:  # 同页：所有词都在这一页
+        content.setdefault(fid, []).append((pg, min(wh[(fid, pg)] for wh in word_hits)))
+    if len(words) > 1:  # 多词放宽：每词在该文件某页（跨页），且无同页命中
+        files = {f for f, _ in word_hits[0]}
+        for wh in word_hits[1:]:
+            files &= {f for f, _ in wh}
+        for fid in files:
+            if fid not in content:
+                pg = min(p for f, p in word_hits[0] if f == fid)
+                content[fid] = [(pg, 1000.0)]  # 跨页命中，低相关排后
+    return content
+
+
 def search(conn: sqlite3.Connection, query: str, scope: str | None = None,
            limit: int = 200) -> list[FileResult]:
     terms, phrases = parse_query(query)
     if not terms and not phrases:
         return []
-    match = build_fts_match(query)
     needles = [normalize(x) for x in (phrases + terms) if x.strip()]
     # 文件名搜索意图：整个 query 去扩展名，用于「完全/前缀匹配」加权（如搜 b.pptx → b）
     q_stem = normalize(query).strip()
@@ -60,19 +107,8 @@ def search(conn: sqlite3.Connection, query: str, scope: str | None = None,
             q_stem = q_stem[: -len(_e)]
             break
 
-    # 内容命中：file_id -> [(page_no, rank)]
-    content: dict[int, list[tuple[int, float]]] = {}
-    if match:
-        try:
-            for r in conn.execute(
-                "SELECT file_id, page_no, bm25(pages_fts) AS rank "
-                "FROM pages_fts WHERE pages_fts MATCH ? ORDER BY rank",
-                (match,),
-            ):
-                content.setdefault(r["file_id"], []).append((r["page_no"], r["rank"]))
-        except sqlite3.OperationalError as e:
-            # FTS5 语法异常（特殊字符/不成对引号等）→ 放弃内容命中，仍保留文件名命中
-            log.warning("FTS match failed query=%r match=%r: %s", query, match, e)
+    # 字级召回 + 原文验证（精度） + 多词（同页优先，无则放宽同文件）
+    content = _recall(conn, terms + phrases)
 
     # 文件名命中：name 包含所有普通词（AND）
     name_hits: set[int] = set()

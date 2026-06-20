@@ -24,6 +24,7 @@ P_NS = "http://schemas.openxmlformats.org/presentationml/2006/main"
 R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 
 A_T = f"{{{A_NS}}}t"
+A_P = f"{{{A_NS}}}p"
 P_SLDIDLST = f"{{{P_NS}}}sldIdLst"
 P_SLDID = f"{{{P_NS}}}sldId"
 R_ID = f"{{{R_NS}}}id"
@@ -44,6 +45,28 @@ def _texts(xml_bytes: bytes) -> list[str]:
         return []
     root = etree.fromstring(xml_bytes)
     return [el.text for el in root.iter(A_T) if el.text and el.text.strip()]
+
+
+def _para_texts(xml_bytes: bytes) -> list[str]:
+    """按段落 <a:p> 分组：段落内多个 <a:t>（run）无缝拼接，返回非空段落文本列表。
+
+    根治 run 截断：PowerPoint 把同一句话拆成多 run 时，旧的「所有 a:t 用 \\n 拼」
+    会在词中间插换行（「小明硕士」→「小明\\n硕士」），导致子串/相邻匹配搜不到。
+    现在同段落内的文字连成一体，只有段落之间才换行。
+    """
+    if not xml_bytes:
+        return []
+    root = etree.fromstring(xml_bytes)
+    paras: list[str] = []
+    seen_p = False
+    for p in root.iter(A_P):
+        seen_p = True
+        s = "".join(t.text for t in p.iter(A_T) if t.text)  # 段落内无缝拼接
+        if s.strip():
+            paras.append(s)
+    if not seen_p:  # 无 <a:p> 结构（少见）→ 兜底取所有 <a:t>
+        return [t.text for t in root.iter(A_T) if t.text and t.text.strip()]
+    return paras
 
 
 def _rels_path(part_path: str) -> str:
@@ -142,19 +165,19 @@ def _parse_zip(zf: zipfile.ZipFile, deck: ParsedDeck) -> ParsedDeck:
 
 
 def _parse_slide(zf: zipfile.ZipFile, slide_part: str, page_no: int) -> SlidePage:
-    body = "\n".join(_texts(zf.read(slide_part)))
+    body = "\n".join(_para_texts(zf.read(slide_part)))
     notes_parts: list[str] = []
     smart_parts: list[str] = []
 
     for rtype, target in _read_rels(zf, slide_part).values():
         if rtype == REL_NOTES:
             try:
-                notes_parts.extend(_texts(zf.read(target)))
+                notes_parts.extend(_para_texts(zf.read(target)))
             except KeyError:
                 pass
         elif rtype == REL_DIAGRAM_DATA:
             try:
-                smart_parts.extend(_texts(zf.read(target)))
+                smart_parts.extend(_para_texts(zf.read(target)))
             except KeyError:
                 pass
 
