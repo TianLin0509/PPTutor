@@ -186,9 +186,9 @@ def test_restore_requires_confirm(qtbot, tmp_path, monkeypatch):
     win._act_restore_version("C:/nonexist.pptx", "v1")   # 取消 → 不恢复
     assert calls == []
     monkeypatch.setattr(win, "_confirm_restore", lambda: True)
-    win._act_restore_version("C:/nonexist.pptx", "v1")   # 确认 → 恢复
-    assert len(calls) == 1
-    assert "✓" in win._toast_label.text()
+    win._act_restore_version("C:/nonexist.pptx", "v1")   # 确认 → 后台恢复（不阻塞主线程）
+    qtbot.waitUntil(lambda: len(calls) == 1, timeout=3000)              # 等后台线程执行恢复
+    qtbot.waitUntil(lambda: "✓" in win._toast_label.text(), timeout=3000)  # 等结果回主线程刷新
 
 
 # ---------- P1-4 详情首开提示 ----------

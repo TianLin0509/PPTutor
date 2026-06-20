@@ -23,6 +23,7 @@ from .. import actions, db, history, search as search_mod
 from ..config import GLOBAL_HOTKEY, data_dir, db_path as cfg_db_path, is_first_run, mark_welcomed
 from ..models import FileResult
 from . import theme
+from .bg_task import BackgroundTask
 from .index_worker import IndexWorker
 from .live_indexer import LiveIndexer
 from .render_worker import RenderWorker
@@ -345,7 +346,7 @@ class MainWindow(QMainWindow):
     def __init__(self, conn=None, render_worker=None, thumb_worker=None, version_mgr=None,
                  do_index=True, roots: list[str] | None = None, workers: int | None = None):
         super().__init__()
-        self.setWindowTitle("pptx-finder · PPTX 查询助手   v0.7.1")
+        self.setWindowTitle("pptx-finder · PPTX 查询助手   v0.7.2")
         self.resize(1180, 760)
 
         self._theme = _load_theme()
@@ -357,6 +358,8 @@ class MainWindow(QMainWindow):
         self._results: list[FileResult] = []
         self._results_raw: list[FileResult] = []  # 排序前原始序（relevance 基准）
         self._render_gen = 0  # 流式渲染代记：每次新渲染 +1，作废上一批仍在流入的分批
+        self._bg_tasks: list[BackgroundTask] = []  # 在跑的后台一次性任务（防 GC + 收尾等待）
+        self._closing = False  # 关窗中：后台任务回调不再碰 UI（防触达已销毁控件）
         self._showing_recent = False  # 当前是否为「空查询默认视图（最近文件）」
         self._cur: FileResult | None = None
         self._cur_item_widget: ResultItem | None = None
@@ -1085,6 +1088,7 @@ class MainWindow(QMainWindow):
             try:
                 versions = self._version_mgr.list_versions(r.path)
             except Exception:  # noqa: BLE001
+                _log.warning("list_versions failed for %s", r.path, exc_info=True)
                 versions = []
         else:
             versions = []
@@ -1093,6 +1097,26 @@ class MainWindow(QMainWindow):
             self.detail_panel.set_outline(db.page_titles(self._conn, r.file_id))
         except Exception:  # noqa: BLE001
             self.detail_panel.set_outline([])
+
+    def _run_bg(self, fn, on_done=None, label: str = "") -> None:
+        """把可能阻塞 UI 的重活丢后台线程跑，完成经信号回主线程。主线程只 start() 即返回。"""
+        task = BackgroundTask(fn, label)
+        self._bg_tasks.append(task)
+
+        def _safe_done(result):
+            # 关窗中 / 控件已销毁时不再碰 UI——COM 冷启动可能慢于 _shutdown 的 wait 超时，
+            # 回调晚到时窗口可能已析构，直接刷 self._toast 会 RuntimeError。
+            if self._closing:
+                return
+            if on_done is not None:
+                try:
+                    on_done(result)
+                except RuntimeError:
+                    pass
+
+        task.done.connect(_safe_done)
+        task.finished.connect(lambda: self._bg_tasks.remove(task) if task in self._bg_tasks else None)
+        task.start()
 
     def _act_restore_version(self, path: str, version_id: str) -> None:
         if self._version_mgr is None:
@@ -1107,9 +1131,14 @@ class MainWindow(QMainWindow):
                 return
         if not self._confirm_restore():
             return
-        ok = self._version_mgr.restore_to(path, version_id)
-        self._toast("✓ 已恢复到该版本（当前内容已自动留底，不会丢）" if ok else "恢复失败")
-        self._update_detail()
+        # 恢复（先快照留底 + 解压重组，大文件数秒）丢后台，避免冻结 UI（压测 BUG 2）
+        self._toast("正在恢复…")
+
+        def _after(ok):
+            self._toast("✓ 已恢复到该版本（当前内容已自动留底，不会丢）" if ok else "恢复失败")
+            self._update_detail()
+
+        self._run_bg(lambda: self._version_mgr.restore_to(path, version_id), _after, "restore")
 
     def _confirm_restore(self) -> bool:
         """恢复前友好确认：强调「会自动留底、随时切回」，降低破坏性操作的心理负担。"""
@@ -1130,8 +1159,12 @@ class MainWindow(QMainWindow):
         from PySide6.QtWidgets import QFileDialog
         base = os.path.splitext(os.path.basename(path))[0]
         dest, _f = QFileDialog.getSaveFileName(self, "导出此版本", base + "_导出.pptx", "PowerPoint (*.pptx)")
-        if dest:
-            self._toast("已导出" if self._version_mgr.export(path, version_id, dest) else "导出失败")
+        if not dest:
+            return
+        # 导出（解压重组，大文件数秒）丢后台，避免冻结 UI（压测 BUG 3）
+        self._toast("正在导出…")
+        self._run_bg(lambda: self._version_mgr.export(path, version_id, dest),
+                     lambda ok: self._toast("已导出" if ok else "导出失败"), "export")
 
     def _act_goto_page(self, page_no: int) -> None:
         if not self._cur:
@@ -1400,11 +1433,20 @@ class MainWindow(QMainWindow):
             history.add_history(q)
             self._refresh_history_model()
         page = self._view_page
-        opened, jumped = actions.open_at_page(self._cur.path, page)
-        if not opened:
-            self._toast("文件已移动或删除")
-        elif not jumped:
-            self._toast(f"已打开，但未能自动跳到第 {page} 页")
+        path = self._cur.path
+
+        # 启 PowerPoint COM + 跳页（冷启动数秒）丢后台，避免冻结 UI（压测 BUG 4）
+        def _after(res):
+            if res is None:  # 后台任务异常（COM 初始化/权限等），别误报「文件已移动」
+                self._toast("打开时出错了，请稍后重试")
+                return
+            opened, jumped = res
+            if not opened:
+                self._toast("文件已移动或删除")
+            elif not jumped:
+                self._toast(f"已打开，但未能自动跳到第 {page} 页")
+
+        self._run_bg(lambda: actions.open_at_page(path, page), _after, "open")
 
     def _on_activate(self, _item) -> None:
         self._act_goto()
@@ -1419,7 +1461,10 @@ class MainWindow(QMainWindow):
         r = self._results[idx]
         menu = QMenu(self)
         menu.addAction("打开文件", lambda: actions.open_file(r.path))
-        menu.addAction("打开并跳到命中页", lambda: actions.open_at_page(r.path, r.hits[0].page_no if r.hits else 1))
+        # 跳页要启 PowerPoint COM（冷启动数秒）→ 走后台，别在主线程冻结 UI（同 _act_goto）
+        menu.addAction("打开并跳到命中页", lambda: self._run_bg(
+            lambda p=r.path, pg=(r.hits[0].page_no if r.hits else 1): actions.open_at_page(p, pg),
+            label="open_ctx"))
         menu.addAction("打开所在文件夹", lambda: actions.open_folder(r.path))
         menu.addSeparator()
         menu.addAction("复制完整路径", lambda: QApplication.clipboard().setText(r.path))
@@ -1660,7 +1705,10 @@ class MainWindow(QMainWindow):
         e.accept()
 
     def _shutdown(self) -> None:
+        self._closing = True   # 后台任务回调即刻停止碰 UI
         self._render_gen += 1  # 作废仍在流入的分批渲染，回调触达已销毁控件前先止住
+        for t in list(self._bg_tasks):  # 等后台一次性任务收尾（恢复/导出/打开）
+            t.wait(3000)
         if self._live is not None:
             self._live.stop()
             self._live.wait(3000)

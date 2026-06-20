@@ -35,6 +35,14 @@ class VersionManager:
     def __init__(self, conn=None, on_snapshot=None):
         self._conn = conn or store.connect(vault.db_path())
         store.init_db(self._conn)
+        # 独立只读连接：UI 主线程查版本/列文档走它，WAL 并发读、**不抢写锁**。
+        # 否则后台给大文件拍快照时 RLock 持锁 ~3s，主线程一查版本就冻结（压测 BUG 1）。
+        # 仅供 UI 主线程单线程使用；注入 conn（测试，单线程）则共用即可。
+        if conn is None:
+            self._read_conn = store.connect(vault.db_path())
+            self._read_conn.isolation_level = None  # autocommit：每次 SELECT 读最新已提交快照
+        else:
+            self._read_conn = conn
         self._lock = threading.RLock()  # 可重入：restore 内部还会调 snapshot
         self._watcher = None
         self._on_snapshot = on_snapshot  # 留版成功回调(path, vid)，watcher 子线程触发
@@ -80,26 +88,21 @@ class VersionManager:
                 n += 1
         return n
 
-    # ---------- 查询（供 UI，全部加锁） ----------
+    # ---------- 查询（供 UI 主线程，走独立只读连接、不抢锁，绝不被快照阻塞） ----------
     def list_docs(self):
-        with self._lock:
-            return store.list_docs(self._conn)
+        return store.list_docs(self._read_conn)
 
     def get_doc(self, doc_id: str):
-        with self._lock:
-            return store.get_doc(self._conn, doc_id)
+        return store.get_doc(self._read_conn, doc_id)
 
     def get_version(self, version_id: str):
-        with self._lock:
-            return store.get_version(self._conn, version_id)
+        return store.get_version(self._read_conn, version_id)
 
     def list_versions(self, path: str):
-        with self._lock:
-            return store.list_versions(self._conn, vault.doc_id_for(path))
+        return store.list_versions(self._read_conn, vault.doc_id_for(path))
 
     def list_versions_by_doc(self, doc_id: str):
-        with self._lock:
-            return store.list_versions(self._conn, doc_id)
+        return store.list_versions(self._read_conn, doc_id)
 
     # ---------- 恢复 / 导出 ----------
     def restore_to(self, path: str, version_id: str, dest: str | None = None) -> bool:
