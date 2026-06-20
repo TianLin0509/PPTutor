@@ -11,13 +11,22 @@ import json
 import logging
 import os
 
+import sys
+
 from PySide6.QtCore import QEvent, QMimeData, QPropertyAnimation, Qt, QStringListModel, QTimer, QUrl
-from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtGui import QColor, QCursor, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QCompleter, QFrame, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMainWindow, QMenu, QProgressBar, QPushButton, QScrollArea,
-    QSizePolicy, QSplitter, QToolButton, QVBoxLayout, QWidget,
+    QSizePolicy, QSplitter, QStackedWidget, QToolButton, QVBoxLayout, QWidget,
 )
+
+try:
+    import ctypes
+    from ctypes import wintypes
+    _WIN = sys.platform == "win32"
+except Exception:  # noqa: BLE001
+    _WIN = False
 
 from .. import actions, db, history, search as search_mod
 from ..config import GLOBAL_HOTKEY, data_dir, db_path as cfg_db_path, is_first_run, mark_welcomed
@@ -30,6 +39,8 @@ from .render_worker import RenderWorker
 from .thumb_worker import ThumbWorker
 from .detail_panel import DetailPanel
 from .facet_panel import FacetPanel
+from .aurora_bg import AuroraCentral
+from .dashboard_view import DashboardView
 
 _log = logging.getLogger(__name__)
 
@@ -346,8 +357,10 @@ class MainWindow(QMainWindow):
     def __init__(self, conn=None, render_worker=None, thumb_worker=None, version_mgr=None,
                  do_index=True, roots: list[str] | None = None, workers: int | None = None):
         super().__init__()
-        self.setWindowTitle("pptx-finder · PPTX 查询助手   v0.7.4")
+        self.setWindowTitle("pptx-finder · PPTX 查询助手   v0.7.5")
         self.resize(1180, 760)
+        self._title_h = 40  # 自绘玻璃标题栏高度（nativeEvent 拖动区/缩放边判定用）
+        self.setWindowFlag(Qt.FramelessWindowHint, True)  # 无边框 → 自绘玻璃标题栏
 
         self._theme = _load_theme()
         self._tok = theme.tok(self._theme)
@@ -411,14 +424,17 @@ class MainWindow(QMainWindow):
             self._refresh_status()
         self._show_recent()  # 启动即列最近文件（① 默认视图，无需先输入再清空）
         self._welcome = None  # 首次欢迎覆盖层（app.py 在 show 后调 maybe_show_welcome）
+        self._enable_native_frame()  # 无边框窗口恢复系统缩放/Snap/最大化/Win11 圆角
 
     # ---------- UI ----------
     def _build_ui(self) -> None:
-        central = QWidget()
-        central.setObjectName("central")
+        central = AuroraCentral(self)  # 自绘极光底（读 self._tok），objectName 仍 "central"
+        self._central = central
         root = QVBoxLayout(central)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
+
+        root.addWidget(self._build_glass_title())  # 无边框窗口的自绘玻璃标题栏
 
         top = QWidget()
         top.setObjectName("topBar")
@@ -512,11 +528,18 @@ class MainWindow(QMainWindow):
         self.result_list.customContextMenuRequested.connect(self._context_menu)
         ll.addWidget(self.result_list, 1)
         self._build_empty_hint(ll)
+        # 列表区用 QStackedWidget 包「结果列表 left」与「仪表盘首屏」二选一切换；
+        # left（含 result_list 及全部信号绑定）原样保留，仅多一层 stack 容器。
+        self._list_stack = QStackedWidget()
+        self._list_stack.setObjectName("listStack")
+        self._list_stack.addWidget(left)                  # index 0：结果列表区
+        self.dashboard = DashboardView(self)
+        self._list_stack.addWidget(self.dashboard)        # index 1：仪表盘首屏
         self.facet_panel = FacetPanel(self._tok)
         self.facet_panel.filters_changed.connect(self._apply_facet)
         self.facet_panel.hide()
         split.addWidget(self.facet_panel)
-        split.addWidget(left)
+        split.addWidget(self._list_stack)
         split.addWidget(self._build_preview())
         self.detail_panel = DetailPanel(self._tok)
         self.detail_panel.restore_requested.connect(self._act_restore_version)
@@ -657,6 +680,116 @@ class MainWindow(QMainWindow):
         self._set_ops_enabled(False)
         return panel
 
+    # ---------- 玻璃标题栏（无边框窗口自绘） ----------
+    def _build_glass_title(self) -> QWidget:
+        tb = QWidget()
+        tb.setObjectName("glassTitle")
+        tb.setFixedHeight(self._title_h)
+        l = QHBoxLayout(tb)
+        l.setContentsMargins(16, 0, 6, 0)
+        l.setSpacing(9)
+        dot = QLabel("◆")
+        dot.setObjectName("gtDot")
+        name = QLabel("PPT Finder")
+        name.setObjectName("gtName")
+        ver = QLabel("v0.7.5")
+        ver.setObjectName("gtVer")
+        self.gt_theme = QLabel(dict(theme.THEMES).get(self._theme, self._theme))
+        self.gt_theme.setObjectName("gtTheme")
+        l.addWidget(dot)
+        l.addWidget(name)
+        l.addWidget(ver)
+        l.addWidget(self.gt_theme)
+        l.addStretch(1)
+        for txt, slot, oid, tip in (("–", self.showMinimized, "winMin", "最小化"),
+                                    ("□", self._win_toggle_max, "winMax", "最大化 / 还原"),
+                                    ("✕", self.close, "winClose", "关闭")):
+            btn = QPushButton(txt)
+            btn.setObjectName(oid)
+            btn.setFixedSize(46, self._title_h)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setToolTip(tip)
+            btn.clicked.connect(slot)
+            l.addWidget(btn)
+        return tb
+
+    def _win_toggle_max(self) -> None:
+        self.showNormal() if self.isMaximized() else self.showMaximized()
+
+    def _enable_native_frame(self) -> None:
+        """无边框窗口恢复系统能力：可拖拉缩放 / 最大化 / 最小化 / Win11 圆角。"""
+        if not _WIN:
+            return
+        try:
+            hwnd = int(self.winId())
+            GWL_STYLE = -16
+            WS_THICKFRAME = 0x00040000
+            WS_MAXIMIZEBOX = 0x00010000
+            WS_MINIMIZEBOX = 0x00020000
+            u = ctypes.windll.user32
+            style = u.GetWindowLongW(hwnd, GWL_STYLE)
+            u.SetWindowLongW(hwnd, GWL_STYLE,
+                             style | WS_THICKFRAME | WS_MAXIMIZEBOX | WS_MINIMIZEBOX)
+            # DWMWA_WINDOW_CORNER_PREFERENCE=33, value 2=ROUND（Win11；旧系统静默失败）
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd, 33, ctypes.byref(ctypes.c_int(2)), 4)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def nativeEvent(self, et, message):  # noqa: N802
+        """WM_NCHITTEST：标题栏区回 HTCAPTION（拖动/双击最大化/Snap），四边角回缩放码。
+
+        用 QCursor.pos 逻辑坐标（非 lParam 物理坐标）避免高 DPI 缩放错位；
+        右侧按钮区不回 HTCAPTION，以便窗口按钮可点击。
+        """
+        if _WIN and et == "windows_generic_MSG":
+            try:
+                msg = wintypes.MSG.from_address(int(message))
+            except Exception:  # noqa: BLE001
+                return super().nativeEvent(et, message)
+            if msg.message == 0x0084:  # WM_NCHITTEST
+                pos = self.mapFromGlobal(QCursor.pos())
+                x, y, w, h, b = pos.x(), pos.y(), self.width(), self.height(), 6
+                if not self.isMaximized():
+                    L = x < b
+                    Rr = x > w - b
+                    Tp = y < b
+                    Bt = y > h - b
+                    if Tp and L:
+                        return True, 13   # HTTOPLEFT
+                    if Tp and Rr:
+                        return True, 14   # HTTOPRIGHT
+                    if Bt and L:
+                        return True, 16   # HTBOTTOMLEFT
+                    if Bt and Rr:
+                        return True, 17   # HTBOTTOMRIGHT
+                    if L:
+                        return True, 10   # HTLEFT
+                    if Rr:
+                        return True, 11   # HTRIGHT
+                    if Tp:
+                        return True, 12   # HTTOP
+                    if Bt:
+                        return True, 15   # HTBOTTOM
+                # 标题栏拖动区：避开顶部 b 缩放边 + 右侧 146px 窗口按钮区
+                if b <= y < self._title_h and x < w - 146:
+                    return True, 2        # HTCAPTION
+        return super().nativeEvent(et, message)
+
+    # ---------- 列表 / 仪表盘 首屏切换 ----------
+    def _show_dashboard(self) -> None:
+        """切到仪表盘首屏（空搜索默认视图）。不动 result_list 本身。"""
+        if getattr(self, "dashboard", None) is not None:
+            self.dashboard.refresh()
+            self._list_stack.setCurrentWidget(self.dashboard)
+
+    def _show_list(self) -> None:
+        """切到结果列表区（有搜索词 / 有结果时）。"""
+        stack = getattr(self, "_list_stack", None)
+        left = stack.widget(0) if stack is not None else None
+        if stack is not None and left is not None:
+            stack.setCurrentWidget(left)
+
     def _set_ops_enabled(self, on: bool) -> None:
         for w in (self.goto_btn, self.open_btn, self.folder_btn, self.clip_btn,
                   self.prev_btn, self.next_btn):
@@ -725,6 +858,13 @@ class MainWindow(QMainWindow):
             self._apply_sort_render()
             self._select_first()
         self._apply_titlebar_theme()
+        # 玻璃化首屏同步刷新：central 极光 + 标题栏主题名 + 仪表盘图表
+        if getattr(self, "_central", None) is not None:
+            self._central.update()
+        if getattr(self, "gt_theme", None) is not None:
+            self.gt_theme.setText(dict(theme.THEMES).get(name, name))
+        if getattr(self, "dashboard", None) is not None:
+            self.dashboard.set_theme()
 
     def _show_theme_menu(self) -> None:
         """顶栏风格按钮 → 弹出风格菜单（当前风格打勾）。"""
@@ -752,6 +892,7 @@ class MainWindow(QMainWindow):
             self._show_recent()
             return
         self._showing_recent = False
+        self._show_list()  # 有搜索词 → 显示结果列表区（隐藏仪表盘首屏）
         results = search_mod.search(self._conn, query)
         m = self.mode.currentText()
         if m == "仅文件名":
@@ -772,11 +913,12 @@ class MainWindow(QMainWindow):
             self._show_empty_hint(query)
 
     def _show_recent(self) -> None:
-        """空查询默认视图：列最近修改的 PPTX，打开即点（零输入也有内容）。"""
+        """空查询默认视图：仪表盘首屏 + 后台仍备好「最近文件」结果（切回搜索即用）。"""
         recents = db.recent_files(self._conn, limit=20)
         self._results_raw = recents
         self._cur = None
         self._showing_recent = bool(recents)
+        self._show_dashboard()  # 空搜索默认视图 = 仪表盘首屏
         if recents:
             self._refresh_facets()
             self._apply_sort_render()
@@ -1651,6 +1793,8 @@ class MainWindow(QMainWindow):
         self._refresh_status()                  # 更新「索引就绪 N 文件」计数
         if self.search_box.text().strip():
             self._do_search()                   # 正在搜就纳入新文件刷新结果
+        elif getattr(self, "dashboard", None) is not None and self._showing_recent:
+            self.dashboard.refresh()            # 空搜索停在仪表盘 → 新文件并入后刷新统计
 
     def _start_indexing(self, roots: list[str] | None, workers: int | None) -> None:
         if self._indexer is not None and self._indexer.isRunning():

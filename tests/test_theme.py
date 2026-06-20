@@ -12,10 +12,10 @@ REQUIRED = {
     # 阶段2：氛围背景 + 面板透出 + 圆角
     "base", "appbg", "panel", "panel2", "radius",
 }
-EXPECTED = ["cloud", "raycast", "cinema", "morandi", "aurora"]
+EXPECTED = ["aurora", "cinema", "cyber", "ocean", "magma", "forest", "sakura", "midnight", "graphite", "cloud"]
 
 
-def test_five_themes_registered():
+def test_all_themes_registered():
     for name in EXPECTED:
         assert name in theme.TOKENS, f"风格 {name} 未注册"
 

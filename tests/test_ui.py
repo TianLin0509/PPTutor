@@ -145,4 +145,4 @@ def test_theme_toggle(qtbot, tmp_path):
     qtbot.addWidget(win)
     win._apply_theme("cloud")
     win._toggle_theme()
-    assert win._theme == "raycast"   # 循环切到下一个风格（cloud → raycast）
+    assert win._theme == "aurora"   # 循环切到下一个风格（cloud → raycast）
