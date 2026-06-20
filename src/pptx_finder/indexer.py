@@ -243,3 +243,27 @@ def update_index(
         progress_cb(total, total, "完成")  # 进度走满
     summary["scanned"] = len(seen)
     return summary
+
+
+def index_single(conn: sqlite3.Connection, path: str) -> bool:
+    """实时增量：索引单个文件（watcher 捕获到新建/改存时调用）。
+
+    只 upsert 这一个文件、绝不删除其他记录（区别于 update_index 的全量删除逻辑）。
+    供「谁变管谁」的实时索引用——新建/改完一个 PPT 立刻可搜，无需重扫全盘。
+    """
+    p = Path(path)
+    try:
+        if not p.exists():
+            return False
+        ext = p.suffix.lower()
+        if ext == PPT_EXT:
+            _write_filename_only(conn, p)
+        elif ext == ".pptx":
+            _write_result(conn, _index_one(str(p)))
+        else:
+            return False
+        conn.commit()
+        return True
+    except Exception as e:  # noqa: BLE001
+        log.warning("index_single failed %s: %s", path, e)
+        return False

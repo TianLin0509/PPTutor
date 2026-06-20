@@ -168,6 +168,8 @@ def main() -> int:
     act_versions.triggered.connect(_open_version_mgr)
     act_settings = QAction("设置…", app)
     act_settings.triggered.connect(_open_settings)
+    act_rescan = QAction("重新扫描全盘", app)
+    act_rescan.triggered.connect(lambda: win._start_indexing(None, None))
     act_quit = QAction("退出", app)
 
     def _real_quit() -> None:
@@ -179,6 +181,8 @@ def main() -> int:
 
     act_quit.triggered.connect(_real_quit)
     menu.addAction(act_show)
+    menu.addSeparator()
+    menu.addAction(act_rescan)
     menu.addAction(act_versions)
     menu.addAction(act_settings)
     menu.addSeparator()

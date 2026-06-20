@@ -391,7 +391,9 @@ class MainWindow(QMainWindow):
         self._apply_theme(self._theme, persist=False)
 
         self._indexer: IndexWorker | None = None
-        if do_index:
+        # 已有索引就秒开（运行中靠 watcher 实时增量 + 托盘「重新扫描」兜底）；
+        # 只有首次（索引为空）才全量建库——不再每次重开都全盘扫。
+        if do_index and self._index_is_empty():
             self._start_indexing(roots, workers)
         else:
             self._refresh_status()
@@ -1449,6 +1451,7 @@ class MainWindow(QMainWindow):
     def on_version_snapshot(self, path: str, version_id: str) -> None:
         """后台留版事件（经 VersionBridge 队列信号，已切回主线程）。"""
         self.refresh_version_shield()
+        self._index_file_live(path)  # 实时并入搜索索引（新建/改的文件秒级可搜）
         cur = getattr(self, "_cur", None)
         if cur is not None and cur.path == path:
             self._update_detail()  # 正看着这个文件 → 刷新版本时间线
@@ -1496,7 +1499,29 @@ class MainWindow(QMainWindow):
             "记得哪页写过什么，就能搜出它在哪个文件、第几页。")
 
     # ---------- 索引 ----------
+    def _index_is_empty(self) -> bool:
+        try:
+            return db.stats(self._conn)["file_count"] == 0
+        except Exception:  # noqa: BLE001
+            return True
+
+    def _index_file_live(self, path: str) -> None:
+        """watcher 捕获保存 → 实时把这一个文件并入搜索索引（无需重扫全盘）。已在主线程。"""
+        from .. import indexer
+        try:
+            ok = indexer.index_single(self._conn, path)
+        except Exception:  # noqa: BLE001
+            _log.warning("live index failed %s", path, exc_info=True)
+            return
+        if ok:
+            self._refresh_status()                  # 更新「索引就绪 N 文件」计数
+            if self.search_box.text().strip():
+                self._do_search()                   # 正在搜就纳入新文件刷新结果
+
     def _start_indexing(self, roots: list[str] | None, workers: int | None) -> None:
+        if self._indexer is not None and self._indexer.isRunning():
+            self._toast("正在扫描中，请稍候…")
+            return
         from ..scanner import fixed_drives
         if not roots:
             env = os.environ.get("PPTX_FINDER_ROOTS", "").strip()
