@@ -346,7 +346,7 @@ class MainWindow(QMainWindow):
     def __init__(self, conn=None, render_worker=None, thumb_worker=None, version_mgr=None,
                  do_index=True, roots: list[str] | None = None, workers: int | None = None):
         super().__init__()
-        self.setWindowTitle("pptx-finder · PPTX 查询助手   v0.7.2")
+        self.setWindowTitle("pptx-finder · PPTX 查询助手   v0.7.3")
         self.resize(1180, 760)
 
         self._theme = _load_theme()
@@ -1044,7 +1044,26 @@ class MainWindow(QMainWindow):
         self._facet_filters = filters
         self._apply_sort_render()
         if self._results:
+            self.result_count.setText(f"命中 {len(self._results)} 个文件")
+            self.list_head.show()
             self._select_first()
+        else:
+            # 筛选后无结果：别留「命中 N 个」陈旧计数 + 给空状态提示（区别于「没搜到」）
+            self.result_count.setText("筛选后无结果")
+            self._cur = None
+            self._update_preview_header(None)
+            self._set_ops_enabled(False)
+            self._show_facet_empty()
+
+    def _show_facet_empty(self) -> None:
+        """facet 把结果筛空时的提示——是筛选太窄，不是没搜到。"""
+        self.result_list.hide()
+        self._empty_icon.setText("🔎")
+        self._empty_query_label.setText("筛选后没有结果")
+        self._empty_tip.setText("筛选条件太窄，放宽或清掉筛选再看看")
+        for btn in self._sugg_btns.values():
+            btn.hide()
+        self.empty_hint.show()
 
     def _refresh_facets(self) -> None:
         """新结果集时重算各维度数量并重置选中。"""

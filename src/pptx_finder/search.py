@@ -54,43 +54,64 @@ def _raw_contains(conn, fid: int, page: int, nw: str) -> bool:
     return bool(row and row["raw_text"] and nw in normalize(row["raw_text"]))
 
 
-def _recall(conn, words: list[str]) -> dict[int, list[tuple[int, float]]]:
-    """每词字级 FTS5 召回 + 原文验证 → {file_id: [(page, rank)]}。
+def _first_verified_page(conn, fid: int, clause: str, nw: str) -> int | None:
+    """跨页放宽用：找该文件里含此词、且原文连续子串验证通过的某页（作代表页/片段）。"""
+    try:
+        for r in conn.execute(
+            "SELECT page_no FROM pages_fts WHERE pages_fts MATCH ? AND file_id=? LIMIT 50",
+            (clause, fid)):
+            if _raw_contains(conn, fid, r["page_no"], nw):
+                return r["page_no"]
+    except sqlite3.OperationalError:
+        pass
+    return None
 
-    多词：同页（所有词都在）优先；无同页时放宽到「同一文件不同页」，低相关排后。
+
+def _recall(conn, words: list[str]) -> dict[int, list[tuple[int, float]]]:
+    """字级 FTS5 召回 + 原文验证 → {file_id: [(page, rank)]}。
+
+    同页（所有词都在一页）优先：用 FTS5 一次性 AND，**只返回全含的页**——天然被最稀有
+    的词收窄，无需 per-term 限额（根治「常见词召回截断漏掉同时含稀有词的文件」假阴性）。
+    多词无同页命中时放宽到「同一文件不同页」，低相关排后。原文验证保精度（不相邻不误中）。
     """
-    word_hits: list[dict[tuple[int, int], float]] = []
-    for w in words:
-        m = char_match(w)
-        hits: dict[tuple[int, int], float] = {}
-        if m:
-            nw = normalize(w)
+    pairs = [(char_match(w), normalize(w)) for w in words]
+    pairs = [(c, nw) for c, nw in pairs if c]
+    if not pairs:
+        return {}
+    clauses = [c for c, _ in pairs]
+    nws = [nw for _, nw in pairs]
+    content: dict[int, list[tuple[int, float]]] = {}
+
+    # 同页：一次 FTS5 AND，只命中所有词都在的页（选择性查询结果集很小，LIMIT 仅兜底）
+    m_and = " AND ".join(clauses)
+    try:
+        for r in conn.execute(
+            "SELECT file_id, page_no, bm25(pages_fts) AS rank FROM pages_fts "
+            "WHERE pages_fts MATCH ? ORDER BY rank LIMIT 3000", (m_and,)):
+            fid, pg = r["file_id"], r["page_no"]
+            if all(_raw_contains(conn, fid, pg, nw) for nw in nws):
+                content.setdefault(fid, []).append((pg, r["rank"]))
+    except sqlite3.OperationalError as e:
+        log.warning("FTS match failed %r: %s", m_and, e)
+
+    # 多词跨页放宽：每词在该文件某页（但无单页全含）→ 文件级交集，代表页排后
+    if len(clauses) > 1:
+        file_sets = []
+        for c in clauses:
+            fs: set[int] = set()
             try:
                 for r in conn.execute(
-                    "SELECT file_id, page_no, bm25(pages_fts) AS rank "
-                    "FROM pages_fts WHERE pages_fts MATCH ? ORDER BY rank LIMIT 800", (m,)):
-                    key = (r["file_id"], r["page_no"])
-                    if key not in hits and _raw_contains(conn, r["file_id"], r["page_no"], nw):
-                        hits[key] = r["rank"]  # FTS5 召回 + 原文确认连续子串
-            except sqlite3.OperationalError as e:
-                log.warning("FTS match failed %r: %s", m, e)
-        word_hits.append(hits)
-    if not word_hits:
-        return {}
-    content: dict[int, list[tuple[int, float]]] = {}
-    common = set(word_hits[0])
-    for wh in word_hits[1:]:
-        common &= set(wh)
-    for fid, pg in common:  # 同页：所有词都在这一页
-        content.setdefault(fid, []).append((pg, min(wh[(fid, pg)] for wh in word_hits)))
-    if len(words) > 1:  # 多词放宽：每词在该文件某页（跨页），且无同页命中
-        files = {f for f, _ in word_hits[0]}
-        for wh in word_hits[1:]:
-            files &= {f for f, _ in wh}
-        for fid in files:
+                    "SELECT DISTINCT file_id FROM pages_fts WHERE pages_fts MATCH ? LIMIT 5000", (c,)):
+                    fs.add(r["file_id"])
+            except sqlite3.OperationalError:
+                pass
+            file_sets.append(fs)
+        cross = set.intersection(*file_sets) if file_sets else set()
+        for fid in cross:
             if fid not in content:
-                pg = min(p for f, p in word_hits[0] if f == fid)
-                content[fid] = [(pg, 1000.0)]  # 跨页命中，低相关排后
+                pg = _first_verified_page(conn, fid, clauses[0], nws[0])
+                if pg is not None:
+                    content[fid] = [(pg, 1000.0)]  # 跨页命中，低相关排后
     return content
 
 
@@ -110,14 +131,16 @@ def search(conn: sqlite3.Connection, query: str, scope: str | None = None,
     # 字级召回 + 原文验证（精度） + 多词（同页优先，无则放宽同文件）
     content = _recall(conn, terms + phrases)
 
-    # 文件名命中：name 包含所有普通词（AND）
+    # 文件名命中：name 归一化后包含所有普通词（AND）。
+    # 在 Python 侧做「归一化 + 字面子串」而非 SQL LIKE——① name 也归一化（NFKC 全半角 +
+    # OpenCC 繁→简），修「软件搜不到 軟體開發.pptx」；② 字面 in 匹配，% _ 不再当通配符误命中。
     name_hits: set[int] = set()
-    like_terms = [normalize(t) for t in (terms + phrases) if t.strip()]
-    if like_terms:
-        where = " AND ".join(["lower(name) LIKE ?"] * len(like_terms))
-        params = [f"%{t}%" for t in like_terms]
-        for r in conn.execute(f"SELECT id FROM files WHERE {where}", params):
-            name_hits.add(r["id"])
+    nterms = [normalize(t) for t in (terms + phrases) if t.strip()]
+    if nterms:
+        for r in conn.execute("SELECT id, name FROM files"):
+            nm = normalize(r["name"])
+            if all(t in nm for t in nterms):
+                name_hits.add(r["id"])
 
     file_ids = set(content) | name_hits
     if not file_ids:
