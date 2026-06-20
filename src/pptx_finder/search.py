@@ -53,6 +53,12 @@ def search(conn: sqlite3.Connection, query: str, scope: str | None = None,
         return []
     match = build_fts_match(query)
     needles = [normalize(x) for x in (phrases + terms) if x.strip()]
+    # 文件名搜索意图：整个 query 去扩展名，用于「完全/前缀匹配」加权（如搜 b.pptx → b）
+    q_stem = normalize(query).strip()
+    for _e in (".pptx", ".ppt"):
+        if q_stem.endswith(_e):
+            q_stem = q_stem[: -len(_e)]
+            break
 
     # 内容命中：file_id -> [(page_no, rank)]
     content: dict[int, list[tuple[int, float]]] = {}
@@ -124,12 +130,25 @@ def search(conn: sqlite3.Connection, query: str, scope: str | None = None,
             return 1.0
         return (m - mmin) / (mmax - mmin)
 
+    def name_bonus(name: str) -> float:
+        """文件名命中质量分级：完全匹配 > 前缀 > 普通包含（让搜 b.pptx 时 b.pptx 居首）。"""
+        nstem = normalize(name)
+        for _e in (".pptx", ".ppt"):
+            if nstem.endswith(_e):
+                nstem = nstem[: -len(_e)]
+                break
+        if q_stem and nstem == q_stem:
+            return 2.0   # 文件名完全匹配 → 绝对优先（盖过 内容0.6+时间0.25+包含0.5=1.35）
+        if q_stem and nstem.startswith(q_stem):
+            return 1.0   # 前缀匹配
+        return NAME_BONUS  # 普通包含（0.50）
+
     results: list[FileResult] = []
     for row, hits, name_hit, best_rank in raw_items:
         score = (
             W_REL * rel_norm(best_rank)
             + W_RECENCY * rec_norm(row["mtime"])
-            + (NAME_BONUS if name_hit else 0.0)
+            + (name_bonus(row["name"]) if name_hit else 0.0)
         )
         results.append(FileResult(
             file_id=row["id"], path=row["path"], name=row["name"], ext=row["ext"],
