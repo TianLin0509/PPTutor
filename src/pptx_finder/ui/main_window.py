@@ -344,7 +344,7 @@ class MainWindow(QMainWindow):
     def __init__(self, conn=None, render_worker=None, thumb_worker=None, version_mgr=None,
                  do_index=True, roots: list[str] | None = None, workers: int | None = None):
         super().__init__()
-        self.setWindowTitle("pptx-finder · PPTX 查询助手   v0.6.0")
+        self.setWindowTitle("pptx-finder · PPTX 查询助手   v0.7.0")
         self.resize(1180, 760)
 
         self._theme = _load_theme()
@@ -355,6 +355,7 @@ class MainWindow(QMainWindow):
 
         self._results: list[FileResult] = []
         self._results_raw: list[FileResult] = []  # 排序前原始序（relevance 基准）
+        self._render_gen = 0  # 流式渲染代记：每次新渲染 +1，作废上一批仍在流入的分批
         self._showing_recent = False  # 当前是否为「空查询默认视图（最近文件）」
         self._cur: FileResult | None = None
         self._cur_item_widget: ResultItem | None = None
@@ -865,23 +866,69 @@ class MainWindow(QMainWindow):
             if self._results:
                 self._select_first()
 
+    # 首屏同步渲染条数：结果 ≤ 此数则全部同步铺（小结果集零延迟，UI 测试不受异步影响）；
+    # 超出部分用事件循环分批"流式"补入——首个结果最快出现，整体仍 < 3s。
+    _RENDER_FIRST = 30
+    _RENDER_CHUNK = 24
+
     def _render_results(self, results: list[FileResult]) -> None:
         self._hide_empty_hint()
         self.result_list.clear()
         self._thumb.clear()        # 丢弃上一批未渲完的缩略图请求
         self._thumb_items.clear()
+        self._render_gen += 1      # 作废上一批仍在流入的分批渲染
         hlcss = theme.highlight_css(self._theme)
+        plan = self._build_render_plan(results)
+        n = self._flush_plan(plan, 0, self._RENDER_FIRST, hlcss)  # 首屏立即铺
+        if n < len(plan):
+            self._stream_plan_rest(plan, n, hlcss, self._render_gen)
+
+    def _build_render_plan(self, results: list[FileResult]) -> list:
+        """展开成线性渲染计划：('h', 标题)=分组头 / ('i', idx, r)=结果条目。"""
+        plan: list = []
         if self._should_group_by_time():
             now_ts = datetime.datetime.now().timestamp()
             idx = 0
             for label, items in group_by_time(results, now_ts):
-                self._add_section_header(f"{label} · {len(items)}")
+                plan.append(("h", f"{label} · {len(items)}"))
                 for r in items:
-                    self._add_result_item(idx, r, hlcss)
+                    plan.append(("i", idx, r))
                     idx += 1
         else:
             for i, r in enumerate(results):
-                self._add_result_item(i, r, hlcss)
+                plan.append(("i", i, r))
+        return plan
+
+    def _flush_plan(self, plan: list, start: int, end: int, hlcss: str) -> int:
+        """渲染 plan[start:end]，返回实际渲到的位置（供续批）。"""
+        for entry in plan[start:end]:
+            if entry[0] == "h":
+                self._add_section_header(entry[1])
+            else:
+                _, idx, r = entry
+                self._add_result_item(idx, r, hlcss)
+        return min(end, len(plan))
+
+    def _stream_plan_rest(self, plan: list, pos: int, hlcss: str, gen: int) -> None:
+        """剩余条目分批流入：每个事件循环 tick 补一批，UI 保持可交互、结果逐条浮现。"""
+        state = {"pos": pos}
+
+        def step() -> None:
+            if gen != self._render_gen:
+                return  # 已被新一次搜索 / 排序 / 关闭作废
+            try:
+                state["pos"] = self._flush_plan(
+                    plan, state["pos"], state["pos"] + self._RENDER_CHUNK, hlcss)
+            except RuntimeError as e:
+                # 仅「窗口/控件 C++ 对象已析构」是预期内良性中断；其余 RuntimeError
+                # 可能是真 bug（会让结果列表静默截断），记日志再停，绝不无声吞掉。
+                if "already deleted" not in str(e).lower():
+                    _log.error("流式渲染异常中断，结果可能不完整", exc_info=True)
+                return
+            if state["pos"] < len(plan):
+                QTimer.singleShot(0, step)
+
+        QTimer.singleShot(0, step)
 
     def _should_group_by_time(self) -> bool:
         """时间分组仅在「时间序」下生效：最近修改排序，或空查询默认视图。"""
@@ -1590,6 +1637,7 @@ class MainWindow(QMainWindow):
         e.accept()
 
     def _shutdown(self) -> None:
+        self._render_gen += 1  # 作废仍在流入的分批渲染，回调触达已销毁控件前先止住
         if self._indexer is not None:
             self._indexer.stop()
             self._indexer.wait(5000)

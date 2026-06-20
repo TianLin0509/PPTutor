@@ -7,7 +7,7 @@ from collections import defaultdict
 
 from . import cluster
 from .models import FileResult, SearchHit
-from .text_tokenize import build_fts_match, char_match, normalize, parse_query
+from .text_tokenize import char_match, normalize, parse_query
 
 log = logging.getLogger(__name__)
 
@@ -68,7 +68,7 @@ def _recall(conn, words: list[str]) -> dict[int, list[tuple[int, float]]]:
             try:
                 for r in conn.execute(
                     "SELECT file_id, page_no, bm25(pages_fts) AS rank "
-                    "FROM pages_fts WHERE pages_fts MATCH ? ORDER BY rank", (m,)):
+                    "FROM pages_fts WHERE pages_fts MATCH ? ORDER BY rank LIMIT 800", (m,)):
                     key = (r["file_id"], r["page_no"])
                     if key not in hits and _raw_contains(conn, r["file_id"], r["page_no"], nw):
                         hits[key] = r["rank"]  # FTS5 召回 + 原文确认连续子串

@@ -4,8 +4,16 @@
 """
 from __future__ import annotations
 
+import logging
 import sqlite3
 from pathlib import Path
+
+log = logging.getLogger(__name__)
+
+# 索引格式版本：分词器/切词规则一旦改版即与旧库不兼容（如词级 jieba → 字级），
+# 启动时若发现旧库版本不符就清空内容、让程序走全量重建——否则用户拿新版套旧库
+# 会出现「原文里有、却怎么都搜不到」（旧 token 与新查询规则对不上）。
+INDEX_VERSION = "2"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS files(
@@ -52,7 +60,31 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    _migrate_index_version(conn)
     conn.commit()
+
+
+def _migrate_index_version(conn: sqlite3.Connection) -> None:
+    """索引格式版本守门：版本不符且库里已有数据 → 清空内容，让启动走全量重建。
+
+    老库（升级前）没有 index_version 标记（=None）但已有词级 token，命中本分支被清空；
+    全新空库（stored=None 且无数据）只盖版本号、不清空，正常走首次全量索引。
+    幂等：同版本直接返回，多连接重复调用安全。
+    """
+    row = conn.execute("SELECT value FROM meta WHERE key='index_version'").fetchone()
+    stored = row["value"] if row else None
+    if stored == INDEX_VERSION:
+        return
+    has_data = conn.execute("SELECT 1 FROM files LIMIT 1").fetchone() is not None
+    if has_data:
+        for t in ("files", "pages_fts", "pages_raw", "minhash"):
+            conn.execute(f"DELETE FROM {t}")
+        log.info("索引格式 %s→%s：已清空旧索引，将全量重建", stored, INDEX_VERSION)
+    conn.execute(
+        "INSERT INTO meta(key,value) VALUES('index_version',?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (INDEX_VERSION,),
+    )
 
 
 def get_file_by_path(conn: sqlite3.Connection, path: str) -> sqlite3.Row | None:

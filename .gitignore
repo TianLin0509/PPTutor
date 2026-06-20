@@ -9,6 +9,12 @@ wheels/
 # Virtual environments
 .venv
 
+# Claude Code worktrees / 会话产物（嵌套 git worktree，勿入库、勿被工具递归扫描）
+.claude/
+
+# 打包自检临时产物（测试集 PPTX + 报告 + 构建日志）
+.selftest/
+
 # pptx-finder demo data & screenshots
 demo_decks/
 artifacts/

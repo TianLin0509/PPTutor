@@ -4,7 +4,9 @@ from PyInstaller.utils.hooks import collect_all
 datas = [('assets/logo.png', 'assets')]
 binaries = []
 hiddenimports = []
-tmp_ret = collect_all('jieba')
+# OpenCC 繁简转换：必须打包它的 .ocd2/.json 词典 + opencc_clib .pyd，
+# 否则 frozen 下 OpenCC("t2s") 找不到词典 → 繁简归一化静默失效（搜「软件」漏掉「軟件」）。
+tmp_ret = collect_all('opencc')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 

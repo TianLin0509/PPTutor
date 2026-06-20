@@ -136,7 +136,7 @@ def update_index(
     inline = workers == 1
     max_workers = workers or min(os.cpu_count() or 4, 8)
     if not inline:
-        tokenize("预热")  # 主线程先触发 jieba 词典加载，避免多线程首次并发竞态
+        tokenize("预热")  # 主线程先触发 OpenCC 繁简词典加载，避免多线程首次并发竞态
     ex = None if inline else ThreadPoolExecutor(max_workers=max_workers)
     futs: dict[Any, Path] = {}
     total = 0  # 需解析的 .pptx 数（随扫描增长）
