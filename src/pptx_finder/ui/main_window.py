@@ -357,7 +357,7 @@ class MainWindow(QMainWindow):
     def __init__(self, conn=None, render_worker=None, thumb_worker=None, version_mgr=None,
                  do_index=True, roots: list[str] | None = None, workers: int | None = None):
         super().__init__()
-        self.setWindowTitle("pptx-finder · PPTX 查询助手   v0.7.5")
+        self.setWindowTitle("pptx-finder · PPTX 查询助手   v0.7.6")
         self.resize(1180, 760)
         self._title_h = 40  # 自绘玻璃标题栏高度（nativeEvent 拖动区/缩放边判定用）
         self.setWindowFlag(Qt.FramelessWindowHint, True)  # 无边框 → 自绘玻璃标题栏
@@ -404,6 +404,13 @@ class MainWindow(QMainWindow):
         self._debounce.setSingleShot(True)
         self._debounce.setInterval(280)
         self._debounce.timeout.connect(self._do_search)
+        # live 索引刷新去抖：watcher 在 OneDrive/PowerPoint 反复存盘时会风暴式触发
+        # _after_live_index，若每次同步重跑 _do_search 会把主线程糊死（实测 maxgap 7.89s
+        # 未响应）。合并成一次延迟刷新：风暴 N 个事件 → 最多 1 次搜索。
+        self._live_refresh = QTimer(self)
+        self._live_refresh.setSingleShot(True)
+        self._live_refresh.setInterval(600)
+        self._live_refresh.timeout.connect(self._do_live_refresh)
 
         self._build_ui()
         self._apply_theme(self._theme, persist=False)
@@ -541,17 +548,19 @@ class MainWindow(QMainWindow):
         split.addWidget(self.facet_panel)
         split.addWidget(self._list_stack)
         split.addWidget(self._build_preview())
-        self.detail_panel = DetailPanel(self._tok)
+        # 详情改为浮动弹窗（不再占第四列，节约横向空间）：非模态 Tool 窗，浮在主窗之上、
+        # 跟随选中实时刷新，关掉不影响搜索/预览主区；信号与 _update_detail 逻辑均不变。
+        self.detail_panel = DetailPanel(self._tok, parent=self)
+        self.detail_panel.setWindowFlags(Qt.Tool | Qt.WindowTitleHint | Qt.WindowCloseButtonHint)
+        self.detail_panel.setWindowTitle("详情 · 版本时间线 / 大纲 / 文件信息")
         self.detail_panel.restore_requested.connect(self._act_restore_version)
         self.detail_panel.export_requested.connect(self._act_export_version)
         self.detail_panel.page_requested.connect(self._act_goto_page)
         self.detail_panel.hide()
-        split.addWidget(self.detail_panel)
         split.setStretchFactor(0, 0)
         split.setStretchFactor(1, 5)
         split.setStretchFactor(2, 6)
-        split.setStretchFactor(3, 0)
-        split.setSizes([0, 520, 660, 0])
+        split.setSizes([0, 520, 660])
         self._split = split
         wrap = QWidget()
         wrap.setObjectName("contentWrap")
@@ -692,7 +701,7 @@ class MainWindow(QMainWindow):
         dot.setObjectName("gtDot")
         name = QLabel("PPT Finder")
         name.setObjectName("gtName")
-        ver = QLabel("v0.7.5")
+        ver = QLabel("v0.7.6")
         ver.setObjectName("gtVer")
         self.gt_theme = QLabel(dict(theme.THEMES).get(self._theme, self._theme))
         self.gt_theme.setObjectName("gtTheme")
@@ -1173,9 +1182,8 @@ class MainWindow(QMainWindow):
 
     def _relayout_split(self) -> None:
         f = 180 if not self.facet_panel.isHidden() else 0
-        d = 286 if not self.detail_panel.isHidden() else 0
-        avail = max(560, self.width() - f - d - 24)
-        self._split.setSizes([f, int(avail * 0.44), int(avail * 0.56), d])
+        avail = max(560, self.width() - f - 24)
+        self._split.setSizes([f, int(avail * 0.44), int(avail * 0.56)])
 
     def _toggle_facet(self) -> None:
         self.facet_panel.setHidden(not self.facet_panel.isHidden())
@@ -1215,14 +1223,23 @@ class MainWindow(QMainWindow):
 
     def _toggle_detail(self) -> None:
         if self.detail_panel.isHidden():
+            self._position_detail_popup()
             self.detail_panel.show()
+            self.detail_panel.raise_()
             self._update_detail()
             self._maybe_hint_detail_versions()
         else:
             self.detail_panel.hide()
         self.detail_btn.setChecked(not self.detail_panel.isHidden())
-        self._relayout_split()
         self._refresh_detail_dot()
+
+    def _position_detail_popup(self) -> None:
+        """详情弹窗浮在主窗右侧内侧，跟随主窗当前位置/大小。"""
+        g = self.frameGeometry()
+        w = 360
+        h = min(640, max(420, g.height() - 120))
+        self.detail_panel.resize(w, h)
+        self.detail_panel.move(max(0, g.right() - w - 30), g.top() + self._title_h + 60)
 
     def _maybe_hint_detail_versions(self) -> None:
         """首次展开详情且当前文件有历史版本时，提示「这里能一键回到历史版本」。"""
@@ -1790,7 +1807,14 @@ class MainWindow(QMainWindow):
         self._after_live_index()
 
     def _after_live_index(self) -> None:
-        self._refresh_status()                  # 更新「索引就绪 N 文件」计数
+        self._refresh_status()                  # 更新「索引就绪 N 文件」计数（廉价，保持即时）
+        # 结果/仪表盘刷新走去抖合并——避免 watcher 存盘风暴把主线程顶成「未响应」。
+        self._live_refresh.start()
+
+    def _do_live_refresh(self) -> None:
+        """live 索引去抖到点：把风暴期间累积的新文件一次性并入当前视图。"""
+        if self._closing:
+            return
         if self.search_box.text().strip():
             self._do_search()                   # 正在搜就纳入新文件刷新结果
         elif getattr(self, "dashboard", None) is not None and self._showing_recent:

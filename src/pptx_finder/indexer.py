@@ -141,6 +141,7 @@ def update_index(
     futs: dict[Any, Path] = {}
     total = 0  # 需解析的 .pptx 数（随扫描增长）
     done = 0
+    scan_done = False  # 扫描是否结束（total 是否已是最终值）→ 决定进度报忙碌态还是真实百分比
 
     def stopped() -> bool:
         return stop_event is not None and stop_event.is_set()
@@ -156,7 +157,12 @@ def update_index(
             summary["errors"] += 1
         done += 1
         if progress_cb:
-            progress_cb(done, total, str(p))
+            if scan_done:
+                progress_cb(done, total, str(p))   # 扫描已完，total 为最终值 → 真实百分比
+            else:
+                # 扫描进行中 total 随发现增长，done/total 恒≈99% 误导用户；
+                # 改报忙碌态(total=-1) + 真实计数，待扫描结束再走确定性百分比。
+                progress_cb(done, -1, f"已发现 {len(seen)} 个 · 已索引 {done} 个")
         if done % COMMIT_EVERY == 0:
             conn.commit()
 
@@ -217,6 +223,7 @@ def update_index(
                     for f in fin:
                         write_done(f)
         conn.commit()
+        scan_done = True  # 扫描结束：total 已是最终值，收尾解析的进度走真实百分比
 
         # ---- 删除磁盘上已消失的文件 ----
         for path in list(existing.keys()):
