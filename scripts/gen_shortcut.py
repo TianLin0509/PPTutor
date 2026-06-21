@@ -6,8 +6,8 @@ from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-DIST = Path(r"C:\Users\lintian\pptx-finder\dist\pptx-finder")
-EXE = DIST / "pptx-finder.exe"
+DIST = Path(r"C:\Users\lintian\pptx-finder\dist\PPTutor")
+EXE = DIST / "PPTutor.exe"
 ICO = DIST / "app.ico"
 
 
@@ -37,13 +37,13 @@ def make_shortcut(icon_path: str) -> Path:
     import win32com.client
 
     desktop = Path(os.environ["USERPROFILE"]) / "Desktop"
-    lnk = desktop / "PPTX 查询助手.lnk"
+    lnk = desktop / "PPTutor.lnk"
     ws = win32com.client.Dispatch("WScript.Shell")
     sc = ws.CreateShortcut(str(lnk))
     sc.TargetPath = str(EXE)
     sc.WorkingDirectory = str(DIST)
     sc.IconLocation = f"{icon_path},0"
-    sc.Description = "pptx-finder · PPTX 查询助手"
+    sc.Description = "PPTutor · PPT 查询助手"
     sc.Save()
     return lnk
 

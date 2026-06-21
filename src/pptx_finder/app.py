@@ -100,6 +100,10 @@ def _toggle_window(win: MainWindow) -> None:
 
 def main() -> int:
     multiprocessing.freeze_support()  # PyInstaller 下多进程必需
+    try:  # 任务栏用窗口图标(吉祥物)而非默认 python/exe 图标，需显式 AppUserModelID
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("PPTutor")
+    except Exception:  # noqa: BLE001 非 Windows / 旧系统静默跳过
+        pass
     from .logging_setup import configure_logging
     configure_logging()
     log = logging.getLogger(__name__)
@@ -145,7 +149,7 @@ def main() -> int:
 
     # 托盘
     tray = QSystemTrayIcon(icon, app)
-    tray.setToolTip("pptx-finder · PPTX 查询助手")
+    tray.setToolTip("PPTutor · PPT 查询助手")
     menu = QMenu()
     act_show = QAction("显示主窗口", app)
     act_show.triggered.connect(lambda: _toggle_window(win))

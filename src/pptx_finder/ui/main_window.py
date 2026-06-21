@@ -67,20 +67,22 @@ def _icon_clear() -> QIcon:
     return _make_icon(lambda p: (p.drawLine(5, 5, 13, 13), p.drawLine(13, 5, 5, 13)))
 
 
+def _asset_path(name: str) -> str:
+    """资源文件路径：dev=repo/assets，frozen=_MEIPASS/assets（spec 已 bundle）。"""
+    base = getattr(sys, "_MEIPASS", None)
+    if base:
+        return os.path.join(base, "assets", name)
+    return os.path.join(os.path.dirname(__file__), "..", "..", "..", "assets", name)
+
+
 def _app_logo() -> QPixmap:
-    """品牌 logo：胶片帧（暖金）+ 搜索镜（电蓝），固定品牌色，深浅主题通用。"""
-    pm = QPixmap(26, 26)
-    pm.fill(Qt.transparent)
-    p = QPainter(pm)
-    p.setRenderHint(QPainter.Antialiasing)
-    p.setBrush(Qt.NoBrush)
-    p.setPen(QPen(QColor("#E3B572"), 2))
-    p.drawRoundedRect(3, 5, 18, 15, 4, 4)
-    p.setPen(QPen(QColor("#5D9BFF"), 2))
-    p.drawEllipse(8, 9, 7, 7)
-    p.drawLine(13, 14, 18, 19)
-    p.end()
-    return pm
+    """品牌 logo：PPTutor 吉祥物（学士帽 + 搜索/PPT），加载打包内 assets/logo.png。"""
+    pm = QPixmap(_asset_path("logo.png"))
+    if not pm.isNull():
+        return pm.scaled(28, 28, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+    fb = QPixmap(28, 28)
+    fb.fill(Qt.transparent)
+    return fb
 
 
 def _load_theme() -> str:
@@ -357,7 +359,8 @@ class MainWindow(QMainWindow):
     def __init__(self, conn=None, render_worker=None, thumb_worker=None, version_mgr=None,
                  do_index=True, roots: list[str] | None = None, workers: int | None = None):
         super().__init__()
-        self.setWindowTitle("pptx-finder · PPTX 查询助手   v0.7.8")
+        self.setWindowTitle("PPTutor · PPT 查询助手   v0.8.0")
+        self.setWindowIcon(QIcon(_asset_path("logo.png")))  # 窗口标题/任务栏图标
         self.resize(1180, 760)
         self._title_h = 40  # 自绘玻璃标题栏高度（nativeEvent 拖动区/缩放边判定用）
         self.setWindowFlag(Qt.FramelessWindowHint, True)  # 无边框 → 自绘玻璃标题栏
@@ -453,7 +456,7 @@ class MainWindow(QMainWindow):
         logo = QLabel()
         logo.setObjectName("appLogo")
         logo.setPixmap(_app_logo())
-        logo.setToolTip("pptx-finder")
+        logo.setToolTip("PPTutor")
         bar.addWidget(logo)
         self.search_box = QLineEdit()
         self.search_box.setObjectName("searchBox")
@@ -699,9 +702,9 @@ class MainWindow(QMainWindow):
         l.setSpacing(9)
         dot = QLabel("◆")
         dot.setObjectName("gtDot")
-        name = QLabel("PPT Finder")
+        name = QLabel("PPTutor")
         name.setObjectName("gtName")
-        ver = QLabel("v0.7.8")
+        ver = QLabel("v0.8.0")
         ver.setObjectName("gtVer")
         self.gt_theme = QLabel(dict(theme.THEMES).get(self._theme, self._theme))
         self.gt_theme.setObjectName("gtTheme")

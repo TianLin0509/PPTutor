@@ -63,7 +63,7 @@ class WelcomeOverlay(QWidget):
         logo.setAlignment(Qt.AlignCenter)
         cl.addWidget(logo, 0, Qt.AlignHCenter)
 
-        title = QLabel('欢迎使用 <span style="color:#E3B572">pptx-finder</span>')
+        title = QLabel('欢迎使用 <span style="color:#E3B572">PPTutor</span>')
         title.setObjectName("wTitle")
         title.setTextFormat(Qt.RichText)
         title.setAlignment(Qt.AlignCenter)
