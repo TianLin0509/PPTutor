@@ -1,7 +1,5 @@
-"""选中文件详情抽屉：版本时间线（恢复/导出）+ 大纲（点击跳页）+ 文件信息。
-
-全盘 lazy 版本管理：无「纳管」概念——有版本就展示，没版本则提示「改存即自动留版」。
-版本数据经 version_mgr.list_versions(path)（只读）。
+"""选中文件详情弹窗：两个 Tab —— 版本管理（文件信息 + 版本时间线，恢复/导出/改动简述）+
+大纲（点击跳页）。无边框玻璃弹窗，可拖动。版本数据经 version_mgr.list_versions(path)（只读）。
 """
 from __future__ import annotations
 
@@ -9,13 +7,13 @@ import datetime
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea, QVBoxLayout, QWidget,
+    QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea, QTabWidget, QVBoxLayout, QWidget,
 )
 
 
 def _fmt_ts(ts: float) -> str:
     try:
-        return datetime.datetime.fromtimestamp(ts).strftime("%m-%d %H:%M")
+        return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")  # 精确到秒
     except (OSError, OverflowError, ValueError):
         return ""
 
@@ -29,6 +27,14 @@ def _fmt_size(n: int) -> str:
             return f"{int(f)} {u}" if u == "B" else f"{f:.1f} {u}"
         f /= 1024
     return f"{f:.1f} TB"
+
+
+def _vget(v, key, default=""):
+    """兼容 sqlite3.Row（无 .get）与 dict、字段可能缺失的安全取值。"""
+    try:
+        return v[key]
+    except (KeyError, IndexError):
+        return default
 
 
 class DetailPanel(QWidget):
@@ -47,7 +53,16 @@ class DetailPanel(QWidget):
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
-        # 玻璃标题栏（可拖动 + 关闭按钮）——无边框弹窗，和主窗风格统一
+        root.addWidget(self._build_head())   # 玻璃标题栏（拖动 + 关闭）
+
+        tabs = QTabWidget()
+        tabs.setObjectName("detailTabs")
+        tabs.addTab(self._build_version_tab(), "版本管理")
+        tabs.addTab(self._build_outline_tab(), "大纲")
+        root.addWidget(tabs, 1)
+
+    # ---------- 结构 ----------
+    def _build_head(self) -> QWidget:
         head = QWidget()
         head.setObjectName("detailHead")
         head.setFixedHeight(40)
@@ -70,42 +85,47 @@ class DetailPanel(QWidget):
         hl.addWidget(close_btn)
         head.mousePressEvent = self._drag_press   # 标题栏拖动整窗
         head.mouseMoveEvent = self._drag_move
-        root.addWidget(head)
+        return head
 
+    def _scroll(self) -> tuple[QScrollArea, QVBoxLayout]:
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
-        content = QWidget()
-        self._cl = QVBoxLayout(content)
-        self._cl.setContentsMargins(13, 12, 13, 16)
-        self._cl.setSpacing(8)
+        c = QWidget()
+        lay = QVBoxLayout(c)
+        lay.setContentsMargins(13, 12, 13, 16)
+        scroll.setWidget(c)
+        return scroll, lay
 
-        self._cl.addWidget(self._sec_title("📍 版本时间线"))
+    def _build_version_tab(self) -> QWidget:
+        scroll, lay = self._scroll()
+        lay.setSpacing(8)
+        self._meta_label = QLabel("← 选中左侧文件查看详情")  # 文件信息（紧凑，置顶）
+        self._meta_label.setObjectName("detailMeta")
+        self._meta_label.setWordWrap(True)
+        lay.addWidget(self._meta_label)
+        lay.addSpacing(2)
+        lay.addWidget(self._sec_title("📍 版本时间线"))
         ver_c = QWidget()
         self._version_box = QVBoxLayout(ver_c)
         self._version_box.setContentsMargins(0, 0, 0, 0)
-        self._version_box.setSpacing(0)
-        self._cl.addWidget(ver_c)
+        self._version_box.setSpacing(7)
+        lay.addWidget(ver_c)
+        lay.addStretch(1)
+        return scroll
 
-        self._cl.addSpacing(8)
-        self._cl.addWidget(self._sec_title("📑 大纲"))
+    def _build_outline_tab(self) -> QWidget:
+        scroll, lay = self._scroll()
+        lay.setSpacing(2)
         ol_c = QWidget()
         self._outline_box = QVBoxLayout(ol_c)
         self._outline_box.setContentsMargins(0, 0, 0, 0)
         self._outline_box.setSpacing(0)
-        self._cl.addWidget(ol_c)
+        lay.addWidget(ol_c)
+        lay.addStretch(1)
+        return scroll
 
-        self._cl.addSpacing(8)
-        self._cl.addWidget(self._sec_title("ℹ️ 文件信息"))
-        self._meta_label = QLabel("← 选中左侧文件查看详情")
-        self._meta_label.setObjectName("detailMeta")
-        self._meta_label.setWordWrap(True)
-        self._cl.addWidget(self._meta_label)
-        self._cl.addStretch(1)
-
-        scroll.setWidget(content)
-        root.addWidget(scroll, 1)
-
+    # ---------- 交互 ----------
     def _drag_press(self, e):  # noqa: N802
         if e.button() == Qt.LeftButton:
             self._drag_off = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
@@ -129,18 +149,18 @@ class DetailPanel(QWidget):
             if it.widget():
                 it.widget().deleteLater()
 
+    # ---------- 数据 ----------
     def update_for(self, r, versions: list) -> None:
         self._path = r.path
-        # —— 文件信息 ——
         parts = []
         sz = _fmt_size(r.size)
         if sz:
-            parts.append(f"大小　{sz}")
+            parts.append(f"大小 {sz}")
         if r.page_count:
-            parts.append(f"页数　{r.page_count} 页")
-        parts.append("版本　" + (f"{len(versions)} 版" if versions else "暂无"))
-        self._meta_label.setText("\n".join(parts))
-        # —— 版本时间线 ——
+            parts.append(f"{r.page_count} 页")
+        parts.append(f"{len(versions)} 个版本" if versions else "暂无版本")
+        self._meta_label.setText("　·　".join(parts))
+
         self._clear(self._version_box)
         self._version_nodes = []
         if not versions:
@@ -149,48 +169,54 @@ class DetailPanel(QWidget):
             tip.setWordWrap(True)
             self._version_box.addWidget(tip)
             return
-        prev_pc = None  # versions 按 ts 降序（最新在前）
+        # versions 按 ts 降序（最新在前）。版本号有序：最老 v1.0 → 最新 v1.(N-1)
+        total = len(versions)
         for i, v in enumerate(versions):
-            node = self._version_node(v, i == 0, prev_pc)
+            seq = total - 1 - i
+            is_latest = i == 0
+            is_oldest = seq == 0
+            label = ("最新版" if is_latest else "历史版") + f" v1.{seq}"
+            node = self._version_node(v, label, is_latest, is_oldest)
             self._version_box.addWidget(node)
             self._version_nodes.append(node)
-            prev_pc = v["page_count"]
 
-    def _version_node(self, v: dict, is_latest: bool, newer_pc: int | None) -> QWidget:
+    def _version_node(self, v, label: str, is_latest: bool, is_oldest: bool) -> QWidget:
         w = QWidget()
         w.setObjectName("verNode")
         lay = QVBoxLayout(w)
-        lay.setContentsMargins(14, 7, 6, 7)
-        lay.setSpacing(2)
+        lay.setContentsMargins(13, 7, 7, 7)
+        lay.setSpacing(3)
+        pc = _vget(v, "page_count", 0)
+        vid = _vget(v, "version_id", "")
+        # 第 1 行：版本标签 · 页数 [增减]  ……右侧 [恢复][导出]（与本行对齐，不独占一行）
         top = QHBoxLayout()
         top.setSpacing(6)
-        title = QLabel(("最新版" if is_latest else "历史版") + f"　·　{v['page_count']} 页")
+        title = QLabel(f"{label}　·　{pc} 页")
         title.setObjectName("verLatest" if is_latest else "verTitle")
         top.addWidget(title)
-        # 与更新版本相比的页数增减
-        if newer_pc is not None:
-            d = newer_pc - v["page_count"]
-            if d:
-                delta = QLabel((f"+{d}" if d > 0 else str(d)) + " 页")
-                delta.setObjectName("verUp" if d > 0 else "verDn")
-                top.addWidget(delta)
         top.addStretch(1)
-        lay.addLayout(top)
-        ts = QLabel(_fmt_ts(v["ts"]))
-        ts.setObjectName("verTs")
-        lay.addWidget(ts)
-        ops = QHBoxLayout()
-        ops.setSpacing(6)
         br = QPushButton("恢复")
         br.setObjectName("verBtnPri" if is_latest else "verBtn")
-        br.clicked.connect(lambda _=False, vid=v["version_id"]: self.restore_requested.emit(self._path, vid))
+        br.clicked.connect(lambda _=False, _v=vid: self.restore_requested.emit(self._path, _v))
         be = QPushButton("导出")
         be.setObjectName("verBtn")
-        be.clicked.connect(lambda _=False, vid=v["version_id"]: self.export_requested.emit(self._path, vid))
-        ops.addWidget(br)
-        ops.addWidget(be)
-        ops.addStretch(1)
-        lay.addLayout(ops)
+        be.clicked.connect(lambda _=False, _v=vid: self.export_requested.emit(self._path, _v))
+        top.addWidget(br)
+        top.addWidget(be)
+        lay.addLayout(top)
+        # 第 2 行：时间（到秒）+ 改动简述
+        sub = QHBoxLayout()
+        sub.setSpacing(9)
+        ts = QLabel(_fmt_ts(_vget(v, "ts", 0)))
+        ts.setObjectName("verTs")
+        sub.addWidget(ts)
+        changed = (_vget(v, "changed", "") or "").strip() or ("首个版本" if is_oldest else "")
+        if changed:
+            cl = QLabel("✎ " + changed)
+            cl.setObjectName("verChanged")
+            sub.addWidget(cl)
+        sub.addStretch(1)
+        lay.addLayout(sub)
         return w
 
     def set_outline(self, titles: list) -> None:

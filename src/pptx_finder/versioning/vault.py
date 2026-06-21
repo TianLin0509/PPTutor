@@ -112,6 +112,26 @@ def _verify(doc_id: str, names: list[str], parts: dict[str, str]) -> bool:
             pass
 
 
+def _change_summary(conn, latest_vid: str, new_pages: list, new_pc: int, old_pc: int) -> str:
+    """对比上一版逐页文本，给一句大致改动简述（改了几页 + 页数增减）。"""
+    try:
+        old = {r["page_no"]: r["content"] for r in conn.execute(
+            "SELECT page_no, content FROM version_pages_fts WHERE version_id=?", (latest_vid,))}
+    except Exception:  # noqa: BLE001
+        old = {}
+    new = {pno: txt for pno, txt in new_pages}
+    changed_pages = sum(1 for p in (set(old) & set(new)) if (old.get(p) or "") != (new.get(p) or ""))
+    parts = []
+    if changed_pages:
+        parts.append(f"改 {changed_pages} 页")
+    d = new_pc - old_pc
+    if d > 0:
+        parts.append(f"+{d} 页")
+    elif d < 0:
+        parts.append(f"{d} 页")
+    return " · ".join(parts) if parts else "内容微调"
+
+
 def snapshot(conn, path: str, session_id: str = "") -> str | None:
     """对 path 当前内容拍快照（按页去重）；内容相对最新版未变则跳过（返回 None）。"""
     path = os.path.abspath(path)
@@ -152,8 +172,10 @@ def snapshot(conn, path: str, session_id: str = "") -> str | None:
         size = os.path.getsize(ext_path(path))
     except OSError:
         size = 0
+    changed = (_change_summary(conn, latest["version_id"], pages, deck.page_count, latest["page_count"] or 0)
+               if latest is not None else "")
     store.upsert_doc(conn, did, path, now)
-    store.add_version(conn, vid, did, now, session_id, deck.page_count, size, chash)
+    store.add_version(conn, vid, did, now, session_id, deck.page_count, size, chash, changed=changed)
     store.index_pages(conn, did, vid, pages)
     store.set_latest(conn, did, vid)
     conn.commit()

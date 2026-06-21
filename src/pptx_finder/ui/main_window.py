@@ -359,7 +359,7 @@ class MainWindow(QMainWindow):
     def __init__(self, conn=None, render_worker=None, thumb_worker=None, version_mgr=None,
                  do_index=True, roots: list[str] | None = None, workers: int | None = None):
         super().__init__()
-        self.setWindowTitle("PPTutor · PPT 查询助手   v0.8.2")
+        self.setWindowTitle("PPTutor · PPT 查询助手   v0.8.3")
         self.setWindowIcon(QIcon(_asset_path("logo.png")))  # 窗口标题/任务栏图标
         self.resize(1180, 760)
         self._title_h = 40  # 自绘玻璃标题栏高度（nativeEvent 拖动区/缩放边判定用）
@@ -709,7 +709,7 @@ class MainWindow(QMainWindow):
         dot.setObjectName("gtDot")
         name = QLabel("PPTutor")
         name.setObjectName("gtName")
-        ver = QLabel("v0.8.2")
+        ver = QLabel("v0.8.3")
         ver.setObjectName("gtVer")
         self.gt_theme = QLabel(dict(theme.THEMES).get(self._theme, self._theme))
         self.gt_theme.setObjectName("gtTheme")

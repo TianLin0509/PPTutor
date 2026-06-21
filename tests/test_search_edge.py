@@ -77,16 +77,18 @@ def test_alnum_substring_precision(tmp_path):
     assert "sep.pptx" not in _names(search.search(conn, "gpt4"))
 
 
-# Codex C3 跨页 AND：逐词原文验证，trigram 碎片不假阳性 + 与词序无关
-def test_cross_page_all_words_verified(tmp_path):
+# 多词只认同一页（1A）+ 同页 trigram 验真：两词同页且真值才命中，跨页/碎片都不算，与词序无关
+def test_multiword_same_page_only(tmp_path):
     conn = _build(tmp_path, {
-        "fp.pptx": ["稀有词标记", "x202y026z 片段"],   # 2026 只有 trigram 碎片，无连续 2026
-        "ok.pptx": ["稀有词标记", "发布 2026 版"],       # 真有连续 2026
+        "ok.pptx": ["稀有词标记 发布 2026 版"],          # 两词同页 + 真有连续 2026 → 命中
+        "cross.pptx": ["稀有词标记", "发布 2026 版"],     # 两词分散不同页 → 1A 下不命中
+        "frag.pptx": ["稀有词标记 x202y026z 片段"],       # 同页但 2026 只有 trigram 碎片 → 原文验真拦下
     })
-    for q in ("稀有词标记 2026", "2026 稀有词标记"):   # 两种词序都验（修前受词序影响）
+    for q in ("稀有词标记 2026", "2026 稀有词标记"):
         names = _names(search.search(conn, q))
-        assert "ok.pptx" in names, q          # 真值命中
-        assert "fp.pptx" not in names, q      # 假阳性被逐词验真拦下
+        assert "ok.pptx" in names, q
+        assert "cross.pptx" not in names, q
+        assert "frag.pptx" not in names, q
 
 
 # Codex C6 跨版本搜索用精确匹配（无 trigram）→ 历史页无原文验证也不假阳性

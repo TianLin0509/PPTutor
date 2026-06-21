@@ -94,28 +94,8 @@ def _recall(conn, words: list[str]) -> dict[int, list[tuple[int, float]]]:
     except sqlite3.OperationalError as e:
         log.warning("FTS match failed %r: %s", m_and, e)
 
-    # 多词跨页放宽：每词在该文件某页（但无单页全含）→ 文件级交集，代表页排后
-    if len(clauses) > 1:
-        file_sets = []
-        for c in clauses:
-            fs: set[int] = set()
-            try:
-                for r in conn.execute(
-                    "SELECT DISTINCT file_id FROM pages_fts WHERE pages_fts MATCH ? LIMIT 5000", (c,)):
-                    fs.add(r["file_id"])
-            except sqlite3.OperationalError:
-                pass
-            file_sets.append(fs)
-        cross = set.intersection(*file_sets) if file_sets else set()
-        for fid in cross:
-            if fid in content:
-                continue
-            # 逐词原文验证：每个词都要在该文件某页真实出现。只验首词会让「rareword 2026」
-            # 误中只有 trigram 碎片（无连续 2026）的文件，且命中与否随词序变化——这里对每个
-            # 词都验真，假阳性被拦下，结果与词序无关。
-            verified = [_first_verified_page(conn, fid, c, nw) for c, nw in zip(clauses, nws)]
-            if all(p is not None for p in verified):
-                content[fid] = [(verified[0], 1000.0)]  # 代表页=首词验证页，低相关排后
+    # 多词只认「同一页」：所有词必须出现在同一页（上面同页 AND 已实现）。不再做「跨页放宽」
+    # （A 在第 3 页、B 在第 50 页也算命中）——按用户要求，多词搜索更精准、避免结果过多。
     return content
 
 
@@ -220,7 +200,8 @@ def search(conn: sqlite3.Connection, query: str, scope: str | None = None,
             group_id=gmap.get(row["id"]),
         ))
 
-    results.sort(key=lambda r: r.score, reverse=True)
+    # 文件名命中硬优先：文件名命中的永远排在纯内容命中之前（name_hit 作主键），同类内按分排
+    results.sort(key=lambda r: (r.name_hit, r.score), reverse=True)
 
     # 版本组内标记“最新版”：文件名含 终稿/定稿/final/最终 优先，否则修改时间最新
     members: dict[int, list[FileResult]] = defaultdict(list)

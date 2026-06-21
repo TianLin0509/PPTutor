@@ -176,6 +176,11 @@ QLabel#dtDot { color: $acc; font-size: 11px; background: transparent; }
 QLabel#dtTitle { color: $ink1; font-size: 13px; font-weight: 700; background: transparent; }
 QPushButton#dtClose { background: transparent; border: none; color: $ink3; font-size: 13px; border-radius: 6px; }
 QPushButton#dtClose:hover { background: rgba(255,69,58,0.9); color: #ffffff; }
+QTabWidget#detailTabs::pane { border: none; border-top: 1px solid $bd; background: transparent; }
+QTabBar::tab { background: transparent; color: $ink3; padding: 7px 18px; font-size: 12.5px; font-weight: 600; border: none; border-bottom: 2px solid transparent; }
+QTabBar::tab:selected { color: $acc; border-bottom: 2px solid $acc; }
+QTabBar::tab:hover:!selected { color: $ink1; }
+QLabel#verChanged { color: $ink3; font-size: 11px; background: transparent; }
 QLabel#detailSecT { color: $ink3; font-size: 11px; font-weight: 700; background: transparent; }
 QLabel#detailMeta { color: $ink3; font-size: 11.5px; background: transparent; }
 QLabel#detailMuted { color: $ink4; font-size: 11.5px; background: transparent; }

@@ -73,10 +73,10 @@ def test_04_multiword_same_page(tmp_path):
     assert "a.pptx" in _names(search.search(conn, "明硕 AI"))
 
 
-# ⑤ 多词·跨页放宽（同文件不同页）
-def test_05_multiword_cross_page(tmp_path):
+# ⑤ 多词·只认同一页（1A 收紧）：明硕/AI 分散在不同页 → 不再算命中
+def test_05_multiword_cross_page_no_match(tmp_path):
     conn = _build(tmp_path, {"a.pptx": ["明硕方案介绍", "中间无关页", "AI落地总结"]})
-    assert "a.pptx" in _names(search.search(conn, "明硕 AI"))
+    assert "a.pptx" not in _names(search.search(conn, "明硕 AI"))
 
 
 # ⑥ 精度：明、硕被标点隔开,搜「明硕」不该误中
