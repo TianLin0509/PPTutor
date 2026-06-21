@@ -357,7 +357,7 @@ class MainWindow(QMainWindow):
     def __init__(self, conn=None, render_worker=None, thumb_worker=None, version_mgr=None,
                  do_index=True, roots: list[str] | None = None, workers: int | None = None):
         super().__init__()
-        self.setWindowTitle("pptx-finder · PPTX 查询助手   v0.7.7")
+        self.setWindowTitle("pptx-finder · PPTX 查询助手   v0.7.8")
         self.resize(1180, 760)
         self._title_h = 40  # 自绘玻璃标题栏高度（nativeEvent 拖动区/缩放边判定用）
         self.setWindowFlag(Qt.FramelessWindowHint, True)  # 无边框 → 自绘玻璃标题栏
@@ -701,7 +701,7 @@ class MainWindow(QMainWindow):
         dot.setObjectName("gtDot")
         name = QLabel("PPT Finder")
         name.setObjectName("gtName")
-        ver = QLabel("v0.7.7")
+        ver = QLabel("v0.7.8")
         ver.setObjectName("gtVer")
         self.gt_theme = QLabel(dict(theme.THEMES).get(self._theme, self._theme))
         self.gt_theme.setObjectName("gtTheme")
