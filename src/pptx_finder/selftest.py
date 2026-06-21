@@ -20,7 +20,7 @@ CASES = [
     ("run截断(小明|硕士毕业→明硕)", "明硕", "02_runsplit.pptx", True),
     ("长词内片段(人民→中华人民共和国)", "人民", "03_longword.pptx", True),
     ("多词同页(明硕 AI)", "明硕 AI", "04_samepage.pptx", True),
-    ("多词跨页放宽(明硕 AI)", "明硕 AI", "05_crosspage.pptx", True),
+    ("多词只认同页·跨页不算(明硕 AI 分散不同页)", "明硕 AI", "05_crosspage.pptx", False),  # 1A 收紧
     ("精度·不相邻不误中(明硕)", "明硕", "06_precision.pptx", False),
     ("全角ＡＩ→AI", "AI", "07_fullwidth.pptx", True),
     ("繁体→简体(软件)", "软件", "08_traditional.pptx", True),
