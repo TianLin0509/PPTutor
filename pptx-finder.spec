@@ -19,11 +19,37 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=['PIL', 'Pillow', 'pptx', 'tkinter', 'matplotlib', 'pandas', 'IPython', 'pytest',
+              'PySide6.QtQuick', 'PySide6.QtQml', 'PySide6.QtQuickWidgets', 'PySide6.QtQuick3D',
+              'PySide6.QtWebEngineCore', 'PySide6.QtWebEngineWidgets', 'PySide6.QtWebChannel',
+              'PySide6.QtMultimedia', 'PySide6.QtMultimediaWidgets', 'PySide6.QtPdf',
+              'PySide6.QtPdfWidgets', 'PySide6.QtCharts', 'PySide6.QtDataVisualization',
+              'PySide6.QtDesigner', 'PySide6.QtOpenGL', 'PySide6.QtOpenGLWidgets'],
     noarchive=False,
     optimize=0,
 )
 pyz = PYZ(a.pure)
+
+# —— 体积优化：剔除搜索 app 用不到的 Qt 模块 DLL + 软件 OpenGL 兜底（QWidget 纯光栅渲染）。
+# 只保留 Qt6Core/Gui/Widgets/Network(单实例)/Svg 等必需项；datasketch 的 scipy 是版本归组硬
+# 依赖，保留。删 DLL 后已 frozen 自检 + 启动冒烟验证 UI 正常。
+_DROP = (
+    'opengl32sw', 'd3dcompiler',
+    'qt6quick', 'qt6qml', 'qml', 'qt6pdf', 'qt6webengine', 'qt6webchannel', 'qt6websockets',
+    'qt63d', 'qt6quick3d', 'qt6multimedia', 'qt6charts', 'qt6datavisualization', 'qt6designer',
+    'qt6opengl', 'qt6virtualkeyboard', 'qt6sensors', 'qt6bluetooth', 'qt6nfc', 'qt6positioning',
+    'qt6serialport', 'qt6serialbus', 'qt6sql', 'qt6test', 'qt6help', 'qt6spatialaudio',
+    'qt6texttospeech', 'qt6remoteobjects', 'qt6scxml', 'qt6statemachine', 'qt6labs',
+)
+
+
+def _keep(entry):
+    n = entry[0].replace('\\', '/').lower()
+    return not any(d in n for d in _DROP)
+
+
+a.binaries = [b for b in a.binaries if _keep(b)]
+a.datas = [d for d in a.datas if _keep(d)]
 
 exe = EXE(
     pyz,
