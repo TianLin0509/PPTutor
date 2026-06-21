@@ -42,7 +42,8 @@ class RenderWorker(QThread):
                         return
                     item = nxt
                 req_id, path, page_no, key = item
-                png = renderer.render_page(path, page_no, cache_key=key)
+                # hi_priority：预览抢占共享 COM 锁，不被一屏缩略图渲染拖在后面排队
+                png = renderer.render_page(path, page_no, cache_key=key, hi_priority=True)
                 self.rendered.emit(req_id, str(png) if png else "")
         finally:
             renderer.shutdown()

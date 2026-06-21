@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import threading
@@ -18,8 +19,36 @@ from .config import cache_dir
 
 log = logging.getLogger(__name__)
 
-_lock = threading.Lock()
 _state = threading.local()
+# 预览优先的 COM 单槽锁：预览(RenderWorker)与缩略图(ThumbWorker)共用一个 PowerPoint
+# COM 渲染通道（不并发）。缩略图 FIFO 渲染一整屏（24 个）会把用户正盯着的预览挤到后面
+# 排队（实测预览明显变慢的主因）。下面这把「优先锁」让预览插队：有预览在排队时，缩略图
+# 一律先让路（且不预先堆到锁队列上），等预览渲完再继续。
+_cv = threading.Condition()
+_busy = False        # COM 通道当前是否被占用
+_hi_waiting = 0      # 排队中的高优先(预览)请求数
+
+
+@contextlib.contextmanager
+def _com_slot(hi_priority: bool):
+    """获取 COM 渲染单槽。预览(hi_priority=True)优先：低优先(缩略图)在有预览排队时
+    一律让路，且不抢先堆到锁队列上——预览随时能插到下一个执行。"""
+    global _busy, _hi_waiting
+    with _cv:
+        if hi_priority:
+            _hi_waiting += 1
+        # 等到通道空闲；低优先还需等到没有预览在排队（让预览插队）
+        while _busy or (not hi_priority and _hi_waiting > 0):
+            _cv.wait()
+        if hi_priority:
+            _hi_waiting -= 1
+        _busy = True
+    try:
+        yield
+    finally:
+        with _cv:
+            _busy = False
+            _cv.notify_all()
 
 
 def _get_app():
@@ -50,11 +79,13 @@ def render_page(
     page_no: int,
     cache_key: str | None = None,
     long_edge: int = 2560,
+    hi_priority: bool = False,
 ) -> Path | None:
     """导出 path 第 page_no 页（1-based）为高清 PNG，返回缓存路径；失败返回 None。
 
     long_edge 为长边像素，高度按 slide 实际宽高比自适应（兼容 16:9 / 4:3）。
     缓存文件名含 long_edge，提分辨率后旧低清缓存自动失效。
+    hi_priority=True（预览）抢占共享 COM 锁，缩略图等低优先渲染让路（见 _priority）。
     """
     path = os.path.abspath(path)
     if cache_key is None:
@@ -67,7 +98,7 @@ def render_page(
     if not os.path.exists(path):
         return None
 
-    with _lock:  # COM 串行
+    with _com_slot(hi_priority):  # COM 串行单槽（预览优先抢占缩略图）
         pres = None
         try:
             app = _get_app()

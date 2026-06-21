@@ -41,13 +41,35 @@ class DetailPanel(QWidget):
         self.setObjectName("detailPanel")
         self._tok = tok
         self._path = None
+        self._drag_off = None
         self._version_nodes: list[QWidget] = []
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
-        head = QLabel("详情")
+        # 玻璃标题栏（可拖动 + 关闭按钮）——无边框弹窗，和主窗风格统一
+        head = QWidget()
         head.setObjectName("detailHead")
+        head.setFixedHeight(40)
+        hl = QHBoxLayout(head)
+        hl.setContentsMargins(15, 0, 7, 0)
+        hl.setSpacing(8)
+        dot = QLabel("◆")
+        dot.setObjectName("dtDot")
+        title = QLabel("详情")
+        title.setObjectName("dtTitle")
+        hl.addWidget(dot)
+        hl.addWidget(title)
+        hl.addStretch(1)
+        close_btn = QPushButton("✕")
+        close_btn.setObjectName("dtClose")
+        close_btn.setFixedSize(30, 28)
+        close_btn.setCursor(Qt.PointingHandCursor)
+        close_btn.setToolTip("关闭")
+        close_btn.clicked.connect(self.hide)
+        hl.addWidget(close_btn)
+        head.mousePressEvent = self._drag_press   # 标题栏拖动整窗
+        head.mouseMoveEvent = self._drag_move
         root.addWidget(head)
 
         scroll = QScrollArea()
@@ -83,6 +105,17 @@ class DetailPanel(QWidget):
 
         scroll.setWidget(content)
         root.addWidget(scroll, 1)
+
+    def _drag_press(self, e):  # noqa: N802
+        if e.button() == Qt.LeftButton:
+            self._drag_off = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
+        else:
+            self._drag_off = None
+
+    def _drag_move(self, e):  # noqa: N802
+        off = self._drag_off
+        if off is not None and (e.buttons() & Qt.LeftButton):
+            self.move(e.globalPosition().toPoint() - off)
 
     def _sec_title(self, text: str) -> QLabel:
         lbl = QLabel(text)

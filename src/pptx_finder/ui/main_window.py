@@ -357,7 +357,7 @@ class MainWindow(QMainWindow):
     def __init__(self, conn=None, render_worker=None, thumb_worker=None, version_mgr=None,
                  do_index=True, roots: list[str] | None = None, workers: int | None = None):
         super().__init__()
-        self.setWindowTitle("pptx-finder · PPTX 查询助手   v0.7.6")
+        self.setWindowTitle("pptx-finder · PPTX 查询助手   v0.7.7")
         self.resize(1180, 760)
         self._title_h = 40  # 自绘玻璃标题栏高度（nativeEvent 拖动区/缩放边判定用）
         self.setWindowFlag(Qt.FramelessWindowHint, True)  # 无边框 → 自绘玻璃标题栏
@@ -551,8 +551,8 @@ class MainWindow(QMainWindow):
         # 详情改为浮动弹窗（不再占第四列，节约横向空间）：非模态 Tool 窗，浮在主窗之上、
         # 跟随选中实时刷新，关掉不影响搜索/预览主区；信号与 _update_detail 逻辑均不变。
         self.detail_panel = DetailPanel(self._tok, parent=self)
-        self.detail_panel.setWindowFlags(Qt.Tool | Qt.WindowTitleHint | Qt.WindowCloseButtonHint)
-        self.detail_panel.setWindowTitle("详情 · 版本时间线 / 大纲 / 文件信息")
+        # 无边框玻璃弹窗（自绘玻璃标题栏可拖动 + 关闭），show 后加 Win11 DWM 圆角，和主窗统一
+        self.detail_panel.setWindowFlags(Qt.Tool | Qt.FramelessWindowHint)
         self.detail_panel.restore_requested.connect(self._act_restore_version)
         self.detail_panel.export_requested.connect(self._act_export_version)
         self.detail_panel.page_requested.connect(self._act_goto_page)
@@ -701,7 +701,7 @@ class MainWindow(QMainWindow):
         dot.setObjectName("gtDot")
         name = QLabel("PPT Finder")
         name.setObjectName("gtName")
-        ver = QLabel("v0.7.6")
+        ver = QLabel("v0.7.7")
         ver.setObjectName("gtVer")
         self.gt_theme = QLabel(dict(theme.THEMES).get(self._theme, self._theme))
         self.gt_theme.setObjectName("gtTheme")
@@ -1225,6 +1225,7 @@ class MainWindow(QMainWindow):
         if self.detail_panel.isHidden():
             self._position_detail_popup()
             self.detail_panel.show()
+            self._round_detail_corners()   # 无边框窗 show 后才能拿 winId 加 Win11 圆角
             self.detail_panel.raise_()
             self._update_detail()
             self._maybe_hint_detail_versions()
@@ -1240,6 +1241,18 @@ class MainWindow(QMainWindow):
         h = min(640, max(420, g.height() - 120))
         self.detail_panel.resize(w, h)
         self.detail_panel.move(max(0, g.right() - w - 30), g.top() + self._title_h + 60)
+
+    def _round_detail_corners(self) -> None:
+        """给无边框详情弹窗加 Win11 DWM 圆角（旧系统静默失败，退化为直角）。"""
+        if not _WIN:
+            return
+        try:
+            hwnd = int(self.detail_panel.winId())
+            # DWMWA_WINDOW_CORNER_PREFERENCE=33, value 2=ROUND
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd, 33, ctypes.byref(ctypes.c_int(2)), 4)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _maybe_hint_detail_versions(self) -> None:
         """首次展开详情且当前文件有历史版本时，提示「这里能一键回到历史版本」。"""

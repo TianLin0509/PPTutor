@@ -171,7 +171,11 @@ QPushButton#facetChip:checked { background: rgba($hl_r,$hl_g,$hl_b,0.16); border
 
 /* 详情抽屉 — 玻璃卡 */
 QWidget#detailPanel { background: $panel2; border: 1px solid $bd; border-radius: ${radius}px; }
-QLabel#detailHead { color: $ink2; font-size: 12px; font-weight: 600; padding: 9px 13px; border-bottom: 1px solid $bd; background: transparent; }
+#detailHead { background: $panel; border-bottom: 1px solid $bd; border-top-left-radius: ${radius}px; border-top-right-radius: ${radius}px; }
+QLabel#dtDot { color: $acc; font-size: 11px; background: transparent; }
+QLabel#dtTitle { color: $ink1; font-size: 13px; font-weight: 700; background: transparent; }
+QPushButton#dtClose { background: transparent; border: none; color: $ink3; font-size: 13px; border-radius: 6px; }
+QPushButton#dtClose:hover { background: rgba(255,69,58,0.9); color: #ffffff; }
 QLabel#detailSecT { color: $ink3; font-size: 11px; font-weight: 700; background: transparent; }
 QLabel#detailMeta { color: $ink3; font-size: 11.5px; background: transparent; }
 QLabel#detailMuted { color: $ink4; font-size: 11.5px; background: transparent; }
