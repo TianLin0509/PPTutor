@@ -359,7 +359,7 @@ class MainWindow(QMainWindow):
     def __init__(self, conn=None, render_worker=None, thumb_worker=None, version_mgr=None,
                  do_index=True, roots: list[str] | None = None, workers: int | None = None):
         super().__init__()
-        self.setWindowTitle("PPTutor · PPT 查询助手   v0.8.1")
+        self.setWindowTitle("PPTutor · PPT 查询助手   v0.8.2")
         self.setWindowIcon(QIcon(_asset_path("logo.png")))  # 窗口标题/任务栏图标
         self.resize(1180, 760)
         self._title_h = 40  # 自绘玻璃标题栏高度（nativeEvent 拖动区/缩放边判定用）
@@ -709,7 +709,7 @@ class MainWindow(QMainWindow):
         dot.setObjectName("gtDot")
         name = QLabel("PPTutor")
         name.setObjectName("gtName")
-        ver = QLabel("v0.8.1")
+        ver = QLabel("v0.8.2")
         ver.setObjectName("gtVer")
         self.gt_theme = QLabel(dict(theme.THEMES).get(self._theme, self._theme))
         self.gt_theme.setObjectName("gtTheme")
@@ -1521,6 +1521,30 @@ class MainWindow(QMainWindow):
         self._preview_provisional = False  # 高清已到，不再是占位
         self._preview_hinted = True  # 首次预览已成功，之后不再提「唤起 PowerPoint」
         self._update_pixmap()
+        self._prefetch_neighbors()  # 后台预渲染相邻/命中页，翻过去时缓存命中=瞬间
+
+    def _prefetch_neighbors(self) -> None:
+        """后台预渲染当前文件「其它命中页 + 前后页」→ 翻过去时缓存命中、瞬间出图。
+
+        文件已打开着，预取每页只是多导出 ~0.07s，低优先、被新预览随时抢占并作废
+        （_request_preview→render_worker.request 会清空待预取），故只预取你当前停留页的邻居。
+        """
+        if self._cur is None or not self._owns_render:
+            return
+        if not hasattr(self._render, "prefetch"):
+            return  # 测试注入的 StubRender 无此方法
+        total = self._cur.page_count or 0
+        cur = self._view_page
+        order: list[int] = [h.page_no for h in (self._cur.hits or []) if h.page_no != cur]
+        order += [cur + 1, cur - 1]  # 其它命中页优先，再前后相邻页
+        seen = {cur}
+        for p in order:
+            if p in seen or p < 1 or (total and p > total):
+                continue
+            seen.add(p)
+            if len(seen) > 7:  # 限量，别过度预渲染
+                break
+            self._render.prefetch(self._cur.path, p)
 
     def _update_pixmap(self) -> None:
         if self._cur_pixmap is None:

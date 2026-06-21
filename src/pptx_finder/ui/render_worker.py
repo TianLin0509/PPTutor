@@ -1,17 +1,18 @@
 """后台渲染线程：串行调用 PowerPoint COM 渲染（COM 单线程套间）。
 
-只渲染最新请求：用户快速切换结果时，丢弃积压的过期请求，避免白渲染。
+优先级模型：预览（仅最新一个）> 预取（相邻/命中页，填磁盘缓存）。
+- 预览随时抢占：新预览到来即作废所有待处理的预取（它们是旧页的邻居）。
+- 预取低优先、不发信号、复用已打开的同一文件（仅多导出几页），让用户翻过去时缓存命中=瞬间。
+- 预热：后台静默拉起 PowerPoint，首次预览免冷启动。
 """
 from __future__ import annotations
 
-import queue
+import collections
+import threading
 
 from PySide6.QtCore import QThread, Signal
 
 from .. import renderer
-
-_STOP = object()
-_WARM = object()  # 预热哨兵：后台静默启动 PowerPoint COM
 
 
 class RenderWorker(QThread):
@@ -19,44 +20,66 @@ class RenderWorker(QThread):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._q: queue.Queue = queue.Queue()
+        self._cv = threading.Condition()
+        self._preview = None  # (req_id, path, page, key)，仅留最新
+        self._prefetch: collections.deque = collections.deque()  # (path, page, key)
+        self._warm = False
+        self._stopping = False
 
     def request(self, req_id: int, path: str, page_no: int, cache_key: str | None = None) -> None:
-        self._q.put((req_id, path, page_no, cache_key))
+        with self._cv:
+            self._preview = (req_id, path, page_no, cache_key)
+            self._prefetch.clear()  # 新预览 → 旧页的预取全作废
+            self._cv.notify()
 
-    def stop(self) -> None:
-        self._q.put(_STOP)
+    def prefetch(self, path: str, page_no: int, cache_key: str | None = None) -> None:
+        """后台预渲染某页填缓存（低优先、不发信号）；新预览到来会清空待预取。"""
+        with self._cv:
+            self._prefetch.append((path, page_no, cache_key))
+            self._cv.notify()
 
     def prewarm(self) -> None:
-        """请求后台静默预热 PowerPoint COM（启动后调），让用户首次预览不卡在冷启动(~1.5s)。"""
-        self._q.put(_WARM)
+        """后台静默预热 PowerPoint COM（启动后调），让用户首次预览不卡冷启动(~1.5s)。"""
+        with self._cv:
+            self._warm = True
+            self._cv.notify()
+
+    def stop(self) -> None:
+        with self._cv:
+            self._stopping = True
+            self._cv.notify()
 
     def run(self) -> None:
         try:
             while True:
-                item = self._q.get()
-                if item is _STOP:
-                    break
-                if item is _WARM:
+                with self._cv:
+                    while not (self._stopping or self._warm or self._preview or self._prefetch):
+                        self._cv.wait()
+                    if self._stopping:
+                        return
+                    if self._warm:
+                        self._warm = False
+                        kind, data = "warm", None
+                    elif self._preview is not None:
+                        kind, data = "preview", self._preview
+                        self._preview = None
+                    else:
+                        kind, data = "prefetch", self._prefetch.popleft()
+                # —— 锁外执行实际渲染 ——
+                if kind == "warm":
                     try:
-                        renderer._get_app()  # 后台静默拉起 PowerPoint，首次预览免冷启动
+                        renderer._get_app()  # 后台静默拉起 PowerPoint
                     except Exception:  # noqa: BLE001
                         pass
-                    continue
-                # 抽干队列，只保留最后一个渲染请求（warm 跳过，stop 立即退）
-                while True:
+                elif kind == "preview":
+                    req_id, path, page_no, key = data
+                    png = renderer.render_page(path, page_no, cache_key=key, hi_priority=True)
+                    self.rendered.emit(req_id, str(png) if png else "")
+                else:  # prefetch：低优先填缓存，不发信号、被预览随时抢占
+                    path, page_no, key = data
                     try:
-                        nxt = self._q.get_nowait()
-                    except queue.Empty:
-                        break
-                    if nxt is _STOP:
-                        return
-                    if nxt is _WARM:
-                        continue
-                    item = nxt
-                req_id, path, page_no, key = item
-                # hi_priority：预览抢占共享 COM 锁，不被一屏缩略图渲染拖在后面排队
-                png = renderer.render_page(path, page_no, cache_key=key, hi_priority=True)
-                self.rendered.emit(req_id, str(png) if png else "")
+                        renderer.render_page(path, page_no, cache_key=key, hi_priority=False)
+                    except Exception:  # noqa: BLE001
+                        pass
         finally:
             renderer.shutdown()
