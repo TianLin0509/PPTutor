@@ -359,7 +359,7 @@ class MainWindow(QMainWindow):
     def __init__(self, conn=None, render_worker=None, thumb_worker=None, version_mgr=None,
                  do_index=True, roots: list[str] | None = None, workers: int | None = None):
         super().__init__()
-        self.setWindowTitle("PPTutor · PPT 查询助手   v0.8.0")
+        self.setWindowTitle("PPTutor · PPT 查询助手   v0.8.1")
         self.setWindowIcon(QIcon(_asset_path("logo.png")))  # 窗口标题/任务栏图标
         self.resize(1180, 760)
         self._title_h = 40  # 自绘玻璃标题栏高度（nativeEvent 拖动区/缩放边判定用）
@@ -383,6 +383,7 @@ class MainWindow(QMainWindow):
         self._view_page = 1  # 当前预览页（原始页序，滚轮可脱离命中页自由翻）
         self._req_id = 0
         self._cur_pixmap: QPixmap | None = None
+        self._preview_provisional = False  # 当前预览是否为缩略图占位（高清未到）
         self._zoom = 1.0  # 预览缩放：1.0=适配窗口，>1 放大看细节
         self._to_tray_on_close = False
         self._thumb_btns: list[QToolButton] = []
@@ -392,6 +393,10 @@ class MainWindow(QMainWindow):
         self._owns_render = render_worker is None
         if self._owns_render:
             self._render.start()
+            # 启动后 1.5s 后台静默预热 PowerPoint COM（用户不感知），首次预览免冷启动 ~1.5s。
+            # 仅真实运行态（do_index）预热；测试 do_index=False 不无谓拉起 PowerPoint。
+            if do_index:
+                QTimer.singleShot(1500, self._render.prewarm)
 
         self._thumb = thumb_worker or ThumbWorker(self)
         self._thumb.thumb_rendered.connect(self._on_thumb)
@@ -704,7 +709,7 @@ class MainWindow(QMainWindow):
         dot.setObjectName("gtDot")
         name = QLabel("PPTutor")
         name.setObjectName("gtName")
-        ver = QLabel("v0.8.0")
+        ver = QLabel("v0.8.1")
         ver.setObjectName("gtVer")
         self.gt_theme = QLabel(dict(theme.THEMES).get(self._theme, self._theme))
         self.gt_theme.setObjectName("gtTheme")
@@ -1452,7 +1457,16 @@ class MainWindow(QMainWindow):
         # 缩略图高亮：当前页正好是某命中页就点亮它
         for i, b in enumerate(self._thumb_btns):
             b.setChecked(i < n and hits[i].page_no == page)
-        self._start_spinner()
+        # 渐进式预览：该页缩略图已缓存就立即放大显示作占位（秒出内容、遮住渲染等待），高清渲染
+        # 好后在 _on_rendered 无缝替换。命中页通常已有缩略图（结果卡片左侧那张就是它）。
+        thumb = self._thumb_cache.get((self._cur.path, page))
+        if thumb is not None and not thumb.isNull():
+            self._cur_pixmap = thumb
+            self._preview_provisional = True
+            self._update_pixmap()
+        else:
+            self._preview_provisional = False
+            self._start_spinner()
         self._req_id += 1
         self._render.request(self._req_id, self._cur.path, page, cache_key=None)
 
@@ -1492,6 +1506,9 @@ class MainWindow(QMainWindow):
             return
         self._stop_spinner()
         if not png or not os.path.exists(png):
+            # 高清渲染失败：若有缩略图占位就保留（仍是有用预览），不闪「无法预览」
+            if self._preview_provisional and self._cur_pixmap is not None:
+                return
             self.image_label.setPixmap(QPixmap())
             self.image_label.setText(
                 '<div style="font-size:30px">📄</div>'
@@ -1501,6 +1518,7 @@ class MainWindow(QMainWindow):
             return
         pm = QPixmap(png)
         self._cur_pixmap = pm if not pm.isNull() else None
+        self._preview_provisional = False  # 高清已到，不再是占位
         self._preview_hinted = True  # 首次预览已成功，之后不再提「唤起 PowerPoint」
         self._update_pixmap()
 

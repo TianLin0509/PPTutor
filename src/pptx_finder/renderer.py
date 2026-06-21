@@ -64,6 +64,40 @@ def _get_app():
     return app
 
 
+def _open_pres(app, path: str, cache_key: str):
+    """复用上次打开的 Presentation：同文件同内容直接返回，免重复 Open（翻页 / 多次预览
+    同一稿，最耗时的就是 Open，大稿尤甚）；换文件或文件已变（cache_key 含 mtime+size）
+    则关旧开新。ReadOnly 打开不锁文件写入（实测），不影响恢复/导出覆盖该文件。"""
+    if (getattr(_state, "pres", None) is not None
+            and getattr(_state, "pres_path", None) == path
+            and getattr(_state, "pres_key", None) == cache_key):
+        return _state.pres
+    _close_pres()
+    pres = app.Presentations.Open(path, ReadOnly=1, WithWindow=0)
+    _state.pres = pres
+    _state.pres_path = path
+    _state.pres_key = cache_key
+    try:
+        sw = float(pres.PageSetup.SlideWidth)
+        sh = float(pres.PageSetup.SlideHeight)
+        _state.pres_ratio = sh / sw if sw else 9 / 16
+    except Exception:  # noqa: BLE001
+        _state.pres_ratio = 9 / 16
+    return pres
+
+
+def _close_pres():
+    pres = getattr(_state, "pres", None)
+    if pres is not None:
+        try:
+            pres.Close()
+        except Exception:  # noqa: BLE001
+            pass
+    _state.pres = None
+    _state.pres_path = None
+    _state.pres_key = None
+
+
 def default_cache_key(path: str) -> str | None:
     """以 路径+mtime+size 派生缓存键；文件变了就换新键、自动失效旧图。"""
     try:
@@ -99,37 +133,27 @@ def render_page(
         return None
 
     with _com_slot(hi_priority):  # COM 串行单槽（预览优先抢占缩略图）
-        pres = None
         try:
             app = _get_app()
-            pres = app.Presentations.Open(path, ReadOnly=1, WithWindow=0)
+            pres = _open_pres(app, path, cache_key)  # 复用已打开的同文件，免重复 Open
             if page_no < 1 or page_no > int(pres.Slides.Count):
                 return None
-            # 按 slide 实际宽高比算输出像素，避免非 16:9 被拉伸
-            try:
-                sw = float(pres.PageSetup.SlideWidth)
-                sh = float(pres.PageSetup.SlideHeight)
-                ratio = sh / sw if sw else 9 / 16
-            except Exception:  # noqa: BLE001
-                ratio = 9 / 16
+            # 按 slide 实际宽高比算输出像素（宽高比随 pres 缓存，避免每页重取）
             width = long_edge
-            height = max(1, int(round(width * ratio)))
+            height = max(1, int(round(width * getattr(_state, "pres_ratio", 9 / 16))))
             pres.Slides(page_no).Export(str(out), "PNG", width, height)
             return out if (out.exists() and out.stat().st_size > 0) else None
         except Exception as e:  # noqa: BLE001
             log.warning("render_page failed path=%s page=%s: %s", path, page_no, e)
-            _state.app = None  # 丢弃可能已损坏的 COM 实例，下次重建干净实例
+            _close_pres()       # 关掉可能损坏的 pres
+            _state.app = None   # 丢弃可能已损坏的 COM 实例，下次重建干净实例
             return None
-        finally:
-            if pres is not None:
-                try:
-                    pres.Close()
-                except Exception as e:  # noqa: BLE001
-                    log.debug("pres.Close failed: %s", e)
+        # 不再每次 Close——保持打开供同文件翻页复用（shutdown 统一关）
 
 
 def shutdown() -> None:
     """退出 PowerPoint 实例并释放 COM。应用退出 / 渲染线程结束时调用。"""
+    _close_pres()  # 关掉保持打开的 Presentation
     app = getattr(_state, "app", None)
     if app is None:
         return

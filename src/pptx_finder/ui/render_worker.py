@@ -11,6 +11,7 @@ from PySide6.QtCore import QThread, Signal
 from .. import renderer
 
 _STOP = object()
+_WARM = object()  # 预热哨兵：后台静默启动 PowerPoint COM
 
 
 class RenderWorker(QThread):
@@ -26,13 +27,23 @@ class RenderWorker(QThread):
     def stop(self) -> None:
         self._q.put(_STOP)
 
+    def prewarm(self) -> None:
+        """请求后台静默预热 PowerPoint COM（启动后调），让用户首次预览不卡在冷启动(~1.5s)。"""
+        self._q.put(_WARM)
+
     def run(self) -> None:
         try:
             while True:
                 item = self._q.get()
                 if item is _STOP:
                     break
-                # 抽干队列，只保留最后一个请求
+                if item is _WARM:
+                    try:
+                        renderer._get_app()  # 后台静默拉起 PowerPoint，首次预览免冷启动
+                    except Exception:  # noqa: BLE001
+                        pass
+                    continue
+                # 抽干队列，只保留最后一个渲染请求（warm 跳过，stop 立即退）
                 while True:
                     try:
                         nxt = self._q.get_nowait()
@@ -40,6 +51,8 @@ class RenderWorker(QThread):
                         break
                     if nxt is _STOP:
                         return
+                    if nxt is _WARM:
+                        continue
                     item = nxt
                 req_id, path, page_no, key = item
                 # hi_priority：预览抢占共享 COM 锁，不被一屏缩略图渲染拖在后面排队
