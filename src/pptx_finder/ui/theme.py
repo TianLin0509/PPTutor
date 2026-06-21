@@ -98,6 +98,9 @@ QLabel#gtDot { color: $acc; font-size: 12px; background: transparent; }
 QLabel#gtName { color: $ink1; font-size: 13px; font-weight: 700; background: transparent; }
 QLabel#gtVer { color: $ink3; font-size: 11px; background: transparent; }
 QLabel#gtTheme { color: $ink3; font-size: 12px; background: transparent; }
+QPushButton#updateChip { background: $acc; color: #FFFFFF; border: none; border-radius: 9px; padding: 3px 11px; font-size: 11px; font-weight: 600; }
+QPushButton#updateChip:hover { background: $acc; }
+QPushButton#updateChip:disabled { background: rgba($hl_r,$hl_g,$hl_b,0.45); color: $ink3; }
 QPushButton#winMin, QPushButton#winMax, QPushButton#winClose { background: transparent; border: none; color: $ink2; font-size: 13px; }
 QPushButton#winMin:hover, QPushButton#winMax:hover { background: rgba($hl_r,$hl_g,$hl_b,0.35); color: $ink1; }
 QPushButton#winClose:hover { background: #E81123; color: #FFFFFF; }
@@ -111,6 +114,7 @@ QLineEdit#searchBox {
   padding: 0 12px; font-size: 15px; color: $ink1; selection-background-color: $acc;
 }
 QLineEdit#searchBox:focus { border-color: $acc; }
+QLabel#queryHint { color: $ink3; font-size: 11.5px; background: transparent; padding: 5px 4px 0 40px; }
 
 /* 模式下拉 */
 QComboBox {

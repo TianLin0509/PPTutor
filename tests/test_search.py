@@ -57,6 +57,17 @@ def test_filename_hit(tmp_path):
     assert res[0].name_hit is True
 
 
+def test_filename_search_uses_normalized_name_index(tmp_path):
+    conn, _ = _build(tmp_path, {"軟體開發.pptx": ["内容无关"]})
+
+    row = conn.execute("SELECT name_norm FROM files WHERE name='軟體開發.pptx'").fetchone()
+    assert row["name_norm"].startswith("软体开发")
+    assert conn.execute("SELECT COUNT(*) FROM file_names_fts").fetchone()[0] == 1
+    res = search.search(conn, "软体")
+    assert len(res) == 1
+    assert res[0].name_hit is True
+
+
 def test_ranking_recency(tmp_path):
     """内容相同时，修改时间更新的排前。"""
     conn, docs = _build(tmp_path, {

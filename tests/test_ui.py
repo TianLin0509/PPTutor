@@ -1,6 +1,8 @@
 """UI 集成测试：搜索→结果→选中→预览请求命中页（注入 stub 渲染器，免 COM）。"""
 from __future__ import annotations
 
+import time
+
 from PySide6.QtCore import QObject, Qt, Signal
 
 import fixtures_gen as fx
@@ -61,6 +63,39 @@ def test_search_select_preview(qtbot, tmp_path):
     assert stub.calls[-1][2] == 2
     # 渲染回空串 → 显示兜底文案
     assert "无法预览" in win.image_label.text()
+
+
+def test_query_hint_explains_current_search(qtbot, tmp_path):
+    conn = _index(tmp_path)
+    win = MainWindow(conn=conn, render_worker=StubRender(), do_index=False)
+    qtbot.addWidget(win)
+
+    win.search_box.setText('"昇腾" 集群')
+    win._do_search()
+
+    assert not win.query_hint.isHidden()
+    assert "精确短语：昇腾" in win.query_hint.text()
+    assert "同页包含：集群" in win.query_hint.text()
+    assert "多条件为 AND" in win.query_hint.text()
+
+
+def test_heavy_background_operations_are_gated(qtbot, tmp_path):
+    conn = _index(tmp_path)
+    win = MainWindow(conn=conn, render_worker=StubRender(), do_index=False)
+    qtbot.addWidget(win)
+    calls: list[str] = []
+
+    def slow():
+        calls.append("first")
+        time.sleep(0.2)
+        return True
+
+    win._run_bg(slow, label="open")
+    qtbot.waitUntil(lambda: win._active_heavy_op == "open", timeout=1000)
+    win._run_bg(lambda: calls.append("second"), label="restore")
+
+    assert "second" not in calls
+    qtbot.waitUntil(lambda: win._active_heavy_op is None, timeout=3000)
 
 
 def test_filename_mode_and_multi_term(qtbot, tmp_path):

@@ -115,16 +115,28 @@ def search(conn: sqlite3.Connection, query: str, scope: str | None = None,
     # 字级召回 + 原文验证（精度） + 多词（同页优先，无则放宽同文件）
     content = _recall(conn, terms + phrases)
 
-    # 文件名命中：name 归一化后包含所有普通词（AND）。
-    # 在 Python 侧做「归一化 + 字面子串」而非 SQL LIKE——① name 也归一化（NFKC 全半角 +
-    # OpenCC 繁→简），修「软件搜不到 軟體開發.pptx」；② 字面 in 匹配，% _ 不再当通配符误命中。
+    # 文件名命中：索引期维护 name_norm + file_names_fts。查询先走 FTS 收窄候选，再用
+    # name_norm 字面子串做最终验证，避免每次搜索都把 files 全表拉到 Python 逐行 normalize。
     name_hits: set[int] = set()
     nterms = [normalize(t) for t in (terms + phrases) if t.strip()]
     if nterms:
-        for r in conn.execute("SELECT id, name FROM files"):
-            nm = normalize(r["name"])
-            if all(t in nm for t in nterms):
-                name_hits.add(r["id"])
+        clauses = [c for c in (char_match(t) for t in (terms + phrases)) if c]
+        if clauses:
+            match = " AND ".join(clauses)
+            try:
+                cands = [r["file_id"] for r in conn.execute(
+                    "SELECT file_id FROM file_names_fts WHERE file_names_fts MATCH ?",
+                    (match,),
+                )]
+            except sqlite3.OperationalError as e:
+                log.warning("filename fts match failed %r: %s", match, e)
+                cands = []
+            if cands:
+                qmarks = ",".join("?" * len(cands))
+                for r in conn.execute(f"SELECT id, name, name_norm FROM files WHERE id IN ({qmarks})", tuple(cands)):
+                    nm = r["name_norm"] or normalize(r["name"])
+                    if all(t in nm for t in nterms):
+                        name_hits.add(r["id"])
 
     file_ids = set(content) | name_hits
     if not file_ids:

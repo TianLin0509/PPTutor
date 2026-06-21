@@ -12,6 +12,7 @@ import logging
 import os
 
 import sys
+import time
 
 from PySide6.QtCore import QEvent, QMimeData, QPropertyAnimation, Qt, QStringListModel, QTimer, QUrl
 from PySide6.QtGui import QColor, QCursor, QIcon, QPainter, QPen, QPixmap
@@ -28,19 +29,24 @@ try:
 except Exception:  # noqa: BLE001
     _WIN = False
 
-from .. import actions, db, history, search as search_mod
-from ..config import GLOBAL_HOTKEY, data_dir, db_path as cfg_db_path, is_first_run, mark_welcomed
+from .. import actions, db, history, search as search_mod, updater, __version__
+from ..config import (
+    GLOBAL_HOTKEY, data_dir, db_path as cfg_db_path, is_first_run, mark_welcomed, update_base_url,
+)
 from ..models import FileResult
+from ..query_explain import explain_query, suggestion_keys
 from . import theme
 from .bg_task import BackgroundTask
 from .index_worker import IndexWorker
 from .live_indexer import LiveIndexer
 from .render_worker import RenderWorker
+from .search_worker import SearchWorker
 from .thumb_worker import ThumbWorker
 from .detail_panel import DetailPanel
 from .facet_panel import FacetPanel
 from .aurora_bg import AuroraCentral
 from .dashboard_view import DashboardView
+from .update_ui import UpdateController
 
 _log = logging.getLogger(__name__)
 
@@ -141,16 +147,17 @@ def _elide_middle(s: str, maxlen: int = 72) -> str:
     return s[:head] + "…" + s[-tail:]
 
 
+def _mode_key_from_text(mode: str) -> str:
+    if mode in {"filename", "仅文件名"} or "文件名" in mode:
+        return "filename"
+    if mode in {"content", "仅内容"} or "内容" in mode:
+        return "content"
+    return "all"
+
+
 def _empty_suggestions(query: str, mode: str) -> list[str]:
-    """零结果时适用的补救建议 key：去引号 / 减词 / 改搜文件名。"""
-    s = []
-    if any(q in query for q in ('"', '“', '”')):
-        s.append("unquote")
-    if len(query.split()) > 1:
-        s.append("fewer")
-    if mode != "仅文件名":
-        s.append("filename")
-    return s
+    """零结果时适用的补救建议 key；保留给测试和旧调用，实际逻辑走 query_explain。"""
+    return suggestion_keys(query, _mode_key_from_text(mode))
 
 
 def _sort_results(results: list, key: str) -> list:
@@ -359,7 +366,7 @@ class MainWindow(QMainWindow):
     def __init__(self, conn=None, render_worker=None, thumb_worker=None, version_mgr=None,
                  do_index=True, roots: list[str] | None = None, workers: int | None = None):
         super().__init__()
-        self.setWindowTitle("PPTutor · PPT 查询助手   v0.8.3")
+        self.setWindowTitle(f"PPTutor · PPT 查询助手   v{__version__}")
         self.setWindowIcon(QIcon(_asset_path("logo.png")))  # 窗口标题/任务栏图标
         self.resize(1180, 760)
         self._title_h = 40  # 自绘玻璃标题栏高度（nativeEvent 拖动区/缩放边判定用）
@@ -375,10 +382,14 @@ class MainWindow(QMainWindow):
         self._results_raw: list[FileResult] = []  # 排序前原始序（relevance 基准）
         self._render_gen = 0  # 流式渲染代记：每次新渲染 +1，作废上一批仍在流入的分批
         self._bg_tasks: list[BackgroundTask] = []  # 在跑的后台一次性任务（防 GC + 收尾等待）
+        self._active_heavy_op: str | None = None
         self._closing = False  # 关窗中：后台任务回调不再碰 UI（防触达已销毁控件）
         self._showing_recent = False  # 当前是否为「空查询默认视图（最近文件）」
         self._cur: FileResult | None = None
         self._cur_item_widget: ResultItem | None = None
+        self._search_seq = 0
+        self._search_worker: SearchWorker | None = None
+        self._async_search = conn is None and do_index
         self._hit_idx = 0
         self._view_page = 1  # 当前预览页（原始页序，滚轮可脱离命中页自由翻）
         self._req_id = 0
@@ -422,6 +433,10 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._apply_theme(self._theme, persist=False)
+        if self._async_search:
+            self._search_worker = SearchWorker(self._db_path, self)
+            self._search_worker.searched.connect(self._on_search_done)
+            self._search_worker.start()
 
         self._indexer: IndexWorker | None = None
         # 实时索引后台线程：保存事件不在主线程 parse/写库（防 UI 冻结）。
@@ -440,6 +455,12 @@ class MainWindow(QMainWindow):
         self._show_recent()  # 启动即列最近文件（① 默认视图，无需先输入再清空）
         self._welcome = None  # 首次欢迎覆盖层（app.py 在 show 后调 maybe_show_welcome）
         self._enable_native_frame()  # 无边框窗口恢复系统缩放/Snap/最大化/Win11 圆角
+        # 增量自动更新：仅打包态后台静默检查；发现新版在标题栏给非模态 chip。dev/测试不联网不打扰
+        self._updater = None
+        if do_index and updater.is_frozen():
+            self._updater = UpdateController(
+                self.update_chip, update_base_url(), self.force_quit, self)
+            QTimer.singleShot(4000, self._updater.start_check)
 
     # ---------- UI ----------
     def _build_ui(self) -> None:
@@ -511,6 +532,11 @@ class MainWindow(QMainWindow):
         self._detail_dot.setAttribute(Qt.WA_TransparentForMouseEvents)
         self._detail_dot.hide()
         tl.addLayout(bar)
+        self.query_hint = QLabel("")
+        self.query_hint.setObjectName("queryHint")
+        self.query_hint.setWordWrap(True)
+        self.query_hint.hide()
+        tl.addWidget(self.query_hint)
         root.addWidget(top)
 
         split = QSplitter(Qt.Horizontal)
@@ -709,14 +735,19 @@ class MainWindow(QMainWindow):
         dot.setObjectName("gtDot")
         name = QLabel("PPTutor")
         name.setObjectName("gtName")
-        ver = QLabel("v0.8.3")
+        ver = QLabel(f"v{__version__}")
         ver.setObjectName("gtVer")
         self.gt_theme = QLabel(dict(theme.THEMES).get(self._theme, self._theme))
         self.gt_theme.setObjectName("gtTheme")
+        self.update_chip = QPushButton("")  # 增量更新 chip：发现新版才显示，非模态、不打断搜索
+        self.update_chip.setObjectName("updateChip")
+        self.update_chip.setCursor(Qt.PointingHandCursor)
+        self.update_chip.hide()
         l.addWidget(dot)
         l.addWidget(name)
         l.addWidget(ver)
         l.addWidget(self.gt_theme)
+        l.addWidget(self.update_chip)
         l.addStretch(1)
         for txt, slot, oid, tip in (("–", self.showMinimized, "winMin", "最小化"),
                                     ("□", self._win_toggle_max, "winMax", "最大化 / 还原"),
@@ -903,24 +934,68 @@ class MainWindow(QMainWindow):
     def _refresh_history_model(self) -> None:
         self._history_model.setStringList(history.load_history(limit=10))
 
+    def _mode_key(self) -> str:
+        return {1: "filename", 2: "content"}.get(self.mode.currentIndex(), "all")
+
+    def _update_query_hint(self, query: str) -> None:
+        if not query:
+            self.query_hint.hide()
+            self.query_hint.setText("")
+            return
+        self.query_hint.setText(explain_query(query, self._mode_key()).summary)
+        self.query_hint.show()
+
     def _do_search(self) -> None:
         query = self.search_box.text().strip()
+        self._search_seq += 1
+        self._update_query_hint(query)
         if not query:
             self._show_recent()
             return
         self._showing_recent = False
         self._show_list()  # 有搜索词 → 显示结果列表区（隐藏仪表盘首屏）
-        results = search_mod.search(self._conn, query)
-        m = self.mode.currentText()
-        if m == "仅文件名":
-            results = [r for r in results if r.name_hit]
-        elif m == "仅内容":
-            results = [r for r in results if r.hits]
+        if self._search_worker is not None:
+            self._show_search_pending(query)
+            self._search_worker.request(self._search_seq, query, self._mode_key())
+            return
+        started = time.perf_counter()
+        results = SearchWorker._apply_mode(search_mod.search(self._conn, query), self._mode_key())
+        self._finish_search(query, results, (time.perf_counter() - started) * 1000)
+
+    def _show_search_pending(self, query: str) -> None:
+        self._results_raw = []
+        self._results = []
+        self._cur = None
+        self.result_list.clear()
+        self._hide_empty_hint()
+        self.result_count.setText("搜索中…")
+        self.list_head.show()
+        self._update_preview_header(None)
+        self._set_ops_enabled(False)
+        self.status_label.setText(f"正在搜索「{query}」…")
+
+    def _on_search_done(self, req_id: int, query: str, results: object, elapsed_ms: float, error: object) -> None:
+        if self._closing or req_id != self._search_seq or query != self.search_box.text().strip():
+            return
+        if error:
+            self._results_raw = []
+            self._results = []
+            self.result_list.clear()
+            self.list_head.hide()
+            self._update_preview_header(None)
+            self._set_ops_enabled(False)
+            self.status_label.setText(f"搜索失败：{error}")
+            self._show_empty_hint(query)
+            return
+        self._finish_search(query, list(results or []), elapsed_ms)
+
+    def _finish_search(self, query: str, results: list[FileResult], elapsed_ms: float | None = None) -> None:
         self._results_raw = results
         self._refresh_facets()
         self._apply_sort_render()
         if results:
-            self.result_count.setText(f"命中 {len(results)} 个文件")
+            suffix = f" · {elapsed_ms:.0f} ms" if elapsed_ms is not None else ""
+            self.result_count.setText(f"命中 {len(results)} 个文件{suffix}")
             self.list_head.show()
             self._select_first()
         else:
@@ -931,6 +1006,7 @@ class MainWindow(QMainWindow):
 
     def _show_recent(self) -> None:
         """空查询默认视图：仪表盘首屏 + 备好「最近文件」结果（切回搜索即用）。"""
+        self.query_hint.hide()
         recents = db.recent_files(self._conn, limit=20)
         self._results_raw = recents
         self._cur = None
@@ -973,7 +1049,12 @@ class MainWindow(QMainWindow):
         self._empty_tip.setAlignment(Qt.AlignCenter)
         v.addWidget(self._empty_tip)
         self._sugg_btns: dict[str, QPushButton] = {}
-        for key, text in (("unquote", "去掉引号再搜"), ("fewer", "只用第一个词"), ("filename", "改搜文件名")):
+        for key, text in (
+            ("unquote", "去掉引号再搜"),
+            ("fewer", "只用第一个词"),
+            ("allmode", "恢复全部范围"),
+            ("filename", "改搜文件名"),
+        ):
             b = QPushButton(text)
             b.setObjectName("suggBtn")
             b.clicked.connect(lambda _=False, k=key: self._apply_suggestion(k))
@@ -988,7 +1069,7 @@ class MainWindow(QMainWindow):
         self._empty_icon.setText("🔍")
         self._empty_tip.setText("换个说法试试")
         self._empty_query_label.setText(f"没找到「{query}」")
-        sugg = _empty_suggestions(query, self.mode.currentText())
+        sugg = suggestion_keys(query, self._mode_key())
         for key, btn in self._sugg_btns.items():
             btn.setVisible(key in sugg)
         self.empty_hint.show()
@@ -1020,6 +1101,8 @@ class MainWindow(QMainWindow):
                 self.search_box.setText(parts[0])
         elif key == "filename":
             self.mode.setCurrentText("仅文件名")
+        elif key == "allmode":
+            self.mode.setCurrentIndex(0)
         self._do_search()
 
     def _sort_key(self) -> str:
@@ -1302,6 +1385,13 @@ class MainWindow(QMainWindow):
 
     def _run_bg(self, fn, on_done=None, label: str = "") -> None:
         """把可能阻塞 UI 的重活丢后台线程跑，完成经信号回主线程。主线程只 start() 即返回。"""
+        heavy = label in {"restore", "export", "open"}
+        if heavy and self._active_heavy_op is not None:
+            self._toast("已有文件操作正在进行，请稍候…")
+            return
+        if heavy:
+            self._active_heavy_op = label
+            self._set_ops_enabled(False)
         task = BackgroundTask(fn, label)
         self._bg_tasks.append(task)
 
@@ -1316,8 +1406,16 @@ class MainWindow(QMainWindow):
                 except RuntimeError:
                     pass
 
+        def _cleanup():
+            if task in self._bg_tasks:
+                self._bg_tasks.remove(task)
+            if heavy and self._active_heavy_op == label:
+                self._active_heavy_op = None
+                if not self._closing:
+                    self._set_ops_enabled(self._cur is not None)
+
         task.done.connect(_safe_done)
-        task.finished.connect(lambda: self._bg_tasks.remove(task) if task in self._bg_tasks else None)
+        task.finished.connect(_cleanup)
         task.start()
 
     def _act_restore_version(self, path: str, version_id: str) -> None:
@@ -1659,10 +1757,19 @@ class MainWindow(QMainWindow):
         if not os.path.exists(self._cur.path):
             self._toast("文件已移动或删除")
             return
-        mime = QMimeData()
-        mime.setUrls([QUrl.fromLocalFile(self._cur.path)])
-        QApplication.clipboard().setMimeData(mime)
-        self._toast("已复制文件到剪贴板，可粘贴到邮件 / 聊天")
+        cb = QApplication.clipboard()
+        ok = False
+        for _ in range(4):
+            mime = QMimeData()
+            mime.setUrls([QUrl.fromLocalFile(self._cur.path)])
+            cb.setMimeData(mime)
+            QApplication.processEvents()
+            md = cb.mimeData()
+            if md.hasUrls() and any(u.toLocalFile() == self._cur.path for u in md.urls()):
+                ok = True
+                break
+            time.sleep(0.05)
+        self._toast("已复制文件到剪贴板，可粘贴到邮件 / 聊天" if ok else "剪贴板暂时不可用，请稍后重试")
 
     def _act_goto(self) -> None:
         if not self._cur:
@@ -1944,6 +2051,17 @@ class MainWindow(QMainWindow):
             self.status_label.setText(f"数据库读取异常：{e}")
 
     # ---------- 生命周期 ----------
+    def force_quit(self) -> None:
+        """真正退出（绕过托盘最小化），让更新 helper 接管文件替换 + 重启。
+
+        close() 触发 _shutdown() 正常收尾线程并释放 PowerPoint COM/文件句柄，
+        随后 QApplication.quit() 确保进程退出（即使托盘图标驻留），helper 的
+        Wait-Process 才会返回、继续替换。
+        """
+        self._to_tray_on_close = False
+        self.close()
+        QApplication.quit()
+
     def closeEvent(self, e):  # noqa: N802
         if self._to_tray_on_close:
             e.ignore()
@@ -1955,6 +2073,9 @@ class MainWindow(QMainWindow):
     def _shutdown(self) -> None:
         self._closing = True   # 后台任务回调即刻停止碰 UI
         self._render_gen += 1  # 作废仍在流入的分批渲染，回调触达已销毁控件前先止住
+        if self._search_worker is not None:
+            self._search_worker.stop()
+            self._search_worker.wait(3000)
         for t in list(self._bg_tasks):  # 等后台一次性任务收尾（恢复/导出/打开）
             t.wait(3000)
         if self._live is not None:

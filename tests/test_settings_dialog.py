@@ -22,3 +22,6 @@ def test_settings_builds_with_autostart_toggle(qtbot, mgr):
     qtbot.addWidget(dlg)
     assert dlg.auto is not None          # 自启开关存在
     assert "守护" in dlg.stat.text()       # 显示已守护文件数
+    assert dlg.tabs.count() == 3
+    assert "data_dir:" in dlg.diagnostic_text.toPlainText()
+    assert "index:" in dlg.diagnostic_text.toPlainText()

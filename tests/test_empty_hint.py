@@ -19,8 +19,8 @@ def test_suggestions_switch_filename():
     assert "filename" not in _empty_suggestions("xyz", "仅文件名")
 
 
-def test_suggestions_single_plain_in_filename_mode_is_empty():
-    assert _empty_suggestions("xyz", "仅文件名") == []
+def test_suggestions_single_plain_in_filename_mode_can_restore_all_scope():
+    assert _empty_suggestions("xyz", "仅文件名") == ["allmode"]
 
 
 def test_zero_result_shows_hint(qtbot, tmp_path):

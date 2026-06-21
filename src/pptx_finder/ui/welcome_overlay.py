@@ -8,7 +8,7 @@ from __future__ import annotations
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
-    QGridLayout, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget,
+    QGridLayout, QHBoxLayout, QLabel, QPushButton, QSizePolicy, QVBoxLayout, QWidget,
 )
 
 from . import theme
@@ -94,18 +94,24 @@ class WelcomeOverlay(QWidget):
         st.setAlignment(Qt.AlignCenter)
         cl.addSpacing(20)
         cl.addWidget(st)
-        sw = QHBoxLayout()
+        # 10 主题分两行网格（5×2）：单行 HBox 在窄窗口会把 chip 挤到文字重叠
+        sw = QGridLayout()
         sw.setSpacing(8)
-        sw.setAlignment(Qt.AlignCenter)
+        sw.setContentsMargins(0, 0, 0, 0)
+        per_row = 5
+        for c in range(per_row):
+            sw.setColumnStretch(c, 1)  # 等宽列，chip 均匀铺满不挤
         self._theme_btns: dict[str, QPushButton] = {}
-        for name, label in theme.THEMES:
+        for i, (name, label) in enumerate(theme.THEMES):
             b = QPushButton(label)
             b.setObjectName("wSwatch")
             b.setCheckable(True)
             b.setChecked(name == self._theme)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             b.clicked.connect(lambda _=False, n=name: self._pick(n))
             self._theme_btns[name] = b
-            sw.addWidget(b)
+            sw.addWidget(b, i // per_row, i % per_row)
         cl.addSpacing(10)
         cl.addLayout(sw)
 
@@ -172,7 +178,7 @@ class WelcomeOverlay(QWidget):
         #wProgress {{ font-size: 13px; color: {t['ink2']}; }}
         #wStyleHint {{ font-size: 11px; color: {t['ink4']}; }}
         #wSwatch {{ background: {t['field']}; border: 1px solid {t['bd']}; border-radius: 8px;
-                    padding: 6px 12px; color: {t['ink3']}; font-size: 12px; }}
+                    padding: 6px 10px; color: {t['ink3']}; font-size: 12px; min-width: 44px; }}
         #wSwatch:checked {{ border-color: {t['acc']}; color: {t['acc']};
                             background: rgba({t['hl_r']},{t['hl_g']},{t['hl_b']},0.14); }}
         #wStart {{ background: {t['acc']}; border: 1px solid {t['acc']}; border-radius: 10px;

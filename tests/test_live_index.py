@@ -7,6 +7,7 @@ from test_ui import StubRender, _index
 from pptx_finder import db, indexer, search
 from pptx_finder.ui.live_indexer import LiveIndexer
 from pptx_finder.ui.main_window import MainWindow
+from pptx_finder.ui.thumb_worker import ThumbWorker
 
 
 def test_index_single_adds_without_deleting(tmp_path):
@@ -80,3 +81,20 @@ def test_live_indexer_async_off_main_thread(qtbot, tmp_path):
 
     conn2 = db.connect(dbp)  # 新连接读后台已提交的数据
     assert any("异步LT" in r.name for r in search.search(conn2, "异步索引内容ABC"))
+
+
+def test_live_indexer_coalesces_duplicate_paths(tmp_path):
+    li = LiveIndexer(str(tmp_path / "i.db"))
+    p = str(tmp_path / "same.pptx")
+    li.submit(p)
+    li.submit(p)
+    assert li._q.qsize() == 1
+
+
+def test_thumb_worker_coalesces_duplicate_requests():
+    tw = ThumbWorker()
+    tw.request("a.pptx", 1)
+    tw.request("a.pptx", 1)
+    tw.request("a.pptx", 2)
+    assert tw._q.qsize() == 2
+    tw.clear()

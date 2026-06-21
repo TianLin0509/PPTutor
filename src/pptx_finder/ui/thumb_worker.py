@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import queue
+import threading
 
 from PySide6.QtCore import QThread, Signal
 
@@ -21,9 +22,16 @@ class ThumbWorker(QThread):
         super().__init__(parent)
         self._q: queue.Queue = queue.Queue()
         self._long_edge = long_edge
+        self._queued: set[tuple[str, int]] = set()
+        self._lock = threading.Lock()
 
     def request(self, path: str, page_no: int) -> None:
-        self._q.put((path, page_no))
+        key = (path, page_no)
+        with self._lock:
+            if key in self._queued:
+                return
+            self._queued.add(key)
+        self._q.put(key)
 
     def clear(self) -> None:
         """丢弃尚未处理的请求（切换搜索时调用）。"""
@@ -33,6 +41,8 @@ class ThumbWorker(QThread):
                 if item is _STOP:  # 保留停止信号
                     self._q.put(_STOP)
                     break
+                with self._lock:
+                    self._queued.discard(item)
         except queue.Empty:
             pass
 
@@ -46,6 +56,8 @@ class ThumbWorker(QThread):
                 if item is _STOP:
                     break
                 path, page_no = item
+                with self._lock:
+                    self._queued.discard((path, page_no))
                 png = renderer.render_page(path, page_no, long_edge=self._long_edge)
                 self.thumb_rendered.emit(path, page_no, str(png) if png else "")
         finally:

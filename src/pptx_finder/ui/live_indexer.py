@@ -28,11 +28,18 @@ class LiveIndexer(QThread):
         self._db_path = db_path
         self._q: queue.Queue = queue.Queue()
         self._stop = threading.Event()
+        self._queued: set[str] = set()
+        self._lock = threading.Lock()
 
     def submit(self, path: str) -> None:
         """主线程调用：仅入队，立即返回（不阻塞 UI）。"""
-        if not self._stop.is_set():
-            self._q.put(path)
+        if self._stop.is_set():
+            return
+        with self._lock:
+            if path in self._queued:
+                return
+            self._queued.add(path)
+        self._q.put(path)
 
     def stop(self) -> None:
         self._stop.set()
@@ -45,6 +52,8 @@ class LiveIndexer(QThread):
                 item = self._q.get()
                 if item is _STOP or self._stop.is_set():
                     break
+                with self._lock:
+                    self._queued.discard(item)
                 try:
                     if indexer.index_single(conn, item):
                         self.indexed.emit(item)

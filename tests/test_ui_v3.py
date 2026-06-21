@@ -4,6 +4,8 @@ from __future__ import annotations
 import datetime
 
 from PySide6.QtCore import QObject, Signal
+from PySide6.QtWidgets import QApplication
+import pytest
 
 import fixtures_gen as fx
 
@@ -65,8 +67,17 @@ def test_size_propagates_to_result(tmp_path):
 
 
 # ---- 复制文件到剪贴板（CF_HDROP / urls）----
+def _clipboard_available() -> bool:
+    cb = QApplication.clipboard()
+    token = "pptutor-clipboard-probe"
+    cb.setText(token)
+    QApplication.processEvents()
+    return cb.text() == token
+
+
 def test_copy_to_clipboard_sets_file_url(qtbot, tmp_path):
-    from PySide6.QtWidgets import QApplication
+    if not _clipboard_available():
+        pytest.skip("Windows clipboard is currently locked by another process")
     conn = _mk(tmp_path)
     win = MainWindow(conn=conn, render_worker=_Stub(), do_index=False)
     qtbot.addWidget(win)

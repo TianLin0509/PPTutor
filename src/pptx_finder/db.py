@@ -8,6 +8,8 @@ import logging
 import sqlite3
 from pathlib import Path
 
+from .text_tokenize import normalize, tokenize
+
 log = logging.getLogger(__name__)
 
 # 索引格式版本：分词器/切词规则改版即与旧库不兼容（如词级 jieba → 字级），
@@ -21,6 +23,7 @@ CREATE TABLE IF NOT EXISTS files(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   path TEXT UNIQUE NOT NULL,
   name TEXT NOT NULL,
+  name_norm TEXT DEFAULT '',
   ext TEXT NOT NULL,
   size INTEGER NOT NULL,
   mtime REAL NOT NULL,
@@ -31,6 +34,10 @@ CREATE TABLE IF NOT EXISTS files(
   indexed_at REAL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_files_name ON files(name);
+CREATE INDEX IF NOT EXISTS idx_files_name_norm ON files(name_norm);
+CREATE VIRTUAL TABLE IF NOT EXISTS file_names_fts USING fts5(
+  content, file_id UNINDEXED
+);
 CREATE VIRTUAL TABLE IF NOT EXISTS pages_fts USING fts5(
   content, file_id UNINDEXED, page_no UNINDEXED
 );
@@ -61,8 +68,32 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    _ensure_filename_index(conn)
     _migrate_index_version(conn)
     conn.commit()
+
+
+def _ensure_filename_index(conn: sqlite3.Connection) -> None:
+    """Add/backfill normalized filename search data without forcing a full rebuild."""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(files)").fetchall()}
+    if "name_norm" not in cols:
+        conn.execute("ALTER TABLE files ADD COLUMN name_norm TEXT DEFAULT ''")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_files_name_norm ON files(name_norm)")
+    conn.execute(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS file_names_fts USING fts5("
+        "content, file_id UNINDEXED)"
+    )
+    rows = conn.execute(
+        "SELECT id, name FROM files WHERE name_norm IS NULL OR name_norm=''"
+    ).fetchall()
+    for r in rows:
+        _update_filename_index(conn, r["id"], r["name"])
+    file_count = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+    fts_count = conn.execute("SELECT COUNT(*) FROM file_names_fts").fetchone()[0]
+    if file_count and fts_count < file_count:
+        conn.execute("DELETE FROM file_names_fts")
+        for r in conn.execute("SELECT id, name FROM files").fetchall():
+            _update_filename_index(conn, r["id"], r["name"])
 
 
 def _migrate_index_version(conn: sqlite3.Connection) -> None:
@@ -78,7 +109,7 @@ def _migrate_index_version(conn: sqlite3.Connection) -> None:
         return
     has_data = conn.execute("SELECT 1 FROM files LIMIT 1").fetchone() is not None
     if has_data:
-        for t in ("files", "pages_fts", "pages_raw", "minhash"):
+        for t in ("files", "file_names_fts", "pages_fts", "pages_raw", "minhash"):
             conn.execute(f"DELETE FROM {t}")
         log.info("索引格式 %s→%s：已清空旧索引，将全量重建", stored, INDEX_VERSION)
     conn.execute(
@@ -111,21 +142,33 @@ def upsert_file(
     error: str,
     indexed_at: float,
 ) -> int:
+    name_norm = normalize(name)
     cur = conn.execute(
         """
-        INSERT INTO files(path,name,ext,size,mtime,content_hash,page_count,status,error,indexed_at)
-        VALUES(:path,:name,:ext,:size,:mtime,:content_hash,:page_count,:status,:error,:indexed_at)
+        INSERT INTO files(path,name,name_norm,ext,size,mtime,content_hash,page_count,status,error,indexed_at)
+        VALUES(:path,:name,:name_norm,:ext,:size,:mtime,:content_hash,:page_count,:status,:error,:indexed_at)
         ON CONFLICT(path) DO UPDATE SET
-          name=excluded.name, ext=excluded.ext, size=excluded.size, mtime=excluded.mtime,
+          name=excluded.name, name_norm=excluded.name_norm, ext=excluded.ext, size=excluded.size, mtime=excluded.mtime,
           content_hash=excluded.content_hash, page_count=excluded.page_count,
           status=excluded.status, error=excluded.error, indexed_at=excluded.indexed_at
         RETURNING id
         """,
-        dict(path=path, name=name, ext=ext, size=size, mtime=mtime,
+        dict(path=path, name=name, name_norm=name_norm, ext=ext, size=size, mtime=mtime,
              content_hash=content_hash, page_count=page_count, status=status,
              error=error, indexed_at=indexed_at),
     )
-    return cur.fetchone()[0]
+    file_id = cur.fetchone()[0]
+    _update_filename_index(conn, file_id, name)
+    return file_id
+
+
+def _update_filename_index(conn: sqlite3.Connection, file_id: int, name: str) -> None:
+    conn.execute("UPDATE files SET name_norm=? WHERE id=?", (normalize(name), file_id))
+    conn.execute("DELETE FROM file_names_fts WHERE file_id=?", (file_id,))
+    conn.execute(
+        "INSERT INTO file_names_fts(content,file_id) VALUES(?,?)",
+        (tokenize(name), file_id),
+    )
 
 
 def replace_pages(conn: sqlite3.Connection, file_id: int, pages: list[tuple[int, str, str]]) -> None:
@@ -157,6 +200,7 @@ def delete_file(conn: sqlite3.Connection, path: str) -> None:
     fid = row["id"]
     conn.execute("DELETE FROM pages_fts WHERE file_id=?", (fid,))
     conn.execute("DELETE FROM pages_raw WHERE file_id=?", (fid,))
+    conn.execute("DELETE FROM file_names_fts WHERE file_id=?", (fid,))
     conn.execute("DELETE FROM minhash WHERE file_id=?", (fid,))
     conn.execute("DELETE FROM files WHERE id=?", (fid,))
 

@@ -83,6 +83,13 @@ MAX_PARSE_SIZE = 200 * 1024 * 1024  # 200MB
 # 全局唤起热键
 GLOBAL_HOTKEY = "Ctrl+Alt+P"
 
+# 增量自动更新：清单 + 内容寻址块的根地址。E2E/灰度可用 PPTX_FINDER_UPDATE_URL 覆盖（如指 localhost）
+_DEFAULT_UPDATE_URL = "https://me.lt-stockpartner.tech/pptutor"
+
+
+def update_base_url() -> str:
+    return os.environ.get("PPTX_FINDER_UPDATE_URL") or _DEFAULT_UPDATE_URL
+
 
 def ext_path(path: str) -> str:
     r"""Windows 上对超长路径(>260)加 \\?\ 前缀，避免 [Errno 22] 打不开。"""
