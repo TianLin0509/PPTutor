@@ -106,3 +106,19 @@ def build_fts_match(query: str) -> str:
     terms, phrases = parse_query(query)
     clauses = [c for c in (char_match(w) for w in terms + phrases) if c]
     return " AND ".join(clauses)
+
+
+def build_fts_match_exact(query: str) -> str:
+    """整个 query → FTS5 MATCH，**不补 trigram**（仅基础 token 相邻短语 = 子串）。
+
+    用于「没有原文验证兜底」的场景（如跨版本历史搜索 version_pages_fts）：trigram 召回
+    本就依赖 search 端原文验证去假阳性，那里无原文可验，用 trigram 会让「2026」误中只含
+    「x202y026」碎片的历史页，故改精确相邻短语匹配。
+    """
+    terms, phrases = parse_query(query)
+    clauses = []
+    for w in terms + phrases:
+        toks = _base_tokens(w)
+        if toks:
+            clauses.append('"' + " ".join(toks) + '"')  # 相邻短语=子串（精确，无 trigram）
+    return " AND ".join(clauses)

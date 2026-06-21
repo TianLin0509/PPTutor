@@ -922,7 +922,7 @@ class MainWindow(QMainWindow):
             self._show_empty_hint(query)
 
     def _show_recent(self) -> None:
-        """空查询默认视图：仪表盘首屏 + 后台仍备好「最近文件」结果（切回搜索即用）。"""
+        """空查询默认视图：仪表盘首屏 + 备好「最近文件」结果（切回搜索即用）。"""
         recents = db.recent_files(self._conn, limit=20)
         self._results_raw = recents
         self._cur = None
@@ -933,7 +933,10 @@ class MainWindow(QMainWindow):
             self._apply_sort_render()
             self.result_count.setText(f"最近修改 · {len(recents)} 个文件")
             self.list_head.show()
-            self._select_first()
+            # 不自动选中/预览首个最近文件——空搜索停在仪表盘、没人在看预览，却会冷启
+            # PowerPoint COM 渲染整页高清预览造成卡顿。预览留到用户真正点选结果时再触发。
+            self._update_preview_header(None)
+            self._set_ops_enabled(False)
         else:
             self.result_list.clear()
             self.list_head.hide()

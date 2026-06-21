@@ -16,7 +16,7 @@ import threading
 
 from ..config import PPTX_EXT
 from ..scanner import iter_ppt_files
-from ..text_tokenize import build_fts_match
+from ..text_tokenize import build_fts_match_exact
 from . import store, vault
 
 SESSION_GAP_SEC = 30 * 60  # 30 分钟内的连续保存算同一编辑会话（时间线折叠用）
@@ -120,9 +120,13 @@ class VersionManager:
 
     # ---------- 跨版本内容搜索 ----------
     def search_history(self, query: str):
-        """返回历史版本命中：[(doc_id, version_id, page_no)]。"""
+        """返回历史版本命中：[(doc_id, version_id, page_no)]。
+
+        用精确匹配（不补 trigram）：version_pages_fts 无原文验证兜底，trigram 会假阳性
+        （搜 2026 误中只含 x202y026 碎片的历史页）。
+        """
         with self._lock:
-            return store.search_versions(self._conn, build_fts_match(query))
+            return store.search_versions(self._conn, build_fts_match_exact(query))
 
     # ---------- 误删 / 改坏找回 ----------
     def scan_deleted(self) -> int:

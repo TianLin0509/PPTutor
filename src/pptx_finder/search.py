@@ -108,10 +108,14 @@ def _recall(conn, words: list[str]) -> dict[int, list[tuple[int, float]]]:
             file_sets.append(fs)
         cross = set.intersection(*file_sets) if file_sets else set()
         for fid in cross:
-            if fid not in content:
-                pg = _first_verified_page(conn, fid, clauses[0], nws[0])
-                if pg is not None:
-                    content[fid] = [(pg, 1000.0)]  # 跨页命中，低相关排后
+            if fid in content:
+                continue
+            # 逐词原文验证：每个词都要在该文件某页真实出现。只验首词会让「rareword 2026」
+            # 误中只有 trigram 碎片（无连续 2026）的文件，且命中与否随词序变化——这里对每个
+            # 词都验真，假阳性被拦下，结果与词序无关。
+            verified = [_first_verified_page(conn, fid, c, nw) for c, nw in zip(clauses, nws)]
+            if all(p is not None for p in verified):
+                content[fid] = [(verified[0], 1000.0)]  # 代表页=首词验证页，低相关排后
     return content
 
 

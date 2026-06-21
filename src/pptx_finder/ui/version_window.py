@@ -129,27 +129,41 @@ class VersionWindow(QWidget):
         return it.data(Qt.UserRole) if it else None
 
     # ---------- 操作 ----------
+    def _doc_path_for_version(self, vid: str) -> str | None:
+        """从版本 id 反查其所属文档的真实路径。
+
+        跨版本搜索的命中可能属于**另一个**文档，绝不能用左侧当前选中文档(_cur_doc)的
+        路径——否则会把 docB 的版本恢复/导出到 docA 的文件上（覆盖错文件，数据安全 bug）。
+        """
+        v = self._mgr.get_version(vid)
+        if not v:
+            return None
+        doc = self._mgr.get_doc(v["doc_id"])
+        return doc["path"] if doc else None
+
     def _restore(self) -> None:
-        if not self._cur_doc:
-            return
         vid = self._sel_version()
         if not vid:
             return
-        _did, path, _ = self._cur_doc
+        path = self._doc_path_for_version(vid)
+        if not path:
+            QMessageBox.warning(self, "恢复", "找不到该版本对应的文档路径")
+            return
         if os.path.exists(path):
-            if QMessageBox.question(self, "恢复", "用此版本覆盖当前文件？\n（当前内容会先自动留一版，不会丢）") != QMessageBox.Yes:
+            if QMessageBox.question(self, "恢复", f"用此版本覆盖：\n{os.path.basename(path)}\n（当前内容会先自动留一版，不会丢）") != QMessageBox.Yes:
                 return
         ok = self._mgr.restore_to(path, vid)
         QMessageBox.information(self, "恢复", "已恢复到该版本" if ok else "恢复失败")
         self._on_doc(self.doc_list.currentItem())
 
     def _export(self) -> None:
-        if not self._cur_doc:
-            return
         vid = self._sel_version()
         if not vid:
             return
-        _did, path, _ = self._cur_doc
+        path = self._doc_path_for_version(vid)
+        if not path:
+            QMessageBox.warning(self, "导出", "找不到该版本对应的文档路径")
+            return
         base = os.path.splitext(os.path.basename(path))[0]
         dest, _f = QFileDialog.getSaveFileName(self, "导出此版本", base + "_导出.pptx", "PowerPoint (*.pptx)")
         if dest:

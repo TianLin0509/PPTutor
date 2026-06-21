@@ -77,6 +77,27 @@ def test_alnum_substring_precision(tmp_path):
     assert "sep.pptx" not in _names(search.search(conn, "gpt4"))
 
 
+# Codex C3 跨页 AND：逐词原文验证，trigram 碎片不假阳性 + 与词序无关
+def test_cross_page_all_words_verified(tmp_path):
+    conn = _build(tmp_path, {
+        "fp.pptx": ["稀有词标记", "x202y026z 片段"],   # 2026 只有 trigram 碎片，无连续 2026
+        "ok.pptx": ["稀有词标记", "发布 2026 版"],       # 真有连续 2026
+    })
+    for q in ("稀有词标记 2026", "2026 稀有词标记"):   # 两种词序都验（修前受词序影响）
+        names = _names(search.search(conn, q))
+        assert "ok.pptx" in names, q          # 真值命中
+        assert "fp.pptx" not in names, q      # 假阳性被逐词验真拦下
+
+
+# Codex C6 跨版本搜索用精确匹配（无 trigram）→ 历史页无原文验证也不假阳性
+def test_build_fts_match_exact_no_trigram():
+    from pptx_finder.text_tokenize import build_fts_match, build_fts_match_exact
+    assert '"202"' in build_fts_match("2026")            # 普通搜含字符 trigram（靠原文验证去假阳）
+    assert '"202"' not in build_fts_match_exact("2026")  # 精确版不含 trigram
+    assert build_fts_match_exact("2026") == '"2026"'     # 仅相邻短语 = 精确子串
+    assert build_fts_match_exact("AI 平台") == '"ai" AND "平 台"'  # 多词 AND，中文逐字相邻
+
+
 # B06 facet 筛到 0：计数不留陈旧值 + 显示空状态提示
 def test_facet_zero_empty_state(qtbot, tmp_path):
     conn = _build(tmp_path, {"甲.pptx": ["通用词内容"], "乙.pptx": ["通用词内容"]})
