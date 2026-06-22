@@ -226,6 +226,16 @@ def recent_files(conn: sqlite3.Connection, limit: int = 20) -> list:
     ]
 
 
+def get_page_text(conn: sqlite3.Connection, file_id: int, page_no: int) -> str:
+    """取某文件某页的原文（pages_raw.raw_text）。无则空串。供「复制本页文字」用，
+    直接读已索引文本，不依赖 PowerPoint COM。"""
+    row = conn.execute(
+        "SELECT raw_text FROM pages_raw WHERE file_id=? AND page_no=?",
+        (file_id, page_no),
+    ).fetchone()
+    return (row["raw_text"] if row and row["raw_text"] else "") or ""
+
+
 def page_titles(conn: sqlite3.Connection, file_id: int, limit: int = 40) -> list:
     """每页首行作大纲标题（近似，用已索引的 raw_text）。返回 [(page_no, title)]。"""
     rows = conn.execute(

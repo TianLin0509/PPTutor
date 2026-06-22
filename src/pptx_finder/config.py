@@ -1,6 +1,7 @@
 """路径、扫描排除规则、常量。"""
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -80,8 +81,56 @@ SUPPORTED_EXTS = (PPTX_EXT, PPT_EXT)
 # 超过此大小跳过解析（仍可文件名命中）
 MAX_PARSE_SIZE = 200 * 1024 * 1024  # 200MB
 
-# 全局唤起热键
+# 全局唤起热键（默认值；用户可在设置里改，覆盖值存 ui.json 的 "hotkey" 键）
 GLOBAL_HOTKEY = "Ctrl+Alt+P"
+
+
+# ---------- UI 偏好（ui.json：主题 / 热键 等，读-改-写保留其它键） ----------
+def _ui_settings_path() -> Path:
+    return data_dir() / "ui.json"
+
+
+def load_ui_settings() -> dict:
+    """读 ui.json，损坏/缺失返回 {}。"""
+    try:
+        p = _ui_settings_path()
+        if p.exists():
+            data = json.loads(p.read_text("utf-8"))
+            if isinstance(data, dict):
+                return data
+    except Exception:  # noqa: BLE001 配置损坏不能拖垮启动
+        pass
+    return {}
+
+
+def update_ui_settings(**changes) -> None:
+    """合并写 ui.json：保留未涉及的键（改主题不清掉热键，反之亦然）。"""
+    data = load_ui_settings()
+    data.update(changes)
+    try:
+        _ui_settings_path().write_text(
+            json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def get_theme(default: str = "cloud") -> str:
+    v = load_ui_settings().get("theme")
+    return v if isinstance(v, str) and v else default
+
+
+def set_theme(name: str) -> None:
+    update_ui_settings(theme=name)
+
+
+def get_hotkey() -> str:
+    """当前全局唤起热键：用户覆盖值优先，否则默认 GLOBAL_HOTKEY。"""
+    v = load_ui_settings().get("hotkey")
+    return v if isinstance(v, str) and v.strip() else GLOBAL_HOTKEY
+
+
+def set_hotkey(spec: str) -> None:
+    update_ui_settings(hotkey=spec)
 
 # 增量自动更新：清单 + 内容寻址块的根地址。E2E/灰度可用 PPTX_FINDER_UPDATE_URL 覆盖（如指 localhost）
 _DEFAULT_UPDATE_URL = "https://me.lt-stockpartner.tech/pptutor"

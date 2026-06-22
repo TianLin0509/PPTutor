@@ -21,7 +21,7 @@ except Exception:  # noqa: BLE001
     def _qt_is_valid(_obj) -> bool:
         return True
 
-from .config import GLOBAL_HOTKEY
+from .config import get_hotkey
 from .ui.main_window import MainWindow
 from .ui.version_bridge import VersionBridge
 from .versioning.manager import VersionManager
@@ -159,6 +159,41 @@ def _toggle_window(win: MainWindow) -> None:
         win.search_box.selectAll()
 
 
+def _apply_global_hotkey(app, win, spec: str) -> bool:
+    """(重新)注册全局唤起热键：先注销旧的、移除旧 filter，再注册新的，并更新状态栏标签。
+    可被设置页反复调用做热重绑。返回是否注册成功。失败不致命（仅状态栏标黄提示）。"""
+    log = logging.getLogger(__name__)
+    try:
+        ctypes.windll.user32.UnregisterHotKey(int(win.winId()), HOTKEY_ID)
+    except Exception:  # noqa: BLE001 没注册过 / 非 Windows
+        pass
+    old = getattr(app, "_hotkey_filter", None)
+    if old is not None:
+        try:
+            app.removeNativeEventFilter(old)
+        except Exception:  # noqa: BLE001
+            pass
+        app._hotkey_filter = None
+    ok = False
+    try:
+        mods, vk = _parse_hotkey(spec or "")
+        if vk is not None and mods:
+            if ctypes.windll.user32.RegisterHotKey(int(win.winId()), HOTKEY_ID, mods, vk):
+                filt = _HotkeyFilter(HOTKEY_ID, lambda: _toggle_window(win))
+                app.installNativeEventFilter(filt)
+                app._hotkey_filter = filt  # 防 GC
+                ok = True
+            else:
+                log.warning("RegisterHotKey failed (maybe taken): %s", spec)
+    except Exception as e:  # noqa: BLE001
+        log.warning("hotkey setup error: %s", e)
+    try:
+        win.set_hotkey_status(spec, ok)
+    except Exception:  # noqa: BLE001
+        pass
+    return ok
+
+
 def main() -> int:
     multiprocessing.freeze_support()  # PyInstaller 下多进程必需
     try:  # 任务栏用窗口图标(吉祥物)而非默认 python/exe 图标，需显式 AppUserModelID
@@ -256,20 +291,10 @@ def main() -> int:
     win.show()
     win.maybe_show_welcome()  # 首次运行弹欢迎引导
 
-    # 全局热键
-    try:
-        mods, vk = _parse_hotkey(GLOBAL_HOTKEY)
-        if vk is not None:
-            hwnd = int(win.winId())
-            if ctypes.windll.user32.RegisterHotKey(hwnd, HOTKEY_ID, mods, vk):
-                filt = _HotkeyFilter(HOTKEY_ID, lambda: _toggle_window(win))
-                app.installNativeEventFilter(filt)
-                app._hotkey_filter = filt  # 防 GC
-            else:
-                log.warning("RegisterHotKey failed (maybe taken): %s", GLOBAL_HOTKEY)
-                win.hotkey_label.setText(f"⚠ 热键 {GLOBAL_HOTKEY} 被占用")
-    except Exception as e:  # noqa: BLE001
-        log.warning("hotkey setup error: %s", e)
+    # 全局热键（可在设置里改；当前值持久化在 config.ui.json，默认 GLOBAL_HOTKEY）
+    win._open_settings_cb = _open_settings          # 状态栏热键标签点击 → 打开设置
+    win._apply_hotkey = lambda spec: _apply_global_hotkey(app, win, spec)  # 设置页热重绑
+    _apply_global_hotkey(app, win, get_hotkey())
 
     return app.exec()
 

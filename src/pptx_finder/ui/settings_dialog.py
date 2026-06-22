@@ -8,18 +8,56 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QDialog,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QPlainTextEdit,
     QPushButton,
     QTabWidget,
     QVBoxLayout,
     QWidget,
 )
+
+_MOD_NAMES = ("Ctrl", "Alt", "Shift", "Win")
+
+
+class HotkeyEdit(QLineEdit):
+    """录制全局热键：聚焦后按下「修饰键 + 主键」即捕获为 'Ctrl+Alt+P' 形式（#2）。"""
+
+    def __init__(self, spec: str = "", parent=None):
+        super().__init__(parent)
+        self.setReadOnly(True)
+        self._spec = spec
+        self.setText(spec or "点此后按下组合键…")
+
+    def spec(self) -> str:
+        return self._spec
+
+    def keyPressEvent(self, e):  # noqa: N802
+        key = e.key()
+        if key in (Qt.Key_Control, Qt.Key_Alt, Qt.Key_Shift, Qt.Key_Meta):
+            return  # 单独的修饰键不算，等主键
+        mods = e.modifiers()
+        parts = []
+        if mods & Qt.ControlModifier:
+            parts.append("Ctrl")
+        if mods & Qt.AltModifier:
+            parts.append("Alt")
+        if mods & Qt.ShiftModifier:
+            parts.append("Shift")
+        if mods & Qt.MetaModifier:
+            parts.append("Win")
+        main = QKeySequence(key).toString()
+        if not main:
+            return
+        parts.append(main)
+        self._spec = "+".join(parts)
+        self.setText(self._spec)
 try:
     from shiboken6 import isValid as _qt_is_valid
 except Exception:  # noqa: BLE001
@@ -30,10 +68,11 @@ from .. import db
 from ..config import (
     APP_NAME,
     EXCLUDE_DIR_NAMES,
-    GLOBAL_HOTKEY,
     cache_dir,
     data_dir,
     db_path,
+    get_hotkey,
+    set_hotkey,
 )
 from ..versioning import autostart
 from .bg_task import BackgroundTask
@@ -106,8 +145,47 @@ class SettingsDialog(QDialog):
         self.auto.setChecked(autostart.is_enabled())
         self.auto.toggled.connect(self._toggle_auto)
         lay.addWidget(self.auto)
+
+        # 全局唤起热键（#2 可改：解决状态栏「热键被占用」无修复路径）
+        hk_title = QLabel("全局唤起热键")
+        hk_title.setStyleSheet("font-weight:700;font-size:13px;margin-top:8px;")
+        lay.addWidget(hk_title)
+        hk_desc = QLabel("在下框中按下新组合键（需含 Ctrl / Alt，再加一个字母或数字），点「应用」即时生效。")
+        hk_desc.setWordWrap(True)
+        lay.addWidget(hk_desc)
+        hk_row = QHBoxLayout()
+        self._hotkey_edit = HotkeyEdit(get_hotkey())
+        hk_row.addWidget(self._hotkey_edit, 1)
+        hk_apply = QPushButton("应用")
+        hk_apply.clicked.connect(self._apply_hotkey)
+        hk_row.addWidget(hk_apply)
+        lay.addLayout(hk_row)
+        self._hotkey_result = QLabel("")
+        self._hotkey_result.setWordWrap(True)
+        self._hotkey_result.setStyleSheet("font-size:11.5px;")
+        lay.addWidget(self._hotkey_result)
+
         lay.addStretch(1)
         return page
+
+    def _apply_hotkey(self) -> None:
+        spec = self._hotkey_edit.spec()
+        parts = [p for p in spec.split("+") if p]
+        # 必须含 Ctrl 或 Alt（光 Shift/Win 会劫持正常打字或撞系统快捷键）+ 恰一个单字符主键
+        has_strong_mod = any(p in ("Ctrl", "Alt") for p in parts)
+        main = [p for p in parts if p not in _MOD_NAMES]
+        if not (has_strong_mod and len(main) == 1 and len(main[0]) == 1):
+            self._hotkey_result.setText("请用 Ctrl / Alt（可加 Shift）+ 一个字母或数字")
+            return
+        set_hotkey(spec)
+        apply_cb = getattr(self._diagnostic_parent, "_apply_hotkey", None)  # app.py 注入的热重绑回调
+        ok = apply_cb(spec) if callable(apply_cb) else None
+        if ok:
+            self._hotkey_result.setText(f"✓ 已生效：{spec}")
+        elif ok is False:
+            self._hotkey_result.setText(f"⚠ {spec} 注册失败（可能被占用），换一个再试")
+        else:
+            self._hotkey_result.setText(f"已保存：{spec}（重启后生效）")
 
     def _build_health_tab(self) -> QWidget:
         page = QWidget()
@@ -214,7 +292,7 @@ class SettingsDialog(QDialog):
             f"data_dir: {data_dir()}",
             f"db_path: {db_path()}",
             f"cache_dir: {cache_dir()}",
-            f"global_hotkey: {GLOBAL_HOTKEY}",
+            f"global_hotkey: {get_hotkey()}",
             f"autostart: {'on' if autostart.is_enabled() else 'off'}",
             f"PPTX_FINDER_ROOTS: {os.environ.get('PPTX_FINDER_ROOTS', '') or '(auto fixed drives)'}",
             f"PPTX_FINDER_DATA_DIR: {os.environ.get('PPTX_FINDER_DATA_DIR', '') or '(default)'}",

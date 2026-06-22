@@ -15,7 +15,7 @@ import sys
 import time
 
 from PySide6.QtCore import QEvent, QMimeData, QPropertyAnimation, Qt, QStringListModel, QTimer, QUrl
-from PySide6.QtGui import QColor, QCursor, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtGui import QColor, QCursor, QIcon, QKeySequence, QPainter, QPen, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QCompleter, QFrame, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMainWindow, QMenu, QProgressBar, QPushButton, QScrollArea,
@@ -31,7 +31,8 @@ except Exception:  # noqa: BLE001
 
 from .. import actions, db, history, search as search_mod, updater, __version__
 from ..config import (
-    GLOBAL_HOTKEY, data_dir, db_path as cfg_db_path, is_first_run, mark_welcomed, update_base_url,
+    data_dir, db_path as cfg_db_path, get_hotkey, get_theme, is_first_run,
+    mark_welcomed, set_theme as cfg_set_theme, update_base_url,
 )
 from ..models import FileResult
 from ..query_explain import explain_query, mode_label, suggestion_keys
@@ -104,20 +105,12 @@ def _app_logo() -> QPixmap:
 
 
 def _load_theme() -> str:
-    try:
-        p = data_dir() / "ui.json"
-        if p.exists():
-            return json.loads(p.read_text("utf-8")).get("theme", "cloud")
-    except Exception:  # noqa: BLE001
-        pass
-    return "cloud"
+    # 主题持久化集中在 config.ui.json（与热键等共用一个文件，合并写不互相清键）
+    return get_theme("cloud")
 
 
 def _save_theme(name: str) -> None:
-    try:
-        (data_dir() / "ui.json").write_text(json.dumps({"theme": name}), encoding="utf-8")
-    except Exception:  # noqa: BLE001
-        pass
+    cfg_set_theme(name)
 
 
 def _highlight(snippet: str, hlcss: str) -> str:
@@ -276,16 +269,22 @@ def _thumb_placeholder(tok: dict) -> QPixmap:
 class ResultItem(QWidget):
     """鍗曟潯缁撴灉鍗＄墖锛氬乏缂╃暐鍥?棣栭〉/鍛戒腑椤? + 鍙?鏂囦欢鍚?+ 鍛戒腑椤佃兌鍥?+ 楂樹寒鐗囨 + mtime)銆?"""
 
-    def __init__(self, r: FileResult, tok: dict, hlcss: str):
+    def __init__(self, r: FileResult, tok: dict, hlcss: str, ginfo: dict | None = None,
+                 on_toggle_group=None):
         super().__init__()
         self.setAttribute(Qt.WA_StyledBackground, True)
         self._tok = tok
         self._sel = False
         self.path = r.path
         self.thumb_page = r.hits[0].page_no if r.hits else 1
+        # 版本组：ginfo 为组主卡时带 count（折叠起来的历史版本数）；为成员行时 member=True
+        self._gid = ginfo.get("gid") if ginfo else None
+        self._exp_btn = None  # 版本组展开器按钮（仅组主卡有），供就地切换文字 ▾/▴
+        is_member = bool(ginfo and ginfo.get("member"))
+        vcount = int(ginfo.get("count", 0)) if ginfo else 0
 
         outer = QHBoxLayout(self)
-        outer.setContentsMargins(11, 9, 12, 9)
+        outer.setContentsMargins(11 + (24 if is_member else 0), 9, 12, 9)  # 历史版本行左缩进，视觉归属上方组主卡
         outer.setSpacing(11)
         self._thumb = QLabel()
         self._thumb.setObjectName("cardThumb")
@@ -300,8 +299,15 @@ class ResultItem(QWidget):
         # 绗?1 琛岋細鏂囦欢鍚?+ 鍛戒腑椤靛窘绔狅紙P1 / P3 P8锛屾渶澶?3 涓級
         row = QHBoxLayout()
         row.setSpacing(6)
+        if is_member:
+            vtag = QLabel("历史版本")
+            vtag.setStyleSheet(
+                f"font-size:10px;font-weight:700;color:{tok['ink4']};"
+                f"border:1px solid {tok['bd2']};border-radius:5px;padding:1px 6px;background:transparent;")
+            row.addWidget(vtag, 0)
         fn = QLabel(html.escape(r.name))
-        fn.setStyleSheet(f"font-size:14px;font-weight:600;color:{tok['ink1']};background:transparent;")
+        _fn_color = tok['ink2'] if is_member else tok['ink1']
+        fn.setStyleSheet(f"font-size:14px;font-weight:600;color:{_fn_color};background:transparent;")
         fn.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         row.addWidget(fn, 1)
 
@@ -323,6 +329,16 @@ class ResultItem(QWidget):
             ext = QLabel(".ppt")
             ext.setStyleSheet(f"font-size:10px;color:{tok['ink4']};border:1px solid {tok['bd2']};border-radius:5px;padding:1px 6px;background:transparent;")
             row.addWidget(ext, 0)
+        if vcount > 0 and on_toggle_group is not None:
+            exp = QToolButton()
+            exp.setObjectName("verExpand")
+            _expanded = bool(ginfo.get("expanded"))
+            exp.setText("▴ 收起版本" if _expanded else f"▾ {vcount} 个历史版本")
+            exp.setCursor(Qt.PointingHandCursor)
+            exp.setToolTip("同一文档的其它版本副本（按修改时间），折叠以减少结果刷屏")
+            exp.clicked.connect(lambda _=False, g=self._gid: on_toggle_group(g))
+            self._exp_btn = exp
+            row.addWidget(exp, 0)
         lay.addLayout(row)
 
         # 绗?2 琛岋細楂樹寒鐗囨锛堝唴瀹瑰懡涓級/ 鑰佹牸寮忚鏄庯紙.ppt锛?
@@ -349,6 +365,11 @@ class ResultItem(QWidget):
     def set_thumbnail(self, pm: QPixmap) -> None:
         if pm is not None and not pm.isNull():
             self._thumb.setPixmap(pm.scaled(74, 55, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+    def set_version_expanded(self, expanded: bool, count: int) -> None:
+        """切换组主卡展开器的文字（就地展开/折叠后调用，不重建卡片）。"""
+        if self._exp_btn is not None:
+            self._exp_btn.setText("▴ 收起版本" if expanded else f"▾ {count} 个历史版本")
 
     def enterEvent(self, e):  # noqa: N802
         if not self._sel:
@@ -474,6 +495,12 @@ class MainWindow(QMainWindow):
         self._zoom = 1.0  # 棰勮缂╂斁锛?.0=閫傞厤绐楀彛锛?1 鏀惧ぇ鐪嬬粏鑺?
         self._to_tray_on_close = False
         self._thumb_btns: list[QToolButton] = []
+        # 版本组折叠（#1）：默认折叠同一 MinHash 组的历史副本为一条，点「N 个历史版本」就地展开
+        self._expanded_groups: set[int] = set()              # 当前已展开的 group_id
+        self._group_others: dict[int, list] = {}             # group_id -> [(idx, FileResult), ...] 隐藏的历史版本
+        self._group_primary_item: dict[int, QListWidgetItem] = {}   # group_id -> 组主卡列表项
+        self._group_member_items: dict[int, list] = {}       # group_id -> 已插入的成员列表项（折叠时移除）
+        self._open_settings_cb = None                        # app.py 注入：状态栏热键标签点击 → 打开设置（#2）
 
         self._render = render_worker or RenderWorker(self)
         self._render.rendered.connect(self._on_rendered)
@@ -795,7 +822,11 @@ class MainWindow(QMainWindow):
         self.status.addPermanentWidget(self.version_shield)
         kb = QLabel('<span id="kbd"> ↑↓ </span> 选择　<span id="kbd"> ↵</span> 打开　<span id="kbd"> Esc </span> 收起')
         kb.setTextFormat(Qt.RichText)
-        self.hotkey_label = QLabel(f"全局热键 {GLOBAL_HOTKEY}")
+        self.hotkey_label = QLabel(f"全局热键 {get_hotkey()}")
+        self.hotkey_label.setObjectName("hotkeyLabel")
+        self.hotkey_label.setCursor(Qt.PointingHandCursor)
+        self.hotkey_label.setToolTip("点击修改全局唤起热键")
+        self.hotkey_label.installEventFilter(self)  # 点击 → 打开设置（#2 热键可改）
         self.status.addPermanentWidget(kb)
         self.status.addPermanentWidget(self.hotkey_label)
 
@@ -805,6 +836,29 @@ class MainWindow(QMainWindow):
 
         self._init_toast()
         self._init_spinner()
+        self._install_shortcuts()
+
+    def _install_shortcuts(self) -> None:
+        """键盘补全（#4）：命中页跳转 + 聚焦搜索框。
+        刻意用 Ctrl 修饰而非裸 n/N——搜索框默认持焦点，裸字母会被当成输入。"""
+        QShortcut(QKeySequence("Ctrl+Down"), self, activated=lambda: self._step_hit(1))
+        QShortcut(QKeySequence("Ctrl+Up"), self, activated=lambda: self._step_hit(-1))
+        QShortcut(QKeySequence("Ctrl+L"), self, activated=self._focus_search)
+
+    def _focus_search(self) -> None:
+        self.search_box.setFocus()
+        self.search_box.selectAll()
+
+    def set_hotkey_status(self, spec: str, ok: bool) -> None:
+        """状态栏全局热键标签（#2）：成功显示热键；失败标黄「点此改」。app.py 注册后回调。"""
+        if not hasattr(self, "hotkey_label"):
+            return
+        if ok:
+            self.hotkey_label.setText(f"全局热键 {spec}")
+            self.hotkey_label.setToolTip("点击修改全局唤起热键")
+        else:
+            self.hotkey_label.setText(f"⚠ 热键 {spec} 被占用 · 点此改")
+            self.hotkey_label.setToolTip("该热键注册失败（可能被占用），点击修改")
 
     def _build_preview(self) -> QWidget:
         panel = QWidget()
@@ -825,6 +879,12 @@ class MainWindow(QMainWindow):
         self.path_label.setObjectName("pathLabel")
         self.path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         pr.addWidget(self.path_label, 1)
+        self.copy_text_btn = QPushButton("复制本页文字")
+        self.copy_text_btn.setObjectName("linkBtn")
+        self.copy_text_btn.setToolTip("复制当前预览页的文字（取自已索引内容，无需打开 PowerPoint）")
+        self.copy_text_btn.clicked.connect(self._act_copy_page_text)
+        self.copy_text_btn.hide()
+        pr.addWidget(self.copy_text_btn, 0)
         self.copy_path_btn = QPushButton("复制路径")
         self.copy_path_btn.setObjectName("linkBtn")
         self.copy_path_btn.clicked.connect(self._act_copy_path)
@@ -861,11 +921,13 @@ class MainWindow(QMainWindow):
         nav = QHBoxLayout()
         self.prev_btn = QPushButton("◀ 上一命中页")
         self.prev_btn.setObjectName("navBtn")
+        self.prev_btn.setToolTip("上一处命中页　(Ctrl+↑)")
         self.prev_btn.clicked.connect(lambda: self._step_hit(-1))
         self.page_label = QLabel("—")
         self.page_label.setAlignment(Qt.AlignCenter)
         self.next_btn = QPushButton("下一命中页 ▶")
         self.next_btn.setObjectName("navBtn")
+        self.next_btn.setToolTip("下一处命中页　(Ctrl+↓)")
         self.next_btn.clicked.connect(lambda: self._step_hit(1))
         nav.addWidget(self.prev_btn)
         nav.addWidget(self.page_label, 1)
@@ -1045,10 +1107,12 @@ class MainWindow(QMainWindow):
             self.path_label.setToolTip("")
             self.meta_label.setText("")
             self.copy_path_btn.hide()
+            self.copy_text_btn.hide()
             return
         self.path_label.setText(_elide_middle(r.path))
         self.path_label.setToolTip(r.path)
         self.copy_path_btn.show()
+        self.copy_text_btn.show()
         parts = []
         sz = _fmt_size(r.size)
         if sz:
@@ -1080,7 +1144,9 @@ class MainWindow(QMainWindow):
         """Windows 绯荤粺鏍囬鏍忔繁娴呰窡闅忛鏍硷紙娣辫壊椋庢牸鈫掓繁鑹叉爣棰樻爮锛屾秷闄ょ櫧鏉″壊瑁傦級銆?"""
         try:
             import ctypes
-            dark = self._theme in ("raycast", "cinema", "aurora")
+            # 跟随主题明暗（修复：旧硬编码清单含不存在的 "raycast"、漏了 ocean/cyber 等深色主题，
+            # 导致深海极光等的系统标题栏没深色化）。统一用 token 的 is_light 标志判定。
+            dark = not self._tok.get("is_light", False)
             val = ctypes.c_int(1 if dark else 0)
             # DWMWA_USE_IMMERSIVE_DARK_MODE = 20锛圵in10 20H1+锛?
             ctypes.windll.dwmapi.DwmSetWindowAttribute(
@@ -1262,6 +1328,7 @@ class MainWindow(QMainWindow):
             self.result_count.setText(f"\u547d\u4e2d {len(results)} \u4e2a\u6587\u4ef6{suffix}")
             self.list_head.show()
             self._select_first(delayed_preview=True)
+            self._animate_list_in()
         else:
             self.list_head.hide()
             self._cur = None
@@ -1271,6 +1338,37 @@ class MainWindow(QMainWindow):
             self._update_preview_header(None)
             self._set_ops_enabled(False)
             self._show_empty_hint(query)
+
+    def _animate_list_in(self) -> None:
+        """结果出现时列表轻量淡入（#10 calm UI 功能性微动效）。动画结束即移除 effect，
+        不留持久 GraphicsEffect 影响流式渲染性能；尊重系统「减弱动态效果」设置。"""
+        try:
+            from .spotlight import animations_enabled
+            if not animations_enabled():
+                return
+            old = getattr(self, "_list_fade_anim", None)
+            if old is not None:
+                try:
+                    old.stop()  # 停掉上一次（防 <140ms 连续搜索时旧 finished 清掉新 effect）
+                except Exception:  # noqa: BLE001
+                    pass
+            eff = QGraphicsOpacityEffect(self._list_stack)
+            self._list_stack.setGraphicsEffect(eff)
+            anim = QPropertyAnimation(eff, b"opacity", self)
+            anim.setDuration(140)
+            anim.setStartValue(0.55)
+            anim.setEndValue(1.0)
+            # 仅当 effect 仍是本次设置的那个才移除，避免旧回调误清新动画的 effect
+            anim.finished.connect(
+                lambda e=eff: self._list_stack.setGraphicsEffect(None)
+                if self._list_stack.graphicsEffect() is e else None)
+            anim.start()
+            self._list_fade_anim = anim  # 防 GC
+        except Exception:  # noqa: BLE001 动效失败绝不影响结果展示
+            try:
+                self._list_stack.setGraphicsEffect(None)
+            except Exception:  # noqa: BLE001
+                pass
 
     def _recent_files_cached(self, *, force: bool = False) -> list[FileResult] | None:
         now = time.monotonic()
@@ -1645,6 +1743,11 @@ class MainWindow(QMainWindow):
         self.result_list.clear()
         self._thumb.clear()        # 涓㈠純涓婁竴鎵规湭娓插畬鐨勭缉鐣ュ浘璇锋眰
         self._thumb_items.clear()
+        # 版本组折叠状态随每次重渲染复位（新搜索/排序/筛选/换肤都回折叠态）；展开是就地插入，不走这里
+        self._group_primary_item = {}
+        self._group_member_items = {}
+        self._group_others = {}
+        self._expanded_groups = set()
         self._render_gen += 1      # 浣滃簾涓婁竴鎵逛粛鍦ㄦ祦鍏ョ殑鍒嗘壒娓叉煋
         hlcss = theme.highlight_css(self._theme)
         plan = self._build_render_plan(results)
@@ -1661,12 +1764,46 @@ class MainWindow(QMainWindow):
             for label, items in group_by_time(results, now_ts):
                 plan.append(("h", f"{label} 路 {len(items)}"))
                 for r in items:
-                    plan.append(("i", idx, r))
+                    plan.append(("i", idx, r, None))
                     idx += 1
+        elif self._sort_key() == "relevance":
+            # 相关度默认视图：同一版本组（search 已把同组排成相邻）折叠为一条组主卡 + 可展开历史版本
+            self._plan_with_version_folding(plan, results)
         else:
             for i, r in enumerate(results):
-                plan.append(("i", i, r))
+                plan.append(("i", i, r, None))
         return plan
+
+    def _plan_with_version_folding(self, plan: list, results: list[FileResult]) -> None:
+        """把连续同 group_id（>1 成员）折叠：只放 is_latest 那条组主卡（带历史版本数），
+        已展开的组额外放出其它成员（成员行）。单文件 / 无组照常逐条放。idx 始终是
+        该结果在 self._results 的真实下标（_on_select 依赖 UserRole→self._results[idx]）。"""
+        self._group_others = {}
+        n = len(results)
+        i = 0
+        while i < n:
+            gid = results[i].group_id
+            if gid is None:
+                plan.append(("i", i, results[i], None))
+                i += 1
+                continue
+            run = []  # (idx, result) 同组相邻成员
+            while i < n and results[i].group_id == gid:
+                run.append((i, results[i]))
+                i += 1
+            if len(run) <= 1:
+                plan.append(("i", run[0][0], run[0][1], None))
+                continue
+            primary = next((p for p in run if p[1].is_latest), run[0])
+            others = [p for p in run if p[0] != primary[0]]
+            others.sort(key=lambda p: p[1].mtime, reverse=True)  # 历史版本按修改时间新→旧
+            self._group_others[gid] = others
+            expanded = gid in self._expanded_groups
+            plan.append(("i", primary[0], primary[1],
+                         {"gid": gid, "count": len(others), "expanded": expanded}))
+            if expanded:
+                for oidx, orr in others:
+                    plan.append(("i", oidx, orr, {"member": True, "gid": gid}))
 
     def _flush_plan(self, plan: list, start: int, end: int, hlcss: str) -> int:
         """娓叉煋 plan[start:end]锛岃繑鍥炲疄闄呮覆鍒扮殑浣嶇疆锛堜緵缁壒锛夈€?"""
@@ -1674,8 +1811,8 @@ class MainWindow(QMainWindow):
             if entry[0] == "h":
                 self._add_section_header(entry[1])
             else:
-                _, idx, r = entry
-                self._add_result_item(idx, r, hlcss)
+                _, idx, r, ginfo = entry
+                self._add_result_item(idx, r, hlcss, ginfo)
         return min(end, len(plan))
 
     def _stream_plan_rest(self, plan: list, pos: int, hlcss: str, gen: int) -> None:
@@ -1706,15 +1843,74 @@ class MainWindow(QMainWindow):
             return True
         return self._showing_recent and key == "relevance"
 
-    def _add_result_item(self, idx: int, r: FileResult, hlcss: str) -> None:
+    def _add_result_item(self, idx: int, r: FileResult, hlcss: str, ginfo: dict | None = None) -> None:
         item = QListWidgetItem()
         item.setData(Qt.UserRole, idx)
         item.setToolTip(r.path)
-        w = ResultItem(r, self._tok, hlcss)
+        w = ResultItem(r, self._tok, hlcss, ginfo=ginfo, on_toggle_group=self._toggle_version_group)
         item.setSizeHint(w.sizeHint())
         self.result_list.addItem(item)
         self.result_list.setItemWidget(item, w)
+        if ginfo and ginfo.get("count"):
+            self._group_primary_item[ginfo["gid"]] = item  # 记录组主卡列表项，供就地展开定位
         self._request_thumb(w, idx)
+
+    def _toggle_version_group(self, gid: int) -> None:
+        """点「N 个历史版本」：就地展开/折叠，不重渲染整表（保留选中/滚动/预览不闪）。"""
+        if gid is None or self._group_primary_item.get(gid) is None:
+            return
+        if gid in self._expanded_groups:
+            self._collapse_version_group(gid)
+        else:
+            self._expand_version_group(gid)
+        w = self.result_list.itemWidget(self._group_primary_item[gid])
+        if isinstance(w, ResultItem):
+            w.set_version_expanded(gid in self._expanded_groups,
+                                   len(self._group_others.get(gid) or []))
+
+    def _expand_version_group(self, gid: int) -> None:
+        primary_item = self._group_primary_item.get(gid)
+        others = self._group_others.get(gid) or []
+        base = self.result_list.row(primary_item) if primary_item is not None else -1
+        if base < 0 or not others:
+            return
+        hlcss = theme.highlight_css(self._theme)
+        inserted = []
+        for k, (oidx, orr) in enumerate(others):
+            item = QListWidgetItem()
+            item.setData(Qt.UserRole, oidx)
+            item.setToolTip(orr.path)
+            w = ResultItem(orr, self._tok, hlcss, ginfo={"member": True, "gid": gid})
+            item.setSizeHint(w.sizeHint())
+            self.result_list.insertItem(base + 1 + k, item)
+            self.result_list.setItemWidget(item, w)
+            # 成员是用户主动展开看的，直接请求缩略图（不受首屏 THUMB_FIRST 门限限制）
+            key = (w.path, w.thumb_page)
+            self._thumb_items[key] = w
+            cached = self._thumb_cache.get(key)
+            if cached is not None and not cached.isNull():
+                w.set_thumbnail(cached)
+            else:
+                self._thumb.request(w.path, w.thumb_page)
+            inserted.append(item)
+        self._group_member_items[gid] = inserted
+        self._expanded_groups.add(gid)
+
+    def _collapse_version_group(self, gid: int) -> None:
+        members = self._group_member_items.pop(gid, [])
+        cur_in_group = self.result_list.currentItem() in members
+        for item in members:
+            row = self.result_list.row(item)
+            if row >= 0:
+                w = self.result_list.itemWidget(item)
+                self.result_list.takeItem(row)
+                if w is not None:
+                    w.deleteLater()
+        self._expanded_groups.discard(gid)
+        if cur_in_group:  # 选中的是被折叠的历史版本 → 选回组主卡，避免选中态丢失
+            pi = self._group_primary_item.get(gid)
+            if pi is not None:
+                self.result_list.setCurrentItem(pi)
 
     def _request_thumb(self, w: ResultItem, idx: int) -> None:
         """缁撴灉鍗＄墖缂╃暐鍥撅細鍛戒腑缂撳瓨鐩存帴鐢紝鍚﹀垯浠呬负棣栧睆鍓嶈嫢骞蹭釜鍙戣捣娓叉煋銆?"""
@@ -2357,13 +2553,14 @@ class MainWindow(QMainWindow):
         hits = self._cur.hits or []
         total = self._cur.page_count or 0
         n = len(hits)
-        hit_pages = {h.page_no for h in hits}
+        # 命中页判定与序号已并入下方 ordn 计算（不再单独维护 hit_pages 集合）
         # 椤电爜锛氱 X / 鍏?N 椤碉紙婊氳疆鍙湪鍘熷椤靛簭闂磋嚜鐢辩炕锛涘懡涓〉鍔犳爣璁帮級
+        ordn = next((i for i, h in enumerate(hits) if h.page_no == page), None)
+        hit_tag = f" \u00b7 \u547d\u4e2d {ordn + 1}/{n}" if ordn is not None else ""
         if total:
-            tag = " \u00b7 \u547d\u4e2d\u9875" if page in hit_pages else ""
-            self.page_label.setText(f"\u7b2c {page} / {total} \u9875{tag}")
+            self.page_label.setText(f"\u7b2c {page} / {total} \u9875{hit_tag}")
         else:
-            self.page_label.setText(f"\u7b2c {page} \u9875")
+            self.page_label.setText(f"\u7b2c {page} \u9875{hit_tag}")
         # 涓?涓嬨€屽懡涓〉銆嶆寜閽細鍦ㄥ懡涓〉涔嬮棿璺?
         nav_enabled = self._active_heavy_op is None and self._search_pending_req is None
         self.prev_btn.setEnabled(nav_enabled and n > 0 and self._hit_idx > 0)
@@ -2538,6 +2735,11 @@ class MainWindow(QMainWindow):
     # ---------- 閿洏 ----------
     def eventFilter(self, obj, ev):  # noqa: N802
         et = ev.type()
+        if obj is getattr(self, "hotkey_label", None) and et == QEvent.MouseButtonPress:
+            cb = self._open_settings_cb  # 状态栏热键标签点击 → 打开设置（#2）
+            if callable(cb):
+                cb()
+            return True
         if et in (QEvent.Wheel, QEvent.MouseButtonDblClick) and obj in (self.image_label, self.scroll.viewport()):
             if et == QEvent.Wheel:
                 if ev.modifiers() & Qt.ControlModifier:
@@ -2622,6 +2824,24 @@ class MainWindow(QMainWindow):
     def _copy_text_with_toast(self, text: str, message: str) -> None:
         QApplication.clipboard().setText(text)
         self._toast(message)
+
+    def _act_copy_page_text(self) -> None:
+        """复制当前预览页的文字：直接取已索引的 pages_raw 原文，不启动 PowerPoint。
+        单行主键查询（WAL 下读不阻塞写），不走重操作后台通道。"""
+        if self._block_if_search_pending():
+            return
+        if not self._cur:
+            return
+        page = self._view_page
+        try:
+            text = db.get_page_text(self._conn, self._cur.file_id, page)
+        except Exception:  # noqa: BLE001 取文本失败不致命，提示即可
+            _log.warning("复制本页文字失败", exc_info=True)
+            text = ""
+        if text.strip():
+            self._copy_text_with_toast(text, f"已复制第 {page} 页文字（{len(text)} 字）")
+        else:
+            self._toast(f"第 {page} 页没有可复制的文字")
 
     def _act_copy_clipboard(self) -> None:
         """澶嶅埗鏂囦欢鏈綋鍒板壀璐存澘锛圵indows CF_HDROP锛夛紝鍙矘璐村埌閭欢 / 鑱婂ぉ / 璧勬簮绠＄悊鍣ㄣ€?"""

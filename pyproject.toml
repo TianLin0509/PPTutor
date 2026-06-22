@@ -1,6 +1,6 @@
 [project]
 name = "pptx-finder"
-version = "0.9.1"
+version = "0.9.2"
 description = "本地 PPTX 内容搜索与预览助手（搜内容定位页 / 版本归组 / 托盘常驻）"
 readme = "README.md"
 authors = [

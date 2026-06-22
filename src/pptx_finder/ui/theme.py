@@ -31,6 +31,7 @@ def _mk(bg, blobs, acc, acc2, ink, light=False):
                  acctext="#0B1020", base="transparent")
     d.update(win=bg, appbg=bg, blobs=blobs, ink1=ink[0], ink2=ink[1], ink3=ink[2], ink4=ink[3],
              acc=acc, accd=acc2, grn="#34D399", hl_r=str(ar), hl_g=str(ag), hl_b=str(ab), hl_a="0.26", radius="13",
+             is_light=light,  # 主题明暗标志：系统标题栏深浅、对比度判定用（替代旧的硬编码主题名清单）
              canvas=("#F7F8FA" if light else "#17171F"))  # report_overlay 浮层卡片背景（不透明）依赖 canvas
     return d
 
@@ -139,6 +140,11 @@ QPushButton#primary:pressed { background: $accd; padding-top: 8px; padding-botto
 QPushButton#ghost { background: transparent; border: none; color: $ink3; padding: 5px 8px; }
 QPushButton#ghost:hover { background: $hover; color: $ink1; }
 
+/* 键盘焦点环（Tab/方向键可见焦点）：边框类描强调色，无边框类给底色 */
+QPushButton:focus, QComboBox:focus { border-color: $acc; }
+QPushButton#ghost:focus, QToolButton:focus { background: $hover; color: $ink1; }
+QPushButton#primary:focus { border: 2px solid $acctext; }
+
 /* 筛选 chip */
 QPushButton#chip { background: $field; border: 1px solid $bd; border-radius: 980px; padding: 4px 12px; color: $ink3; font-size: 12px; }
 QPushButton#chip:hover { border-color: $bd2; color: $ink2; }
@@ -220,6 +226,10 @@ QPushButton#suggBtn:hover { border-color: $acc; background: $hover; }
 
 /* 结果卡片缩略图 */
 QLabel#cardThumb { background: $field; border: 1px solid $bd; border-radius: 5px; }
+
+/* 版本组展开器（结果卡上的「N 个历史版本 ▾」） */
+QToolButton#verExpand { background: rgba($hl_r,$hl_g,$hl_b,0.12); border: 1px solid $bd2; border-radius: 980px; padding: 1px 9px; color: $acc; font-size: 11px; font-weight: 700; }
+QToolButton#verExpand:hover { background: rgba($hl_r,$hl_g,$hl_b,0.22); border-color: $acc; }
 
 /* 缩略图按钮 */
 QToolButton#thumb { background: $field; border: 1px solid $bd; border-radius: 5px; padding: 0; }
