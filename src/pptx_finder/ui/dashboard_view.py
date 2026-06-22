@@ -11,12 +11,20 @@ from __future__ import annotations
 import datetime
 import logging
 import os
+import time
 
-from PySide6.QtCore import QPointF, QRectF, Qt
+from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
     QFrame, QGridLayout, QHBoxLayout, QLabel, QVBoxLayout, QWidget,
 )
+try:
+    from shiboken6 import isValid as _qt_is_valid
+except Exception:  # noqa: BLE001
+    def _qt_is_valid(_obj) -> bool:
+        return True
+
+from .bg_task import BackgroundTask
 
 _log = logging.getLogger(__name__)
 
@@ -35,6 +43,17 @@ def _rgb_of(tok: dict) -> tuple[int, int, int]:
 
 def _ink(tok: dict, i: int) -> str:
     return tok.get(f"ink{i + 1}", ("#F0EEFC", "#C8C2E8", "#948CC0", "#6A6298")[i])
+
+
+def _conn_path(conn) -> str | None:
+    try:
+        row = conn.execute("PRAGMA database_list").fetchone()
+        if row is None:
+            return None
+        path = row["file"] if hasattr(row, "keys") else row[2]
+        return path or None
+    except Exception:  # noqa: BLE001
+        return None
 
 
 class _Donut(QWidget):
@@ -166,6 +185,7 @@ class DashboardView(QWidget):
 
     refresh()：重算真实统计 + 重绘（主窗在切到首屏 / 切主题 / 索引完成时调）。
     """
+    _REFRESH_MIN_INTERVAL_MS = 1000
 
     def __init__(self, win):
         super().__init__()
@@ -176,8 +196,19 @@ class DashboardView(QWidget):
         self._folders: list[tuple[str, int]] = []
         self._week: list[int] = [0] * 7
         self._recent: list[tuple[str, str, str]] = []
+        self._last_refresh_at = 0.0
+        self._refresh_token = 0
+        self._refresh_apply_token = 0
+        self._refresh_inflight_token: int | None = None
+        self._refresh_inflight_force = False
+        self._pending_refresh_force = False
+        self._refresh_tasks: list[BackgroundTask] = []
+        self._parent_bg_tasks = getattr(win, "_bg_tasks", None)
+        if not isinstance(self._parent_bg_tasks, list):
+            self._parent_bg_tasks = None
         self._build()
-        self.refresh()
+        self._apply_data()
+        self._restyle()
 
     def _tok(self) -> dict:
         return getattr(self._win, "_tok", {}) or {}
@@ -298,17 +329,196 @@ class DashboardView(QWidget):
         return w
 
     # ---------- 数据 ----------
-    def refresh(self) -> None:
+    def schedule_refresh(self, *, force: bool = False, delay_ms: int = 0) -> None:
+        """把统计重算推迟到事件循环空档，并合并短时间内的重复请求。"""
+        if not self._ui_alive():
+            return
+        self._refresh_token += 1
+        token = self._refresh_token
+        self._pending_refresh_force = self._pending_refresh_force or force
+        QTimer.singleShot(delay_ms, lambda token=token: self._run_scheduled_refresh(token))
+
+    def _run_scheduled_refresh(self, token: int) -> None:
+        if not self._ui_alive():
+            return
+        if token != self._refresh_token:
+            return
+        force = self._pending_refresh_force
+        self._pending_refresh_force = False
+        self.refresh(force=force)
+
+    def refresh(self, *, force: bool = False) -> None:
         """重算真实统计并刷新 KPI/列表/图表（取不到则占位，绝不抛异常打断 UI）。"""
-        try:
-            self._recompute()
-        except Exception:  # noqa: BLE001 仪表盘是装饰性首屏，统计失败不该影响搜索主流程
-            _log.warning("dashboard refresh failed", exc_info=True)
-        self._apply_data()
-        self._restyle()
+        if not self._ui_alive():
+            return
+        now = time.monotonic()
+        if (
+            not force
+            and self._last_refresh_at
+            and (now - self._last_refresh_at) * 1000 < self._REFRESH_MIN_INTERVAL_MS
+        ):
+            self._restyle()
+            return
+        if self._refresh_inflight_token is not None and (self._refresh_inflight_force or not force):
+            self._restyle()
+            return
+        self._last_refresh_at = now
+        self._refresh_apply_token += 1
+        token = self._refresh_apply_token
+        conn = self._conn()
+        conn_path = _conn_path(conn) if conn is not None else None
+        fallback_conn = conn if conn is not None and conn_path is None else None
+        vm = getattr(self._win, "_version_mgr", None)
+        task = BackgroundTask(
+            lambda conn_path=conn_path, fallback_conn=fallback_conn, vm=vm: self._build_payload(
+                conn_path=conn_path,
+                fallback_conn=fallback_conn,
+                version_mgr=vm,
+            ),
+            "dashboard-refresh",
+            None,
+        )
+        self._refresh_inflight_token = token
+        self._refresh_inflight_force = force
+        self._track_refresh_task(task)
+        task.done.connect(lambda payload, token=token: self._on_refresh_payload(token, payload))
+        task.finished.connect(lambda task=task, token=token: self._forget_refresh_task(task, token))
+        task.start()
 
     def _conn(self):
         return getattr(self._win, "_conn", None)
+
+    def _ui_alive(self) -> bool:
+        try:
+            if not _qt_is_valid(self):
+                return False
+            return not getattr(self._win, "_closing", False)
+        except RuntimeError:
+            return False
+
+    def _on_refresh_payload(self, token: int, payload: object) -> None:
+        if not self._ui_alive() or token != self._refresh_apply_token:
+            return
+        if isinstance(payload, dict):
+            self._apply_payload(payload)
+            self._apply_data()
+        self._restyle()
+
+    def _track_refresh_task(self, task) -> None:
+        self._refresh_tasks.append(task)
+        if self._parent_bg_tasks is not None and task not in self._parent_bg_tasks:
+            self._parent_bg_tasks.append(task)
+
+    def _forget_refresh_task(self, task, token: int | None = None) -> None:
+        parent_tasks = self._parent_bg_tasks
+        try:
+            if _qt_is_valid(self):
+                if task in self._refresh_tasks:
+                    self._refresh_tasks.remove(task)
+                if token is not None and self._refresh_inflight_token == token:
+                    self._refresh_inflight_token = None
+                    self._refresh_inflight_force = False
+        except RuntimeError:
+            pass
+        if parent_tasks is not None and task in parent_tasks:
+            parent_tasks.remove(task)
+
+    def _build_payload(self, *, conn_path: str | None = None, fallback_conn=None,
+                       version_mgr=None) -> dict:
+        conn = None
+        own_conn = False
+        if conn_path:
+            from .. import db
+            conn = db.connect(conn_path)
+            own_conn = True
+        else:
+            conn = fallback_conn
+
+        file_count = page_count = 0
+        rows: list = []
+        if conn is not None:
+            from .. import db
+            try:
+                s = db.stats(conn)
+                file_count, page_count = s["file_count"], s["page_count"]
+            except Exception:  # noqa: BLE001
+                _log.warning("db.stats failed in dashboard", exc_info=True)
+            try:
+                rows = conn.execute(
+                    "SELECT path, name, mtime FROM files ORDER BY mtime DESC LIMIT 400"
+                ).fetchall()
+            except Exception:  # noqa: BLE001
+                _log.warning("db files query failed in dashboard", exc_info=True)
+                rows = []
+
+        guarded = 0
+        if version_mgr is not None:
+            try:
+                if hasattr(version_mgr, "list_docs_details"):
+                    guarded = len(version_mgr.list_docs_details())
+                else:
+                    guarded = len(version_mgr.list_docs())
+            except Exception:  # noqa: BLE001
+                guarded = 0
+
+        folder_counts: dict[str, int] = {}
+        week = [0] * 7
+        now = datetime.datetime.now()
+        week_start = (now - datetime.timedelta(days=now.weekday())).date()
+        recent_week = 0
+        for r in rows:
+            folder = os.path.basename(os.path.dirname(r["path"])) or "根目录"
+            folder_counts[folder] = folder_counts.get(folder, 0) + 1
+            try:
+                dt = datetime.datetime.fromtimestamp(r["mtime"])
+            except (OSError, OverflowError, ValueError):
+                continue
+            if dt.date() >= week_start:
+                week[dt.weekday()] += 1
+                recent_week += 1
+
+        folders_sorted = sorted(folder_counts.items(), key=lambda kv: kv[1], reverse=True)
+        top_folders = folders_sorted[:5]
+        if len(folders_sorted) > 5:
+            rest = sum(v for _, v in folders_sorted[5:])
+            top_folders = folders_sorted[:4] + [("其他", rest)]
+
+        recents: list[tuple[str, str, str]] = []
+        if conn is not None:
+            from .. import db
+            try:
+                for fr in db.recent_files(conn, limit=5):
+                    recents.append((fr.name, _rel_time(fr.mtime),
+                                    f"{fr.page_count}页" if fr.page_count else ""))
+            except Exception:  # noqa: BLE001
+                _log.warning("recent_files failed in dashboard", exc_info=True)
+
+        if own_conn and conn is not None:
+            conn.close()
+
+        return {
+            "kpi_vals": [
+                (f"{file_count:,}", "已索引文档", "全文可搜"),
+                (f"{guarded:,}" if guarded else "—", "版本快照", "PPT 版 git"),
+                (f"{page_count:,}", "已索引页", "命中即定位"),
+                (f"{recent_week:,}", "本周改动", "近 7 日活跃"),
+            ],
+            "folders": top_folders,
+            "topics": top_folders,
+            "week": week if any(week) else [0] * 7,
+            "week_shield_text": (
+                f"🛡 版本保护 {guarded} 份 · 改存即自动留版" if guarded
+                else "🛡 改存即自动留版，随时回到旧版本"),
+            "recent": recents,
+        }
+
+    def _apply_payload(self, payload: dict) -> None:
+        self._kpi_vals = list(payload.get("kpi_vals") or [("—", "", "")] * 4)
+        self._folders = list(payload.get("folders") or [])
+        self._topics = list(payload.get("topics") or [])
+        self._week = list(payload.get("week") or [0] * 7)
+        self._week_shield_text = str(payload.get("week_shield_text") or "")
+        self._recent = list(payload.get("recent") or [])
 
     def _recompute(self) -> None:
         conn = self._conn()

@@ -214,6 +214,7 @@ QWidget#emptyHint { background: transparent; }
 QLabel#emptyIcon { font-size: 38px; background: transparent; }
 QLabel#emptyTitle { color: $ink2; font-size: 15px; font-weight: 600; background: transparent; }
 QLabel#emptyTip { color: $ink3; font-size: 12px; background: transparent; }
+QLabel#emptyMeta { color: $ink4; font-size: 11.5px; background: transparent; }
 QPushButton#suggBtn { background: $field; border: 1px solid $bd2; border-radius: 8px; padding: 7px 18px; color: $acc; font-size: 12.5px; font-weight: 600; }
 QPushButton#suggBtn:hover { border-color: $acc; background: $hover; }
 

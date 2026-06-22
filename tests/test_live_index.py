@@ -1,13 +1,44 @@
 """实时索引：watcher 留版事件 → 单文件并入搜索（无需重扫）+ 启动跳过全盘扫。"""
 from __future__ import annotations
 
+import threading
+
 import fixtures_gen as fx
-from test_ui import StubRender, _index
+from test_ui import StubRender, StubThumb, _finish_fake_task, _index, _install_fake_background_task
 
 from pptx_finder import db, indexer, search
+from pptx_finder.ui.index_worker import IndexWorker
 from pptx_finder.ui.live_indexer import LiveIndexer
+import pptx_finder.ui.main_window as main_window_mod
 from pptx_finder.ui.main_window import MainWindow
 from pptx_finder.ui.thumb_worker import ThumbWorker
+
+
+class _FakeSignal:
+    def __init__(self):
+        self.callbacks = []
+
+    def connect(self, callback):
+        self.callbacks.append(callback)
+
+
+class _FakeLiveIndexer:
+    def __init__(self, *_args, **_kwargs):
+        self.indexed = _FakeSignal()
+        self.started = False
+        self.stopped = False
+
+    def start(self):
+        self.started = True
+
+    def stop(self):
+        self.stopped = True
+
+    def wait(self, _ms):
+        return True
+
+    def submit(self, _path):
+        pass
 
 
 def test_index_single_adds_without_deleting(tmp_path):
@@ -57,6 +88,77 @@ def test_index_is_empty_on_blank_db(qtbot, tmp_path):
     assert win._index_is_empty() is True
 
 
+def test_startup_empty_index_check_runs_in_background(qtbot, monkeypatch, tmp_path):
+    tasks = _install_fake_background_task(monkeypatch)
+    calls = []
+    starts = []
+
+    def fake_stats(_conn):
+        calls.append("stats")
+        return {"file_count": 0, "page_count": 0}
+
+    monkeypatch.setattr(main_window_mod.db, "stats", fake_stats)
+    monkeypatch.setattr(main_window_mod, "LiveIndexer", _FakeLiveIndexer)
+    monkeypatch.setattr(
+        MainWindow,
+        "_start_indexing",
+        lambda self, roots, workers: starts.append((roots, workers)) or True,
+    )
+
+    conn = db.connect(tmp_path / "blank.db")
+    db.init_db(conn)
+    win = MainWindow(
+        conn=conn,
+        render_worker=StubRender(),
+        thumb_worker=StubThumb(),
+        do_index=True,
+        roots=["C:/docs"],
+        workers=2,
+    )
+    qtbot.addWidget(win)
+
+    assert calls == []
+    assert starts == []
+    startup_task = next(t for t in tasks if t.label == "startup-index-check")
+
+    _finish_fake_task(startup_task)
+
+    assert calls == ["stats"]
+    assert starts == [(["C:/docs"], 2)]
+
+
+def test_startup_existing_index_check_updates_status_without_scan(qtbot, monkeypatch, tmp_path):
+    tasks = _install_fake_background_task(monkeypatch)
+    starts = []
+
+    monkeypatch.setattr(
+        main_window_mod.db,
+        "stats",
+        lambda _conn: {"file_count": 4, "page_count": 9},
+    )
+    monkeypatch.setattr(main_window_mod, "LiveIndexer", _FakeLiveIndexer)
+    monkeypatch.setattr(
+        MainWindow,
+        "_start_indexing",
+        lambda self, roots, workers: starts.append((roots, workers)) or True,
+    )
+
+    conn = _index(tmp_path)
+    win = MainWindow(
+        conn=conn,
+        render_worker=StubRender(),
+        thumb_worker=StubThumb(),
+        do_index=True,
+    )
+    qtbot.addWidget(win)
+    startup_task = next(t for t in tasks if t.label == "startup-index-check")
+
+    _finish_fake_task(startup_task)
+
+    assert starts == []
+    assert "索引就绪：4 个文件 · 9 页" in win.status_label.text()
+
+
 def test_live_indexer_async_off_main_thread(qtbot, tmp_path):
     """LiveIndexer：submit 入队 → 后台线程索引 → indexed 信号 → 文件可搜。
 
@@ -89,6 +191,171 @@ def test_live_indexer_coalesces_duplicate_paths(tmp_path):
     li.submit(p)
     li.submit(p)
     assert li._q.qsize() == 1
+
+
+def test_live_index_deferred_while_full_index_running(qtbot, tmp_path):
+    conn = _index(tmp_path)
+    win = MainWindow(conn=conn, render_worker=StubRender(), do_index=False)
+    qtbot.addWidget(win)
+    submitted: list[str] = []
+
+    class FakeLive:
+        def submit(self, path: str):
+            submitted.append(path)
+
+        def stop(self):
+            pass
+
+        def wait(self, _ms):
+            return True
+
+    class RunningIndexer:
+        def __init__(self):
+            self.running = True
+
+        def isRunning(self):
+            return self.running
+
+        def stop(self):
+            pass
+
+        def wait(self, _ms):
+            return True
+
+    running = RunningIndexer()
+    win._live = FakeLive()
+    win._indexer = running
+
+    win._index_file_live("C:/new.pptx")
+
+    assert submitted == []
+    assert win._live_deferred_paths == {"C:/new.pptx"}
+
+    running.running = False
+    win._flush_deferred_live_index()
+
+    assert submitted == ["C:/new.pptx"]
+    assert win._live_deferred_paths == set()
+
+
+def test_deferred_live_flush_is_batched(qtbot, monkeypatch, tmp_path):
+    monkeypatch.setattr(MainWindow, "_LIVE_FLUSH_BATCH", 2)
+    conn = _index(tmp_path)
+    win = MainWindow(conn=conn, render_worker=StubRender(), do_index=False)
+    qtbot.addWidget(win)
+    submitted: list[str] = []
+    scheduled: list[tuple[int, object]] = []
+
+    monkeypatch.setattr(win, "_submit_live_index", lambda path: submitted.append(path))
+    monkeypatch.setattr(
+        main_window_mod.QTimer,
+        "singleShot",
+        lambda delay_ms, callback: scheduled.append((delay_ms, callback)),
+    )
+    win._live_deferred_paths = {f"C:/new-{i}.pptx" for i in range(5)}
+
+    win._flush_deferred_live_index()
+
+    assert len(submitted) == 2
+    assert len(win._live_deferred_paths) == 3
+    assert len(scheduled) == 1
+    assert scheduled[-1][0] >= 1
+
+    scheduled.pop(0)[1]()
+    assert len(submitted) == 4
+    assert len(win._live_deferred_paths) == 1
+    assert len(scheduled) == 1
+
+    scheduled.pop(0)[1]()
+    assert len(submitted) == 5
+    assert win._live_deferred_paths == set()
+    assert scheduled == []
+
+
+def test_deferred_live_flush_does_not_sort_entire_storm(qtbot, monkeypatch, tmp_path):
+    monkeypatch.setattr(MainWindow, "_LIVE_FLUSH_BATCH", 64)
+    conn = _index(tmp_path)
+    win = MainWindow(conn=conn, render_worker=StubRender(), do_index=False)
+    qtbot.addWidget(win)
+    submitted: list[str] = []
+    scheduled: list[tuple[int, object]] = []
+
+    def fail_sorted(_items):
+        raise AssertionError("deferred live flush must not sort the full pending storm")
+
+    monkeypatch.setattr(win, "_submit_live_index", lambda path: submitted.append(path))
+    monkeypatch.setattr(main_window_mod, "sorted", fail_sorted, raising=False)
+    monkeypatch.setattr(
+        main_window_mod.QTimer,
+        "singleShot",
+        lambda delay_ms, callback: scheduled.append((delay_ms, callback)),
+    )
+    win._live_deferred_paths = {f"C:/storm-{i}.pptx" for i in range(500)}
+
+    win._flush_deferred_live_index()
+
+    assert len(submitted) == 64
+    assert len(win._live_deferred_paths) == 436
+    assert len(scheduled) == 1
+    assert scheduled[-1][0] >= 1
+
+
+def test_index_worker_reports_search_ready_before_clustering(monkeypatch, qtbot, tmp_path):
+    cluster_started = threading.Event()
+    release_cluster = threading.Event()
+    emitted = []
+
+    def fake_update_index(conn, roots, progress_cb=None, workers=None, stop_event=None):
+        return {"indexed": 1, "deleted": 0}
+
+    def slow_compute_groups(conn):
+        cluster_started.set()
+        release_cluster.wait(1)
+        return {}
+
+    monkeypatch.setattr(indexer, "update_index", fake_update_index)
+    monkeypatch.setattr("pptx_finder.cluster.compute_groups", slow_compute_groups)
+
+    worker = IndexWorker(str(tmp_path / "i.db"), [str(tmp_path)], workers=1)
+    worker.finished_index.connect(lambda summary: emitted.append(summary))
+    worker.start()
+    try:
+        assert cluster_started.wait(1), "cluster should start in worker thread"
+        qtbot.wait(80)
+        assert emitted == [{"indexed": 1, "deleted": 0}]
+    finally:
+        release_cluster.set()
+        worker.wait(1000)
+
+
+def test_index_worker_throttles_progress_burst_before_ui(monkeypatch, qtbot, tmp_path):
+    emitted: list[tuple[int, int, str]] = []
+
+    def fake_update_index(conn, roots, progress_cb=None, workers=None, stop_event=None):
+        assert progress_cb is not None
+        for i in range(1, 20):
+            progress_cb(i, 100, f"deck-{i}.pptx")
+        progress_cb(100, 100, "完成")
+        return {"indexed": 100, "deleted": 0}
+
+    monkeypatch.setattr(indexer, "update_index", fake_update_index)
+    monkeypatch.setattr("pptx_finder.cluster.compute_groups", lambda _conn: {})
+    worker = IndexWorker(str(tmp_path / "i.db"), [str(tmp_path)], workers=1)
+    worker.progress.connect(lambda done, total, cur: emitted.append((done, total, cur)))
+    worker.start()
+    try:
+        with qtbot.waitSignal(worker.finished_index, timeout=3000):
+            pass
+        worker.wait(1000)
+        qtbot.wait(50)
+    finally:
+        if worker.isRunning():
+            worker.stop()
+            worker.wait(1000)
+
+    assert emitted[0] == (1, 100, "deck-1.pptx")
+    assert emitted[-1] == (100, 100, "完成")
+    assert len(emitted) <= 3
 
 
 def test_thumb_worker_coalesces_duplicate_requests():

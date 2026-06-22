@@ -10,10 +10,17 @@ from datetime import datetime
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea, QVBoxLayout, QWidget,
+    QFileDialog, QFrame, QHBoxLayout, QLabel, QMessageBox, QPushButton, QScrollArea, QVBoxLayout, QWidget,
 )
+try:
+    from shiboken6 import isValid as _qt_is_valid
+except Exception:  # noqa: BLE001
+    def _qt_is_valid(_obj) -> bool:
+        return True
 
+from .. import db
 from .. import stats
+from .bg_task import BackgroundTask
 from .heatmap import HeatmapWidget
 
 _RED_MANSION_CHARS = 730_000  # 《红楼梦》约 73 万字
@@ -49,6 +56,27 @@ def _this_year() -> int:
     return datetime.now().year
 
 
+def _conn_path(conn) -> str | None:
+    try:
+        row = conn.execute("PRAGMA database_list").fetchone()
+        if row is None:
+            return None
+        return row["file"] if hasattr(row, "keys") else row[2]
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _build_report_off_ui(conn, *, year=None):
+    path = _conn_path(conn)
+    if path:
+        own = db.connect(path)
+        try:
+            return stats.build_report(own, year=year)
+        finally:
+            own.close()
+    return stats.build_report(conn, year=year)
+
+
 # ---------- 浮层 ----------
 
 class ReportOverlay(QWidget):
@@ -58,10 +86,21 @@ class ReportOverlay(QWidget):
         super().__init__(parent)
         self._tok = tok
         self._conn = conn
+        self._closing_owner = parent
         self.current_report = report
         self.current_year = report.scope_year
+        self._switch_token = 0
+        self._switch_inflight: tuple[int, int | None] | None = None
+        self._report_ready_for_export = True
+        self._export_inflight = False
+        self._report_tasks: list[BackgroundTask] = []
+        self._parent_bg_tasks = getattr(parent, "_bg_tasks", None)
+        if not isinstance(self._parent_bg_tasks, list):
+            self._parent_bg_tasks = None
+        self._closing = False
         self.setObjectName("reportOverlay")
         self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setAttribute(Qt.WA_DeleteOnClose, True)
         self.setStyleSheet("#reportOverlay{background:rgba(0,0,0,0.42);}")
 
         self._card = QFrame()
@@ -95,6 +134,27 @@ class ReportOverlay(QWidget):
         if parent is not None:
             self.setGeometry(parent.rect())
 
+    def _ui_alive(self) -> bool:
+        if self._closing or not _qt_is_valid(self):
+            return False
+        owner = getattr(self, "_closing_owner", None)
+        try:
+            return owner is None or not getattr(owner, "_closing", False)
+        except RuntimeError:
+            return False
+
+    def closeEvent(self, event):  # noqa: N802
+        self._closing = True
+        self._switch_token += 1
+        self._switch_inflight = None
+        try:
+            parent = self.parent()
+            if parent is not None and getattr(parent, "_stats_overlay", None) is self:
+                parent._stats_overlay = None
+        except RuntimeError:
+            pass
+        super().closeEvent(event)
+
     # ---- 构建 ----
     def _build_header(self) -> None:
         tok = self._tok
@@ -124,6 +184,7 @@ class ReportOverlay(QWidget):
         self.export_btn.setStyleSheet(
             f"QPushButton{{background:{tok['acc']};color:{tok['acctext']};border:none;"
             f"border-radius:7px;padding:5px 12px;font-weight:600;}}")
+        self.export_btn.clicked.connect(self._export_clicked)
         head.addWidget(self.export_btn)
         self.close_btn = QPushButton("✕")
         self.close_btn.setFixedWidth(30)
@@ -134,10 +195,99 @@ class ReportOverlay(QWidget):
         self._card_lay.addLayout(head)
 
     def switch_year(self, year: int | None) -> None:
+        if not self._ui_alive():
+            return
+        if year == self.current_year and self.current_report.scope_year == year:
+            return
+        if self._switch_inflight is not None:
+            return
         self.current_year = year
         if self._conn is not None:
-            self.current_report = stats.build_report(self._conn, year=year)
+            self._switch_token += 1
+            token = self._switch_token
+            self._switch_inflight = (token, year)
+            self._report_ready_for_export = False
+            self._set_year_buttons_enabled(False)
+            self.export_btn.setEnabled(False)
+            self._show_loading(year)
+            task = BackgroundTask(
+                lambda year=year: _build_report_off_ui(self._conn, year=year),
+                "stats-report-switch",
+                None,
+            )
+            self._track_report_task(task)
+            task.done.connect(
+                lambda report, token=token, year=year: self._on_report_switched(token, year, report))
+            task.finished.connect(
+                lambda task=task: self._forget_report_task(task))
+            task.start()
+        else:
+            self._fill_content()
+
+    def _set_year_buttons_enabled(self, enabled: bool) -> None:
+        for btn_name in ("_all_btn", "_year_btn"):
+            btn = getattr(self, btn_name, None)
+            if btn is not None:
+                btn.setEnabled(enabled)
+
+    def _show_loading(self, year: int | None) -> None:
+        while self._content_lay.count():
+            it = self._content_lay.takeAt(0)
+            if it.widget():
+                it.widget().deleteLater()
+        if self._conn is not None:
+            self._all_btn.setChecked(year is None)
+            self._year_btn.setChecked(year is not None)
+        scope = f"{year} 年" if year else "全部历史"
+        lab = QLabel(f"正在生成 {scope} 胶片报告…")
+        lab.setWordWrap(True)
+        lab.setStyleSheet(f"color:{self._tok['ink3']};background:transparent;border:none;font-size:12.5px;")
+        self._content_lay.addWidget(lab)
+
+    def _show_switch_error(self, year: int | None) -> None:
+        while self._content_lay.count():
+            it = self._content_lay.takeAt(0)
+            if it.widget():
+                it.widget().deleteLater()
+        if self._conn is not None:
+            self._all_btn.setChecked(year is None)
+            self._year_btn.setChecked(year is not None)
+        scope = f"{year} 年" if year else "全部历史"
+        lab = QLabel(f"{scope}胶片报告生成失败，请稍后重试。")
+        lab.setWordWrap(True)
+        lab.setStyleSheet(f"color:{self._tok['ink3']};background:transparent;border:none;font-size:12.5px;")
+        self._content_lay.addWidget(lab)
+
+    def _on_report_switched(self, token: int, year: int | None, report: object) -> None:
+        if not self._ui_alive() or token != self._switch_token:
+            return
+        if self._switch_inflight == (token, year):
+            self._switch_inflight = None
+        self._set_year_buttons_enabled(True)
+        if report is None:
+            self._show_switch_error(year)
+            return
+        self.current_year = year
+        self.current_report = report
         self._fill_content()
+        self._report_ready_for_export = True
+        self.export_btn.setEnabled(not self._export_inflight)
+
+    def _track_report_task(self, task) -> None:
+        self._report_tasks.append(task)
+        if self._parent_bg_tasks is not None and task not in self._parent_bg_tasks:
+            self._parent_bg_tasks.append(task)
+
+    def _forget_report_task(self, task) -> None:
+        parent_tasks = self._parent_bg_tasks
+        try:
+            if _qt_is_valid(self) and task in self._report_tasks:
+                self._report_tasks.remove(task)
+        except RuntimeError:
+            pass
+        if parent_tasks is not None and task in parent_tasks:
+            parent_tasks.remove(task)
+
 
     def _fill_content(self) -> None:
         while self._content_lay.count():
@@ -224,6 +374,41 @@ class ReportOverlay(QWidget):
         return f
 
     # ---- 行为 ----
+    def _export_clicked(self) -> None:
+        if not self._ui_alive() or self._export_inflight or not self.export_btn.isEnabled():
+            return
+        scope = str(self.current_year) if self.current_year is not None else "全部历史"
+        default_name = f"胶片报告_{scope}.png"
+        path, _ = QFileDialog.getSaveFileName(self, "导出胶片报告图片", default_name, "PNG Image (*.png)")
+        if not path:
+            return
+        if not path.lower().endswith(".png"):
+            path = f"{path}.png"
+        self._card.adjustSize()
+        image = self._card.grab().toImage()
+        self._export_inflight = True
+        self.export_btn.setEnabled(False)
+        old_text = self.export_btn.text()
+        self.export_btn.setText("导出中…")
+        task = BackgroundTask(
+            lambda image=image, path=path: bool(image.save(path)),
+            "stats-report-export",
+            None,
+        )
+        self._track_report_task(task)
+        task.done.connect(lambda ok, path=path, old_text=old_text: self._on_export_done(path, old_text, ok))
+        task.finished.connect(lambda task=task: self._forget_report_task(task))
+        task.start()
+
+    def _on_export_done(self, path: str, old_text: str, ok: object) -> None:
+        if not self._ui_alive():
+            return
+        self._export_inflight = False
+        self.export_btn.setText(old_text)
+        if self._report_ready_for_export:
+            self.export_btn.setEnabled(True)
+        QMessageBox.information(self, "导出图片", "已导出图片" if ok else "导出失败")
+
     def export_png(self, path: str) -> bool:
         self._card.adjustSize()
         return bool(self._card.grab().save(path))

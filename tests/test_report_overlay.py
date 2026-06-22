@@ -2,6 +2,10 @@
 from __future__ import annotations
 
 from datetime import datetime
+from types import SimpleNamespace
+
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QWidget
 
 from pptx_finder import db, stats
 from pptx_finder.ui import report_overlay as ro
@@ -49,6 +53,106 @@ def test_overlay_constructs_and_exports_png(qtbot, tmp_path):
     assert out.exists() and out.stat().st_size > 0
 
 
+def test_export_button_saves_png(qtbot, tmp_path, monkeypatch):
+    conn = db.connect(tmp_path / "i.db")
+    db.init_db(conn)
+    fid = db.upsert_file(conn, path="/clicked.pptx", name="clicked.pptx", ext=".pptx",
+                         size=2_000_000, mtime=_ts(2026, 6, 1, 2), content_hash="h",
+                         page_count=88, status="ok", error="", indexed_at=0)
+    db.replace_pages(conn, fid, [(1, "export button path" * 100, "t")])
+    conn.commit()
+    report = stats.build_report(conn, year=None)
+
+    ov = ro.ReportOverlay(report, theme.tok("cloud"))
+    qtbot.addWidget(ov)
+    out = tmp_path / "clicked-report.png"
+    messages = []
+    monkeypatch.setattr(
+        ro,
+        "QFileDialog",
+        SimpleNamespace(getSaveFileName=lambda *args, **kwargs: (str(out), "")),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        ro,
+        "QMessageBox",
+        SimpleNamespace(information=lambda *args, **kwargs: messages.append(args)),
+        raising=False,
+    )
+
+    qtbot.mouseClick(ov.export_btn, Qt.LeftButton)
+
+    qtbot.waitUntil(lambda: out.exists() and out.stat().st_size > 0 and bool(messages), timeout=1000)
+
+
+def test_export_button_saves_png_in_background(qtbot, tmp_path, monkeypatch):
+    conn = db.connect(tmp_path / "i.db")
+    db.init_db(conn)
+    fid = db.upsert_file(conn, path="/async-export.pptx", name="async-export.pptx", ext=".pptx",
+                         size=2_000_000, mtime=_ts(2026, 6, 1, 2), content_hash="h",
+                         page_count=88, status="ok", error="", indexed_at=0)
+    db.replace_pages(conn, fid, [(1, "async export button path" * 100, "t")])
+    conn.commit()
+    report = stats.build_report(conn, year=None)
+    tasks = []
+    messages = []
+    out = tmp_path / "async-report.png"
+
+    class FakeSignal:
+        def __init__(self):
+            self.callbacks = []
+
+        def connect(self, callback):
+            self.callbacks.append(callback)
+
+        def emit(self, *args):
+            for callback in list(self.callbacks):
+                callback(*args)
+
+    class FakeTask:
+        def __init__(self, fn, label="", parent=None):
+            self.fn = fn
+            self.label = label
+            self.done = FakeSignal()
+            self.finished = FakeSignal()
+
+        def start(self):
+            tasks.append(self)
+
+    monkeypatch.setattr(ro, "BackgroundTask", FakeTask, raising=False)
+    monkeypatch.setattr(
+        ro,
+        "QFileDialog",
+        SimpleNamespace(getSaveFileName=lambda *args, **kwargs: (str(out), "")),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        ro,
+        "QMessageBox",
+        SimpleNamespace(information=lambda *args, **kwargs: messages.append(args)),
+        raising=False,
+    )
+
+    ov = ro.ReportOverlay(report, theme.tok("cloud"))
+    qtbot.addWidget(ov)
+    export_calls = []
+    monkeypatch.setattr(ov, "export_png", lambda _path: export_calls.append(_path) or True)
+
+    qtbot.mouseClick(ov.export_btn, Qt.LeftButton)
+
+    assert export_calls == []
+    assert tasks and tasks[-1].label == "stats-report-export"
+    assert ov.export_btn.isEnabled() is False
+    assert messages == []
+
+    result = tasks[-1].fn()
+    tasks[-1].done.emit(result)
+
+    assert out.exists() and out.stat().st_size > 0
+    assert messages
+    assert ov.export_btn.isEnabled() is True
+
+
 def test_overlay_year_switch_rebuilds_report(qtbot, tmp_path):
     conn = db.connect(tmp_path / "i.db")
     db.init_db(conn)
@@ -64,8 +168,646 @@ def test_overlay_year_switch_rebuilds_report(qtbot, tmp_path):
     qtbot.addWidget(ov)
     assert ov.current_report.deck_count == 2     # 全部历史
     ov.switch_year(2026)
+    qtbot.waitUntil(lambda: ov.current_report.deck_count == 1, timeout=1000)
     assert ov.current_year == 2026
     assert ov.current_report.deck_count == 1     # 仅 2026 那份
     ov.switch_year(None)
+    qtbot.waitUntil(lambda: ov.current_report.deck_count == 2, timeout=1000)
     assert ov.current_year is None
     assert ov.current_report.deck_count == 2
+
+
+def test_overlay_year_switch_builds_in_background(qtbot, tmp_path, monkeypatch):
+    conn = db.connect(tmp_path / "i.db")
+    db.init_db(conn)
+    db.upsert_file(conn, path="/a.pptx", name="a.pptx", ext=".pptx", size=1000,
+                   mtime=_ts(2026, 6, 1, 2), content_hash="h", page_count=5,
+                   status="ok", error="", indexed_at=0)
+    conn.commit()
+    report = stats.build_report(conn, year=None)
+    calls = []
+    tasks = []
+
+    class FakeSignal:
+        def __init__(self):
+            self.callbacks = []
+
+        def connect(self, callback):
+            self.callbacks.append(callback)
+
+        def emit(self, *args):
+            for callback in list(self.callbacks):
+                callback(*args)
+
+    class FakeTask:
+        def __init__(self, fn, label="", parent=None):
+            self.fn = fn
+            self.label = label
+            self.done = FakeSignal()
+            self.finished = FakeSignal()
+
+        def start(self):
+            tasks.append(self)
+
+    def fake_build_report(_conn, *, year=None):
+        calls.append(year)
+        return report
+
+    monkeypatch.setattr(ro, "BackgroundTask", FakeTask, raising=False)
+    monkeypatch.setattr(ro.stats, "build_report", fake_build_report)
+
+    ov = ro.ReportOverlay(report, theme.tok("cloud"), conn=conn)
+    qtbot.addWidget(ov)
+    calls.clear()
+
+    ov.switch_year(2026)
+
+    assert calls == []
+    assert tasks and tasks[-1].label == "stats-report-switch"
+    assert "生成" in ov._content_lay.itemAt(0).widget().text()
+
+    result = tasks[-1].fn()
+    tasks[-1].done.emit(result)
+
+    assert calls == [2026]
+    assert ov.current_year == 2026
+
+
+def test_overlay_tasks_registered_for_parent_shutdown(qtbot, tmp_path, monkeypatch):
+    conn = db.connect(tmp_path / "i.db")
+    db.init_db(conn)
+    db.upsert_file(conn, path="/a.pptx", name="a.pptx", ext=".pptx", size=1000,
+                   mtime=_ts(2026, 6, 1, 2), content_hash="h", page_count=5,
+                   status="ok", error="", indexed_at=0)
+    conn.commit()
+    report = stats.build_report(conn, year=None)
+    tasks = []
+
+    class FakeSignal:
+        def __init__(self):
+            self.callbacks = []
+
+        def connect(self, callback):
+            self.callbacks.append(callback)
+
+        def emit(self, *args):
+            for callback in list(self.callbacks):
+                callback(*args)
+
+    class FakeTask:
+        def __init__(self, fn, label="", parent=None):
+            self.fn = fn
+            self.label = label
+            self._label = label
+            self.done = FakeSignal()
+            self.finished = FakeSignal()
+
+        def start(self):
+            tasks.append(self)
+
+    parent = QWidget()
+    parent._bg_tasks = []
+    qtbot.addWidget(parent)
+    monkeypatch.setattr(ro, "BackgroundTask", FakeTask, raising=False)
+
+    ov = ro.ReportOverlay(report, theme.tok("cloud"), parent=parent, conn=conn)
+
+    ov.switch_year(2026)
+    switch_task = tasks[-1]
+
+    assert switch_task in ov._report_tasks
+    assert switch_task in parent._bg_tasks
+
+    switch_task.finished.emit()
+
+    assert switch_task not in ov._report_tasks
+    assert switch_task not in parent._bg_tasks
+
+
+def test_overlay_export_task_registered_for_parent_shutdown(qtbot, tmp_path, monkeypatch):
+    conn = db.connect(tmp_path / "i.db")
+    db.init_db(conn)
+    fid = db.upsert_file(conn, path="/export-parent.pptx", name="export-parent.pptx", ext=".pptx",
+                         size=2_000_000, mtime=_ts(2026, 6, 1, 2), content_hash="h",
+                         page_count=88, status="ok", error="", indexed_at=0)
+    db.replace_pages(conn, fid, [(1, "export parent path" * 100, "t")])
+    conn.commit()
+    report = stats.build_report(conn, year=None)
+    tasks = []
+    out = tmp_path / "export-parent.png"
+
+    class FakeSignal:
+        def __init__(self):
+            self.callbacks = []
+
+        def connect(self, callback):
+            self.callbacks.append(callback)
+
+        def emit(self, *args):
+            for callback in list(self.callbacks):
+                callback(*args)
+
+    class FakeTask:
+        def __init__(self, fn, label="", parent=None):
+            self.fn = fn
+            self.label = label
+            self._label = label
+            self.done = FakeSignal()
+            self.finished = FakeSignal()
+
+        def start(self):
+            tasks.append(self)
+
+    parent = QWidget()
+    parent._bg_tasks = []
+    qtbot.addWidget(parent)
+    monkeypatch.setattr(ro, "BackgroundTask", FakeTask, raising=False)
+    monkeypatch.setattr(
+        ro,
+        "QFileDialog",
+        SimpleNamespace(getSaveFileName=lambda *args, **kwargs: (str(out), "")),
+        raising=False,
+    )
+
+    ov = ro.ReportOverlay(report, theme.tok("cloud"), parent=parent)
+
+    ov._export_clicked()
+    export_task = tasks[-1]
+
+    assert export_task in ov._report_tasks
+    assert export_task in parent._bg_tasks
+
+    export_task.finished.emit()
+
+    assert export_task not in ov._report_tasks
+    assert export_task not in parent._bg_tasks
+
+
+def test_overlay_year_switch_reuses_inflight_same_year(qtbot, tmp_path, monkeypatch):
+    conn = db.connect(tmp_path / "i.db")
+    db.init_db(conn)
+    db.upsert_file(conn, path="/a.pptx", name="a.pptx", ext=".pptx", size=1000,
+                   mtime=_ts(2026, 6, 1, 2), content_hash="h", page_count=5,
+                   status="ok", error="", indexed_at=0)
+    conn.commit()
+    report = stats.build_report(conn, year=None)
+    tasks = []
+
+    class FakeSignal:
+        def __init__(self):
+            self.callbacks = []
+
+        def connect(self, callback):
+            self.callbacks.append(callback)
+
+        def emit(self, value=None):
+            for callback in list(self.callbacks):
+                callback(value)
+
+    class FakeTask:
+        def __init__(self, fn, label="", parent=None):
+            self.fn = fn
+            self.label = label
+            self.done = FakeSignal()
+            self.finished = FakeSignal()
+
+        def start(self):
+            tasks.append(self)
+
+    monkeypatch.setattr(ro, "BackgroundTask", FakeTask, raising=False)
+
+    ov = ro.ReportOverlay(report, theme.tok("cloud"), conn=conn)
+    qtbot.addWidget(ov)
+
+    ov.switch_year(2026)
+    first_task = tasks[-1]
+    ov.switch_year(2026)
+    ov.switch_year(2026)
+
+    switch_tasks = [task for task in tasks if task.label == "stats-report-switch"]
+    assert switch_tasks == [first_task]
+
+
+def test_overlay_year_switch_ignores_new_switch_while_inflight(qtbot, tmp_path, monkeypatch):
+    conn = db.connect(tmp_path / "i.db")
+    db.init_db(conn)
+    db.upsert_file(conn, path="/a.pptx", name="a.pptx", ext=".pptx", size=1000,
+                   mtime=_ts(2026, 6, 1, 2), content_hash="h", page_count=5,
+                   status="ok", error="", indexed_at=0)
+    conn.commit()
+    report = stats.build_report(conn, year=None)
+    tasks = []
+
+    class FakeSignal:
+        def __init__(self):
+            self.callbacks = []
+
+        def connect(self, callback):
+            self.callbacks.append(callback)
+
+        def emit(self, value=None):
+            for callback in list(self.callbacks):
+                callback(value)
+
+    class FakeTask:
+        def __init__(self, fn, label="", parent=None):
+            self.fn = fn
+            self.label = label
+            self.done = FakeSignal()
+            self.finished = FakeSignal()
+
+        def start(self):
+            tasks.append(self)
+
+    monkeypatch.setattr(ro, "BackgroundTask", FakeTask, raising=False)
+
+    ov = ro.ReportOverlay(report, theme.tok("cloud"), conn=conn)
+    qtbot.addWidget(ov)
+
+    ov.switch_year(2026)
+    first_task = tasks[-1]
+    ov.switch_year(None)
+
+    switch_tasks = [task for task in tasks if task.label == "stats-report-switch"]
+    assert switch_tasks == [first_task]
+    assert ov._switch_inflight == (1, 2026)
+    assert ov.current_year == 2026
+
+
+def test_overlay_year_switch_disables_export_until_report_ready(qtbot, tmp_path, monkeypatch):
+    conn = db.connect(tmp_path / "i.db")
+    db.init_db(conn)
+    db.upsert_file(conn, path="/a.pptx", name="a.pptx", ext=".pptx", size=1000,
+                   mtime=_ts(2026, 6, 1, 2), content_hash="h", page_count=5,
+                   status="ok", error="", indexed_at=0)
+    conn.commit()
+    report = stats.build_report(conn, year=None)
+    tasks = []
+    dialogs = []
+
+    class FakeSignal:
+        def __init__(self):
+            self.callbacks = []
+
+        def connect(self, callback):
+            self.callbacks.append(callback)
+
+        def emit(self, value=None):
+            for callback in list(self.callbacks):
+                callback(value)
+
+    class FakeTask:
+        def __init__(self, fn, label="", parent=None):
+            self.fn = fn
+            self.label = label
+            self.done = FakeSignal()
+            self.finished = FakeSignal()
+
+        def start(self):
+            tasks.append(self)
+
+    monkeypatch.setattr(ro, "BackgroundTask", FakeTask, raising=False)
+    monkeypatch.setattr(
+        ro,
+        "QFileDialog",
+        SimpleNamespace(getSaveFileName=lambda *args, **kwargs: dialogs.append(args) or ("C:/loading.png", "")),
+        raising=False,
+    )
+    ov = ro.ReportOverlay(report, theme.tok("cloud"), conn=conn)
+    qtbot.addWidget(ov)
+
+    ov.switch_year(2026)
+
+    assert ov.export_btn.isEnabled() is False
+    ov._export_clicked()
+    assert dialogs == []
+
+    result = tasks[-1].fn()
+    tasks[-1].done.emit(result)
+
+    assert ov.export_btn.isEnabled() is True
+
+
+def test_overlay_late_export_done_does_not_reenable_during_year_switch(qtbot, tmp_path, monkeypatch):
+    conn = db.connect(tmp_path / "i.db")
+    db.init_db(conn)
+    db.upsert_file(conn, path="/a.pptx", name="a.pptx", ext=".pptx", size=1000,
+                   mtime=_ts(2026, 6, 1, 2), content_hash="h", page_count=5,
+                   status="ok", error="", indexed_at=0)
+    conn.commit()
+    report = stats.build_report(conn, year=None)
+    tasks = []
+    messages = []
+
+    class FakeSignal:
+        def __init__(self):
+            self.callbacks = []
+
+        def connect(self, callback):
+            self.callbacks.append(callback)
+
+        def emit(self, value=None):
+            for callback in list(self.callbacks):
+                callback(value)
+
+    class FakeTask:
+        def __init__(self, fn, label="", parent=None):
+            self.fn = fn
+            self.label = label
+            self.done = FakeSignal()
+            self.finished = FakeSignal()
+
+        def start(self):
+            tasks.append(self)
+
+    monkeypatch.setattr(ro, "BackgroundTask", FakeTask, raising=False)
+    monkeypatch.setattr(
+        ro,
+        "QFileDialog",
+        SimpleNamespace(getSaveFileName=lambda *args, **kwargs: ("C:/report.png", "")),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        ro,
+        "QMessageBox",
+        SimpleNamespace(information=lambda *args, **kwargs: messages.append(args)),
+        raising=False,
+    )
+    ov = ro.ReportOverlay(report, theme.tok("cloud"), conn=conn)
+    qtbot.addWidget(ov)
+
+    ov._export_clicked()
+    export_task = tasks[-1]
+    assert export_task.label == "stats-report-export"
+    ov.switch_year(2026)
+    switch_task = tasks[-1]
+    assert switch_task.label == "stats-report-switch"
+    assert ov.export_btn.isEnabled() is False
+
+    export_task.done.emit(True)
+
+    assert ov.export_btn.isEnabled() is False
+
+    result = switch_task.fn()
+    switch_task.done.emit(result)
+
+    assert ov.export_btn.isEnabled() is True
+
+
+def test_overlay_year_switch_done_does_not_reenable_active_export(qtbot, tmp_path, monkeypatch):
+    conn = db.connect(tmp_path / "i.db")
+    db.init_db(conn)
+    db.upsert_file(conn, path="/a.pptx", name="a.pptx", ext=".pptx", size=1000,
+                   mtime=_ts(2026, 6, 1, 2), content_hash="h", page_count=5,
+                   status="ok", error="", indexed_at=0)
+    conn.commit()
+    report = stats.build_report(conn, year=None)
+    tasks = []
+    messages = []
+
+    class FakeSignal:
+        def __init__(self):
+            self.callbacks = []
+
+        def connect(self, callback):
+            self.callbacks.append(callback)
+
+        def emit(self, value=None):
+            for callback in list(self.callbacks):
+                callback(value)
+
+    class FakeTask:
+        def __init__(self, fn, label="", parent=None):
+            self.fn = fn
+            self.label = label
+            self.done = FakeSignal()
+            self.finished = FakeSignal()
+
+        def start(self):
+            tasks.append(self)
+
+    monkeypatch.setattr(ro, "BackgroundTask", FakeTask, raising=False)
+    monkeypatch.setattr(
+        ro,
+        "QFileDialog",
+        SimpleNamespace(getSaveFileName=lambda *args, **kwargs: ("C:/report.png", "")),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        ro,
+        "QMessageBox",
+        SimpleNamespace(information=lambda *args, **kwargs: messages.append(args)),
+        raising=False,
+    )
+    ov = ro.ReportOverlay(report, theme.tok("cloud"), conn=conn)
+    qtbot.addWidget(ov)
+
+    ov._export_clicked()
+    export_task = tasks[-1]
+    assert export_task.label == "stats-report-export"
+
+    ov.switch_year(2026)
+    switch_task = tasks[-1]
+    assert switch_task.label == "stats-report-switch"
+    result = switch_task.fn()
+    switch_task.done.emit(result)
+
+    assert ov.export_btn.isEnabled() is False
+
+    export_task.done.emit(True)
+
+    assert ov.export_btn.isEnabled() is True
+
+
+def test_overlay_year_switch_failure_shows_retryable_error(qtbot, tmp_path, monkeypatch):
+    conn = db.connect(tmp_path / "i.db")
+    db.init_db(conn)
+    db.upsert_file(conn, path="/a.pptx", name="a.pptx", ext=".pptx", size=1000,
+                   mtime=_ts(2026, 6, 1, 2), content_hash="h", page_count=5,
+                   status="ok", error="", indexed_at=0)
+    conn.commit()
+    report = stats.build_report(conn, year=None)
+    tasks = []
+
+    class FakeSignal:
+        def __init__(self):
+            self.callbacks = []
+
+        def connect(self, callback):
+            self.callbacks.append(callback)
+
+        def emit(self, value=None):
+            for callback in list(self.callbacks):
+                callback(value)
+
+    class FakeTask:
+        def __init__(self, fn, label="", parent=None):
+            self.fn = fn
+            self.label = label
+            self.done = FakeSignal()
+            self.finished = FakeSignal()
+
+        def start(self):
+            tasks.append(self)
+
+    monkeypatch.setattr(ro, "BackgroundTask", FakeTask, raising=False)
+    ov = ro.ReportOverlay(report, theme.tok("cloud"), conn=conn)
+    qtbot.addWidget(ov)
+
+    ov.switch_year(2026)
+    tasks[-1].done.emit(None)
+
+    text = ov._content_lay.itemAt(0).widget().text()
+    assert "生成失败" in text
+    assert "重试" in text
+    assert ov._all_btn.isEnabled()
+    assert ov._year_btn.isEnabled()
+    assert ov.export_btn.isEnabled() is False
+
+
+def test_overlay_late_year_switch_ignored_after_closing(qtbot, tmp_path, monkeypatch):
+    conn = db.connect(tmp_path / "i.db")
+    db.init_db(conn)
+    db.upsert_file(conn, path="/a.pptx", name="a.pptx", ext=".pptx", size=1000,
+                   mtime=_ts(2026, 6, 1, 2), content_hash="h", page_count=5,
+                   status="ok", error="", indexed_at=0)
+    conn.commit()
+    report = stats.build_report(conn, year=None)
+    year_report = stats.build_report(conn, year=2026)
+    tasks = []
+
+    class FakeSignal:
+        def __init__(self):
+            self.callbacks = []
+
+        def connect(self, callback):
+            self.callbacks.append(callback)
+
+        def emit(self, value=None):
+            for callback in list(self.callbacks):
+                callback(value)
+
+    class FakeTask:
+        def __init__(self, fn, label="", parent=None):
+            self.fn = fn
+            self.label = label
+            self.done = FakeSignal()
+            self.finished = FakeSignal()
+
+        def start(self):
+            tasks.append(self)
+
+    monkeypatch.setattr(ro, "BackgroundTask", FakeTask, raising=False)
+    ov = ro.ReportOverlay(report, theme.tok("cloud"), conn=conn)
+    qtbot.addWidget(ov)
+
+    ov.switch_year(2026)
+    ov._closing = True
+    tasks[-1].done.emit(year_report)
+
+    assert ov.current_report is report
+
+
+def test_overlay_late_year_switch_ignored_after_owner_closing(qtbot, tmp_path, monkeypatch):
+    conn = db.connect(tmp_path / "i.db")
+    db.init_db(conn)
+    db.upsert_file(conn, path="/a.pptx", name="a.pptx", ext=".pptx", size=1000,
+                   mtime=_ts(2026, 6, 1, 2), content_hash="h", page_count=5,
+                   status="ok", error="", indexed_at=0)
+    conn.commit()
+    report = stats.build_report(conn, year=None)
+    year_report = stats.build_report(conn, year=2026)
+    tasks = []
+
+    class FakeSignal:
+        def __init__(self):
+            self.callbacks = []
+
+        def connect(self, callback):
+            self.callbacks.append(callback)
+
+        def emit(self, *args):
+            for callback in list(self.callbacks):
+                callback(*args)
+
+    class FakeTask:
+        def __init__(self, fn, label="", parent=None):
+            self.fn = fn
+            self.label = label
+            self.done = FakeSignal()
+            self.finished = FakeSignal()
+
+        def start(self):
+            tasks.append(self)
+
+    parent = QWidget()
+    parent._closing = False
+    qtbot.addWidget(parent)
+    monkeypatch.setattr(ro, "BackgroundTask", FakeTask, raising=False)
+    ov = ro.ReportOverlay(report, theme.tok("cloud"), parent=parent, conn=conn)
+
+    ov.switch_year(2026)
+    parent._closing = True
+    tasks[-1].done.emit(year_report)
+
+    assert ov.current_report is report
+
+
+def test_overlay_late_export_done_ignored_after_owner_closing(qtbot, tmp_path, monkeypatch):
+    conn = db.connect(tmp_path / "i.db")
+    db.init_db(conn)
+    fid = db.upsert_file(conn, path="/owner-export.pptx", name="owner-export.pptx", ext=".pptx",
+                         size=2_000_000, mtime=_ts(2026, 6, 1, 2), content_hash="h",
+                         page_count=88, status="ok", error="", indexed_at=0)
+    db.replace_pages(conn, fid, [(1, "owner export path" * 100, "t")])
+    conn.commit()
+    report = stats.build_report(conn, year=None)
+    tasks = []
+    messages = []
+    out = tmp_path / "owner-export.png"
+
+    class FakeSignal:
+        def __init__(self):
+            self.callbacks = []
+
+        def connect(self, callback):
+            self.callbacks.append(callback)
+
+        def emit(self, *args):
+            for callback in list(self.callbacks):
+                callback(*args)
+
+    class FakeTask:
+        def __init__(self, fn, label="", parent=None):
+            self.fn = fn
+            self.label = label
+            self.done = FakeSignal()
+            self.finished = FakeSignal()
+
+        def start(self):
+            tasks.append(self)
+
+    parent = QWidget()
+    parent._closing = False
+    qtbot.addWidget(parent)
+    monkeypatch.setattr(ro, "BackgroundTask", FakeTask, raising=False)
+    monkeypatch.setattr(
+        ro,
+        "QFileDialog",
+        SimpleNamespace(getSaveFileName=lambda *args, **kwargs: (str(out), "")),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        ro,
+        "QMessageBox",
+        SimpleNamespace(information=lambda *args, **kwargs: messages.append(args)),
+        raising=False,
+    )
+    ov = ro.ReportOverlay(report, theme.tok("cloud"), parent=parent)
+
+    ov._export_clicked()
+    parent._closing = True
+    tasks[-1].done.emit(True)
+
+    assert messages == []
+    assert ov.export_btn.isEnabled() is False

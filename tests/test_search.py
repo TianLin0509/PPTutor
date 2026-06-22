@@ -68,6 +68,39 @@ def test_filename_search_uses_normalized_name_index(tmp_path):
     assert res[0].name_hit is True
 
 
+def test_init_db_migrates_existing_files_table_without_name_norm(tmp_path):
+    conn = db.connect(tmp_path / "old.db")
+    conn.executescript(
+        """
+        CREATE TABLE files(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          path TEXT UNIQUE NOT NULL,
+          name TEXT NOT NULL,
+          ext TEXT NOT NULL,
+          size INTEGER NOT NULL,
+          mtime REAL NOT NULL,
+          content_hash TEXT,
+          page_count INTEGER DEFAULT 0,
+          status TEXT DEFAULT 'ok',
+          error TEXT DEFAULT '',
+          indexed_at REAL DEFAULT 0
+        );
+        CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
+        INSERT INTO meta(key,value) VALUES('index_version','4');
+        INSERT INTO files(path,name,ext,size,mtime,content_hash,page_count,status,error,indexed_at)
+        VALUES('C:/deck.pptx','deck.pptx','.pptx',1,1,'hash',1,'ok','',1);
+        """
+    )
+    conn.commit()
+
+    db.init_db(conn)
+
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(files)").fetchall()}
+    assert "name_norm" in cols
+    assert conn.execute("SELECT name_norm FROM files WHERE path='C:/deck.pptx'").fetchone()[0] == "deck.pptx"
+    assert conn.execute("SELECT COUNT(*) FROM file_names_fts").fetchone()[0] == 1
+
+
 def test_ranking_recency(tmp_path):
     """内容相同时，修改时间更新的排前。"""
     conn, docs = _build(tmp_path, {

@@ -13,6 +13,9 @@ from PySide6.QtWidgets import (
 _DIMS = [("time", "修改时间"), ("type", "类型"), ("page", "页数"), ("folder", "文件夹")]
 
 
+_MAX_BUCKETS = {"folder": 16}
+
+
 class FacetPanel(QWidget):
     filters_changed = Signal(dict)  # {dim: set(buckets)}
 
@@ -61,6 +64,9 @@ class FacetPanel(QWidget):
         self._chip_btns = {}
         for dim, label in _DIMS:
             buckets = counts.get(dim, [])
+            limit = _MAX_BUCKETS.get(dim)
+            if limit is not None and len(buckets) > limit:
+                buckets = sorted(buckets, key=lambda item: (-item[1], str(item[0]).lower()))[:limit]
             if not buckets:
                 continue
             t = QLabel(label)

@@ -34,7 +34,6 @@ CREATE TABLE IF NOT EXISTS files(
   indexed_at REAL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_files_name ON files(name);
-CREATE INDEX IF NOT EXISTS idx_files_name_norm ON files(name_norm);
 CREATE VIRTUAL TABLE IF NOT EXISTS file_names_fts USING fts5(
   content, file_id UNINDEXED
 );

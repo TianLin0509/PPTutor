@@ -33,13 +33,14 @@ def _sid(ts: float) -> str:
 
 class VersionManager:
     def __init__(self, conn=None, on_snapshot=None):
-        self._conn = conn or store.connect(vault.db_path())
+        self._db_path = vault.db_path() if conn is None else None
+        self._conn = conn or store.connect(self._db_path)
         store.init_db(self._conn)
         # 独立只读连接：UI 主线程查版本/列文档走它，WAL 并发读、**不抢写锁**。
         # 否则后台给大文件拍快照时 RLock 持锁 ~3s，主线程一查版本就冻结（压测 BUG 1）。
         # 仅供 UI 主线程单线程使用；注入 conn（测试，单线程）则共用即可。
         if conn is None:
-            self._read_conn = store.connect(vault.db_path())
+            self._read_conn = store.connect(self._db_path)
             self._read_conn.isolation_level = None  # autocommit：每次 SELECT 读最新已提交快照
         else:
             self._read_conn = conn
@@ -92,6 +93,18 @@ class VersionManager:
     def list_docs(self):
         return store.list_docs(self._read_conn)
 
+    def list_docs_details(self) -> list[dict]:
+        """后台文档列表读取：生产态使用短生命周期连接，避免共享 UI 读连接。"""
+        if self._db_path is None:
+            with self._lock:
+                return list(store.list_docs(self._conn))
+        conn = store.connect(self._db_path)
+        try:
+            conn.isolation_level = None
+            return list(store.list_docs(conn))
+        finally:
+            conn.close()
+
     def get_doc(self, doc_id: str):
         return store.get_doc(self._read_conn, doc_id)
 
@@ -101,8 +114,38 @@ class VersionManager:
     def list_versions(self, path: str):
         return store.list_versions(self._read_conn, vault.doc_id_for(path))
 
+    def list_versions_details(self, path: str, limit: int | None = None) -> list[dict]:
+        """后台文件详情读取：按 path 查版本列表，生产态使用短生命周期连接。"""
+        return self.list_versions_by_doc_details(vault.doc_id_for(path), limit)
+
     def list_versions_by_doc(self, doc_id: str):
         return store.list_versions(self._read_conn, doc_id)
+
+    def list_versions_by_doc_details(self, doc_id: str, limit: int | None = None) -> list[dict]:
+        """后台版本时间线读取：生产态使用短生命周期连接，避免共享 UI 读连接。"""
+        if self._db_path is None:
+            with self._lock:
+                return self._list_versions_by_doc_details_on_conn(self._conn, doc_id, limit)
+        conn = store.connect(self._db_path)
+        try:
+            conn.isolation_level = None
+            return self._list_versions_by_doc_details_on_conn(conn, doc_id, limit)
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _list_versions_by_doc_details_on_conn(conn, doc_id: str, limit: int | None) -> list[dict]:
+        rows = store.list_versions(conn, doc_id)
+        if limit is not None:
+            rows = rows[:max(0, int(limit))]
+        return [
+            {
+                "version_id": r["version_id"],
+                "ts": r["ts"],
+                "page_count": r["page_count"],
+            }
+            for r in rows
+        ]
 
     # ---------- 恢复 / 导出 ----------
     def restore_to(self, path: str, version_id: str, dest: str | None = None) -> bool:
@@ -127,6 +170,60 @@ class VersionManager:
         """
         with self._lock:
             return store.search_versions(self._conn, build_fts_match_exact(query))
+
+    def search_history_details(self, query: str, limit: int = 200) -> dict:
+        """后台跨版本搜索详情：使用独立连接一次性 join 文档/版本信息。
+
+        VersionWindow 的后台线程不能共享 UI 主线程专用的 _read_conn；这里在
+        生产态为每次后台搜索打开短生命周期连接，避免跨线程共用 SQLite cursor/conn。
+        """
+        match = build_fts_match_exact(query)
+        if not match:
+            return {"query": query, "total": 0, "rows": []}
+        if self._db_path is None:
+            with self._lock:
+                return self._search_history_details_on_conn(self._conn, query, match, limit)
+        conn = store.connect(self._db_path)
+        try:
+            conn.isolation_level = None
+            return self._search_history_details_on_conn(conn, query, match, limit)
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _search_history_details_on_conn(conn, query: str, match: str, limit: int) -> dict:
+        try:
+            total = int(conn.execute(
+                "SELECT COUNT(*) FROM version_pages_fts WHERE version_pages_fts MATCH ?",
+                (match,),
+            ).fetchone()[0])
+            rows = conn.execute(
+                """
+                SELECT f.doc_id, f.version_id, f.page_no, d.path AS doc_path, v.ts AS ts
+                FROM version_pages_fts AS f
+                LEFT JOIN managed_docs AS d ON d.doc_id = f.doc_id
+                LEFT JOIN versions AS v ON v.version_id = f.version_id
+                WHERE version_pages_fts MATCH ?
+                LIMIT ?
+                """,
+                (match, int(limit)),
+            ).fetchall()
+        except Exception:  # noqa: BLE001 保持 search_history 的容错语义：坏查询/FTS 异常返回空
+            return {"query": query, "total": 0, "rows": []}
+        return {
+            "query": query,
+            "total": total,
+            "rows": [
+                {
+                    "doc_id": r["doc_id"],
+                    "version_id": r["version_id"],
+                    "page_no": r["page_no"],
+                    "doc_path": r["doc_path"] or r["doc_id"],
+                    "ts": r["ts"] or 0,
+                }
+                for r in rows
+            ],
+        }
 
     # ---------- 误删 / 改坏找回 ----------
     def scan_deleted(self) -> int:

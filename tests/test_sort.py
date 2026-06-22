@@ -36,6 +36,7 @@ def test_ui_sort_switch(qtbot, tmp_path):
     qtbot.addWidget(win)
     win.search_box.setText("")
     win._do_search()
+    qtbot.waitUntil(lambda: len(win._results) == 3, timeout=2000)
     assert win._results[0].name == "new.pptx"            # recent 视图默认 mtime 序
     win.sort_combo.setCurrentText("文件名")
     assert [r.name for r in win._results] == ["mid.pptx", "new.pptx", "old.pptx"]

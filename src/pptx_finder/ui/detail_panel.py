@@ -150,6 +150,18 @@ class DetailPanel(QWidget):
                 it.widget().deleteLater()
 
     # ---------- 数据 ----------
+    def clear_selection(self) -> None:
+        self._path = None
+        self._meta_label.setText("← 选中左侧文件查看详情")
+        self._clear(self._version_box)
+        self._version_nodes = []
+        self._clear(self._outline_box)
+
+    def set_file_actions_enabled(self, enabled: bool) -> None:
+        for btn in self.findChildren(QPushButton):
+            if btn.objectName() in {"verBtn", "verBtnPri", "outlineItem"}:
+                btn.setEnabled(enabled)
+
     def update_for(self, r, versions: list) -> None:
         self._path = r.path
         parts = []

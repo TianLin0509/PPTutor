@@ -1,7 +1,7 @@
-"""主窗口：双主题 + 精致结果项（焦点双态/半透明高亮/字重层级）+ P0 交互
-（即时搜索 / 全键盘导航 / 命中页缩略图条 / 索引进度条）。
+﻿"""涓荤獥鍙ｏ細鍙屼富棰?+ 绮捐嚧缁撴灉椤癸紙鐒︾偣鍙屾€?鍗婇€忔槑楂樹寒/瀛楅噸灞傜骇锛? P0 浜や簰
+锛堝嵆鏃舵悳绱?/ 鍏ㄩ敭鐩樺鑸?/ 鍛戒腑椤电缉鐣ュ浘鏉?/ 绱㈠紩杩涘害鏉★級銆?
 
-可测试性：conn 与 render_worker 可注入；do_index=False 时不启动磁盘索引。
+鍙祴璇曟€э細conn 涓?render_worker 鍙敞鍏ワ紱do_index=False 鏃朵笉鍚姩纾佺洏绱㈠紩銆?
 """
 from __future__ import annotations
 
@@ -34,11 +34,12 @@ from ..config import (
     GLOBAL_HOTKEY, data_dir, db_path as cfg_db_path, is_first_run, mark_welcomed, update_base_url,
 )
 from ..models import FileResult
-from ..query_explain import explain_query, suggestion_keys
+from ..query_explain import explain_query, mode_label, suggestion_keys
 from . import theme
 from .bg_task import BackgroundTask
 from .index_worker import IndexWorker
 from .live_indexer import LiveIndexer
+from .path_helpers import ensure_pptx_suffix
 from .render_worker import RenderWorker
 from .search_worker import SearchWorker
 from .thumb_worker import ThumbWorker
@@ -74,15 +75,26 @@ def _icon_clear() -> QIcon:
 
 
 def _asset_path(name: str) -> str:
-    """资源文件路径：dev=repo/assets，frozen=_MEIPASS/assets（spec 已 bundle）。"""
+    """璧勬簮鏂囦欢璺緞锛歞ev=repo/assets锛宖rozen=_MEIPASS/assets锛坰pec 宸?bundle锛夈€?"""
     base = getattr(sys, "_MEIPASS", None)
     if base:
         return os.path.join(base, "assets", name)
     return os.path.join(os.path.dirname(__file__), "..", "..", "..", "assets", name)
 
 
+def _sqlite_file_path(conn) -> str | None:
+    try:
+        row = conn.execute("PRAGMA database_list").fetchone()
+        if row is None:
+            return None
+        path = row["file"] if hasattr(row, "keys") else row[2]
+        return path or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _app_logo() -> QPixmap:
-    """品牌 logo：PPTutor 吉祥物（学士帽 + 搜索/PPT），加载打包内 assets/logo.png。"""
+    """鍝佺墝 logo锛歅PTutor 鍚夌ゥ鐗╋紙瀛﹀＋甯?+ 鎼滅储/PPT锛夛紝鍔犺浇鎵撳寘鍐?assets/logo.png銆?"""
     pm = QPixmap(_asset_path("logo.png"))
     if not pm.isNull():
         return pm.scaled(28, 28, Qt.KeepAspectRatio, Qt.SmoothTransformation)
@@ -109,14 +121,14 @@ def _save_theme(name: str) -> None:
 
 
 def _highlight(snippet: str, hlcss: str) -> str:
-    """把片段里的【命中】转成半透明底高亮（不变色不加粗）。"""
+    """鎶婄墖娈甸噷鐨勩€愬懡涓€戣浆鎴愬崐閫忔槑搴曢珮浜紙涓嶅彉鑹蹭笉鍔犵矖锛夈€?"""
     s = html.escape(snippet)
-    s = s.replace("【", f'<span style="{hlcss}">').replace("】", "</span>")
+    s = s.replace("\u3010", f'<span style="{hlcss}">').replace("\u3011", "</span>")
     return s
 
 
 def _fmt_mtime(ts: float) -> str:
-    """修改时间：同年 'MM-DD HH:MM'，跨年 'YYYY-MM-DD'。"""
+    """淇敼鏃堕棿锛氬悓骞?'MM-DD HH:MM'锛岃法骞?'YYYY-MM-DD'銆?"""
     try:
         dt = datetime.datetime.fromtimestamp(ts)
     except (OSError, OverflowError, ValueError):
@@ -127,7 +139,7 @@ def _fmt_mtime(ts: float) -> str:
 
 
 def _fmt_size(n: int) -> str:
-    """字节数转人类可读：'2.3 MB' / '456 KB' / '18 B'。"""
+    """瀛楄妭鏁拌浆浜虹被鍙锛?2.3 MB' / '456 KB' / '18 B'銆?"""
     if not n or n <= 0:
         return ""
     f = float(n)
@@ -139,12 +151,12 @@ def _fmt_size(n: int) -> str:
 
 
 def _elide_middle(s: str, maxlen: int = 72) -> str:
-    """路径过长时中间省略，保留盘符与文件名两端。"""
+    """璺緞杩囬暱鏃朵腑闂寸渷鐣ワ紝淇濈暀鐩樼涓庢枃浠跺悕涓ょ銆?"""
     if len(s) <= maxlen:
         return s
     head = (maxlen - 1) * 2 // 3
     tail = maxlen - 1 - head
-    return s[:head] + "…" + s[-tail:]
+    return s[:head] + "\u2026" + s[-tail:]
 
 
 def _mode_key_from_text(mode: str) -> str:
@@ -156,12 +168,12 @@ def _mode_key_from_text(mode: str) -> str:
 
 
 def _empty_suggestions(query: str, mode: str) -> list[str]:
-    """零结果时适用的补救建议 key；保留给测试和旧调用，实际逻辑走 query_explain。"""
+    """闆剁粨鏋滄椂閫傜敤鐨勮ˉ鏁戝缓璁?key锛涗繚鐣欑粰娴嬭瘯鍜屾棫璋冪敤锛屽疄闄呴€昏緫璧?query_explain銆?"""
     return suggestion_keys(query, _mode_key_from_text(mode))
 
 
 def _sort_results(results: list, key: str) -> list:
-    """结果排序：relevance 保持原序 / recent 按 mtime 降序 / name 按文件名升序。"""
+    """缁撴灉鎺掑簭锛歳elevance 淇濇寔鍘熷簭 / recent 鎸?mtime 闄嶅簭 / name 鎸夋枃浠跺悕鍗囧簭銆?"""
     if key == "recent":
         return sorted(results, key=lambda r: r.mtime, reverse=True)
     if key == "name":
@@ -170,7 +182,7 @@ def _sort_results(results: list, key: str) -> list:
 
 
 def _time_bucket(mtime: float, now_ts: float) -> str:
-    """按 mtime 归入时间桶：今天 / 昨天 / 本周 / 本月 / 更早。"""
+    """鎸?mtime 褰掑叆鏃堕棿妗讹細浠婂ぉ / 鏄ㄥぉ / 鏈懆 / 鏈湀 / 鏇存棭銆?"""
     now = datetime.datetime.fromtimestamp(now_ts)
     try:
         dt = datetime.datetime.fromtimestamp(mtime)
@@ -189,7 +201,7 @@ def _time_bucket(mtime: float, now_ts: float) -> str:
 
 
 def group_by_time(results: list, now_ts: float) -> list:
-    """按 mtime 分时间桶，保持输入顺序。返回 [(label, [items]), ...]。"""
+    """鎸?mtime 鍒嗘椂闂存《锛屼繚鎸佽緭鍏ラ『搴忋€傝繑鍥?[(label, [items]), ...]銆?"""
     buckets: dict[str, list] = {}
     order: list[str] = []
     for r in results:
@@ -219,7 +231,7 @@ def _facet_type(r) -> str:
 
 
 def facet_counts(results: list, now_ts: float) -> dict:
-    """按维度聚合数量：time/type/page/folder → [(bucket, count)]（保持出现顺序）。"""
+    """鎸夌淮搴﹁仛鍚堟暟閲忥細time/type/page/folder 鈫?[(bucket, count)]锛堜繚鎸佸嚭鐜伴『搴忥級銆?"""
     dims: dict[str, dict] = {"time": {}, "type": {}, "page": {}, "folder": {}}
 
     def bump(d, k):
@@ -234,7 +246,7 @@ def facet_counts(results: list, now_ts: float) -> dict:
 
 
 def facet_filter(results: list, filters: dict, now_ts: float) -> list:
-    """多维 AND 过滤；某维度未选=不限该维度。"""
+    """澶氱淮 AND 杩囨护锛涙煇缁村害鏈€?涓嶉檺璇ョ淮搴︺€?"""
     def ok(r):
         if filters.get("time") and _time_bucket(r.mtime, now_ts) not in filters["time"]:
             return False
@@ -249,7 +261,7 @@ def facet_filter(results: list, filters: dict, now_ts: float) -> list:
 
 
 def _thumb_placeholder(tok: dict) -> QPixmap:
-    """缩略图占位：幻灯片样子（顶部色条 + 内容线），真实图渲染好后替换。"""
+    """缂╃暐鍥惧崰浣嶏細骞荤伅鐗囨牱瀛愶紙椤堕儴鑹叉潯 + 鍐呭绾匡級锛岀湡瀹炲浘娓叉煋濂藉悗鏇挎崲銆?"""
     pm = QPixmap(74, 55)
     pm.fill(QColor(tok["field"]))
     p = QPainter(pm)
@@ -262,7 +274,7 @@ def _thumb_placeholder(tok: dict) -> QPixmap:
 
 
 class ResultItem(QWidget):
-    """单条结果卡片：左缩略图(首页/命中页) + 右(文件名 + 命中页胶囊 + 高亮片段 + mtime)。"""
+    """鍗曟潯缁撴灉鍗＄墖锛氬乏缂╃暐鍥?棣栭〉/鍛戒腑椤? + 鍙?鏂囦欢鍚?+ 鍛戒腑椤佃兌鍥?+ 楂樹寒鐗囨 + mtime)銆?"""
 
     def __init__(self, r: FileResult, tok: dict, hlcss: str):
         super().__init__()
@@ -285,7 +297,7 @@ class ResultItem(QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(4)
 
-        # 第 1 行：文件名 + 命中页徽章（P1 / P3 P8，最多 3 个）
+        # 绗?1 琛岋細鏂囦欢鍚?+ 鍛戒腑椤靛窘绔狅紙P1 / P3 P8锛屾渶澶?3 涓級
         row = QHBoxLayout()
         row.setSpacing(6)
         fn = QLabel(html.escape(r.name))
@@ -302,7 +314,7 @@ class ResultItem(QWidget):
                     "border-radius:6px;padding:1px 7px;")
                 row.addWidget(pg, 0)
         elif r.name_hit:
-            nh = QLabel("文件名命中")
+            nh = QLabel("\u6587\u4ef6\u540d\u547d\u4e2d")
             nh.setStyleSheet(
                 f"font-size:10.5px;font-weight:700;color:{tok['grn']};"
                 f"border:1px solid {tok['bd2']};border-radius:6px;padding:1px 7px;background:transparent;")
@@ -313,7 +325,7 @@ class ResultItem(QWidget):
             row.addWidget(ext, 0)
         lay.addLayout(row)
 
-        # 第 2 行：高亮片段（内容命中）/ 老格式说明（.ppt）
+        # 绗?2 琛岋細楂樹寒鐗囨锛堝唴瀹瑰懡涓級/ 鑰佹牸寮忚鏄庯紙.ppt锛?
         if r.hits and r.hits[0].snippet:
             sn = QLabel(_highlight(r.hits[0].snippet, hlcss))
             sn.setTextFormat(Qt.RichText)
@@ -321,11 +333,11 @@ class ResultItem(QWidget):
             sn.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
             lay.addWidget(sn)
         elif r.status == "filename_only":
-            sub = QLabel("老格式 · 仅文件名搜索与预览")
+            sub = QLabel("\u8001\u683c\u5f0f \u00b7 \u4ec5\u6587\u4ef6\u540d\u641c\u7d22\u4e0e\u9884\u89c8")
             sub.setStyleSheet(f"font-size:11.5px;color:{tok['ink4']};background:transparent;")
             lay.addWidget(sub)
 
-        # 第 3 行：修改时间（显式体现新旧）
+        # 绗?3 琛岋細淇敼鏃堕棿锛堟樉寮忎綋鐜版柊鏃э級
         tm = _fmt_mtime(r.mtime)
         if tm:
             t = QLabel(tm)
@@ -363,14 +375,34 @@ class ResultItem(QWidget):
 
 
 class MainWindow(QMainWindow):
+    _SEARCH_SLOW_HINT_MS = 1000
+    _AUTO_PREVIEW_DELAY_MS = 180
+    _UI_LOOP_INTERVAL_MS = 250
+    _UI_LOOP_SLOW_GAP_MS = 250
+    _RECENT_CACHE_MS = 1000
+    _LIVE_FLUSH_BATCH = 64
+    _LIVE_FLUSH_YIELD_MS = 1
+    _DEFERRED_LIVE_SEARCH_YIELD_MS = 1
+    _LIVE_STATUS_REFRESH_MS = 250
+    _DETAIL_UPDATE_DELAY_MS = 80
+    _DETAIL_DOT_DELAY_MS = 80
+    _VERSION_SHIELD_REFRESH_MS = 250
+    _INDEX_PROGRESS_UI_MS = 100
+    _INDEX_STATUS_CACHE_MS = 1000
+    _BG_LIGHT_SHUTDOWN_WAIT_MS = 250
+    _BG_LIGHT_SHUTDOWN_TOTAL_WAIT_MS = 1000
+    _SEARCH_SHUTDOWN_WAIT_MS = 500
+    _BG_HEAVY_SHUTDOWN_WAIT_MS = 3000
+    _BG_HEAVY_LABELS = {"open", "restore", "export", "version-restore", "version-export", "version-recover"}
+
     def __init__(self, conn=None, render_worker=None, thumb_worker=None, version_mgr=None,
                  do_index=True, roots: list[str] | None = None, workers: int | None = None):
         super().__init__()
         self.setWindowTitle(f"PPTutor · PPT 查询助手   v{__version__}")
-        self.setWindowIcon(QIcon(_asset_path("logo.png")))  # 窗口标题/任务栏图标
+        self.setWindowIcon(QIcon(_asset_path("logo.png")))  # 绐楀彛鏍囬/浠诲姟鏍忓浘鏍?
         self.resize(1180, 760)
-        self._title_h = 40  # 自绘玻璃标题栏高度（nativeEvent 拖动区/缩放边判定用）
-        self.setWindowFlag(Qt.FramelessWindowHint, True)  # 无边框 → 自绘玻璃标题栏
+        self._title_h = 40  # 鑷粯鐜荤拑鏍囬鏍忛珮搴︼紙nativeEvent 鎷栧姩鍖?缂╂斁杈瑰垽瀹氱敤锛?
+        self.setWindowFlag(Qt.FramelessWindowHint, True)  # 鏃犺竟妗?鈫?鑷粯鐜荤拑鏍囬鏍?
 
         self._theme = _load_theme()
         self._tok = theme.tok(self._theme)
@@ -379,23 +411,67 @@ class MainWindow(QMainWindow):
         db.init_db(self._conn)
 
         self._results: list[FileResult] = []
-        self._results_raw: list[FileResult] = []  # 排序前原始序（relevance 基准）
-        self._render_gen = 0  # 流式渲染代记：每次新渲染 +1，作废上一批仍在流入的分批
-        self._bg_tasks: list[BackgroundTask] = []  # 在跑的后台一次性任务（防 GC + 收尾等待）
+        self._results_raw: list[FileResult] = []
+        self._render_gen = 0
+        self._bg_tasks: list[BackgroundTask] = []
+        self._settings_dialogs: list = []
         self._active_heavy_op: str | None = None
-        self._closing = False  # 关窗中：后台任务回调不再碰 UI（防触达已销毁控件）
-        self._showing_recent = False  # 当前是否为「空查询默认视图（最近文件）」
+        self._closing = False  # 鍏崇獥涓細鍚庡彴浠诲姟鍥炶皟涓嶅啀纰?UI锛堥槻瑙﹁揪宸查攢姣佹帶浠讹級
+        self._showing_recent = False
+        self._recent_cache: list[FileResult] | None = None
+        self._recent_cache_at = 0.0
+        self._recent_load_inflight_token: int | None = None
+        self._status_refresh_inflight_token: int | None = None
+        self._index_status_cache: dict | None = None
+        self._index_status_cache_at = 0.0
         self._cur: FileResult | None = None
         self._cur_item_widget: ResultItem | None = None
         self._search_seq = 0
+        self._search_pending_req: int | None = None
         self._search_worker: SearchWorker | None = None
         self._async_search = conn is None and do_index
+        self._live_refresh_after_search = False
+        self._live_deferred_paths: set[str] = set()
+        self._search_slow_hint_req_id = 0
+        self._search_slow_hint_query = ""
+        self._auto_preview_token = 0
+        self._auto_preview_seq = 0
+        self._clipboard_copy_token = 0
+        self._detail_update_token = 0
+        self._detail_update_force = False
+        self._detail_load_inflight_token: int | None = None
+        self._detail_load_inflight_path: str | None = None
+        self._detail_load_inflight_file_id: int | None = None
+        self._detail_dot_token = 0
+        self._detail_dot_inflight_token: int | None = None
+        self._detail_dot_inflight_path: str | None = None
+        self._detail_hint_token = 0
+        self._detail_hint_inflight_token: int | None = None
+        self._detail_hint_inflight_path: str | None = None
+        self._recent_load_token = 0
+        self._status_refresh_token = 0
+        self._empty_status_token = 0
+        self._empty_status_inflight_token: int | None = None
+        self._empty_status_inflight_mode: str | None = None
+        self._startup_index_token = 0
+        self._version_shield_token = 0
+        self._version_shield_inflight_token: int | None = None
+        self._suppress_select_preview = False
+        self._preview_deferred_due_to_busy = False
+        self._index_started_at = 0.0
+        self._index_search_ready = False
+        self._index_last_done = 0
+        self._index_last_total = 0
+        self._index_last_current = ""
+        self._index_last_summary: dict | None = None
+        self._index_progress_last_ui_at = 0.0
+        self._index_progress_last_phase: str | None = None
         self._hit_idx = 0
-        self._view_page = 1  # 当前预览页（原始页序，滚轮可脱离命中页自由翻）
+        self._view_page = 1  # 褰撳墠棰勮椤碉紙鍘熷椤靛簭锛屾粴杞彲鑴辩鍛戒腑椤佃嚜鐢辩炕锛?
         self._req_id = 0
         self._cur_pixmap: QPixmap | None = None
-        self._preview_provisional = False  # 当前预览是否为缩略图占位（高清未到）
-        self._zoom = 1.0  # 预览缩放：1.0=适配窗口，>1 放大看细节
+        self._preview_provisional = False  # 褰撳墠棰勮鏄惁涓虹缉鐣ュ浘鍗犱綅锛堥珮娓呮湭鍒帮級
+        self._zoom = 1.0  # 棰勮缂╂斁锛?.0=閫傞厤绐楀彛锛?1 鏀惧ぇ鐪嬬粏鑺?
         self._to_tray_on_close = False
         self._thumb_btns: list[QToolButton] = []
 
@@ -404,32 +480,76 @@ class MainWindow(QMainWindow):
         self._owns_render = render_worker is None
         if self._owns_render:
             self._render.start()
-            # 启动后 1.5s 后台静默预热 PowerPoint COM（用户不感知），首次预览免冷启动 ~1.5s。
-            # 仅真实运行态（do_index）预热；测试 do_index=False 不无谓拉起 PowerPoint。
+            # 鍚姩鍚?1.5s 鍚庡彴闈欓粯棰勭儹 PowerPoint COM锛堢敤鎴蜂笉鎰熺煡锛夛紝棣栨棰勮鍏嶅喎鍚姩 ~1.5s銆?
+            # 浠呯湡瀹炶繍琛屾€侊紙do_index锛夐鐑紱娴嬭瘯 do_index=False 涓嶆棤璋撴媺璧?PowerPoint銆?
             if do_index:
-                QTimer.singleShot(1500, self._render.prewarm)
+                QTimer.singleShot(1500, self._maybe_prewarm_render)
 
         self._thumb = thumb_worker or ThumbWorker(self)
         self._thumb.thumb_rendered.connect(self._on_thumb)
         self._owns_thumb = thumb_worker is None
         if self._owns_thumb and do_index:
-            self._thumb.start()  # 测试 do_index=False 不起真渲染线程
+            self._thumb.start()  # 娴嬭瘯 do_index=False 涓嶈捣鐪熸覆鏌撶嚎绋?
         self._thumb_cache: dict[tuple[str, int], QPixmap] = {}
         self._thumb_items: dict[tuple[str, int], ResultItem] = {}
-        self._version_mgr = version_mgr  # 版本管理（app.py 注入，详情面板用；可 None）
-        self._facet_filters: dict[str, set] = {}  # 当前 facet 筛选（08）
+        self._version_mgr = version_mgr  # 鐗堟湰绠＄悊锛坅pp.py 娉ㄥ叆锛岃鎯呴潰鏉跨敤锛涘彲 None锛?
+        self._facet_filters: dict[str, set] = {}  # 褰撳墠 facet 绛涢€夛紙08锛?
 
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
         self._debounce.setInterval(280)
         self._debounce.timeout.connect(self._do_search)
-        # live 索引刷新去抖：watcher 在 OneDrive/PowerPoint 反复存盘时会风暴式触发
-        # _after_live_index，若每次同步重跑 _do_search 会把主线程糊死（实测 maxgap 7.89s
-        # 未响应）。合并成一次延迟刷新：风暴 N 个事件 → 最多 1 次搜索。
+        self._search_slow_hint_timer = QTimer(self)
+        self._search_slow_hint_timer.setSingleShot(True)
+        self._search_slow_hint_timer.setInterval(self._SEARCH_SLOW_HINT_MS)
+        self._search_slow_hint_timer.timeout.connect(
+            lambda: self._show_search_slow_hint(
+                self._search_slow_hint_req_id,
+                self._search_slow_hint_query,
+            )
+        )
+        self._auto_preview_timer = QTimer(self)
+        self._auto_preview_timer.setSingleShot(True)
+        self._auto_preview_timer.setInterval(self._AUTO_PREVIEW_DELAY_MS)
+        self._auto_preview_timer.timeout.connect(
+            lambda: self._run_auto_preview(self._auto_preview_token, self._auto_preview_seq)
+        )
+        self._detail_update_timer = QTimer(self)
+        self._detail_update_timer.setSingleShot(True)
+        self._detail_update_timer.setInterval(self._DETAIL_UPDATE_DELAY_MS)
+        self._detail_update_timer.timeout.connect(
+            lambda: self._run_detail_update(self._detail_update_token)
+        )
+        self._detail_dot_timer = QTimer(self)
+        self._detail_dot_timer.setSingleShot(True)
+        self._detail_dot_timer.setInterval(self._DETAIL_DOT_DELAY_MS)
+        self._detail_dot_timer.timeout.connect(
+            lambda: self._run_detail_dot_refresh(self._detail_dot_token)
+        )
+        # live 绱㈠紩鍒锋柊鍘绘姈锛歸atcher 鍦?OneDrive/PowerPoint 鍙嶅瀛樼洏鏃朵細椋庢毚寮忚Е鍙?        # _after_live_index锛岃嫢姣忔鍚屾閲嶈窇 _do_search 浼氭妸涓荤嚎绋嬬硦姝伙紙瀹炴祴 maxgap 7.89s
+        # 鏈搷搴旓級銆傚悎骞舵垚涓€娆″欢杩熷埛鏂帮細椋庢毚 N 涓簨浠?鈫?鏈€澶?1 娆℃悳绱€?
         self._live_refresh = QTimer(self)
         self._live_refresh.setSingleShot(True)
         self._live_refresh.setInterval(600)
         self._live_refresh.timeout.connect(self._do_live_refresh)
+        self._live_status_refresh = QTimer(self)
+        self._live_status_refresh.setSingleShot(True)
+        self._live_status_refresh.setInterval(self._LIVE_STATUS_REFRESH_MS)
+        self._live_status_refresh.timeout.connect(lambda: self._refresh_status())
+        self._version_shield_refresh_timer = QTimer(self)
+        self._version_shield_refresh_timer.setSingleShot(True)
+        self._version_shield_refresh_timer.setInterval(self._VERSION_SHIELD_REFRESH_MS)
+        self._version_shield_refresh_timer.timeout.connect(
+            lambda: self._run_version_shield_refresh(self._version_shield_token)
+        )
+        self._ui_loop_samples = 0
+        self._ui_loop_last_tick = time.monotonic()
+        self._ui_loop_last_gap_ms = 0.0
+        self._ui_loop_max_gap_ms = 0.0
+        self._ui_loop_slow_gaps = 0
+        self._ui_loop_timer = QTimer(self)
+        self._ui_loop_timer.setInterval(self._UI_LOOP_INTERVAL_MS)
+        self._ui_loop_timer.timeout.connect(self._record_ui_loop_tick)
 
         self._build_ui()
         self._apply_theme(self._theme, persist=False)
@@ -439,38 +559,85 @@ class MainWindow(QMainWindow):
             self._search_worker.start()
 
         self._indexer: IndexWorker | None = None
-        # 实时索引后台线程：保存事件不在主线程 parse/写库（防 UI 冻结）。
-        # do_index=False 的测试无此线程，走 _index_file_live 的同步兜底。
+        # 瀹炴椂绱㈠紩鍚庡彴绾跨▼锛氫繚瀛樹簨浠朵笉鍦ㄤ富绾跨▼ parse/鍐欏簱锛堥槻 UI 鍐荤粨锛夈€?
+        # do_index=False 鐨勬祴璇曟棤姝ょ嚎绋嬶紝璧?_index_file_live 鐨勫悓姝ュ厹搴曘€?
         self._live: LiveIndexer | None = None
         if do_index:
             self._live = LiveIndexer(self._db_path)
             self._live.indexed.connect(self._on_live_indexed)
             self._live.start()
-        # 已有索引就秒开（运行中靠 watcher 实时增量 + 托盘「重新扫描」兜底）；
-        # 只有首次（索引为空）才全量建库——不再每次重开都全盘扫。
-        if do_index and self._index_is_empty():
-            self._start_indexing(roots, workers)
+        if do_index:
+            self._schedule_startup_index_check(roots, workers)
         else:
             self._refresh_status()
-        self._show_recent()  # 启动即列最近文件（① 默认视图，无需先输入再清空）
-        self._welcome = None  # 首次欢迎覆盖层（app.py 在 show 后调 maybe_show_welcome）
-        self._enable_native_frame()  # 无边框窗口恢复系统缩放/Snap/最大化/Win11 圆角
-        # 增量自动更新：仅打包态后台静默检查；发现新版在标题栏给非模态 chip。dev/测试不联网不打扰
+        self._show_recent()  # 鍚姩鍗冲垪鏈€杩戞枃浠讹紙鈶?榛樿瑙嗗浘锛屾棤闇€鍏堣緭鍏ュ啀娓呯┖锛?
+        self._welcome = None  # 棣栨娆㈣繋瑕嗙洊灞傦紙app.py 鍦?show 鍚庤皟 maybe_show_welcome锛?
+        self._enable_native_frame()  # 鏃犺竟妗嗙獥鍙ｆ仮澶嶇郴缁熺缉鏀?Snap/鏈€澶у寲/Win11 鍦嗚
+        # 澧為噺鑷姩鏇存柊锛氫粎鎵撳寘鎬佸悗鍙伴潤榛樻鏌ワ紱鍙戠幇鏂扮増鍦ㄦ爣棰樻爮缁欓潪妯℃€?chip銆俤ev/娴嬭瘯涓嶈仈缃戜笉鎵撴壈
         self._updater = None
         if do_index and updater.is_frozen():
             self._updater = UpdateController(
                 self.update_chip, update_base_url(), self.force_quit, self)
             QTimer.singleShot(4000, self._updater.start_check)
+        QTimer.singleShot(0, self._start_ui_loop_monitor)
+
+    def _record_ui_loop_tick(self, now: float | None = None) -> None:
+        now = time.monotonic() if now is None else now
+        expected = self._UI_LOOP_INTERVAL_MS / 1000.0
+        gap_ms = max(0.0, (now - self._ui_loop_last_tick - expected) * 1000.0)
+        self._ui_loop_last_tick = now
+        self._ui_loop_samples += 1
+        self._ui_loop_last_gap_ms = gap_ms
+        self._ui_loop_max_gap_ms = max(self._ui_loop_max_gap_ms, gap_ms)
+        if gap_ms >= self._UI_LOOP_SLOW_GAP_MS:
+            self._ui_loop_slow_gaps += 1
+
+    def _start_ui_loop_monitor(self) -> None:
+        if self._closing:
+            return
+        self._ui_loop_last_tick = time.monotonic()
+        if not self._ui_loop_timer.isActive():
+            self._ui_loop_timer.start()
+
+    def diagnostic_lines(self) -> list[str]:
+        lines = [
+            "ui_loop: "
+            f"samples={self._ui_loop_samples} "
+            f"last_gap={self._ui_loop_last_gap_ms:.0f} ms "
+            f"max_gap={self._ui_loop_max_gap_ms:.0f} ms "
+            f"slow_gaps={self._ui_loop_slow_gaps} "
+            f"threshold={self._UI_LOOP_SLOW_GAP_MS} ms"
+        ]
+        indexer_running = self._indexer is not None and self._indexer.isRunning()
+        if indexer_running:
+            elapsed_ms = max(0.0, (time.monotonic() - self._index_started_at) * 1000.0) if self._index_started_at else 0.0
+            phase = "search-ready" if self._index_search_ready else "scanning"
+            lines.append(
+                "index_active: "
+                f"phase={phase} elapsed={elapsed_ms:.0f} ms "
+                f"done={self._index_last_done} total={self._index_last_total} "
+                f"current={os.path.basename(self._index_last_current or '') or '-'} "
+                f"deferred_live={len(self._live_deferred_paths)}")
+        elif self._index_last_summary is not None:
+            summary = self._index_last_summary
+            lines.append(
+                "index_last: "
+                f"indexed={summary.get('indexed', 0)} "
+                f"deleted={summary.get('deleted', 0)} "
+                f"error={summary.get('error', '') or '-'}")
+        elif self._live_deferred_paths:
+            lines.append(f"index_deferred_live: {len(self._live_deferred_paths)}")
+        return lines
 
     # ---------- UI ----------
     def _build_ui(self) -> None:
-        central = AuroraCentral(self)  # 自绘极光底（读 self._tok），objectName 仍 "central"
+        central = AuroraCentral(self)  # 鑷粯鏋佸厜搴曪紙璇?self._tok锛夛紝objectName 浠?"central"
         self._central = central
         root = QVBoxLayout(central)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        root.addWidget(self._build_glass_title())  # 无边框窗口的自绘玻璃标题栏
+        root.addWidget(self._build_glass_title())  # 鏃犺竟妗嗙獥鍙ｇ殑鑷粯鐜荤拑鏍囬鏍?
 
         top = QWidget()
         top.setObjectName("topBar")
@@ -486,13 +653,13 @@ class MainWindow(QMainWindow):
         bar.addWidget(logo)
         self.search_box = QLineEdit()
         self.search_box.setObjectName("searchBox")
-        self.search_box.setPlaceholderText("输入你记得的文字 / 文件名…（多词空格=同时含，\"引号\"=精确短语）")
+        self.search_box.setPlaceholderText('输入你记得的文字 / 文件名…（多词空格=同时含，"引号"=精确短语）')
         self.search_box.setMinimumHeight(42)
         self.search_box.addAction(_icon_search(), QLineEdit.LeadingPosition)
         self._clear_act = self.search_box.addAction(_icon_clear(), QLineEdit.TrailingPosition)
         self._clear_act.setVisible(False)
         self._clear_act.setToolTip("清空")
-        self._clear_act.triggered.connect(self.search_box.clear)
+        self._clear_act.triggered.connect(self._clear_search_now)
         self.search_box.textChanged.connect(lambda: self._debounce.start())
         self.search_box.textChanged.connect(lambda t: self._clear_act.setVisible(bool(t)))
         self.search_box.installEventFilter(self)
@@ -512,7 +679,7 @@ class MainWindow(QMainWindow):
         self.facet_btn.setObjectName("ghost")
         self.facet_btn.setMinimumHeight(42)
         self.facet_btn.setCheckable(True)
-        self.facet_btn.setToolTip("按时间 / 类型 / 页数 / 文件夹 筛选")
+        self.facet_btn.setToolTip("按时间 / 类型 / 页数 / 文件夹筛选")
         self.facet_btn.clicked.connect(self._toggle_facet)
         bar.addWidget(self.facet_btn)
         self.theme_btn = QPushButton()
@@ -527,7 +694,7 @@ class MainWindow(QMainWindow):
         self.detail_btn.setToolTip("显示/隐藏 版本时间线 · 大纲 · 文件信息")
         self.detail_btn.clicked.connect(self._toggle_detail)
         bar.addWidget(self.detail_btn)
-        self._detail_dot = QLabel("●", self.detail_btn)  # 有版本时右上角红点
+        self._detail_dot = QLabel("●", self.detail_btn)
         self._detail_dot.setObjectName("navDot")
         self._detail_dot.setAttribute(Qt.WA_TransparentForMouseEvents)
         self._detail_dot.hide()
@@ -569,23 +736,23 @@ class MainWindow(QMainWindow):
         self.result_list.customContextMenuRequested.connect(self._context_menu)
         ll.addWidget(self.result_list, 1)
         self._build_empty_hint(ll)
-        # 列表区用 QStackedWidget 包「结果列表 left」与「仪表盘首屏」二选一切换；
-        # left（含 result_list 及全部信号绑定）原样保留，仅多一层 stack 容器。
+        # 鍒楄〃鍖虹敤 QStackedWidget 鍖呫€岀粨鏋滃垪琛?left銆嶄笌銆屼华琛ㄧ洏棣栧睆銆嶄簩閫変竴鍒囨崲锛?
+        # left锛堝惈 result_list 鍙婂叏閮ㄤ俊鍙风粦瀹氾級鍘熸牱淇濈暀锛屼粎澶氫竴灞?stack 瀹瑰櫒銆?
         self._list_stack = QStackedWidget()
         self._list_stack.setObjectName("listStack")
-        self._list_stack.addWidget(left)                  # index 0：结果列表区
+        self._list_stack.addWidget(left)                  # index 0锛氱粨鏋滃垪琛ㄥ尯
         self.dashboard = DashboardView(self)
-        self._list_stack.addWidget(self.dashboard)        # index 1：仪表盘首屏
+        self._list_stack.addWidget(self.dashboard)        # index 1锛氫华琛ㄧ洏棣栧睆
         self.facet_panel = FacetPanel(self._tok)
         self.facet_panel.filters_changed.connect(self._apply_facet)
         self.facet_panel.hide()
         split.addWidget(self.facet_panel)
         split.addWidget(self._list_stack)
         split.addWidget(self._build_preview())
-        # 详情改为浮动弹窗（不再占第四列，节约横向空间）：非模态 Tool 窗，浮在主窗之上、
-        # 跟随选中实时刷新，关掉不影响搜索/预览主区；信号与 _update_detail 逻辑均不变。
+        # 璇︽儏鏀逛负娴姩寮圭獥锛堜笉鍐嶅崰绗洓鍒楋紝鑺傜害妯悜绌洪棿锛夛細闈炴ā鎬?Tool 绐楋紝娴湪涓荤獥涔嬩笂銆?
+        # 璺熼殢閫変腑瀹炴椂鍒锋柊锛屽叧鎺変笉褰卞搷鎼滅储/棰勮涓诲尯锛涗俊鍙蜂笌 _update_detail 閫昏緫鍧囦笉鍙樸€?
         self.detail_panel = DetailPanel(self._tok, parent=self)
-        # 无边框玻璃弹窗（自绘玻璃标题栏可拖动 + 关闭），show 后加 Win11 DWM 圆角，和主窗统一
+        # 鏃犺竟妗嗙幓鐠冨脊绐楋紙鑷粯鐜荤拑鏍囬鏍忓彲鎷栧姩 + 鍏抽棴锛夛紝show 鍚庡姞 Win11 DWM 鍦嗚锛屽拰涓荤獥缁熶竴
         self.detail_panel.setWindowFlags(Qt.Tool | Qt.FramelessWindowHint)
         self.detail_panel.restore_requested.connect(self._act_restore_version)
         self.detail_panel.export_requested.connect(self._act_export_version)
@@ -599,7 +766,7 @@ class MainWindow(QMainWindow):
         wrap = QWidget()
         wrap.setObjectName("contentWrap")
         wl = QVBoxLayout(wrap)
-        wl.setContentsMargins(16, 6, 16, 10)  # 中间内容区四周留白，不贴窗口边
+        wl.setContentsMargins(16, 6, 16, 10)  # 涓棿鍐呭鍖哄洓鍛ㄧ暀鐧斤紝涓嶈创绐楀彛杈?
         wl.addWidget(split)
         root.addWidget(wrap, 1)
 
@@ -624,15 +791,15 @@ class MainWindow(QMainWindow):
         self.status.addWidget(self.status_label)
         self.version_shield = QLabel("")
         self.version_shield.setObjectName("verShield")
-        self.version_shield.hide()  # 有版本后才显示
+        self.version_shield.hide()  # 鏈夌増鏈悗鎵嶆樉绀?
         self.status.addPermanentWidget(self.version_shield)
-        kb = QLabel('<span id="kbd"> ↑↓ </span> 选择　<span id="kbd"> ↵ </span> 打开　<span id="kbd"> Esc </span> 收起')
+        kb = QLabel('<span id="kbd"> ↑↓ </span> 选择　<span id="kbd"> ↵</span> 打开　<span id="kbd"> Esc </span> 收起')
         kb.setTextFormat(Qt.RichText)
         self.hotkey_label = QLabel(f"全局热键 {GLOBAL_HOTKEY}")
         self.status.addPermanentWidget(kb)
         self.status.addPermanentWidget(self.hotkey_label)
 
-        # 趣味统计「我的胶片报告」入口（非侵入注入，逻辑全在 stats_entry）
+        # 瓒ｅ懗缁熻銆屾垜鐨勮兌鐗囨姤鍛娿€嶅叆鍙ｏ紙闈炰镜鍏ユ敞鍏ワ紝閫昏緫鍏ㄥ湪 stats_entry锛?
         from .stats_entry import install_stats_entry
         install_stats_entry(self)
 
@@ -646,7 +813,7 @@ class MainWindow(QMainWindow):
         lay.setContentsMargins(12, 10, 12, 12)
         lay.setSpacing(8)
 
-        # 顶栏：完整路径（可复制）+ 文件元信息（大小·页数·修改时间）
+        # 椤舵爮锛氬畬鏁磋矾寰勶紙鍙鍒讹級+ 鏂囦欢鍏冧俊鎭紙澶у皬路椤垫暟路淇敼鏃堕棿锛?
         head = QWidget()
         head.setObjectName("previewHeadBar")
         hv = QVBoxLayout(head)
@@ -678,12 +845,12 @@ class MainWindow(QMainWindow):
         self.image_label.setObjectName("previewImage")
         self.image_label.setAlignment(Qt.AlignCenter)
         self.scroll.setWidget(self.image_label)
-        # 预览区滚轮 = 按原始页序翻页（看前几页判断是不是要找的 PPT）
+        # 棰勮鍖烘粴杞?= 鎸夊師濮嬮〉搴忕炕椤碉紙鐪嬪墠鍑犻〉鍒ゆ柇鏄笉鏄鎵剧殑 PPT锛?
         self.scroll.viewport().installEventFilter(self)
         self.image_label.installEventFilter(self)
         lay.addWidget(self.scroll, 1)
 
-        # 命中页缩略图条
+        # 鍛戒腑椤电缉鐣ュ浘鏉?
         self.thumb_row = QHBoxLayout()
         self.thumb_row.setSpacing(7)
         self.thumb_row.setAlignment(Qt.AlignCenter)
@@ -723,7 +890,7 @@ class MainWindow(QMainWindow):
         self._set_ops_enabled(False)
         return panel
 
-    # ---------- 玻璃标题栏（无边框窗口自绘） ----------
+    # ---------- 鐜荤拑鏍囬鏍忥紙鏃犺竟妗嗙獥鍙ｈ嚜缁橈級 ----------
     def _build_glass_title(self) -> QWidget:
         tb = QWidget()
         tb.setObjectName("glassTitle")
@@ -739,7 +906,7 @@ class MainWindow(QMainWindow):
         ver.setObjectName("gtVer")
         self.gt_theme = QLabel(dict(theme.THEMES).get(self._theme, self._theme))
         self.gt_theme.setObjectName("gtTheme")
-        self.update_chip = QPushButton("")  # 增量更新 chip：发现新版才显示，非模态、不打断搜索
+        self.update_chip = QPushButton("")  # 澧為噺鏇存柊 chip锛氬彂鐜版柊鐗堟墠鏄剧ず锛岄潪妯℃€併€佷笉鎵撴柇鎼滅储
         self.update_chip.setObjectName("updateChip")
         self.update_chip.setCursor(Qt.PointingHandCursor)
         self.update_chip.hide()
@@ -749,9 +916,9 @@ class MainWindow(QMainWindow):
         l.addWidget(self.gt_theme)
         l.addWidget(self.update_chip)
         l.addStretch(1)
-        for txt, slot, oid, tip in (("–", self.showMinimized, "winMin", "最小化"),
+        for txt, slot, oid, tip in (("—", self.showMinimized, "winMin", "最小化"),
                                     ("□", self._win_toggle_max, "winMax", "最大化 / 还原"),
-                                    ("✕", self.close, "winClose", "关闭")):
+                                    ("×", self.close, "winClose", "关闭")):
             btn = QPushButton(txt)
             btn.setObjectName(oid)
             btn.setFixedSize(46, self._title_h)
@@ -765,7 +932,7 @@ class MainWindow(QMainWindow):
         self.showNormal() if self.isMaximized() else self.showMaximized()
 
     def _enable_native_frame(self) -> None:
-        """无边框窗口恢复系统能力：可拖拉缩放 / 最大化 / 最小化 / Win11 圆角。"""
+        """鏃犺竟妗嗙獥鍙ｆ仮澶嶇郴缁熻兘鍔涳細鍙嫋鎷夌缉鏀?/ 鏈€澶у寲 / 鏈€灏忓寲 / Win11 鍦嗚銆?"""
         if not _WIN:
             return
         try:
@@ -778,17 +945,17 @@ class MainWindow(QMainWindow):
             style = u.GetWindowLongW(hwnd, GWL_STYLE)
             u.SetWindowLongW(hwnd, GWL_STYLE,
                              style | WS_THICKFRAME | WS_MAXIMIZEBOX | WS_MINIMIZEBOX)
-            # DWMWA_WINDOW_CORNER_PREFERENCE=33, value 2=ROUND（Win11；旧系统静默失败）
+            # DWMWA_WINDOW_CORNER_PREFERENCE=33, value 2=ROUND锛圵in11锛涙棫绯荤粺闈欓粯澶辫触锛?
             ctypes.windll.dwmapi.DwmSetWindowAttribute(
                 hwnd, 33, ctypes.byref(ctypes.c_int(2)), 4)
         except Exception:  # noqa: BLE001
             pass
 
     def nativeEvent(self, et, message):  # noqa: N802
-        """WM_NCHITTEST：标题栏区回 HTCAPTION（拖动/双击最大化/Snap），四边角回缩放码。
+        """WM_NCHITTEST锛氭爣棰樻爮鍖哄洖 HTCAPTION锛堟嫋鍔?鍙屽嚮鏈€澶у寲/Snap锛夛紝鍥涜竟瑙掑洖缂╂斁鐮併€?
 
-        用 QCursor.pos 逻辑坐标（非 lParam 物理坐标）避免高 DPI 缩放错位；
-        右侧按钮区不回 HTCAPTION，以便窗口按钮可点击。
+        鐢?QCursor.pos 閫昏緫鍧愭爣锛堥潪 lParam 鐗╃悊鍧愭爣锛夐伩鍏嶉珮 DPI 缂╂斁閿欎綅锛?
+        鍙充晶鎸夐挳鍖轰笉鍥?HTCAPTION锛屼互渚跨獥鍙ｆ寜閽彲鐐瑰嚮銆?
         """
         if _WIN and et == "windows_generic_MSG":
             try:
@@ -819,32 +986,60 @@ class MainWindow(QMainWindow):
                         return True, 12   # HTTOP
                     if Bt:
                         return True, 15   # HTBOTTOM
-                # 标题栏拖动区：避开顶部 b 缩放边 + 右侧 146px 窗口按钮区
+                # 鏍囬鏍忔嫋鍔ㄥ尯锛氶伩寮€椤堕儴 b 缂╂斁杈?+ 鍙充晶 146px 绐楀彛鎸夐挳鍖?
                 if b <= y < self._title_h and x < w - 146:
                     return True, 2        # HTCAPTION
         return super().nativeEvent(et, message)
 
-    # ---------- 列表 / 仪表盘 首屏切换 ----------
-    def _show_dashboard(self) -> None:
-        """切到仪表盘首屏（空搜索默认视图）。不动 result_list 本身。"""
+    # ---------- 鍒楄〃 / 浠〃鐩?棣栧睆鍒囨崲 ----------
+    def _show_dashboard(self, *, force_refresh: bool = False) -> None:
+        """鍒囧埌浠〃鐩橀灞忥紙绌烘悳绱㈤粯璁よ鍥撅級銆備笉鍔?result_list 鏈韩銆?"""
         if getattr(self, "dashboard", None) is not None:
-            self.dashboard.refresh()
             self._list_stack.setCurrentWidget(self.dashboard)
+            self.dashboard.schedule_refresh(force=force_refresh)
 
     def _show_list(self) -> None:
-        """切到结果列表区（有搜索词 / 有结果时）。"""
+        """鍒囧埌缁撴灉鍒楄〃鍖猴紙鏈夋悳绱㈣瘝 / 鏈夌粨鏋滄椂锛夈€?"""
         stack = getattr(self, "_list_stack", None)
         left = stack.widget(0) if stack is not None else None
         if stack is not None and left is not None:
             stack.setCurrentWidget(left)
 
     def _set_ops_enabled(self, on: bool) -> None:
+        on = on and self._active_heavy_op is None and self._search_pending_req is None
         for w in (self.goto_btn, self.open_btn, self.folder_btn, self.clip_btn,
+                  self.copy_path_btn,
                   self.prev_btn, self.next_btn):
             w.setEnabled(on)
+        for b in getattr(self, "_thumb_btns", []):
+            b.setEnabled(on)
+        panel = getattr(self, "detail_panel", None)
+        set_detail_actions = getattr(panel, "set_file_actions_enabled", None)
+        if callable(set_detail_actions):
+            set_detail_actions(on)
+
+    def _set_result_refine_enabled(self, enabled: bool) -> None:
+        for w in (self.sort_combo, self.facet_btn, self.facet_panel):
+            w.setEnabled(enabled)
+
+    def _clear_stale_result_context(self) -> None:
+        self._results_raw = []
+        self._results = []
+        self._cur = None
+        self._cur_item_widget = None
+        self._preview_deferred_due_to_busy = False
+        self._clear_detail_load_inflight()
+        self._clear_detail_panel_selection()
+        self._invalidate_preview_request()
+        self._update_preview_header(None)
+        self._clear_preview_empty()
+        self.result_list.clear()
+        self._thumb.clear()
+        self._thumb_items.clear()
+        self._set_ops_enabled(False)
 
     def _update_preview_header(self, r: FileResult | None) -> None:
-        """预览顶栏：完整路径（可复制）+ 大小·页数·修改时间。"""
+        """棰勮椤舵爮锛氬畬鏁磋矾寰勶紙鍙鍒讹級+ 澶у皬路椤垫暟路淇敼鏃堕棿銆?"""
         if r is None:
             self.path_label.setText("← 选中左侧结果查看预览")
             self.path_label.setToolTip("")
@@ -865,32 +1060,32 @@ class MainWindow(QMainWindow):
             parts.append(f"修改于 {tm}")
         self.meta_label.setText("　·　".join(parts))
 
-    # ---------- 主题 ----------
+    # ---------- 涓婚 ----------
     def showEvent(self, e):  # noqa: N802
         super().showEvent(e)
-        self._apply_titlebar_theme()  # 窗口显示后系统标题栏才接受深色属性
+        self._apply_titlebar_theme()  # 绐楀彛鏄剧ず鍚庣郴缁熸爣棰樻爮鎵嶆帴鍙楁繁鑹插睘鎬?
         if not getattr(self, "_did_fade", False):
             self._did_fade = True
             from .spotlight import animations_enabled
-            if animations_enabled():  # 尊重系统「减弱动态效果」，关则直接显示
+            if animations_enabled():  # 灏婇噸绯荤粺銆屽噺寮卞姩鎬佹晥鏋溿€嶏紝鍏冲垯鐩存帴鏄剧ず
                 self.setWindowOpacity(0.0)
                 self._fade = QPropertyAnimation(self, b"windowOpacity", self)
                 self._fade.setDuration(200)
                 self._fade.setStartValue(0.0)
                 self._fade.setEndValue(1.0)
                 self._fade.start()
-        self._maybe_show_version_intro()  # 有「首次留版」待告知且窗口已露脸则补弹
+        self._maybe_show_version_intro()  # 鏈夈€岄娆＄暀鐗堛€嶅緟鍛婄煡涓旂獥鍙ｅ凡闇茶劯鍒欒ˉ寮?
 
     def _apply_titlebar_theme(self) -> None:
-        """Windows 系统标题栏深浅跟随风格（深色风格→深色标题栏，消除白条割裂）。"""
+        """Windows 绯荤粺鏍囬鏍忔繁娴呰窡闅忛鏍硷紙娣辫壊椋庢牸鈫掓繁鑹叉爣棰樻爮锛屾秷闄ょ櫧鏉″壊瑁傦級銆?"""
         try:
             import ctypes
             dark = self._theme in ("raycast", "cinema", "aurora")
             val = ctypes.c_int(1 if dark else 0)
-            # DWMWA_USE_IMMERSIVE_DARK_MODE = 20（Win10 20H1+）
+            # DWMWA_USE_IMMERSIVE_DARK_MODE = 20锛圵in10 20H1+锛?
             ctypes.windll.dwmapi.DwmSetWindowAttribute(
                 int(self.winId()), 20, ctypes.byref(val), ctypes.sizeof(val))
-        except Exception:  # noqa: BLE001 非 Windows / 旧系统静默跳过
+        except Exception:  # noqa: BLE001 闈?Windows / 鏃х郴缁熼潤榛樿烦杩?
             pass
 
     def _apply_theme(self, name: str, persist: bool = True) -> None:
@@ -906,7 +1101,7 @@ class MainWindow(QMainWindow):
             self._apply_sort_render()
             self._select_first()
         self._apply_titlebar_theme()
-        # 玻璃化首屏同步刷新：central 极光 + 标题栏主题名 + 仪表盘图表
+        # 鐜荤拑鍖栭灞忓悓姝ュ埛鏂帮細central 鏋佸厜 + 鏍囬鏍忎富棰樺悕 + 浠〃鐩樺浘琛?
         if getattr(self, "_central", None) is not None:
             self._central.update()
         if getattr(self, "gt_theme", None) is not None:
@@ -915,7 +1110,7 @@ class MainWindow(QMainWindow):
             self.dashboard.set_theme()
 
     def _show_theme_menu(self) -> None:
-        """顶栏风格按钮 → 弹出风格菜单（当前风格打勾）。"""
+        """椤舵爮椋庢牸鎸夐挳 鈫?寮瑰嚭椋庢牸鑿滃崟锛堝綋鍓嶉鏍兼墦鍕撅級銆?"""
         menu = QMenu(self)
         for name, label in theme.THEMES:
             act = menu.addAction(label)
@@ -925,12 +1120,12 @@ class MainWindow(QMainWindow):
         menu.exec(self.theme_btn.mapToGlobal(self.theme_btn.rect().bottomLeft()))
 
     def _toggle_theme(self) -> None:
-        """循环切到下一个风格（保留的快捷切换入口）。"""
+        """寰幆鍒囧埌涓嬩竴涓鏍硷紙淇濈暀鐨勫揩鎹峰垏鎹㈠叆鍙ｏ級銆?"""
         names = [n for n, _ in theme.THEMES]
         i = names.index(self._theme) if self._theme in names else 0
         self._apply_theme(names[(i + 1) % len(names)])
 
-    # ---------- 搜索 ----------
+    # ---------- 鎼滅储 ----------
     def _refresh_history_model(self) -> None:
         self._history_model.setStringList(history.load_history(limit=10))
 
@@ -945,15 +1140,28 @@ class MainWindow(QMainWindow):
         self.query_hint.setText(explain_query(query, self._mode_key()).summary)
         self.query_hint.show()
 
+    def _clear_search_now(self) -> None:
+        self.search_box.clear()
+        self._do_search()
+
     def _do_search(self) -> None:
+        if self._closing:
+            return
+        self._debounce.stop()
         query = self.search_box.text().strip()
         self._search_seq += 1
+        self._cancel_auto_preview()
         self._update_query_hint(query)
         if not query:
+            self._clear_search_pending()
+            cancel = getattr(self._search_worker, "cancel", None)
+            if callable(cancel):
+                cancel()
             self._show_recent()
             return
+        self._recent_load_token += 1
         self._showing_recent = False
-        self._show_list()  # 有搜索词 → 显示结果列表区（隐藏仪表盘首屏）
+        self._show_list()  # 鏈夋悳绱㈣瘝 鈫?鏄剧ず缁撴灉鍒楄〃鍖猴紙闅愯棌浠〃鐩橀灞忥級
         if self._search_worker is not None:
             self._show_search_pending(query)
             self._search_worker.request(self._search_seq, query, self._mode_key())
@@ -963,62 +1171,140 @@ class MainWindow(QMainWindow):
         self._finish_search(query, results, (time.perf_counter() - started) * 1000)
 
     def _show_search_pending(self, query: str) -> None:
-        self._results_raw = []
-        self._results = []
-        self._cur = None
-        self.result_list.clear()
-        self._hide_empty_hint()
-        self.result_count.setText("搜索中…")
+        self._status_refresh_token += 1
+        req_id = self._search_seq
+        self._search_pending_req = req_id
+        self._render_gen += 1
+        self._thumb.clear()
+        self.result_list.setEnabled(False)
+        self._set_result_refine_enabled(False)
+        has_visible_results = self.result_list.count() > 0 and not self.result_list.isHidden()
+        if has_visible_results:
+            self._hide_empty_hint()
+            self.result_count.setText(f"搜索中… 当前结果暂留 · {len(self._results)} 个文件")
+            self._set_ops_enabled(False)
+        else:
+            self._results_raw = []
+            self._results = []
+            self._cur = None
+            self._clear_detail_load_inflight()
+            self._clear_detail_panel_selection()
+            self._invalidate_preview_request()
+            self.result_list.clear()
+            self._hide_empty_hint()
+            self.result_count.setText("搜索中…")
+            self._update_preview_header(None)
+            self._set_ops_enabled(False)
         self.list_head.show()
-        self._update_preview_header(None)
-        self._set_ops_enabled(False)
-        self.status_label.setText(f"正在搜索「{query}」…")
+        self.status_label.setText(f"\u6b63\u5728\u641c\u7d22\u300c{query}\u300d...")
+        self._search_slow_hint_req_id = req_id
+        self._search_slow_hint_query = query
+        self._search_slow_hint_timer.setInterval(self._SEARCH_SLOW_HINT_MS)
+        self._search_slow_hint_timer.start()
+
+    def _clear_search_pending(self) -> None:
+        self._search_pending_req = None
+        self._search_slow_hint_timer.stop()
+
+    def _maybe_run_deferred_live_refresh(self, query: str) -> None:
+        if not self._live_refresh_after_search:
+            return
+        self._live_refresh_after_search = False
+        if self._closing or self.search_box.text().strip() != query:
+            return
+        QTimer.singleShot(self._DEFERRED_LIVE_SEARCH_YIELD_MS, self._do_search)
+
+    def _show_search_slow_hint(self, req_id: int, query: str) -> None:
+        if self._closing or self._search_pending_req != req_id:
+            return
+        if req_id != self._search_seq or query != self.search_box.text().strip():
+            return
+        has_visible_results = self.result_list.count() > 0 and not self.result_list.isHidden()
+        if has_visible_results:
+            self.result_count.setText(
+                f"搜索仍在进行… 当前结果暂留 · {len(self._results)} 个文件 · 可继续输入缩小范围")
+        else:
+            self.result_count.setText("搜索仍在进行… 可继续输入缩小范围")
+        self.list_head.show()
+        self.status_label.setText(f"\u6b63\u5728\u641c\u7d22\u300c{query}\u300d... \u67e5\u8be2\u8f83\u5927\uff0c\u53ef\u7ee7\u7eed\u8f93\u5165\u7f29\u5c0f\u8303\u56f4")
 
     def _on_search_done(self, req_id: int, query: str, results: object, elapsed_ms: float, error: object) -> None:
         if self._closing or req_id != self._search_seq or query != self.search_box.text().strip():
             return
+        self._clear_search_pending()
         if error:
-            self._results_raw = []
-            self._results = []
-            self.result_list.clear()
-            self.list_head.hide()
-            self._update_preview_header(None)
-            self._set_ops_enabled(False)
-            self.status_label.setText(f"搜索失败：{error}")
-            self._show_empty_hint(query)
+            self.status_label.setText(f"\u641c\u7d22\u5931\u8d25\uff1a{error}")
+            self.result_count.setText("搜索失败 · 已保留当前结果" if self.result_list.count() else "搜索失败")
+            if self.result_list.count():
+                self.result_list.setEnabled(True)
+                self._set_result_refine_enabled(True)
+                self._set_ops_enabled(self._cur is not None)
+                self._flush_deferred_preview_if_idle()
+            else:
+                self.list_head.hide()
+                self._invalidate_preview_request()
+                self._update_preview_header(None)
+                self._set_ops_enabled(False)
+                self._show_empty_hint(query)
+            self._maybe_run_deferred_live_refresh(query)
             return
         self._finish_search(query, list(results or []), elapsed_ms)
+        self._refresh_status()
+        self._maybe_run_deferred_live_refresh(query)
 
     def _finish_search(self, query: str, results: list[FileResult], elapsed_ms: float | None = None) -> None:
+        self._clear_search_pending()
         self._results_raw = results
         self._refresh_facets()
         self._apply_sort_render()
         if results:
-            suffix = f" · {elapsed_ms:.0f} ms" if elapsed_ms is not None else ""
-            self.result_count.setText(f"命中 {len(results)} 个文件{suffix}")
+            suffix = f" \u00b7 {elapsed_ms:.0f} ms" if elapsed_ms is not None else ""
+            self.result_count.setText(f"\u547d\u4e2d {len(results)} \u4e2a\u6587\u4ef6{suffix}")
             self.list_head.show()
-            self._select_first()
+            self._select_first(delayed_preview=True)
         else:
             self.list_head.hide()
+            self._cur = None
+            self._clear_detail_load_inflight()
+            self._clear_detail_panel_selection()
+            self._invalidate_preview_request()
             self._update_preview_header(None)
             self._set_ops_enabled(False)
             self._show_empty_hint(query)
 
-    def _show_recent(self) -> None:
-        """空查询默认视图：仪表盘首屏 + 备好「最近文件」结果（切回搜索即用）。"""
-        self.query_hint.hide()
-        recents = db.recent_files(self._conn, limit=20)
-        self._results_raw = recents
+    def _recent_files_cached(self, *, force: bool = False) -> list[FileResult] | None:
+        now = time.monotonic()
+        if (
+            not force
+            and self._recent_cache is not None
+            and (now - self._recent_cache_at) * 1000 < self._RECENT_CACHE_MS
+        ):
+            return list(self._recent_cache)
+        return None
+
+    def _load_recent_files(self, conn_path: str | None) -> list[FileResult]:
+        if conn_path:
+            own = db.connect(conn_path)
+            try:
+                return list(db.recent_files(own, limit=20))
+            finally:
+                own.close()
+        return list(db.recent_files(self._conn, limit=20))
+
+    def _apply_recent_results(self, recents: list[FileResult]) -> None:
+        self.result_list.setEnabled(True)
+        self._set_result_refine_enabled(True)
+        self._results_raw = list(recents)
         self._cur = None
-        self._showing_recent = bool(recents)
-        self._show_dashboard()  # 空搜索默认视图 = 仪表盘首屏
+        self._clear_detail_load_inflight()
+        self._clear_detail_panel_selection()
+        self._invalidate_preview_request()
+        self._showing_recent = True
         if recents:
             self._refresh_facets()
             self._apply_sort_render()
             self.result_count.setText(f"最近修改 · {len(recents)} 个文件")
             self.list_head.show()
-            # 不自动选中/预览首个最近文件——空搜索停在仪表盘、没人在看预览，却会冷启
-            # PowerPoint COM 渲染整页高清预览造成卡顿。预览留到用户真正点选结果时再触发。
             self._update_preview_header(None)
             self._set_ops_enabled(False)
         else:
@@ -1028,8 +1314,71 @@ class MainWindow(QMainWindow):
             self._set_ops_enabled(False)
             self._show_start_hint()
 
+    def _on_recent_files_loaded(self, token: int, payload: object) -> None:
+        if self._closing or token != self._recent_load_token:
+            return
+        if self.search_box.text().strip():
+            return
+        recents = list(payload or [])
+        self._recent_cache = list(recents)
+        self._recent_cache_at = time.monotonic()
+        self._apply_recent_results(recents)
+
+    def _finish_recent_files_load(self, task, token: int) -> None:
+        if task in self._bg_tasks:
+            self._bg_tasks.remove(task)
+        if self._recent_load_inflight_token == token:
+            self._recent_load_inflight_token = None
+
+    def _show_recent(self, *, dashboard_force_refresh: bool = False,
+                     recent_force_refresh: bool = False) -> None:
+        """绌烘煡璇㈤粯璁よ鍥撅細浠〃鐩橀灞?+ 澶囧ソ銆屾渶杩戞枃浠躲€嶇粨鏋滐紙鍒囧洖鎼滅储鍗崇敤锛夈€?"""
+        self._clear_search_pending()
+        self.query_hint.hide()
+        self._clear_stale_result_context()
+        already_on_recent_dashboard = (
+            self._showing_recent
+            and getattr(self, "dashboard", None) is not None
+            and self._list_stack.currentWidget() is self.dashboard
+        )
+        self._showing_recent = True
+        if dashboard_force_refresh or not already_on_recent_dashboard:
+            self._show_dashboard(force_refresh=dashboard_force_refresh)
+        recents = self._recent_files_cached(force=recent_force_refresh)
+        if recents is not None:
+            self._recent_load_token += 1
+            self._recent_load_inflight_token = None
+            self._apply_recent_results(recents)
+            return
+        if (
+            self._recent_load_inflight_token is not None
+            and self._recent_load_inflight_token == self._recent_load_token
+        ):
+            self.result_count.setText("\u6700\u8fd1\u4fee\u6539 \u00b7 \u52a0\u8f7d\u4e2d...")
+            return
+        conn_path = _sqlite_file_path(self._conn)
+        self._recent_load_token += 1
+        token = self._recent_load_token
+        if not conn_path:
+            recents = self._load_recent_files(conn_path)
+            self._recent_cache = list(recents)
+            self._recent_cache_at = time.monotonic()
+            self._apply_recent_results(recents)
+            return
+        self.result_count.setText("\u6700\u8fd1\u4fee\u6539 \u00b7 \u52a0\u8f7d\u4e2d...")
+        task = BackgroundTask(
+            lambda conn_path=conn_path: self._load_recent_files(conn_path),
+            "recent-files-load",
+        )
+        self._recent_load_inflight_token = token
+        self._bg_tasks.append(task)
+        task.done.connect(lambda payload, token=token: self._on_recent_files_loaded(token, payload))
+        task.finished.connect(
+            lambda task=task, token=token: self._finish_recent_files_load(task, token))
+        task.start()
+
     def _build_empty_hint(self, parent_layout) -> None:
-        """零结果引导面板（默认隐藏，零结果时覆盖结果列表位置）。"""
+        """闆剁粨鏋滃紩瀵奸潰鏉匡紙榛樿闅愯棌锛岄浂缁撴灉鏃惰鐩栫粨鏋滃垪琛ㄤ綅缃級銆?"""
         self.empty_hint = QWidget()
         self.empty_hint.setObjectName("emptyHint")
         v = QVBoxLayout(self.empty_hint)
@@ -1048,6 +1397,11 @@ class MainWindow(QMainWindow):
         self._empty_tip.setObjectName("emptyTip")
         self._empty_tip.setAlignment(Qt.AlignCenter)
         v.addWidget(self._empty_tip)
+        self._empty_index_status = QLabel("")
+        self._empty_index_status.setObjectName("emptyMeta")
+        self._empty_index_status.setAlignment(Qt.AlignCenter)
+        self._empty_index_status.setWordWrap(True)
+        v.addWidget(self._empty_index_status)
         self._sugg_btns: dict[str, QPushButton] = {}
         for key, text in (
             ("unquote", "去掉引号再搜"),
@@ -1060,39 +1414,155 @@ class MainWindow(QMainWindow):
             b.clicked.connect(lambda _=False, k=key: self._apply_suggestion(k))
             v.addWidget(b, 0, Qt.AlignCenter)
             self._sugg_btns[key] = b
+        self._diagnose_btn = QPushButton("查看健康诊断")
+        self._diagnose_btn.setObjectName("suggBtn")
+        self._diagnose_btn.setToolTip("查看索引库、扫描范围、数据目录和 PowerPoint 状态")
+        self._diagnose_btn.clicked.connect(self._open_health_diagnostics)
+        v.addWidget(self._diagnose_btn, 0, Qt.AlignCenter)
         self.empty_hint.hide()
         parent_layout.addWidget(self.empty_hint, 1)
 
+    def _index_status_text(self) -> str:
+        try:
+            s = self._index_status_stats_cached()
+        except Exception:  # noqa: BLE001
+            return f"\u7d22\u5f15\u72b6\u6001\uff1a\u8bfb\u53d6\u5931\u8d25 \u00b7 \u5f53\u524d\u8303\u56f4\uff1a{mode_label(self._mode_key())}"
+        return self._index_status_text_from_stats(s, self._mode_key())
+
+    def _index_status_text_from_stats(self, stats: dict, mode_key: str) -> str:
+        try:
+            files = int(stats.get("file_count", 0))
+            pages = int(stats.get("page_count", 0))
+        except Exception:  # noqa: BLE001
+            return f"\u7d22\u5f15\u72b6\u6001\uff1a\u8bfb\u53d6\u5931\u8d25 \u00b7 \u5f53\u524d\u8303\u56f4\uff1a{mode_label(mode_key)}"
+        scanning = self._indexer is not None and self._indexer.isRunning()
+        if files <= 0:
+            state = "\u6b63\u5728\u626b\u63cf \u00b7 \u7d22\u5f15\u5e93\u4e3a\u7a7a" if scanning else "\u7d22\u5f15\u5e93\u4e3a\u7a7a"
+            return f"\u7d22\u5f15\u72b6\u6001\uff1a{state} \u00b7 \u5f53\u524d\u8303\u56f4\uff1a{mode_label(mode_key)}"
+        state = "\u6b63\u5728\u626b\u63cf" if scanning else "\u7d22\u5f15\u5c31\u7eea"
+        return f"\u7d22\u5f15\u72b6\u6001\uff1a{state} \u00b7 \u5df2\u7d22\u5f15 {files} \u4e2a\u6587\u4ef6 / {pages} \u9875 \u00b7 \u5f53\u524d\u8303\u56f4\uff1a{mode_label(mode_key)}"
+
+    def _index_status_cache_hit(self) -> dict | None:
+        now = time.monotonic()
+        if (
+            self._index_status_cache is not None
+            and (now - self._index_status_cache_at) * 1000 < self._INDEX_STATUS_CACHE_MS
+        ):
+            return dict(self._index_status_cache)
+        return None
+
+    def _index_status_stats_cached(self, *, force: bool = False) -> dict:
+        now = time.monotonic()
+        if (
+            not force
+            and self._index_status_cache is not None
+            and (now - self._index_status_cache_at) * 1000 < self._INDEX_STATUS_CACHE_MS
+        ):
+            return dict(self._index_status_cache)
+        s = dict(db.stats(self._conn))
+        self._index_status_cache = dict(s)
+        self._index_status_cache_at = now
+        return s
+
+    def _set_empty_index_status_async(self) -> None:
+        mode_key = self._mode_key()
+        cached = self._index_status_cache_hit()
+        if cached is not None:
+            self._empty_status_token += 1
+            self._empty_status_inflight_token = None
+            self._empty_status_inflight_mode = None
+            self._empty_index_status.setText(self._index_status_text_from_stats(cached, mode_key))
+            return
+        if (
+            self._empty_status_inflight_token is not None
+            and self._empty_status_inflight_token == self._empty_status_token
+            and self._empty_status_inflight_mode == mode_key
+        ):
+            self._empty_index_status.setText(f"\u7d22\u5f15\u72b6\u6001\uff1a\u8bfb\u53d6\u4e2d... \u00b7 \u5f53\u524d\u8303\u56f4\uff1a{mode_label(mode_key)}")
+            return
+        self._empty_status_token += 1
+        token = self._empty_status_token
+        self._empty_index_status.setText(f"\u7d22\u5f15\u72b6\u6001\uff1a\u8bfb\u53d6\u4e2d... \u00b7 \u5f53\u524d\u8303\u56f4\uff1a{mode_label(mode_key)}")
+        conn_path = _sqlite_file_path(self._conn)
+        if not conn_path:
+            try:
+                stats = self._load_status_stats(conn_path)
+            except Exception:  # noqa: BLE001
+                self._on_empty_index_status_loaded(token, mode_key, None)
+                return
+            self._on_empty_index_status_loaded(token, mode_key, stats)
+            return
+        task = BackgroundTask(
+            lambda conn_path=conn_path: self._load_status_stats(conn_path),
+            "empty-index-status-refresh",
+        )
+        self._empty_status_inflight_token = token
+        self._empty_status_inflight_mode = mode_key
+        self._bg_tasks.append(task)
+        task.done.connect(
+            lambda payload, token=token, mode_key=mode_key:
+                self._on_empty_index_status_loaded(token, mode_key, payload)
+        )
+        task.finished.connect(
+            lambda task=task, token=token: self._finish_empty_index_status(task, token))
+        task.start()
+
+    def _finish_empty_index_status(self, task, token: int) -> None:
+        if task in self._bg_tasks:
+            self._bg_tasks.remove(task)
+        if self._empty_status_inflight_token == token:
+            self._empty_status_inflight_token = None
+            self._empty_status_inflight_mode = None
+
+    def _on_empty_index_status_loaded(self, token: int, mode_key: str, payload: object) -> None:
+        if self._closing or token != self._empty_status_token:
+            return
+        if self._mode_key() != mode_key:
+            return
+        if not isinstance(payload, dict):
+            self._empty_index_status.setText(f"\u7d22\u5f15\u72b6\u6001\uff1a\u8bfb\u53d6\u5931\u8d25 \u00b7 \u5f53\u524d\u8303\u56f4\uff1a{mode_label(mode_key)}")
+            return
+        self._index_status_cache = dict(payload)
+        self._index_status_cache_at = time.monotonic()
+        self._empty_index_status.setText(self._index_status_text_from_stats(payload, mode_key))
+
     def _show_empty_hint(self, query: str) -> None:
-        """零结果引导：列表让位，给「没找到 + 可点建议」。"""
+        """闆剁粨鏋滃紩瀵硷細鍒楄〃璁╀綅锛岀粰銆屾病鎵惧埌 + 鍙偣寤鸿銆嶃€?"""
         self.result_list.hide()
         self._empty_icon.setText("🔍")
         self._empty_tip.setText("换个说法试试")
-        self._empty_query_label.setText(f"没找到「{query}」")
+        self._empty_query_label.setText(f"\u6ca1\u627e\u5230\u300c{query}\u300d")
+        self._set_empty_index_status_async()
         sugg = suggestion_keys(query, self._mode_key())
         for key, btn in self._sugg_btns.items():
             btn.setVisible(key in sugg)
         self.empty_hint.show()
 
     def _show_start_hint(self) -> None:
-        """无最近文件（刚装 / 还在索引）时的起步引导，复用 emptyHint 容器（隐藏建议按钮）。"""
+        """鏃犳渶杩戞枃浠讹紙鍒氳 / 杩樺湪绱㈠紩锛夋椂鐨勮捣姝ュ紩瀵硷紝澶嶇敤 emptyHint 瀹瑰櫒锛堥殣钘忓缓璁寜閽級銆?"""
         self.result_list.hide()
         self._empty_icon.setText("📂")
-        self._empty_query_label.setText("还在整理你的 PPT…")
+        self._empty_query_label.setText("\u8fd8\u5728\u6574\u7406\u4f60\u7684 PPT...")
         self._empty_tip.setText("索引好后这里会列出最近文件；现在就能在上方搜索框直接搜你写过的字")
+        self._set_empty_index_status_async()
         for btn in self._sugg_btns.values():
             btn.hide()
         self.empty_hint.show()
 
-    def _hide_empty_hint(self) -> None:
+    def _hide_empty_hint(self, *, invalidate_status: bool = True) -> None:
         if getattr(self, "empty_hint", None) is not None:
+            if invalidate_status:
+                self._empty_status_token += 1
+                self._empty_status_inflight_token = None
+                self._empty_status_inflight_mode = None
             self.empty_hint.hide()
             self.result_list.show()
 
     def _apply_suggestion(self, key: str) -> None:
         q = self.search_box.text()
+        search_started = False
         if key == "unquote":
-            for ch in ('"', '“', '”'):
+            for ch in ('"', "\u201c", "\u201d"):
                 q = q.replace(ch, "")
             self.search_box.setText(q)
         elif key == "fewer":
@@ -1100,10 +1570,42 @@ class MainWindow(QMainWindow):
             if parts:
                 self.search_box.setText(parts[0])
         elif key == "filename":
-            self.mode.setCurrentText("仅文件名")
+            old_index = self.mode.currentIndex()
+            self.mode.setCurrentIndex(1)
+            search_started = self.mode.currentIndex() != old_index
         elif key == "allmode":
+            old_index = self.mode.currentIndex()
             self.mode.setCurrentIndex(0)
-        self._do_search()
+            search_started = self.mode.currentIndex() != old_index
+        if not search_started:
+            self._do_search()
+
+    def _open_health_diagnostics(self) -> None:
+        """闆剁粨鏋?璧锋鎬佺殑涓€閿帓鏌ュ叆鍙ｏ細鎵撳紑璁剧疆骞跺畾浣嶅埌鍋ュ悍璇婃柇銆?"""
+        from .settings_dialog import SettingsDialog
+
+        for dlg in list(self._settings_dialogs):
+            try:
+                if getattr(dlg, "_closing", False) or not dlg.isVisible():
+                    self._settings_dialogs.remove(dlg)
+                    continue
+                dlg.tabs.setCurrentIndex(1)
+                dlg.raise_()
+                dlg.activateWindow()
+                return
+            except RuntimeError:
+                self._settings_dialogs.remove(dlg)
+        dlg = SettingsDialog(self._version_mgr, self, on_rescan=self._request_full_rescan)
+        dlg.tabs.setCurrentIndex(1)
+        self._settings_dialogs.append(dlg)
+        dlg.destroyed.connect(lambda _=None, d=dlg: self._settings_dialogs.remove(d) if d in self._settings_dialogs else None)
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _request_full_rescan(self) -> bool:
+        """鍋ュ悍璇婃柇閲岀殑涓€閿噸鎵叆鍙ｏ細鍙彂璧峰悗鍙扮储寮曪紝涓嶉樆濉炶缃璇濇銆?"""
+        return self._start_indexing(None, None)
 
     def _sort_key(self) -> str:
         return {"相关度": "relevance", "最近修改": "recent", "文件名": "name"}.get(
@@ -1117,36 +1619,47 @@ class MainWindow(QMainWindow):
         self._render_results(self._results)
 
     def _on_sort_changed(self) -> None:
+        if self._search_pending_req is not None:
+            return
         if self._results_raw:
+            self._cancel_auto_preview()
             self._apply_sort_render()
             if self._results:
-                self._select_first()
+                self._select_first(delayed_preview=True)
 
-    # 首屏同步渲染条数：结果 ≤ 此数则全部同步铺（小结果集零延迟，UI 测试不受异步影响）；
-    # 超出部分用事件循环分批"流式"补入——首个结果最快出现，整体仍 < 3s。
-    _RENDER_FIRST = 30
-    _RENDER_CHUNK = 24
+    # 棣栧睆鍚屾娓叉煋鏉℃暟锛氱粨鏋?鈮?姝ゆ暟鍒欏叏閮ㄥ悓姝ラ摵锛堝皬缁撴灉闆嗛浂寤惰繜锛孶I 娴嬭瘯涓嶅彈寮傛褰卞搷锛夛紱
+    # 瓒呭嚭閮ㄥ垎鐢ㄤ簨浠跺惊鐜垎鎵?娴佸紡"琛ュ叆鈥斺€旈涓粨鏋滄渶蹇嚭鐜帮紝鏁翠綋浠?< 3s銆?
+    _RENDER_FIRST = 16
+    _RENDER_CHUNK = 16
+    _THUMB_FIRST = 16
+    _THUMB_CACHE_MAX = 256
+    _HIT_NAV_MAX = 12
+    _RENDER_YIELD_MS = 1
 
     def _render_results(self, results: list[FileResult]) -> None:
-        self._hide_empty_hint()
+        self.result_list.setEnabled(True)
+        self._set_result_refine_enabled(True)
+        if not self._showing_recent:
+            self._recent_load_token += 1
+        self._hide_empty_hint(invalidate_status=bool(results))
         self.result_list.clear()
-        self._thumb.clear()        # 丢弃上一批未渲完的缩略图请求
+        self._thumb.clear()        # 涓㈠純涓婁竴鎵规湭娓插畬鐨勭缉鐣ュ浘璇锋眰
         self._thumb_items.clear()
-        self._render_gen += 1      # 作废上一批仍在流入的分批渲染
+        self._render_gen += 1      # 浣滃簾涓婁竴鎵逛粛鍦ㄦ祦鍏ョ殑鍒嗘壒娓叉煋
         hlcss = theme.highlight_css(self._theme)
         plan = self._build_render_plan(results)
-        n = self._flush_plan(plan, 0, self._RENDER_FIRST, hlcss)  # 首屏立即铺
+        n = self._flush_plan(plan, 0, self._RENDER_FIRST, hlcss)  # 棣栧睆绔嬪嵆閾?
         if n < len(plan):
             self._stream_plan_rest(plan, n, hlcss, self._render_gen)
 
     def _build_render_plan(self, results: list[FileResult]) -> list:
-        """展开成线性渲染计划：('h', 标题)=分组头 / ('i', idx, r)=结果条目。"""
+        """灞曞紑鎴愮嚎鎬ф覆鏌撹鍒掞細('h', 鏍囬)=鍒嗙粍澶?/ ('i', idx, r)=缁撴灉鏉＄洰銆?"""
         plan: list = []
         if self._should_group_by_time():
             now_ts = datetime.datetime.now().timestamp()
             idx = 0
             for label, items in group_by_time(results, now_ts):
-                plan.append(("h", f"{label} · {len(items)}"))
+                plan.append(("h", f"{label} 路 {len(items)}"))
                 for r in items:
                     plan.append(("i", idx, r))
                     idx += 1
@@ -1156,7 +1669,7 @@ class MainWindow(QMainWindow):
         return plan
 
     def _flush_plan(self, plan: list, start: int, end: int, hlcss: str) -> int:
-        """渲染 plan[start:end]，返回实际渲到的位置（供续批）。"""
+        """娓叉煋 plan[start:end]锛岃繑鍥炲疄闄呮覆鍒扮殑浣嶇疆锛堜緵缁壒锛夈€?"""
         for entry in plan[start:end]:
             if entry[0] == "h":
                 self._add_section_header(entry[1])
@@ -1166,28 +1679,28 @@ class MainWindow(QMainWindow):
         return min(end, len(plan))
 
     def _stream_plan_rest(self, plan: list, pos: int, hlcss: str, gen: int) -> None:
-        """剩余条目分批流入：每个事件循环 tick 补一批，UI 保持可交互、结果逐条浮现。"""
+        """鍓╀綑鏉＄洰鍒嗘壒娴佸叆锛氭瘡涓簨浠跺惊鐜?tick 琛ヤ竴鎵癸紝UI 淇濇寔鍙氦浜掋€佺粨鏋滈€愭潯娴幇銆?"""
         state = {"pos": pos}
 
         def step() -> None:
             if gen != self._render_gen:
-                return  # 已被新一次搜索 / 排序 / 关闭作废
+                return  # 宸茶鏂颁竴娆℃悳绱?/ 鎺掑簭 / 鍏抽棴浣滃簾
             try:
                 state["pos"] = self._flush_plan(
                     plan, state["pos"], state["pos"] + self._RENDER_CHUNK, hlcss)
             except RuntimeError as e:
-                # 仅「窗口/控件 C++ 对象已析构」是预期内良性中断；其余 RuntimeError
-                # 可能是真 bug（会让结果列表静默截断），记日志再停，绝不无声吞掉。
+                # 浠呫€岀獥鍙?鎺т欢 C++ 瀵硅薄宸叉瀽鏋勩€嶆槸棰勬湡鍐呰壇鎬т腑鏂紱鍏朵綑 RuntimeError
+                # 鍙兘鏄湡 bug锛堜細璁╃粨鏋滃垪琛ㄩ潤榛樻埅鏂級锛岃鏃ュ織鍐嶅仠锛岀粷涓嶆棤澹板悶鎺夈€?
                 if "already deleted" not in str(e).lower():
-                    _log.error("流式渲染异常中断，结果可能不完整", exc_info=True)
+                    _log.error("娴佸紡娓叉煋寮傚父涓柇锛岀粨鏋滃彲鑳戒笉瀹屾暣", exc_info=True)
                 return
             if state["pos"] < len(plan):
-                QTimer.singleShot(0, step)
+                QTimer.singleShot(self._RENDER_YIELD_MS, step)
 
-        QTimer.singleShot(0, step)
+        QTimer.singleShot(self._RENDER_YIELD_MS, step)
 
     def _should_group_by_time(self) -> bool:
-        """时间分组仅在「时间序」下生效：最近修改排序，或空查询默认视图。"""
+        """鏃堕棿鍒嗙粍浠呭湪銆屾椂闂村簭銆嶄笅鐢熸晥锛氭渶杩戜慨鏀规帓搴忥紝鎴栫┖鏌ヨ榛樿瑙嗗浘銆?"""
         key = self._sort_key()
         if key == "recent":
             return True
@@ -1204,30 +1717,42 @@ class MainWindow(QMainWindow):
         self._request_thumb(w, idx)
 
     def _request_thumb(self, w: ResultItem, idx: int) -> None:
-        """结果卡片缩略图：命中缓存直接用，否则仅为首屏前若干个发起渲染。"""
+        """缁撴灉鍗＄墖缂╃暐鍥撅細鍛戒腑缂撳瓨鐩存帴鐢紝鍚﹀垯浠呬负棣栧睆鍓嶈嫢骞蹭釜鍙戣捣娓叉煋銆?"""
         key = (w.path, w.thumb_page)
         self._thumb_items[key] = w
-        cached = self._thumb_cache.get(key)
+        cached = self._thumb_cache.pop(key, None)
         if cached is not None:
+            self._thumb_cache[key] = cached
             w.set_thumbnail(cached)
-        elif idx < 24:  # 只渲首屏可见的，避免一次渲 50 张拖慢
+        elif idx < self._THUMB_FIRST:
             self._thumb.request(w.path, w.thumb_page)
 
+    def _remember_thumb(self, key: tuple[str, int], pm: QPixmap) -> None:
+        self._thumb_cache.pop(key, None)
+        self._thumb_cache[key] = pm
+        while len(self._thumb_cache) > self._THUMB_CACHE_MAX:
+            self._thumb_cache.pop(next(iter(self._thumb_cache)))
+
     def _on_thumb(self, path: str, page: int, png: str) -> None:
+        if self._closing:
+            return
+        key = (path, page)
+        if key not in self._thumb_items:
+            return
+        w = self._thumb_items.pop(key, None)
         if not png or not os.path.exists(png):
             return
         pm = QPixmap(png)
         if pm.isNull():
             return
-        self._thumb_cache[(path, page)] = pm
-        w = self._thumb_items.get((path, page))
+        self._remember_thumb(key, pm)
         if w is not None:
             w.set_thumbnail(pm)
 
     def _add_section_header(self, label: str) -> None:
         item = QListWidgetItem()
         item.setData(Qt.UserRole, None)
-        item.setFlags(Qt.NoItemFlags)  # 分组头：不可选不可交互
+        item.setFlags(Qt.NoItemFlags)  # 鍒嗙粍澶达細涓嶅彲閫変笉鍙氦浜?
         lbl = QLabel(label)
         lbl.setObjectName("sectionHead")
         item.setSizeHint(lbl.sizeHint())
@@ -1240,29 +1765,64 @@ class MainWindow(QMainWindow):
                 return i
         return -1
 
-    def _select_first(self) -> None:
+    def _select_first(self, *, delayed_preview: bool = False) -> None:
         row = self._first_selectable_row()
         if row >= 0:
+            if delayed_preview:
+                self._suppress_select_preview = True
             self.result_list.setCurrentRow(row)
+            if delayed_preview:
+                self._schedule_auto_preview(self._search_seq)
+                QTimer.singleShot(0, lambda: setattr(self, "_suppress_select_preview", False))
 
-    # ---------- 选择 / 预览 ----------
+    # ---------- 閫夋嫨 / 棰勮 ----------
+    def _cancel_auto_preview(self) -> None:
+        self._auto_preview_token += 1
+        self._auto_preview_timer.stop()
+
+    def _schedule_auto_preview(self, seq: int) -> None:
+        self._auto_preview_token += 1
+        self._auto_preview_seq = seq
+        self._auto_preview_timer.setInterval(self._AUTO_PREVIEW_DELAY_MS)
+        self._auto_preview_timer.start()
+
+    def _run_auto_preview(self, token: int, seq: int) -> None:
+        if self._closing or token != self._auto_preview_token or seq != self._search_seq:
+            return
+        if self._search_pending_req is not None:
+            return
+        if self.result_list.currentItem() is None or self._cur is None:
+            return
+        self._request_preview()
+
     def _on_select(self, cur: QListWidgetItem | None, prev: QListWidgetItem | None = None) -> None:
         if prev is not None:
             pw = self.result_list.itemWidget(prev)
             if isinstance(pw, ResultItem):
                 pw.set_selected(False)
         if cur is None:
+            self._detail_update_token += 1
+            self._detail_update_force = False
+            self._detail_dot_token += 1
+            self._detail_update_timer.stop()
+            self._detail_dot_timer.stop()
             self._cur = None
             self._cur_item_widget = None
+            self._clear_detail_load_inflight()
+            self._clear_detail_panel_selection()
+            self._invalidate_preview_request()
             self._update_preview_header(None)
             self._set_ops_enabled(False)
+            self._refresh_detail_dot()
+            return
+        if self._search_pending_req is not None:
             return
         idx = cur.data(Qt.UserRole)
         if idx is None or idx >= len(self._results):
             return
         self._cur = self._results[idx]
         self._hit_idx = 0
-        self._view_page = self._current_page()  # 初始定位首个命中页（无命中=第1页）
+        self._view_page = self._current_page()  # 鍒濆瀹氫綅棣栦釜鍛戒腑椤碉紙鏃犲懡涓?绗?椤碉級
         w = self.result_list.itemWidget(cur)
         if isinstance(w, ResultItem):
             w.set_selected(True, self.isActiveWindow())
@@ -1270,9 +1830,16 @@ class MainWindow(QMainWindow):
         self._update_preview_header(self._cur)
         self._set_ops_enabled(True)
         self._populate_thumbs()
+        self._zoom = 1.0
+        if self._suppress_select_preview:
+            self._show_preview_pending()
+            self._schedule_detail_update()
+            self._schedule_detail_dot_refresh()
+            return
+        self._cancel_auto_preview()
         self._request_preview()
-        self._update_detail()
-        self._refresh_detail_dot()
+        self._schedule_detail_update()
+        self._schedule_detail_dot_refresh()
 
     def _relayout_split(self) -> None:
         f = 180 if not self.facet_panel.isHidden() else 0
@@ -1280,37 +1847,49 @@ class MainWindow(QMainWindow):
         self._split.setSizes([f, int(avail * 0.44), int(avail * 0.56)])
 
     def _toggle_facet(self) -> None:
+        if self._search_pending_req is not None:
+            return
         self.facet_panel.setHidden(not self.facet_panel.isHidden())
         self.facet_btn.setChecked(not self.facet_panel.isHidden())
         self._relayout_split()
 
     def _apply_facet(self, filters: dict) -> None:
+        if self._search_pending_req is not None:
+            return
         self._facet_filters = filters
+        self._cancel_auto_preview()
+        self._suppress_select_preview = True
         self._apply_sort_render()
         if self._results:
             self.result_count.setText(f"命中 {len(self._results)} 个文件")
             self.list_head.show()
-            self._select_first()
+            self._select_first(delayed_preview=True)
         else:
-            # 筛选后无结果：别留「命中 N 个」陈旧计数 + 给空状态提示（区别于「没搜到」）
+            QTimer.singleShot(0, lambda: setattr(self, "_suppress_select_preview", False))
+            # 绛涢€夊悗鏃犵粨鏋滐細鍒暀銆屽懡涓?N 涓€嶉檲鏃ц鏁?+ 缁欑┖鐘舵€佹彁绀猴紙鍖哄埆浜庛€屾病鎼滃埌銆嶏級
             self.result_count.setText("筛选后无结果")
             self._cur = None
+            self._clear_detail_load_inflight()
+            self._clear_detail_panel_selection()
+            self._invalidate_preview_request()
+            self._clear_preview_empty("筛选后没有可预览结果")
             self._update_preview_header(None)
             self._set_ops_enabled(False)
             self._show_facet_empty()
 
     def _show_facet_empty(self) -> None:
-        """facet 把结果筛空时的提示——是筛选太窄，不是没搜到。"""
+        """facet 鎶婄粨鏋滅瓫绌烘椂鐨勬彁绀衡€斺€旀槸绛涢€夊お绐勶紝涓嶆槸娌℃悳鍒般€?"""
         self.result_list.hide()
         self._empty_icon.setText("🔎")
         self._empty_query_label.setText("筛选后没有结果")
         self._empty_tip.setText("筛选条件太窄，放宽或清掉筛选再看看")
+        self._set_empty_index_status_async()
         for btn in self._sugg_btns.values():
             btn.hide()
         self.empty_hint.show()
 
     def _refresh_facets(self) -> None:
-        """新结果集时重算各维度数量并重置选中。"""
+        """鏂扮粨鏋滈泦鏃堕噸绠楀悇缁村害鏁伴噺骞堕噸缃€変腑銆?"""
         self._facet_filters = {}
         self.facet_panel.update_counts(
             facet_counts(self._results_raw, datetime.datetime.now().timestamp()), keep=False)
@@ -1319,17 +1898,24 @@ class MainWindow(QMainWindow):
         if self.detail_panel.isHidden():
             self._position_detail_popup()
             self.detail_panel.show()
-            self._round_detail_corners()   # 无边框窗 show 后才能拿 winId 加 Win11 圆角
+            self._round_detail_corners()   # 鏃犺竟妗嗙獥 show 鍚庢墠鑳芥嬁 winId 鍔?Win11 鍦嗚
             self.detail_panel.raise_()
+            self._detail_update_token += 1
             self._update_detail()
             self._maybe_hint_detail_versions()
         else:
             self.detail_panel.hide()
+            self._detail_update_token += 1
+            self._detail_update_force = False
+            self._detail_update_timer.stop()
+            self._clear_detail_load_inflight()
         self.detail_btn.setChecked(not self.detail_panel.isHidden())
+        self._detail_dot_token += 1
+        self._detail_dot_timer.stop()
         self._refresh_detail_dot()
 
     def _position_detail_popup(self) -> None:
-        """详情弹窗浮在主窗右侧内侧，跟随主窗当前位置/大小。"""
+        """璇︽儏寮圭獥娴湪涓荤獥鍙充晶鍐呬晶锛岃窡闅忎富绐楀綋鍓嶄綅缃?澶у皬銆?"""
         g = self.frameGeometry()
         w = 360
         h = min(640, max(420, g.height() - 120))
@@ -1337,7 +1923,7 @@ class MainWindow(QMainWindow):
         self.detail_panel.move(max(0, g.right() - w - 30), g.top() + self._title_h + 60)
 
     def _round_detail_corners(self) -> None:
-        """给无边框详情弹窗加 Win11 DWM 圆角（旧系统静默失败，退化为直角）。"""
+        """缁欐棤杈规璇︽儏寮圭獥鍔?Win11 DWM 鍦嗚锛堟棫绯荤粺闈欓粯澶辫触锛岄€€鍖栦负鐩磋锛夈€?"""
         if not _WIN:
             return
         try:
@@ -1349,46 +1935,175 @@ class MainWindow(QMainWindow):
             pass
 
     def _maybe_hint_detail_versions(self) -> None:
-        """首次展开详情且当前文件有历史版本时，提示「这里能一键回到历史版本」。"""
+        """棣栨灞曞紑璇︽儏涓斿綋鍓嶆枃浠舵湁鍘嗗彶鐗堟湰鏃讹紝鎻愮ず銆岃繖閲岃兘涓€閿洖鍒板巻鍙茬増鏈€嶃€?"""
         if getattr(self, "_detail_opened_once", False):
             return
-        self._detail_opened_once = True
         cur = getattr(self, "_cur", None)
         if cur is None or self._version_mgr is None:
+            self._detail_hint_inflight_token = None
+            self._detail_hint_inflight_path = None
             return
-        try:
-            has = bool(self._version_mgr.list_versions(cur.path))
-        except Exception:  # noqa: BLE001
-            _log.warning("list_versions failed in detail hint", exc_info=True)
-            has = False
-        if has:
+        if (
+            self._detail_hint_inflight_token is not None
+            and self._detail_hint_inflight_path == cur.path
+        ):
+            return
+        self._detail_hint_token += 1
+        token = self._detail_hint_token
+        path = cur.path
+        version_mgr = self._version_mgr
+        task = BackgroundTask(
+            lambda path=path, version_mgr=version_mgr: self._detail_has_versions(path, version_mgr),
+            "detail-hint-check",
+        )
+        self._detail_hint_inflight_token = token
+        self._detail_hint_inflight_path = path
+        self._bg_tasks.append(task)
+        task.done.connect(lambda has, token=token, path=path: self._on_detail_hint_checked(token, path, has))
+        task.finished.connect(
+            lambda task=task, token=token, path=path: self._finish_detail_hint_check(task, token, path))
+        task.start()
+
+    def _finish_detail_hint_check(self, task, token: int, path: str) -> None:
+        if task in self._bg_tasks:
+            self._bg_tasks.remove(task)
+        if self._detail_hint_inflight_token == token and self._detail_hint_inflight_path == path:
+            self._detail_hint_inflight_token = None
+            self._detail_hint_inflight_path = None
+
+    def _on_detail_hint_checked(self, token: int, path: str, has: object) -> None:
+        cur = getattr(self, "_cur", None)
+        if self._closing or token != self._detail_hint_token or cur is None or cur.path != path:
+            return
+        if bool(has) and not self.detail_panel.isHidden():
+            self._detail_opened_once = True
             self._toast("💡 这里能一键回到任意历史版本")
 
-    def _update_detail(self) -> None:
+    def _schedule_detail_update(self, *, force: bool = False) -> None:
+        if self.detail_panel.isHidden():
+            return
+        self._detail_update_token += 1
+        self._detail_update_force = self._detail_update_force or force
+        self._detail_update_timer.setInterval(self._DETAIL_UPDATE_DELAY_MS)
+        self._detail_update_timer.start()
+
+    def _run_detail_update(self, token: int) -> None:
+        if self._closing or token != self._detail_update_token:
+            return
+        force = self._detail_update_force
+        self._detail_update_force = False
+        if force:
+            self._update_detail(force=True)
+        else:
+            self._update_detail()
+
+    def _clear_detail_load_inflight(self) -> None:
+        self._detail_load_inflight_token = None
+        self._detail_load_inflight_path = None
+        self._detail_load_inflight_file_id = None
+
+    def _clear_detail_panel_selection(self) -> None:
+        panel = getattr(self, "detail_panel", None)
+        clear = getattr(panel, "clear_selection", None)
+        if callable(clear):
+            clear()
+
+    def _update_detail(self, *, force: bool = False) -> None:
         if self.detail_panel.isHidden() or self._cur is None:
+            self._clear_detail_load_inflight()
+            if self._cur is None:
+                self._clear_detail_panel_selection()
             return
         r = self._cur
-        # 全盘 lazy：无「纳管」概念——有版本就展示，无版本则提示「改存即自动留版」
-        if self._version_mgr is not None:
+        if (
+            not force
+            and self._detail_load_inflight_token is not None
+            and self._detail_load_inflight_path == r.path
+            and self._detail_load_inflight_file_id == r.file_id
+        ):
+            return
+        self._detail_update_token += 1
+        token = self._detail_update_token
+        conn_path = _sqlite_file_path(self._conn)
+        version_mgr = self._version_mgr
+        task = BackgroundTask(
+            lambda r=r, conn_path=conn_path, version_mgr=version_mgr: self._load_detail_payload(
+                r,
+                conn_path=conn_path,
+                version_mgr=version_mgr,
+            ),
+            "detail-load",
+        )
+        self._detail_load_inflight_token = token
+        self._detail_load_inflight_path = r.path
+        self._detail_load_inflight_file_id = r.file_id
+        self._bg_tasks.append(task)
+        task.done.connect(lambda payload, token=token, path=r.path, file_id=r.file_id:
+                          self._on_detail_payload(token, path, file_id, payload))
+        task.finished.connect(
+            lambda task=task, token=token, path=r.path, file_id=r.file_id:
+            self._finish_detail_load(task, token, path, file_id))
+        task.start()
+
+    def _finish_detail_load(self, task, token: int, path: str, file_id: int) -> None:
+        if task in self._bg_tasks:
+            self._bg_tasks.remove(task)
+        if (
+            self._detail_load_inflight_token == token
+            and self._detail_load_inflight_path == path
+            and self._detail_load_inflight_file_id == file_id
+        ):
+            self._detail_load_inflight_token = None
+            self._detail_load_inflight_path = None
+            self._detail_load_inflight_file_id = None
+
+    def _load_detail_payload(self, r: FileResult, *, conn_path: str | None, version_mgr) -> dict:
+        versions = []
+        if version_mgr is not None:
             try:
-                versions = self._version_mgr.list_versions(r.path)
+                if hasattr(version_mgr, "list_versions_details"):
+                    versions = version_mgr.list_versions_details(r.path)
+                else:
+                    versions = version_mgr.list_versions(r.path)
             except Exception:  # noqa: BLE001
                 _log.warning("list_versions failed for %s", r.path, exc_info=True)
                 versions = []
-        else:
-            versions = []
+        titles = []
+        if conn_path:
+            own = db.connect(conn_path)
+            try:
+                titles = db.page_titles(own, r.file_id)
+            except Exception:  # noqa: BLE001
+                titles = []
+            finally:
+                own.close()
+        return {"result": r, "versions": list(versions or []), "titles": list(titles or [])}
+
+    def _on_detail_payload(self, token: int, path: str, file_id: int, payload: object) -> None:
+        if self._closing or token != self._detail_update_token:
+            return
+        if self.detail_panel.isHidden() or self._cur is None:
+            return
+        if self._cur.path != path or self._cur.file_id != file_id:
+            return
+        if not isinstance(payload, dict):
+            return
+        r = payload.get("result") or self._cur
+        versions = list(payload.get("versions") or [])
+        titles = list(payload.get("titles") or [])
         self.detail_panel.update_for(r, versions)
         try:
-            self.detail_panel.set_outline(db.page_titles(self._conn, r.file_id))
+            self.detail_panel.set_outline(titles)
         except Exception:  # noqa: BLE001
             self.detail_panel.set_outline([])
+        self._set_ops_enabled(self._cur is not None)
 
-    def _run_bg(self, fn, on_done=None, label: str = "") -> None:
-        """把可能阻塞 UI 的重活丢后台线程跑，完成经信号回主线程。主线程只 start() 即返回。"""
+    def _run_bg(self, fn, on_done=None, label: str = "") -> bool:
+        """鎶婂彲鑳介樆濉?UI 鐨勯噸娲讳涪鍚庡彴绾跨▼璺戯紝瀹屾垚缁忎俊鍙峰洖涓荤嚎绋嬨€備富绾跨▼鍙?start() 鍗宠繑鍥炪€?"""
         heavy = label in {"restore", "export", "open"}
         if heavy and self._active_heavy_op is not None:
             self._toast("已有文件操作正在进行，请稍候…")
-            return
+            return False
         if heavy:
             self._active_heavy_op = label
             self._set_ops_enabled(False)
@@ -1396,8 +2111,8 @@ class MainWindow(QMainWindow):
         self._bg_tasks.append(task)
 
         def _safe_done(result):
-            # 关窗中 / 控件已销毁时不再碰 UI——COM 冷启动可能慢于 _shutdown 的 wait 超时，
-            # 回调晚到时窗口可能已析构，直接刷 self._toast 会 RuntimeError。
+            # 鍏崇獥涓?/ 鎺т欢宸查攢姣佹椂涓嶅啀纰?UI鈥斺€擟OM 鍐峰惎鍔ㄥ彲鑳芥參浜?_shutdown 鐨?wait 瓒呮椂锛?
+            # Late callbacks may arrive after widgets are destroyed.
             if self._closing:
                 return
             if on_done is not None:
@@ -1413,41 +2128,82 @@ class MainWindow(QMainWindow):
                 self._active_heavy_op = None
                 if not self._closing:
                     self._set_ops_enabled(self._cur is not None)
+                    self._flush_deferred_preview_if_idle()
 
         task.done.connect(_safe_done)
         task.finished.connect(_cleanup)
         task.start()
+        return True
+
+    def _block_if_file_op_active(self) -> bool:
+        if self._active_heavy_op is None:
+            return False
+        self._toast("已有文件操作正在进行，请稍候…")
+        return True
+
+    def _block_if_search_pending(self) -> bool:
+        if self._search_pending_req is None:
+            return False
+        self._toast("搜索还在进行，请等结果更新后再操作")
+        return True
+
+    def _preview_interaction_blocked(self) -> bool:
+        return self._search_pending_req is not None or self._active_heavy_op is not None
+
+    def _defer_preview_if_file_op_active(self) -> bool:
+        if self._active_heavy_op is None:
+            return False
+        self._preview_deferred_due_to_busy = True
+        self._show_preview_pending()
+        return True
+
+    def _flush_deferred_preview_if_idle(self) -> None:
+        if not self._preview_deferred_due_to_busy:
+            return
+        if self._closing or self._active_heavy_op is not None or self._search_pending_req is not None:
+            return
+        self._preview_deferred_due_to_busy = False
+        if self._cur is not None:
+            self._request_preview()
 
     def _act_restore_version(self, path: str, version_id: str) -> None:
         if self._version_mgr is None:
             return
-        # 恢复要覆盖原文件——若正被 PowerPoint 打开会写失败，提前给明确提示而非笼统「恢复失败」
+        if self._block_if_search_pending():
+            return
+        if self._block_if_file_op_active():
+            return
+        if not self._confirm_restore():
+            return
+        self._toast("正在恢复...")
+
+        def _after(ok):
+            if ok == "locked":
+                self._toast("无法恢复：该文件正被 PowerPoint 打开，请先关闭它再恢复")
+                return
+            self._toast("✓ 已恢复到该版本（当前内容已自动留底，不会丢）" if ok else "恢复失败")
+            if ok:
+                self._update_detail(force=True)
+
+        self._run_bg(lambda: self._restore_version_off_ui(path, version_id), _after, "restore")
+
+    def _restore_version_off_ui(self, path: str, version_id: str):
         if os.path.exists(path):
             try:
                 with open(path, "r+b"):
                     pass
             except OSError:
-                self._toast("无法恢复：该文件正被 PowerPoint 打开，请先关闭它再恢复")
-                return
-        if not self._confirm_restore():
-            return
-        # 恢复（先快照留底 + 解压重组，大文件数秒）丢后台，避免冻结 UI（压测 BUG 2）
-        self._toast("正在恢复…")
-
-        def _after(ok):
-            self._toast("✓ 已恢复到该版本（当前内容已自动留底，不会丢）" if ok else "恢复失败")
-            self._update_detail()
-
-        self._run_bg(lambda: self._version_mgr.restore_to(path, version_id), _after, "restore")
+                return "locked"
+        return bool(self._version_mgr.restore_to(path, version_id))
 
     def _confirm_restore(self) -> bool:
-        """恢复前友好确认：强调「会自动留底、随时切回」，降低破坏性操作的心理负担。"""
+        """鎭㈠鍓嶅弸濂界‘璁わ細寮鸿皟銆屼細鑷姩鐣欏簳銆侀殢鏃跺垏鍥炪€嶏紝闄嶄綆鐮村潖鎬ф搷浣滅殑蹇冪悊璐熸媴銆?"""
         from PySide6.QtWidgets import QMessageBox
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Question)
         box.setWindowTitle("恢复到这个版本？")
         box.setText("会用这个历史版本覆盖当前文件。")
-        box.setInformativeText("别担心——覆盖前会自动把当前内容也留一版，之后随时能再切回来。")
+        box.setInformativeText("别担心：覆盖前会自动把当前内容也留一版，之后随时能再切回来。")
         yes = box.addButton("恢复", QMessageBox.AcceptRole)
         box.addButton("取消", QMessageBox.RejectRole)
         box.exec()
@@ -1456,17 +2212,23 @@ class MainWindow(QMainWindow):
     def _act_export_version(self, path: str, version_id: str) -> None:
         if self._version_mgr is None:
             return
+        if self._block_if_search_pending():
+            return
+        if self._block_if_file_op_active():
+            return
         from PySide6.QtWidgets import QFileDialog
         base = os.path.splitext(os.path.basename(path))[0]
         dest, _f = QFileDialog.getSaveFileName(self, "导出此版本", base + "_导出.pptx", "PowerPoint (*.pptx)")
         if not dest:
             return
-        # 导出（解压重组，大文件数秒）丢后台，避免冻结 UI（压测 BUG 3）
-        self._toast("正在导出…")
+        dest = ensure_pptx_suffix(dest)
+        self._toast("正在导出...")
         self._run_bg(lambda: self._version_mgr.export(path, version_id, dest),
                      lambda ok: self._toast("已导出" if ok else "导出失败"), "export")
 
     def _act_goto_page(self, page_no: int) -> None:
+        if self._preview_interaction_blocked():
+            return
         if not self._cur:
             return
         self._view_page = page_no
@@ -1485,24 +2247,39 @@ class MainWindow(QMainWindow):
         self._thumb_btns = []
         if not self._cur or not self._cur.hits:
             return
-        for i, h in enumerate(self._cur.hits[:12]):
+        hits = self._cur.hits
+        for i, h in enumerate(hits[:self._HIT_NAV_MAX]):
             b = QToolButton()
             b.setObjectName("thumb")
-            b.setText(f"第{h.page_no}页")
+            b.setText(f"\u7b2c{h.page_no}\u9875")
             b.setCheckable(True)
             b.setChecked(i == self._hit_idx)
+            b.setEnabled(self._active_heavy_op is None and self._search_pending_req is None)
             b.setFixedSize(64, 34)
             b.clicked.connect(lambda _=False, i=i: self._goto_hit(i))
             self.thumb_row.addWidget(b)
             self._thumb_btns.append(b)
+        remaining = len(hits) - self._HIT_NAV_MAX
+        if remaining > 0:
+            more = QToolButton()
+            more.setObjectName("thumbMore")
+            more.setText(f"+{remaining}")
+            more.setToolTip(f"还有 {remaining} 个命中页，可用上/下命中页继续切换")
+            more.setEnabled(False)
+            more.setFixedSize(52, 34)
+            self.thumb_row.addWidget(more)
 
     def _goto_hit(self, i: int) -> None:
+        if self._preview_interaction_blocked():
+            return
         self._hit_idx = i
         if self._cur and self._cur.hits:
             self._view_page = self._cur.hits[i].page_no
         self._request_preview()
 
     def _step_hit(self, delta: int) -> None:
+        if self._preview_interaction_blocked():
+            return
         if not self._cur or not self._cur.hits:
             return
         self._hit_idx = max(0, min(len(self._cur.hits) - 1, self._hit_idx + delta))
@@ -1519,8 +2296,11 @@ class MainWindow(QMainWindow):
         self._spin_idx += 1
         accent = self._tok.get("acc", "#0A84FF")
         sub = self._tok.get("ink3", "#888")
-        msg = ("首次预览要唤起 PowerPoint，稍等几秒…"
-               if not getattr(self, "_preview_hinted", False) else "正在渲染预览…")
+        msg = (
+            "\u9996\u6b21\u9884\u89c8\u9700\u8981\u542f\u52a8 PowerPoint\uff0c\u8bf7\u7a0d\u7b49..."
+            if not getattr(self, "_preview_hinted", False)
+            else "\u6b63\u5728\u6e32\u67d3\u9884\u89c8..."
+        )
         self.image_label.setPixmap(QPixmap())
         self.image_label.setText(
             f'<div style="font-size:30px;color:{accent}">{ch}</div>'
@@ -1534,29 +2314,65 @@ class MainWindow(QMainWindow):
     def _stop_spinner(self) -> None:
         self._spin_timer.stop()
 
+    def _invalidate_preview_request(self) -> None:
+        self._preview_deferred_due_to_busy = False
+        self._req_id += 1
+        if hasattr(self, "_spin_timer"):
+            self._stop_spinner()
+
+    def _show_preview_pending(self) -> None:
+        self._cur_pixmap = None
+        self._preview_provisional = False
+        self.image_label.setPixmap(QPixmap())
+        self.image_label.setText(
+            '<div style="font-size:28px">…</div>'
+            '<div style="color:#888;font-size:13px;margin-top:12px">正在准备预览</div>')
+
+    def _clear_preview_empty(self, message: str = "选中左侧结果查看预览") -> None:
+        self._cur_pixmap = None
+        self._preview_provisional = False
+        self.image_label.setPixmap(QPixmap())
+        self.image_label.setText(
+            f'<div style="color:#888;font-size:13px">{message}</div>')
+
+    def _show_preview_unavailable(self) -> None:
+        self.image_label.setPixmap(QPixmap())
+        self.image_label.setText(
+            '<div style="font-size:30px">📫</div>'
+            '<div style="color:#888;font-size:13px;margin-top:12px">此页暂时无法预览<br>'
+            '点“打开文件”直接查看</div>')
+        self._cur_pixmap = None
+        self._preview_provisional = False
+
     def _request_preview(self) -> None:
         if not self._cur:
             return
+        if self._search_pending_req is not None:
+            return
+        if self._defer_preview_if_file_op_active():
+            return
+        self._preview_deferred_due_to_busy = False
         self._zoom = 1.0
         page = self._view_page
         hits = self._cur.hits or []
         total = self._cur.page_count or 0
         n = len(hits)
         hit_pages = {h.page_no for h in hits}
-        # 页码：第 X / 共 N 页（滚轮可在原始页序间自由翻；命中页加标记）
+        # 椤电爜锛氱 X / 鍏?N 椤碉紙婊氳疆鍙湪鍘熷椤靛簭闂磋嚜鐢辩炕锛涘懡涓〉鍔犳爣璁帮級
         if total:
-            tag = "　·　命中页" if page in hit_pages else ""
-            self.page_label.setText(f"第 {page} / {total} 页{tag}")
+            tag = " \u00b7 \u547d\u4e2d\u9875" if page in hit_pages else ""
+            self.page_label.setText(f"\u7b2c {page} / {total} \u9875{tag}")
         else:
-            self.page_label.setText(f"第 {page} 页")
-        # 上/下「命中页」按钮：在命中页之间跳
-        self.prev_btn.setEnabled(n > 0 and self._hit_idx > 0)
-        self.next_btn.setEnabled(n > 0 and self._hit_idx < n - 1)
-        # 缩略图高亮：当前页正好是某命中页就点亮它
+            self.page_label.setText(f"\u7b2c {page} \u9875")
+        # 涓?涓嬨€屽懡涓〉銆嶆寜閽細鍦ㄥ懡涓〉涔嬮棿璺?
+        nav_enabled = self._active_heavy_op is None and self._search_pending_req is None
+        self.prev_btn.setEnabled(nav_enabled and n > 0 and self._hit_idx > 0)
+        self.next_btn.setEnabled(nav_enabled and n > 0 and self._hit_idx < n - 1)
+        # 缂╃暐鍥鹃珮浜細褰撳墠椤垫濂芥槸鏌愬懡涓〉灏辩偣浜畠
         for i, b in enumerate(self._thumb_btns):
             b.setChecked(i < n and hits[i].page_no == page)
-        # 渐进式预览：该页缩略图已缓存就立即放大显示作占位（秒出内容、遮住渲染等待），高清渲染
-        # 好后在 _on_rendered 无缝替换。命中页通常已有缩略图（结果卡片左侧那张就是它）。
+        # 娓愯繘寮忛瑙堬細璇ラ〉缂╃暐鍥惧凡缂撳瓨灏辩珛鍗虫斁澶ф樉绀轰綔鍗犱綅锛堢鍑哄唴瀹广€侀伄浣忔覆鏌撶瓑寰咃級锛岄珮娓呮覆鏌?
+        # 濂藉悗鍦?_on_rendered 鏃犵紳鏇挎崲銆傚懡涓〉閫氬父宸叉湁缂╃暐鍥撅紙缁撴灉鍗＄墖宸︿晶閭ｅ紶灏辨槸瀹冿級銆?
         thumb = self._thumb_cache.get((self._cur.path, page))
         if thumb is not None and not thumb.isNull():
             self._cur_pixmap = thumb
@@ -1568,13 +2384,28 @@ class MainWindow(QMainWindow):
         self._req_id += 1
         self._render.request(self._req_id, self._cur.path, page, cache_key=None)
 
+    def _maybe_prewarm_render(self) -> None:
+        if self._closing or not self._owns_render:
+            return
+        if self._search_pending_req is not None:
+            return
+        if self.search_box.text().strip():
+            return
+        if self._cur is not None or self._cur_pixmap is not None:
+            return
+        prewarm = getattr(self._render, "prewarm", None)
+        if callable(prewarm):
+            prewarm()
+
     def _wheel_page(self, delta_y: int) -> None:
-        """预览区滚轮：按原始页序上下翻页（向上滚=上一页，向下滚=下一页）。"""
+        """棰勮鍖烘粴杞細鎸夊師濮嬮〉搴忎笂涓嬬炕椤碉紙鍚戜笂婊?涓婁竴椤碉紝鍚戜笅婊?涓嬩竴椤碉級銆?"""
         if not self._cur:
+            return
+        if self._preview_interaction_blocked():
             return
         total = self._cur.page_count or 0
         if total <= 0:
-            return  # .ppt / 未解析，页数未知，不翻页
+            return  # .ppt / 鏈В鏋愶紝椤垫暟鏈煡锛屼笉缈婚〉
         new = self._view_page + (-1 if delta_y > 0 else 1)
         new = max(1, min(total, new))
         if new == self._view_page:
@@ -1582,17 +2413,21 @@ class MainWindow(QMainWindow):
         self._view_page = new
         for i, h in enumerate(self._cur.hits or []):
             if h.page_no == new:
-                self._hit_idx = i  # 翻到命中页时同步，让上/下命中页按钮接续
+                self._hit_idx = i  # 缈诲埌鍛戒腑椤垫椂鍚屾锛岃涓?涓嬪懡涓〉鎸夐挳鎺ョ画
                 break
         self._request_preview()
 
     def _zoom_by(self, factor: float) -> None:
+        if self._preview_interaction_blocked():
+            return
         if self._cur_pixmap is None:
             return
         self._zoom = max(1.0, min(5.0, self._zoom * factor))
         self._update_pixmap()
 
     def _toggle_zoom(self) -> None:
+        if self._preview_interaction_blocked():
+            return
         if self._cur_pixmap is None:
             return
         self._zoom = 1.0 if self._zoom > 1.0 else 2.0
@@ -1600,47 +2435,48 @@ class MainWindow(QMainWindow):
         self._toast("原尺寸放大 · 再双击还原" if self._zoom > 1.0 else "已适配窗口")
 
     def _on_rendered(self, req_id: int, png: str) -> None:
+        if self._closing:
+            return
         if req_id != self._req_id:
             return
         self._stop_spinner()
         if not png or not os.path.exists(png):
-            # 高清渲染失败：若有缩略图占位就保留（仍是有用预览），不闪「无法预览」
             if self._preview_provisional and self._cur_pixmap is not None:
                 return
-            self.image_label.setPixmap(QPixmap())
-            self.image_label.setText(
-                '<div style="font-size:30px">📄</div>'
-                '<div style="color:#888;font-size:13px;margin-top:12px">此页暂时无法预览<br>'
-                '点「打开文件」直接查看</div>')
-            self._cur_pixmap = None
+            self._show_preview_unavailable()
             return
         pm = QPixmap(png)
-        self._cur_pixmap = pm if not pm.isNull() else None
-        self._preview_provisional = False  # 高清已到，不再是占位
-        self._preview_hinted = True  # 首次预览已成功，之后不再提「唤起 PowerPoint」
+        if pm.isNull():
+            if self._preview_provisional and self._cur_pixmap is not None:
+                return
+            self._show_preview_unavailable()
+            return
+        self._cur_pixmap = pm
+        self._preview_provisional = False  # 楂樻竻宸插埌锛屼笉鍐嶆槸鍗犱綅
+        self._preview_hinted = True  # 棣栨棰勮宸叉垚鍔燂紝涔嬪悗涓嶅啀鎻愩€屽敜璧?PowerPoint銆?
         self._update_pixmap()
-        self._prefetch_neighbors()  # 后台预渲染相邻/命中页，翻过去时缓存命中=瞬间
+        self._prefetch_neighbors()  # 鍚庡彴棰勬覆鏌撶浉閭?鍛戒腑椤碉紝缈昏繃鍘绘椂缂撳瓨鍛戒腑=鐬棿
 
     def _prefetch_neighbors(self) -> None:
-        """后台预渲染当前文件「其它命中页 + 前后页」→ 翻过去时缓存命中、瞬间出图。
+        """鍚庡彴棰勬覆鏌撳綋鍓嶆枃浠躲€屽叾瀹冨懡涓〉 + 鍓嶅悗椤点€嶁啋 缈昏繃鍘绘椂缂撳瓨鍛戒腑銆佺灛闂村嚭鍥俱€?
 
-        文件已打开着，预取每页只是多导出 ~0.07s，低优先、被新预览随时抢占并作废
-        （_request_preview→render_worker.request 会清空待预取），故只预取你当前停留页的邻居。
+        鏂囦欢宸叉墦寮€鐫€锛岄鍙栨瘡椤靛彧鏄瀵煎嚭 ~0.07s锛屼綆浼樺厛銆佽鏂伴瑙堥殢鏃舵姠鍗犲苟浣滃簾
+        锛坃request_preview鈫抮ender_worker.request 浼氭竻绌哄緟棰勫彇锛夛紝鏁呭彧棰勫彇浣犲綋鍓嶅仠鐣欓〉鐨勯偦灞呫€?
         """
         if self._cur is None or not self._owns_render:
             return
         if not hasattr(self._render, "prefetch"):
-            return  # 测试注入的 StubRender 无此方法
+            return  # 娴嬭瘯娉ㄥ叆鐨?StubRender 鏃犳鏂规硶
         total = self._cur.page_count or 0
         cur = self._view_page
         order: list[int] = [h.page_no for h in (self._cur.hits or []) if h.page_no != cur]
-        order += [cur + 1, cur - 1]  # 其它命中页优先，再前后相邻页
+        order += [cur + 1, cur - 1]  # 鍏跺畠鍛戒腑椤典紭鍏堬紝鍐嶅墠鍚庣浉閭婚〉
         seen = {cur}
         for p in order:
             if p in seen or p < 1 or (total and p > total):
                 continue
             seen.add(p)
-            if len(seen) > 7:  # 限量，别过度预渲染
+            if len(seen) > 7:  # 闄愰噺锛屽埆杩囧害棰勬覆鏌?
                 break
             self._render.prefetch(self._cur.path, p)
 
@@ -1663,7 +2499,7 @@ class MainWindow(QMainWindow):
             self.image_label.resize(scaled.size())
 
     def maybe_show_welcome(self) -> None:
-        """首次运行时弹欢迎覆盖层（app.py 在 win.show() 后调用）。"""
+        """棣栨杩愯鏃跺脊娆㈣繋瑕嗙洊灞傦紙app.py 鍦?win.show() 鍚庤皟鐢級銆?"""
         if not is_first_run() or self._welcome is not None:
             return
         from .welcome_overlay import WelcomeOverlay
@@ -1684,7 +2520,7 @@ class MainWindow(QMainWindow):
             self._welcome.hide()
             self._welcome.deleteLater()
             self._welcome = None
-        QTimer.singleShot(350, self._show_search_coach)  # 谢幕后引导搜索框
+        QTimer.singleShot(350, self._show_search_coach)  # 璋㈠箷鍚庡紩瀵兼悳绱㈡
 
     def resizeEvent(self, e):  # noqa: N802
         super().resizeEvent(e)
@@ -1699,7 +2535,7 @@ class MainWindow(QMainWindow):
             self._cur_item_widget.set_selected(True, self.isActiveWindow())
         super().changeEvent(e)
 
-    # ---------- 键盘 ----------
+    # ---------- 閿洏 ----------
     def eventFilter(self, obj, ev):  # noqa: N802
         et = ev.type()
         if et in (QEvent.Wheel, QEvent.MouseButtonDblClick) and obj in (self.image_label, self.scroll.viewport()):
@@ -1718,6 +2554,8 @@ class MainWindow(QMainWindow):
         if obj is self.search_box and ev.type() == QEvent.KeyPress:
             k = ev.key()
             if k in (Qt.Key_Down, Qt.Key_Up):
+                if self._search_pending_req is not None:
+                    return True
                 n = self.result_list.count()
                 if n:
                     cur = max(0, self.result_list.currentRow())
@@ -1730,74 +2568,153 @@ class MainWindow(QMainWindow):
                 return True
             if k == Qt.Key_Escape:
                 if self.search_box.text():
-                    self.search_box.clear()
+                    self._clear_search_now()
                 elif self._to_tray_on_close:
                     self.hide()
                 return True
         return super().eventFilter(obj, ev)
 
-    # ---------- 打开动作 ----------
+    # ---------- 鎵撳紑鍔ㄤ綔 ----------
+    def _open_file_path(self, path: str) -> None:
+        def _after(ok):
+            if ok is None:
+                self._toast("打开文件时出错了，请稍后重试")
+            elif not ok:
+                self._toast("文件已移动或删除")
+
+        if self._run_bg(lambda: actions.open_file(path), _after, "open"):
+            self._toast("正在打开文件…")
+
+    def _open_folder_path(self, path: str) -> None:
+        def _after(ok):
+            if ok is None:
+                self._toast("打开文件夹时出错了，请稍后重试")
+            elif not ok:
+                self._toast("找不到所在文件夹")
+
+        if self._run_bg(lambda: actions.open_folder(path), _after, "open"):
+            self._toast("正在打开所在文件夹…")
+
     def _act_open(self) -> None:
-        if self._cur and not actions.open_file(self._cur.path):
-            self._toast("文件已移动或删除")
+        if self._block_if_search_pending():
+            return
+        if self._block_if_file_op_active():
+            return
+        if self._cur:
+            self._open_file_path(self._cur.path)
 
     def _act_folder(self) -> None:
-        if self._cur and not actions.open_folder(self._cur.path):
-            self._toast("找不到所在文件夹")
+        if self._block_if_search_pending():
+            return
+        if self._block_if_file_op_active():
+            return
+        if self._cur:
+            self._open_folder_path(self._cur.path)
 
     def _act_copy_path(self) -> None:
+        if self._block_if_search_pending():
+            return
+        if self._block_if_file_op_active():
+            return
         if self._cur:
-            QApplication.clipboard().setText(self._cur.path)
-            self._toast("已复制完整路径")
+            self._copy_text_with_toast(self._cur.path, "已复制完整路径")
+
+    def _copy_text_with_toast(self, text: str, message: str) -> None:
+        QApplication.clipboard().setText(text)
+        self._toast(message)
 
     def _act_copy_clipboard(self) -> None:
-        """复制文件本体到剪贴板（Windows CF_HDROP），可粘贴到邮件 / 聊天 / 资源管理器。"""
+        """澶嶅埗鏂囦欢鏈綋鍒板壀璐存澘锛圵indows CF_HDROP锛夛紝鍙矘璐村埌閭欢 / 鑱婂ぉ / 璧勬簮绠＄悊鍣ㄣ€?"""
+        if self._block_if_search_pending():
+            return
+        if self._block_if_file_op_active():
+            return
         if not self._cur:
             return
-        if not os.path.exists(self._cur.path):
-            self._toast("文件已移动或删除")
-            return
-        cb = QApplication.clipboard()
-        ok = False
-        for _ in range(4):
-            mime = QMimeData()
-            mime.setUrls([QUrl.fromLocalFile(self._cur.path)])
-            cb.setMimeData(mime)
-            QApplication.processEvents()
-            md = cb.mimeData()
-            if md.hasUrls() and any(u.toLocalFile() == self._cur.path for u in md.urls()):
-                ok = True
-                break
-            time.sleep(0.05)
-        self._toast("已复制文件到剪贴板，可粘贴到邮件 / 聊天" if ok else "剪贴板暂时不可用，请稍后重试")
-
-    def _act_goto(self) -> None:
-        if not self._cur:
-            return
-        q = self.search_box.text().strip()
-        if q:
-            history.add_history(q)
-            self._refresh_history_model()
-        page = self._view_page
         path = self._cur.path
+        self._clipboard_copy_token += 1
+        token = self._clipboard_copy_token
+        self._check_clipboard_file_exists_bg(path, token)
+        self._set_file_clipboard(path)
+        self._confirm_file_clipboard(path, token, 4)
 
-        # 启 PowerPoint COM + 跳页（冷启动数秒）丢后台，避免冻结 UI（压测 BUG 4）
+    def _check_clipboard_file_exists_bg(self, path: str, token: int) -> None:
+        def _after(ok):
+            if self._closing or token != self._clipboard_copy_token:
+                return
+            if ok is False:
+                self._toast("文件已移动或删除，剪贴板中的文件可能无法粘贴")
+
+        self._run_bg(lambda: os.path.exists(path), _after, "copy-exists")
+
+    def _set_file_clipboard(self, path: str) -> None:
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(path)])
+        QApplication.clipboard().setMimeData(mime)
+
+    def _confirm_file_clipboard(self, path: str, token: int, remaining: int) -> None:
+        if self._closing or token != self._clipboard_copy_token:
+            return
+        md = QApplication.clipboard().mimeData()
+        ok = md.hasUrls() and any(u.toLocalFile() == path for u in md.urls())
+        if ok:
+            self._toast("已复制文件到剪贴板，可粘贴到邮件 / 聊天")
+            return
+        if remaining <= 0:
+            self._toast("剪贴板暂时不可用，请稍后重试")
+            return
+        self._set_file_clipboard(path)
+        QTimer.singleShot(
+            50,
+            lambda path=path, token=token, remaining=remaining - 1:
+                self._confirm_file_clipboard(path, token, remaining),
+        )
+
+    def _open_at_page_bg(self, path: str, page: int) -> None:
         def _after(res):
-            if res is None:  # 后台任务异常（COM 初始化/权限等），别误报「文件已移动」
+            if res is None:
                 self._toast("打开时出错了，请稍后重试")
                 return
             opened, jumped = res
             if not opened:
                 self._toast("文件已移动或删除")
             elif not jumped:
-                self._toast(f"已打开，但未能自动跳到第 {page} 页")
+                self._toast(f"\u5df2\u6253\u5f00\uff0c\u4f46\u672a\u80fd\u81ea\u52a8\u8df3\u5230\u7b2c {page} \u9875")
 
-        self._run_bg(lambda: actions.open_at_page(path, page), _after, "open")
+        if self._run_bg(lambda: actions.open_at_page(path, page), _after, "open"):
+            self._toast(f"\u6b63\u5728\u6253\u5f00\u7b2c {page} \u9875...")
+
+    def _act_goto(self) -> None:
+        if self._block_if_search_pending():
+            return
+        if self._block_if_file_op_active():
+            return
+        if not self._cur:
+            return
+        q = self.search_box.text().strip()
+        if q:
+            history.add_history(q)
+            self._refresh_history_model()
+        self._open_at_page_bg(self._cur.path, self._view_page)
 
     def _on_activate(self, _item) -> None:
         self._act_goto()
 
+    def _run_context_menu_action(self, render_gen: int, callback) -> None:
+        if self._block_if_search_pending():
+            return
+        if self._block_if_file_op_active():
+            return
+        if render_gen != self._render_gen:
+            self._toast("结果已更新，请重新打开右键菜单")
+            return
+        callback()
+
     def _context_menu(self, pos) -> None:
+        if self._block_if_search_pending():
+            return
+        if self._block_if_file_op_active():
+            return
         item = self.result_list.itemAt(pos)
         if item is None:
             return
@@ -1805,20 +2722,31 @@ class MainWindow(QMainWindow):
         if idx is None or idx >= len(self._results):
             return
         r = self._results[idx]
+        render_gen = self._render_gen
         menu = QMenu(self)
-        menu.addAction("打开文件", lambda: actions.open_file(r.path))
-        # 跳页要启 PowerPoint COM（冷启动数秒）→ 走后台，别在主线程冻结 UI（同 _act_goto）
-        menu.addAction("打开并跳到命中页", lambda: self._run_bg(
-            lambda p=r.path, pg=(r.hits[0].page_no if r.hits else 1): actions.open_at_page(p, pg),
-            label="open_ctx"))
-        menu.addAction("打开所在文件夹", lambda: actions.open_folder(r.path))
+        menu.addAction("打开文件", lambda _checked=False, r=r, gen=render_gen:
+                       self._run_context_menu_action(gen, lambda: self._open_file_path(r.path)))
+        menu.addAction("打开并跳到命中页", lambda _checked=False, r=r, gen=render_gen:
+                       self._run_context_menu_action(
+                           gen,
+                           lambda: self._open_at_page_bg(
+                               r.path, r.hits[0].page_no if r.hits else 1)))
+        menu.addAction("打开所在文件夹", lambda _checked=False, r=r, gen=render_gen:
+                       self._run_context_menu_action(gen, lambda: self._open_folder_path(r.path)))
         menu.addSeparator()
-        menu.addAction("复制完整路径", lambda: QApplication.clipboard().setText(r.path))
-        menu.addAction("复制文件名", lambda: QApplication.clipboard().setText(r.name))
+        menu.addAction("复制完整路径", lambda _checked=False, r=r, gen=render_gen:
+                       self._run_context_menu_action(
+                           gen,
+                           lambda: self._copy_text_with_toast(r.path, "已复制完整路径")))
+        menu.addAction("复制文件名", lambda _checked=False, r=r, gen=render_gen:
+                       self._run_context_menu_action(
+                           gen,
+                           lambda: self._copy_text_with_toast(r.name, "已复制文件名")))
         menu.exec(self.result_list.mapToGlobal(pos))
 
     def _init_toast(self) -> None:
-        """中下方浮层提示：一次性操作反馈不再污染状态栏。"""
+        """涓笅鏂规诞灞傛彁绀猴細涓€娆℃€ф搷浣滃弽棣堜笉鍐嶆薄鏌撶姸鎬佹爮銆?"""
+        self._toast_hide_token = 0
         self._toast_label = QLabel(self)
         self._toast_label.setObjectName("toast")
         self._toast_label.setAlignment(Qt.AlignCenter)
@@ -1834,10 +2762,11 @@ class MainWindow(QMainWindow):
     def _reposition_toast(self) -> None:
         lbl = self._toast_label
         x = (self.width() - lbl.width()) // 2
-        y = self.height() - lbl.height() - 64  # 悬于状态栏上方
+        y = self.height() - lbl.height() - 64  # 鎮簬鐘舵€佹爮涓婃柟
         lbl.move(max(8, x), max(8, y))
 
     def _toast(self, msg: str) -> None:
+        self._toast_hide_token += 1
         lbl = self._toast_label
         lbl.setText(msg)
         lbl.adjustSize()
@@ -1851,21 +2780,71 @@ class MainWindow(QMainWindow):
         self._toast_timer.start(1800)
 
     def _hide_toast(self) -> None:
+        self._toast_hide_token += 1
+        token = self._toast_hide_token
         self._toast_fade.stop()
         self._toast_fade.setStartValue(self._toast_fx.opacity())
         self._toast_fade.setEndValue(0.0)
         self._toast_fade.start()
-        QTimer.singleShot(200, self._toast_label.hide)
+        QTimer.singleShot(200, lambda token=token: self._finish_hide_toast(token))
 
-    # ---------- 版本管理存在感（P0-1：日常静默盾牌 + 仅首次告知） ----------
-    def refresh_version_shield(self) -> None:
-        """状态栏「版本保护」盾牌：显示已守护文件数，日常静默的存在感。"""
-        if getattr(self, "version_shield", None) is None or self._version_mgr is None:
+    def _finish_hide_toast(self, token: int) -> None:
+        if token != self._toast_hide_token:
             return
         try:
-            n = len(self._version_mgr.list_docs())
+            self._toast_label.hide()
+        except RuntimeError:
+            pass
+
+    # ---------- 鐗堟湰绠＄悊瀛樺湪鎰燂紙P0-1锛氭棩甯搁潤榛樼浘鐗?+ 浠呴娆″憡鐭ワ級 ----------
+    def refresh_version_shield(self) -> None:
+        """鐘舵€佹爮銆岀増鏈繚鎶ゃ€嶇浘鐗岋細鏄剧ず宸插畧鎶ゆ枃浠舵暟锛屾棩甯搁潤榛樼殑瀛樺湪鎰熴€?"""
+        if getattr(self, "version_shield", None) is None or self._version_mgr is None:
+            self._version_shield_inflight_token = None
+            return
+        if (
+            self._version_shield_inflight_token is not None
+            and self._version_shield_inflight_token == self._version_shield_token
+        ):
+            return
+        self._version_shield_token += 1
+        token = self._version_shield_token
+        version_mgr = self._version_mgr
+        task = BackgroundTask(
+            lambda version_mgr=version_mgr: self._load_version_shield_count(version_mgr),
+            "version-shield-refresh",
+        )
+        self._version_shield_inflight_token = token
+        self._bg_tasks.append(task)
+        task.done.connect(lambda count, token=token: self._on_version_shield_count(token, count))
+        task.finished.connect(
+            lambda task=task, token=token: self._finish_version_shield_refresh(task, token))
+        task.start()
+
+    def _finish_version_shield_refresh(self, task, token: int) -> None:
+        if task in self._bg_tasks:
+            self._bg_tasks.remove(task)
+        if self._version_shield_inflight_token == token:
+            self._version_shield_inflight_token = None
+
+    def _load_version_shield_count(self, version_mgr) -> int:
+        try:
+            if hasattr(version_mgr, "list_docs_details"):
+                return len(version_mgr.list_docs_details())
+            return len(version_mgr.list_docs())
         except Exception:  # noqa: BLE001
+            return 0
+
+    def _on_version_shield_count(self, token: int, count: object) -> None:
+        if self._closing or token != self._version_shield_token:
+            return
+        try:
+            n = int(count or 0)
+        except (TypeError, ValueError):
             n = 0
+        self._apply_version_shield_count(n)
+
+    def _apply_version_shield_count(self, n: int) -> None:
         if n > 0:
             self.version_shield.setText(f"🛡️ 版本保护 · {n}")
             self.version_shield.setToolTip(f"已为 {n} 个你改过的 PPT 自动留底，改崩了能找回")
@@ -1873,19 +2852,84 @@ class MainWindow(QMainWindow):
         else:
             self.version_shield.hide()
 
+    def _schedule_version_shield_refresh(self) -> None:
+        self._version_shield_token += 1
+        if self._closing:
+            return
+        self._version_shield_refresh_timer.setInterval(self._VERSION_SHIELD_REFRESH_MS)
+        self._version_shield_refresh_timer.start()
+
+    def _run_version_shield_refresh(self, token: int) -> None:
+        if self._closing or token != self._version_shield_token:
+            return
+        self.refresh_version_shield()
+
+    def _schedule_detail_dot_refresh(self) -> None:
+        self._detail_dot_token += 1
+        self._detail_dot_timer.setInterval(self._DETAIL_DOT_DELAY_MS)
+        self._detail_dot_timer.start()
+
+    def _run_detail_dot_refresh(self, token: int) -> None:
+        if self._closing or token != self._detail_dot_token:
+            return
+        self._refresh_detail_dot()
+
     def _refresh_detail_dot(self) -> None:
-        """选中文件有历史版本时，详情按钮亮红点；本 session 首次发现时呼吸一次引导。"""
-        has = False
-        if self._version_mgr is not None and getattr(self, "_cur", None) is not None:
-            try:
-                has = bool(self._version_mgr.list_versions(self._cur.path))
-            except Exception:  # noqa: BLE001
-                has = False
-        if has and self.detail_panel.isHidden():  # 详情已打开就不用红点再提示
+        """閫変腑鏂囦欢鏈夊巻鍙茬増鏈椂锛岃鎯呮寜閽寒绾㈢偣锛涙湰 session 棣栨鍙戠幇鏃跺懠鍚镐竴娆″紩瀵笺€?"""
+        cur = getattr(self, "_cur", None)
+        if self._version_mgr is None or cur is None or not self.detail_panel.isHidden():
+            self._detail_dot_inflight_token = None
+            self._detail_dot_inflight_path = None
+            self._apply_detail_dot(False)
+            return
+        token = self._detail_dot_token
+        path = cur.path
+        version_mgr = self._version_mgr
+        self._apply_detail_dot(False)
+        if (
+            self._detail_dot_inflight_token == token
+            and self._detail_dot_inflight_path == path
+        ):
+            return
+        task = BackgroundTask(
+            lambda path=path, version_mgr=version_mgr: self._detail_has_versions(path, version_mgr),
+            "detail-dot-check",
+        )
+        self._detail_dot_inflight_token = token
+        self._detail_dot_inflight_path = path
+        self._bg_tasks.append(task)
+        task.done.connect(lambda has, token=token, path=path: self._on_detail_dot_checked(token, path, has))
+        task.finished.connect(
+            lambda task=task, token=token, path=path: self._finish_detail_dot_check(task, token, path))
+        task.start()
+
+    def _finish_detail_dot_check(self, task, token: int, path: str) -> None:
+        if task in self._bg_tasks:
+            self._bg_tasks.remove(task)
+        if self._detail_dot_inflight_token == token and self._detail_dot_inflight_path == path:
+            self._detail_dot_inflight_token = None
+            self._detail_dot_inflight_path = None
+
+    def _detail_has_versions(self, path: str, version_mgr) -> bool:
+        try:
+            if hasattr(version_mgr, "list_versions_details"):
+                return bool(version_mgr.list_versions_details(path))
+            return bool(version_mgr.list_versions(path))
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _on_detail_dot_checked(self, token: int, path: str, has: object) -> None:
+        cur = getattr(self, "_cur", None)
+        if self._closing or token != self._detail_dot_token or cur is None or cur.path != path:
+            return
+        self._apply_detail_dot(bool(has))
+
+    def _apply_detail_dot(self, has: bool) -> None:
+        if has and self.detail_panel.isHidden():  # 璇︽儏宸叉墦寮€灏变笉鐢ㄧ孩鐐瑰啀鎻愮ず
             self._detail_dot.move(self.detail_btn.width() - 14, 5)
             self._detail_dot.show()
             self._detail_dot.raise_()
-            # 首次发现 + 窗口可见时才呼吸引导（隐藏到托盘时不浪费动画，留到下次再试）
+            # 棣栨鍙戠幇 + 绐楀彛鍙鏃舵墠鍛煎惛寮曞锛堥殣钘忓埌鎵樼洏鏃朵笉娴垂鍔ㄧ敾锛岀暀鍒颁笅娆″啀璇曪級
             if not getattr(self, "_detail_hint_done", False) and self.isVisible():
                 self._detail_hint_done = True
                 from .spotlight import attention_pulse
@@ -1895,18 +2939,18 @@ class MainWindow(QMainWindow):
             self._detail_dot.hide()
 
     def on_version_snapshot(self, path: str, version_id: str) -> None:
-        """后台留版事件（经 VersionBridge 队列信号，已切回主线程）。"""
-        self.refresh_version_shield()
-        self._index_file_live(path)  # 实时并入搜索索引（新建/改的文件秒级可搜）
+        """鍚庡彴鐣欑増浜嬩欢锛堢粡 VersionBridge 闃熷垪淇″彿锛屽凡鍒囧洖涓荤嚎绋嬶級銆?"""
+        self._schedule_version_shield_refresh()
+        self._index_file_live(path)
         cur = getattr(self, "_cur", None)
         if cur is not None and cur.path == path:
-            self._update_detail()  # 正看着这个文件 → 刷新版本时间线
-            self._refresh_detail_dot()
+            self._schedule_detail_update(force=True)
+            self._schedule_detail_dot_refresh()
         self._pending_version_intro = True
         self._maybe_show_version_intro()
 
     def _maybe_show_version_intro(self) -> None:
-        """首次留版 + 主窗已露脸时，弹一次聚光灯告知「版本保护」，之后永久静默。"""
+        """棣栨鐣欑増 + 涓荤獥宸查湶鑴告椂锛屽脊涓€娆¤仛鍏夌伅鍛婄煡銆岀増鏈繚鎶ゃ€嶏紝涔嬪悗姘镐箙闈欓粯銆?"""
         if not getattr(self, "_pending_version_intro", False):
             return
         from ..config import is_version_intro_done, mark_version_intro_done
@@ -1915,7 +2959,7 @@ class MainWindow(QMainWindow):
             return
         if (not self.isVisible() or self.isMinimized()
                 or getattr(self, "_welcome", None) is not None):
-            return  # 窗口没露脸 / 欢迎页还在 → 等下次 showEvent 补弹
+            return  # 绐楀彛娌￠湶鑴?/ 娆㈣繋椤佃繕鍦?鈫?绛変笅娆?showEvent 琛ュ脊
         self._show_spotlight(
             self.detail_btn,
             "已自动给你改过的 PPT 留了底 🛡️\n"
@@ -1924,42 +2968,89 @@ class MainWindow(QMainWindow):
         self._pending_version_intro = False
 
     def _show_spotlight(self, target, text: str) -> None:
-        """统一弹聚光灯引导：先关旧的再弹新的，避免叠加 / 泄漏。"""
+        """缁熶竴寮硅仛鍏夌伅寮曞锛氬厛鍏虫棫鐨勫啀寮规柊鐨勶紝閬垮厤鍙犲姞 / 娉勬紡銆?"""
         old = getattr(self, "_spotlight", None)
         if old is not None:
             try:
                 old.hide()
                 old.deleteLater()
             except RuntimeError:
-                pass  # widget C++ 对象已销毁——AttributeError 等类型错误故意不吞
+                pass  # widget C++ 瀵硅薄宸查攢姣佲€斺€擜ttributeError 绛夌被鍨嬮敊璇晠鎰忎笉鍚?
         from .spotlight import SpotlightOverlay
         self._spotlight = SpotlightOverlay(self.centralWidget(), target, text, tok=self._tok)
 
     def _show_search_coach(self) -> None:
-        """首次欢迎页谢幕后，聚光灯引导搜索框（一生一次，随欢迎页 flag）。"""
+        """棣栨娆㈣繋椤佃阿骞曞悗锛岃仛鍏夌伅寮曞鎼滅储妗嗭紙涓€鐢熶竴娆★紝闅忔杩庨〉 flag锛夈€?"""
         if not self.isVisible() or self.isMinimized() or self._welcome is not None:
             return
         self._show_spotlight(
             self.search_box,
-            "在这里输入你 PPT 里写过的字 →\n"
+            "在这里输入你 PPT 里写过的字 ↵\n"
             "记得哪页写过什么，就能搜出它在哪个文件、第几页。")
 
-    # ---------- 索引 ----------
+    # ---------- 绱㈠紩 ----------
     def _index_is_empty(self) -> bool:
         try:
             return db.stats(self._conn)["file_count"] == 0
         except Exception:  # noqa: BLE001
             return True
 
-    def _index_file_live(self, path: str) -> None:
-        """watcher 捕获保存 → 把这一个文件并入搜索索引（无需重扫全盘）。
+    def _schedule_startup_index_check(self, roots: list[str] | None, workers: int | None) -> None:
+        self._startup_index_token += 1
+        token = self._startup_index_token
+        conn_path = _sqlite_file_path(self._conn)
+        if not conn_path:
+            try:
+                stats = self._load_status_stats(conn_path)
+            except Exception:  # noqa: BLE001
+                self._on_startup_index_checked(token, roots, workers, None)
+                return
+            self._on_startup_index_checked(token, roots, workers, stats)
+            return
+        task = BackgroundTask(
+            lambda conn_path=conn_path: self._load_status_stats(conn_path),
+            "startup-index-check",
+        )
+        self._bg_tasks.append(task)
+        task.done.connect(
+            lambda payload, token=token, roots=roots, workers=workers:
+                self._on_startup_index_checked(token, roots, workers, payload)
+        )
+        task.finished.connect(
+            lambda task=task: self._bg_tasks.remove(task) if task in self._bg_tasks else None)
+        task.start()
 
-        生产（有后台 live 线程）：仅入队即返回，**绝不在主线程 parse/写库**——
-        否则会抢后台 IndexWorker 的 SQLite 写锁（最长等 8s）把 UI 顶成「未响应」。
-        无 live 线程（do_index=False 测试）：同步兜底，保持可测。
-        """
+    def _on_startup_index_checked(
+        self,
+        token: int,
+        roots: list[str] | None,
+        workers: int | None,
+        payload: object,
+    ) -> None:
+        if self._closing or token != self._startup_index_token:
+            return
+        stats = dict(payload or {}) if isinstance(payload, dict) else {}
+        try:
+            file_count = int(stats.get("file_count", 0))
+        except (TypeError, ValueError):
+            file_count = 0
+        if file_count <= 0:
+            self._start_indexing(roots, workers)
+            return
+        self._apply_status_stats(None, stats)
+
+    def _index_file_live(self, path: str) -> None:
+        """watcher 鎹曡幏淇濆瓨 鈫?鎶婅繖涓€涓枃浠跺苟鍏ユ悳绱㈢储寮曪紙鏃犻渶閲嶆壂鍏ㄧ洏锛夈€?
+        鐢熶骇锛堟湁鍚庡彴 live 绾跨▼锛夛細浠呭叆闃熷嵆杩斿洖锛?*缁濅笉鍦ㄤ富绾跨▼ parse/鍐欏簱**鈥斺€?
+        鍚﹀垯浼氭姠鍚庡彴 IndexWorker 鐨?SQLite 鍐欓攣锛堟渶闀跨瓑 8s锛夋妸 UI 椤舵垚銆屾湭鍝嶅簲銆嶃€?        鏃?live 绾跨▼锛坉o_index=False 娴嬭瘯锛夛細鍚屾鍏滃簳锛屼繚鎸佸彲娴嬨€?        """
+        if self._indexer is not None and self._indexer.isRunning():
+            self._live_deferred_paths.add(path)
+            return
+        self._submit_live_index(path)
+
+    def _submit_live_index(self, path: str) -> None:
         if self._live is not None:
-            self._live.submit(path)  # 后台线程 parse+写库，完成经 indexed 信号回主线程
+            self._live.submit(path)  # 鍚庡彴绾跨▼ parse+鍐欏簱锛屽畬鎴愮粡 indexed 淇″彿鍥炰富绾跨▼
             return
         from .. import indexer
         try:
@@ -1970,28 +3061,43 @@ class MainWindow(QMainWindow):
         if ok:
             self._after_live_index()
 
+    def _flush_deferred_live_index(self) -> None:
+        if self._closing or not self._live_deferred_paths:
+            return
+        batch_size = min(self._LIVE_FLUSH_BATCH, len(self._live_deferred_paths))
+        for _ in range(batch_size):
+            path = self._live_deferred_paths.pop()
+            self._submit_live_index(path)
+        if self._live_deferred_paths and not self._closing:
+            QTimer.singleShot(self._LIVE_FLUSH_YIELD_MS, self._flush_deferred_live_index)
+
     def _on_live_indexed(self, path: str) -> None:
-        """后台 live 线程索引完一个文件（信号已切回主线程）→ 刷新状态/结果。"""
+        """鍚庡彴 live 绾跨▼绱㈠紩瀹屼竴涓枃浠讹紙淇″彿宸插垏鍥炰富绾跨▼锛夆啋 鍒锋柊鐘舵€?缁撴灉銆?"""
         self._after_live_index()
 
     def _after_live_index(self) -> None:
-        self._refresh_status()                  # 更新「索引就绪 N 文件」计数（廉价，保持即时）
-        # 结果/仪表盘刷新走去抖合并——避免 watcher 存盘风暴把主线程顶成「未响应」。
+        if self._closing:
+            return
+        self._index_status_cache = None
+        self._live_status_refresh.start()       # 鍚堝苟 watcher 椋庢毚涓嬬殑鐘舵€?DB 鏌ヨ
         self._live_refresh.start()
 
     def _do_live_refresh(self) -> None:
-        """live 索引去抖到点：把风暴期间累积的新文件一次性并入当前视图。"""
+        """live 绱㈠紩鍘绘姈鍒扮偣锛氭妸椋庢毚鏈熼棿绱Н鐨勬柊鏂囦欢涓€娆℃€у苟鍏ュ綋鍓嶈鍥俱€?"""
         if self._closing:
             return
+        if self._search_pending_req is not None and self.search_box.text().strip():
+            self._live_refresh_after_search = True
+            return
         if self.search_box.text().strip():
-            self._do_search()                   # 正在搜就纳入新文件刷新结果
+            self._do_search()
         elif getattr(self, "dashboard", None) is not None and self._showing_recent:
-            self.dashboard.refresh()            # 空搜索停在仪表盘 → 新文件并入后刷新统计
+            self._show_recent(dashboard_force_refresh=True, recent_force_refresh=True)  # 绌烘悳绱㈠仠鍦ㄤ华琛ㄧ洏 鈫?鏂版枃浠跺苟鍏ュ悗鍒锋柊缁熻
 
-    def _start_indexing(self, roots: list[str] | None, workers: int | None) -> None:
+    def _start_indexing(self, roots: list[str] | None, workers: int | None) -> bool:
         if self._indexer is not None and self._indexer.isRunning():
             self._toast("正在扫描中，请稍候…")
-            return
+            return False
         from ..scanner import fixed_drives
         if not roots:
             env = os.environ.get("PPTX_FINDER_ROOTS", "").strip()
@@ -2001,62 +3107,170 @@ class MainWindow(QMainWindow):
         self._indexer = IndexWorker(self._db_path, roots, workers=workers)
         self._indexer.progress.connect(self._on_index_progress)
         self._indexer.finished_index.connect(self._on_index_done)
+        self._indexer.finished.connect(self._flush_deferred_live_index)
+        self._index_started_at = time.monotonic()
+        self._index_search_ready = False
+        self._index_last_done = 0
+        self._index_last_total = 0
+        self._index_last_current = ""
+        self._index_last_summary = None
+        self._index_progress_last_ui_at = 0.0
+        self._index_progress_last_phase = None
+        self._index_status_cache = None
         self.index_bar.setRange(0, 0)
         self.index_bar.show()
         self.status_dot.hide()
         self.status_label.setText(f"开始索引：{', '.join(roots)}")
         self._indexer.start()
+        return True
 
     def _on_index_progress(self, done: int, total: int, cur: str) -> None:
+        if self._closing:
+            return
+        self._status_refresh_token += 1
+        self._index_last_done = done
+        self._index_last_total = total
+        self._index_last_current = cur
+        phase = "scan" if total < 0 else "index"
+        now = time.monotonic()
+        force_ui = done >= total > 0 or phase != self._index_progress_last_phase
+        if (
+            not force_ui
+            and self._index_progress_last_ui_at
+            and (now - self._index_progress_last_ui_at) * 1000 < self._INDEX_PROGRESS_UI_MS
+        ):
+            return
+        self._index_progress_last_ui_at = now
+        self._index_progress_last_phase = phase
         self.status_dot.hide()
         self.index_bar.show()
         if getattr(self, "_welcome", None) is not None and done > 0:
             self._welcome.update_progress(done)
+        preserve_search_status = self._search_pending_req is not None
         if total < 0:
-            self.index_bar.setRange(0, 0)  # busy：进度条来回流动（扫描，总数未知）
+            self.index_bar.setRange(0, 0)  # busy锛氳繘搴︽潯鏉ュ洖娴佸姩锛堟壂鎻忥紝鎬绘暟鏈煡锛?
             self.pct_label.setText("")
-            self.status_label.setText(f"扫描磁盘中…　{cur}（可边扫边搜）")
+            if not preserve_search_status:
+                self.status_label.setText(f"扫描磁盘中…　{cur}（可边扫边搜）")
         else:
             self.index_bar.setRange(0, max(1, total))
             self.index_bar.setValue(done)
             self.pct_label.setText(f"{int(done / max(1, total) * 100)}%")
-            self.status_label.setText(f"正在索引内容　{done}/{total}　·　{os.path.basename(cur)}")
+            if not preserve_search_status:
+                self.status_label.setText(f"正在索引内容　{done}/{total}　·　{os.path.basename(cur)}")
 
     def _on_index_done(self, summary: dict) -> None:
+        if self._closing:
+            return
+        self._index_search_ready = True
+        self._index_last_summary = dict(summary or {})
+        self._index_status_cache = None
         self.index_bar.hide()
         self.pct_label.setText("")
-        self._refresh_status(summary)
-        if not self.search_box.text().strip():
-            self._show_recent()  # 索引完成后刷新最近（用户还没开始搜时，纳入新索引的文件）
-        if not getattr(self, "_index_celebrated", False):  # 首次索引就绪，庆祝一次
+        celebrate = not getattr(self, "_index_celebrated", False)
+        if celebrate:
             self._index_celebrated = True
+        self._refresh_status(summary, celebrate=celebrate)
+        if not self.search_box.text().strip():
+            self._show_recent(dashboard_force_refresh=True, recent_force_refresh=True)  # 绱㈠紩瀹屾垚鍚庡埛鏂版渶杩戯紙鐢ㄦ埛杩樻病寮€濮嬫悳鏃讹紝绾冲叆鏂扮储寮曠殑鏂囦欢锛?
+    def _load_status_stats(self, conn_path: str | None) -> dict:
+        if conn_path:
+            own = db.connect(conn_path)
             try:
-                n = db.stats(self._conn)["file_count"]
-            except Exception:  # noqa: BLE001
-                _log.warning("db.stats failed for index celebration", exc_info=True)
+                return dict(db.stats(own))
+            finally:
+                own.close()
+        return dict(db.stats(self._conn))
+
+    def _refresh_status(self, summary: dict | None = None, *, celebrate: bool = False) -> None:
+        payload_summary = dict(summary or {}) if summary else None
+        if (
+            payload_summary is None
+            and not celebrate
+            and self._status_refresh_inflight_token is not None
+            and self._status_refresh_inflight_token == self._status_refresh_token
+        ):
+            return
+        self._status_refresh_token += 1
+        token = self._status_refresh_token
+        conn_path = _sqlite_file_path(self._conn)
+        if not conn_path:
+            try:
+                stats = self._load_status_stats(conn_path)
+            except Exception as e:  # noqa: BLE001
+                self._apply_status_error(token, e)
+                return
+            self._on_status_stats_loaded(token, payload_summary, celebrate, {"stats": stats})
+            return
+        task = BackgroundTask(
+            lambda conn_path=conn_path: {"stats": self._load_status_stats(conn_path)},
+            "index-status-refresh",
+        )
+        self._status_refresh_inflight_token = token
+        self._bg_tasks.append(task)
+        task.done.connect(
+            lambda payload, token=token, summary=payload_summary, celebrate=celebrate:
+                self._on_status_stats_loaded(token, summary, celebrate, payload)
+        )
+        task.finished.connect(
+            lambda task=task, token=token: self._finish_status_refresh(task, token))
+        task.start()
+
+    def _finish_status_refresh(self, task, token: int) -> None:
+        if task in self._bg_tasks:
+            self._bg_tasks.remove(task)
+        if self._status_refresh_inflight_token == token:
+            self._status_refresh_inflight_token = None
+
+    def _on_status_stats_loaded(self, token: int, summary: dict | None, celebrate: bool, payload: object) -> None:
+        if self._closing or token != self._status_refresh_token:
+            return
+        if not isinstance(payload, dict) or "stats" not in payload:
+            self._apply_status_error(token, RuntimeError("stats unavailable"))
+            return
+        stats = dict(payload.get("stats") or {})
+        self._apply_status_stats(summary, stats)
+        if celebrate:
+            try:
+                n = int(stats.get("file_count", 0))
+            except (TypeError, ValueError):
                 n = 0
-            if n > 0 and self.isVisible() and not self.isMinimized():
+            if (
+                n > 0
+                and self._search_pending_req is None
+                and self.isVisible()
+                and not self.isMinimized()
+            ):
                 self._toast(f"✓ 已整理好 {n} 个 PPT，搜搜看你写过的字吧")
 
-    def _refresh_status(self, summary: dict | None = None) -> None:
-        try:
-            s = db.stats(self._conn)
-            extra = ""
-            if summary and "deleted" in summary:
-                extra = f"（更新 {summary.get('indexed', 0)}，移除 {summary.get('deleted', 0)}）"
-            self.status_dot.show()
-            self.status_label.setText(f"索引就绪：{s['file_count']} 个文件 · {s['page_count']} 页{extra}")
-        except Exception as e:  # noqa: BLE001
-            self.status_dot.hide()
-            self.status_label.setText(f"数据库读取异常：{e}")
+    def _apply_status_stats(self, summary: dict | None, stats: dict) -> None:
+        self._index_status_cache = dict(stats)
+        self._index_status_cache_at = time.monotonic()
+        if self._search_pending_req is not None:
+            return
+        extra = ""
+        if summary and "deleted" in summary:
+            extra = f"\uff08\u66f4\u65b0 {summary.get('indexed', 0)}\uff0c\u79fb\u9664 {summary.get('deleted', 0)}\uff09"
+        self.status_dot.show()
+        self.status_label.setText(
+            f"\u7d22\u5f15\u5c31\u7eea\uff1a{stats.get('file_count', 0)} \u4e2a\u6587\u4ef6 \u00b7 {stats.get('page_count', 0)} \u9875{extra}"
+        )
 
-    # ---------- 生命周期 ----------
+    def _apply_status_error(self, token: int, error: Exception) -> None:
+        if self._closing or token != self._status_refresh_token:
+            return
+        if self._search_pending_req is not None:
+            return
+        self.status_dot.hide()
+        self.status_label.setText(f"数据库读取异常：{error}")
+
+    # ---------- 鐢熷懡鍛ㄦ湡 ----------
     def force_quit(self) -> None:
-        """真正退出（绕过托盘最小化），让更新 helper 接管文件替换 + 重启。
+        """鐪熸閫€鍑猴紙缁曡繃鎵樼洏鏈€灏忓寲锛夛紝璁╂洿鏂?helper 鎺ョ鏂囦欢鏇挎崲 + 閲嶅惎銆?
 
-        close() 触发 _shutdown() 正常收尾线程并释放 PowerPoint COM/文件句柄，
-        随后 QApplication.quit() 确保进程退出（即使托盘图标驻留），helper 的
-        Wait-Process 才会返回、继续替换。
+        close() 瑙﹀彂 _shutdown() 姝ｅ父鏀跺熬绾跨▼骞堕噴鏀?PowerPoint COM/鏂囦欢鍙ユ焺锛?
+        闅忓悗 QApplication.quit() 纭繚杩涚▼閫€鍑猴紙鍗充娇鎵樼洏鍥炬爣椹荤暀锛夛紝helper 鐨?
+        Wait-Process 鎵嶄細杩斿洖銆佺户缁浛鎹€?
         """
         self._to_tray_on_close = False
         self.close()
@@ -2071,13 +3285,24 @@ class MainWindow(QMainWindow):
         e.accept()
 
     def _shutdown(self) -> None:
-        self._closing = True   # 后台任务回调即刻停止碰 UI
-        self._render_gen += 1  # 作废仍在流入的分批渲染，回调触达已销毁控件前先止住
+        self._closing = True
+        self._render_gen += 1
         if self._search_worker is not None:
             self._search_worker.stop()
-            self._search_worker.wait(3000)
-        for t in list(self._bg_tasks):  # 等后台一次性任务收尾（恢复/导出/打开）
-            t.wait(3000)
+            self._search_worker.wait(self._SEARCH_SHUTDOWN_WAIT_MS)
+        light_elapsed_ms = 0.0
+        for t in list(self._bg_tasks):
+            wait = getattr(t, "wait", None)
+            if callable(wait):
+                timeout_ms = self._bg_task_shutdown_wait_ms(t)
+                if not self._is_heavy_bg_task(t):
+                    remaining_ms = max(0, self._BG_LIGHT_SHUTDOWN_TOTAL_WAIT_MS - int(light_elapsed_ms))
+                    timeout_ms = min(timeout_ms, remaining_ms)
+                    before = time.monotonic()
+                    wait(timeout_ms)
+                    light_elapsed_ms += max(0.0, (time.monotonic() - before) * 1000.0)
+                else:
+                    wait(timeout_ms)
         if self._live is not None:
             self._live.stop()
             self._live.wait(3000)
@@ -2086,11 +3311,22 @@ class MainWindow(QMainWindow):
             self._indexer.wait(5000)
         if self._owns_thumb:
             self._thumb.stop()
+        if self._owns_render:
+            self._render.stop()
+        if self._owns_thumb:
             if not self._thumb.wait(6000):
                 self._thumb.terminate()
                 self._thumb.wait(1500)
         if self._owns_render:
-            self._render.stop()
             if not self._render.wait(8000):
                 self._render.terminate()
                 self._render.wait(2000)
+
+    def _bg_task_shutdown_wait_ms(self, task) -> int:
+        if self._is_heavy_bg_task(task):
+            return self._BG_HEAVY_SHUTDOWN_WAIT_MS
+        return self._BG_LIGHT_SHUTDOWN_WAIT_MS
+
+    def _is_heavy_bg_task(self, task) -> bool:
+        label = getattr(task, "_label", "")
+        return label in self._BG_HEAVY_LABELS

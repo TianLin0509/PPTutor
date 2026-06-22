@@ -23,12 +23,16 @@ class ThumbWorker(QThread):
         self._q: queue.Queue = queue.Queue()
         self._long_edge = long_edge
         self._queued: set[tuple[str, int]] = set()
+        self._active: set[tuple[str, int]] = set()
+        self._stopping = False
         self._lock = threading.Lock()
 
     def request(self, path: str, page_no: int) -> None:
         key = (path, page_no)
         with self._lock:
-            if key in self._queued:
+            if self._stopping:
+                return
+            if key in self._queued or key in self._active:
                 return
             self._queued.add(key)
         self._q.put(key)
@@ -47,6 +51,16 @@ class ThumbWorker(QThread):
             pass
 
     def stop(self) -> None:
+        with self._lock:
+            self._stopping = True
+        try:
+            while True:
+                item = self._q.get_nowait()
+                if item is not _STOP:
+                    with self._lock:
+                        self._queued.discard(item)
+        except queue.Empty:
+            pass
         self._q.put(_STOP)
 
     def run(self) -> None:
@@ -58,7 +72,15 @@ class ThumbWorker(QThread):
                 path, page_no = item
                 with self._lock:
                     self._queued.discard((path, page_no))
-                png = renderer.render_page(path, page_no, long_edge=self._long_edge)
-                self.thumb_rendered.emit(path, page_no, str(png) if png else "")
+                    self._active.add((path, page_no))
+                try:
+                    try:
+                        png = renderer.render_page(path, page_no, long_edge=self._long_edge)
+                    except Exception:  # noqa: BLE001
+                        png = None
+                    self.thumb_rendered.emit(path, page_no, str(png) if png else "")
+                finally:
+                    with self._lock:
+                        self._active.discard((path, page_no))
         finally:
             renderer.shutdown()

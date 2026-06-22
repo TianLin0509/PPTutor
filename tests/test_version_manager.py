@@ -74,6 +74,82 @@ def test_search_history_finds_deleted_content(tmp_path):
     assert hits and any(h["doc_id"] == vault.doc_id_for(str(p)) for h in hits)
 
 
+def test_search_history_details_uses_fresh_connection_not_ui_read_conn(tmp_path):
+    p = tmp_path / "a.pptx"
+    fx.make_pptx(p, [{"body": "含 区块链 论述"}])
+    mgr = _mgr()
+    mgr.snapshot_now(str(p))
+
+    class BrokenReadConn:
+        def execute(self, *args, **kwargs):
+            raise AssertionError("background history details must not use UI read connection")
+
+    mgr._read_conn = BrokenReadConn()
+
+    result = mgr.search_history_details("区块链")
+
+    assert result["total"] >= 1
+    assert result["rows"]
+    assert result["rows"][0]["doc_path"].endswith("a.pptx")
+
+
+def test_list_versions_by_doc_details_uses_fresh_connection_not_ui_read_conn(tmp_path):
+    p = tmp_path / "a.pptx"
+    fx.make_pptx(p, [{"body": "v1"}])
+    mgr = _mgr()
+    mgr.snapshot_now(str(p))
+    did = vault.doc_id_for(str(p))
+
+    class BrokenReadConn:
+        def execute(self, *args, **kwargs):
+            raise AssertionError("background version list must not use UI read connection")
+
+    mgr._read_conn = BrokenReadConn()
+
+    rows = mgr.list_versions_by_doc_details(did)
+
+    assert rows
+    assert rows[0]["version_id"]
+    assert rows[0]["page_count"] == 1
+
+
+def test_list_versions_details_uses_fresh_connection_not_ui_read_conn(tmp_path):
+    p = tmp_path / "a.pptx"
+    fx.make_pptx(p, [{"body": "v1"}])
+    mgr = _mgr()
+    mgr.snapshot_now(str(p))
+
+    class BrokenReadConn:
+        def execute(self, *args, **kwargs):
+            raise AssertionError("background file version detail must not use UI read connection")
+
+    mgr._read_conn = BrokenReadConn()
+
+    rows = mgr.list_versions_details(str(p))
+
+    assert rows
+    assert rows[0]["version_id"]
+    assert rows[0]["page_count"] == 1
+
+
+def test_list_docs_details_uses_fresh_connection_not_ui_read_conn(tmp_path):
+    p = tmp_path / "a.pptx"
+    fx.make_pptx(p, [{"body": "v1"}])
+    mgr = _mgr()
+    mgr.snapshot_now(str(p))
+
+    class BrokenReadConn:
+        def execute(self, *args, **kwargs):
+            raise AssertionError("background doc list must not use UI read connection")
+
+    mgr._read_conn = BrokenReadConn()
+
+    rows = mgr.list_docs_details()
+
+    assert rows
+    assert rows[0]["path"].endswith("a.pptx")
+
+
 def test_recover_deleted_file(tmp_path):
     p = tmp_path / "a.pptx"
     fx.make_pptx(p, [{"body": "重要内容 KEEPME"}])

@@ -1,0 +1,86 @@
+from __future__ import annotations
+
+from PySide6.QtWidgets import QWidget
+
+from pptx_finder import app as app_mod
+
+
+def test_closed_version_window_not_kept_before_reopen(qtbot):
+    owner = QWidget()
+    qtbot.addWidget(owner)
+    owner._version_windows = []
+    created = []
+
+    class FakeVersionWindow(QWidget):
+        def __init__(self, _manager):
+            super().__init__()
+            self._closing = False
+            created.append(self)
+
+    manager = object()
+
+    app_mod._open_version_window(owner, manager, window_cls=FakeVersionWindow)
+
+    assert len(owner._version_windows) == 1
+    first = owner._version_windows[0]
+    qtbot.addWidget(first)
+
+    first.close()
+    qtbot.waitUntil(lambda: not first.isVisible(), timeout=1000)
+    app_mod._open_version_window(owner, manager, window_cls=FakeVersionWindow)
+
+    assert len(owner._version_windows) == 1
+    assert owner._version_windows[0] is not first
+    assert owner._version_windows[0].isVisible()
+
+
+def test_open_version_window_hands_owner_bg_tasks_to_window(qtbot):
+    owner = QWidget()
+    qtbot.addWidget(owner)
+    owner._version_windows = []
+    owner._bg_tasks = []
+
+    class FakeVersionWindow(QWidget):
+        def __init__(self, _manager):
+            super().__init__()
+            self._closing = False
+
+    window = app_mod._open_version_window(owner, object(), window_cls=FakeVersionWindow)
+    qtbot.addWidget(window)
+
+    assert getattr(window, "_parent_bg_tasks", None) is owner._bg_tasks
+
+
+def test_settings_dialog_from_app_receives_rescan_callback(qtbot):
+    owner = QWidget()
+    qtbot.addWidget(owner)
+    manager = object()
+    created = []
+
+    def rescan():
+        return True
+
+    owner._request_full_rescan = rescan
+
+    class FakeSettingsDialog:
+        def __init__(self, _manager, parent=None, on_rescan=None):
+            self.parent = parent
+            self.on_rescan = on_rescan
+            self.exec_called = False
+            created.append(self)
+
+        def exec(self):
+            self.exec_called = True
+            return 123
+
+    result = app_mod._open_settings_dialog(
+        owner,
+        manager,
+        dialog_cls=FakeSettingsDialog,
+    )
+
+    assert result == 123
+    assert len(created) == 1
+    assert created[0].parent is owner
+    assert created[0].on_rescan is rescan
+    assert created[0].exec_called is True

@@ -58,6 +58,7 @@ def test_recent_view_inserts_headers(qtbot, tmp_path):
     qtbot.addWidget(win)
     win.search_box.setText("")
     win._do_search()
+    qtbot.waitUntil(lambda: win.result_list.count() > 2, timeout=2000)
     assert win.result_list.count() > 2        # 2 文件 + 分组头
     win.sort_combo.setCurrentText("文件名")
     assert win.result_list.count() == 2       # 文件名排序 → 不分组

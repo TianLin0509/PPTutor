@@ -56,6 +56,17 @@ def test_facet_panel_emits_filters(qtbot):
     assert "1-10" in fired[-1].get("page", set())
 
 
+def test_facet_panel_caps_large_folder_bucket_count(qtbot):
+    fp = FacetPanel(theme.tok("raycast"))
+    qtbot.addWidget(fp)
+    folders = [(f"folder-{i:02d}", 1) for i in range(60)]
+
+    fp.update_counts({"folder": folders})
+
+    folder_chips = [key for key in fp._chip_btns if key[0] == "folder"]
+    assert len(folder_chips) <= 16
+
+
 def test_mainwindow_facet_toggle(qtbot, tmp_path):
     win = MainWindow(conn=_index(tmp_path), render_worker=StubRender(), do_index=False)
     qtbot.addWidget(win)

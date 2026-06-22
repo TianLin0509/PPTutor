@@ -11,6 +11,11 @@ import tempfile
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QThread, Signal
+try:
+    from shiboken6 import isValid as _qt_is_valid
+except Exception:  # noqa: BLE001
+    def _qt_is_valid(_obj) -> bool:
+        return True
 
 from .. import updater
 
@@ -21,6 +26,8 @@ def _staging_dir() -> Path:
 
 class _CheckThread(QThread):
     found = Signal(object)  # UpdateInfo
+    checked = Signal()
+    failed = Signal(str)
 
     def __init__(self, base_url: str, parent=None):
         super().__init__(parent)
@@ -31,8 +38,10 @@ class _CheckThread(QThread):
             info = updater.check_for_update(self._url)
             if info is not None:
                 self.found.emit(info)
-        except Exception:  # noqa: BLE001 网络/解析失败一律静默，不打扰用户
-            pass
+            else:
+                self.checked.emit()
+        except Exception as exc:  # noqa: BLE001 网络/解析失败静默，但交给诊断记录
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
 
 
 class _DownloadThread(QThread):
@@ -71,23 +80,69 @@ class UpdateController(QObject):
         self._quit = quit_fn
         self._state = "idle"
         self._info = None
+        self._check_status = "never"
+        self._check_error = ""
+        self._download_error = ""
         self._staging = _staging_dir()
         self._check: _CheckThread | None = None
         self._dl: _DownloadThread | None = None
+        self._download_token = 0
+        self._parent_bg_tasks = getattr(parent, "_bg_tasks", None)
+        if not isinstance(self._parent_bg_tasks, list):
+            self._parent_bg_tasks = None
         chip.hide()
         chip.clicked.connect(self._on_click)
 
+    def _track_thread(self, thread, label: str) -> None:
+        try:
+            thread._label = label
+        except Exception:  # noqa: BLE001
+            pass
+        if self._parent_bg_tasks is not None and thread not in self._parent_bg_tasks:
+            self._parent_bg_tasks.append(thread)
+        finished = getattr(thread, "finished", None)
+        connect = getattr(finished, "connect", None)
+        if callable(connect):
+            connect(lambda thread=thread: self._forget_thread(thread))
+
+    def _forget_thread(self, thread) -> None:
+        tasks = self._parent_bg_tasks
+        if tasks is not None and thread in tasks:
+            tasks.remove(thread)
+
+    def _ui_alive(self) -> bool:
+        try:
+            if not _qt_is_valid(self) or not _qt_is_valid(self._chip):
+                return False
+            return not getattr(self.parent(), "_closing", False)
+        except RuntimeError:
+            return False
+
     # ---------- 检查 ----------
     def start_check(self) -> None:
+        if not self._ui_alive():
+            return
         if self._state != "idle":
             return
+        self._state = "checking"
+        self._check_status = "checking"
+        self._check_error = ""
         self._check = _CheckThread(self._url, self)
         self._check.found.connect(self._on_found)
+        self._check.checked.connect(self._on_check_done)
+        self._check.failed.connect(self._on_check_failed)
+        self._track_thread(self._check, "update-check")
         self._check.start()
 
     def _on_found(self, info) -> None:
+        if not self._ui_alive():
+            return
+        if self._state != "checking":
+            return
         self._info = info
         self._state = "available"
+        self._check_status = f"found v{info.version}"
+        self._check_error = ""
         mb = info.total_bytes / 1024 / 1024
         self._chip.setEnabled(True)
         self._chip.setText(f"🔵 新版 v{info.version} · 更新")
@@ -95,39 +150,119 @@ class UpdateController(QObject):
         self._chip.setToolTip(tip.strip())
         self._chip.show()
 
+    def _on_check_done(self) -> None:
+        if not self._ui_alive():
+            return
+        if self._state != "checking":
+            return
+        self._state = "idle"
+        self._check_status = "ok-no-update"
+        self._check_error = ""
+
+    def _on_check_failed(self, msg: str) -> None:
+        if not self._ui_alive():
+            return
+        if self._state != "checking":
+            return
+        self._state = "idle"
+        self._check_status = "failed"
+        self._check_error = str(msg or "unknown")
+        self._chip.hide()
+
+    def diagnostic_lines(self) -> list[str]:
+        line = f"update: state={self._state} check={self._check_status}"
+        if self._check_error:
+            line += f" error={self._check_error}"
+        if self._download_error:
+            line += f" download_error={self._download_error}"
+        if self._info is not None:
+            line += f" version={getattr(self._info, 'version', '')}"
+        return [line]
+
     # ---------- 点击：状态机 ----------
     def _on_click(self) -> None:
+        if not self._ui_alive():
+            return
         if self._state in ("available", "error"):
             self._start_download()
         elif self._state == "ready":
             self._apply()
 
     def _start_download(self) -> None:
+        if not self._ui_alive():
+            return
         self._state = "downloading"
+        self._download_token += 1
+        token = self._download_token
+        self._download_error = ""
         self._chip.setEnabled(False)
         self._chip.setText("下载中 0%")
         self._dl = _DownloadThread(self._url, self._info, self._staging, self)
-        self._dl.progress.connect(self._on_progress)
-        self._dl.done.connect(self._on_done)
-        self._dl.failed.connect(self._on_failed)
+        self._dl.progress.connect(lambda pct, token=token: self._on_progress(pct, token))
+        self._dl.done.connect(lambda token=token: self._on_done(token))
+        self._dl.failed.connect(lambda msg, token=token: self._on_failed(msg, token))
+        self._track_thread(self._dl, "update-download")
         self._dl.start()
 
-    def _on_progress(self, pct: int) -> None:
+    def _on_progress(self, pct: int, token: int | None = None) -> None:
+        if not self._ui_alive():
+            return
+        if token is not None and token != self._download_token:
+            return
+        if self._state != "downloading":
+            return
+        pct = max(0, min(100, int(pct)))
         self._chip.setText(f"下载中 {pct}%")
 
-    def _on_done(self) -> None:
+    def _on_done(self, token: int | None = None) -> None:
+        if not self._ui_alive():
+            return
+        if token is not None and token != self._download_token:
+            return
+        if self._state != "downloading":
+            return
         self._state = "ready"
+        self._download_error = ""
         self._chip.setEnabled(True)
         self._chip.setText("✅ 就绪 · 重启更新")
         self._chip.setToolTip("新版已下载完成，点击重启应用完成更新（你的索引和版本库不受影响）")
 
-    def _on_failed(self, msg: str) -> None:
+    def _on_failed(self, msg: str, token: int | None = None) -> None:
+        if not self._ui_alive():
+            return
+        if token is not None and token != self._download_token:
+            return
+        if self._state not in ("downloading", "applying"):
+            return
         self._state = "error"
+        self._download_error = str(msg or "unknown")
         self._chip.setEnabled(True)
-        self._chip.setText("⚠ 更新失败 · 重试")
-        self._chip.setToolTip(f"下载失败：{msg}\n点击重试")
+        reason = self._short_error_reason(msg)
+        self._chip.setText(f"⚠ {reason} · 重试")
+        self._chip.setToolTip(f"更新失败：{msg}\n点击重试")
+
+    @staticmethod
+    def _short_error_reason(msg: str) -> str:
+        m = (msg or "").lower()
+        if "哈希" in msg or "校验" in msg or "hash" in m or "sha256" in m:
+            return "校验失败"
+        if "timeout" in m or "timed out" in m or "超时" in msg:
+            return "网络超时"
+        if "permission" in m or "access denied" in m or "拒绝访问" in msg:
+            return "权限不足"
+        if "urlopen" in m or "connection" in m or "http" in m or "404" in m or "403" in m:
+            return "网络失败"
+        return "更新失败"
 
     def _apply(self) -> None:
+        if not self._ui_alive():
+            return
+        if self._state == "applying":
+            return
+        self._state = "applying"
+        self._chip.setEnabled(False)
+        self._chip.setText("正在重启更新…")
+        self._chip.setToolTip("正在启动更新 helper，请稍候。")
         try:
             updater.apply_update(
                 self._staging, updater.install_dir(), self._info,

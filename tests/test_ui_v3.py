@@ -10,6 +10,7 @@ import pytest
 import fixtures_gen as fx
 
 from pptx_finder import db, indexer, search as search_mod
+import pptx_finder.ui.main_window as main_window_mod
 from pptx_finder.ui.main_window import (
     MainWindow, _elide_middle, _fmt_mtime, _fmt_size,
 )
@@ -85,6 +86,14 @@ def test_copy_to_clipboard_sets_file_url(qtbot, tmp_path):
     win._do_search()
     win.result_list.setCurrentRow(0)
     win._act_copy_clipboard()
+
+    def copied() -> bool:
+        md = QApplication.clipboard().mimeData()
+        return md.hasUrls() and md.urls()[0].toLocalFile().endswith("算力方案.pptx")
+
+    qtbot.waitUntil(lambda: copied() or "剪贴板暂时不可用" in win._toast_label.text(), timeout=1500)
+    if "剪贴板暂时不可用" in win._toast_label.text():
+        pytest.skip("Windows clipboard is currently locked by another process")
     md = QApplication.clipboard().mimeData()
     assert md.hasUrls()
     assert md.urls()[0].toLocalFile().endswith("算力方案.pptx")
@@ -119,8 +128,59 @@ def test_index_progress_three_states(qtbot, tmp_path):
     assert "正在索引" in win.status_label.text()
     # 就绪态
     win._on_index_done({"indexed": 1, "deleted": 0})
+    qtbot.waitUntil(lambda: "索引就绪" in win.status_label.text(), timeout=2000)
     assert "索引就绪" in win.status_label.text()
     assert win.pct_label.text() == ""
+
+
+def test_index_progress_ui_updates_are_throttled(qtbot, monkeypatch, tmp_path):
+    monkeypatch.setattr(MainWindow, "_INDEX_PROGRESS_UI_MS", 100, raising=False)
+    now = [100.0]
+    monkeypatch.setattr(main_window_mod.time, "monotonic", lambda: now[0])
+    conn = _mk(tmp_path)
+    win = MainWindow(conn=conn, render_worker=_Stub(), do_index=False)
+    qtbot.addWidget(win)
+
+    win._on_index_progress(1, 100, "a.pptx")
+    assert win.pct_label.text() == "1%"
+    assert "a.pptx" in win.status_label.text()
+
+    now[0] = 100.02
+    win._on_index_progress(2, 100, "b.pptx")
+
+    assert win._index_last_done == 2
+    assert win._index_last_current == "b.pptx"
+    assert win.pct_label.text() == "1%"
+    assert "a.pptx" in win.status_label.text()
+
+    now[0] = 100.13
+    win._on_index_progress(3, 100, "c.pptx")
+
+    assert win.pct_label.text() == "3%"
+    assert "c.pptx" in win.status_label.text()
+
+
+def test_index_signals_ignored_after_closing(qtbot, monkeypatch, tmp_path):
+    conn = _mk(tmp_path)
+    win = MainWindow(conn=conn, render_worker=_Stub(), do_index=False)
+    qtbot.addWidget(win)
+    calls = []
+    monkeypatch.setattr(win, "_refresh_status", lambda *a, **k: calls.append("refresh"))
+    monkeypatch.setattr(win, "_show_recent", lambda *a, **k: calls.append("recent"))
+    win._closing = True
+    win.status_label.setText("closing")
+    win.pct_label.setText("keep")
+    win._index_last_done = 9
+    win._index_last_summary = {"old": True}
+
+    win._on_index_progress(1, 4, "late.pptx")
+    win._on_index_done({"indexed": 1, "deleted": 0})
+
+    assert win.status_label.text() == "closing"
+    assert win.pct_label.text() == "keep"
+    assert win._index_last_done == 9
+    assert win._index_last_summary == {"old": True}
+    assert calls == []
 
 
 # ---- 预览滚轮翻原始页 ----

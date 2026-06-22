@@ -15,6 +15,11 @@ from PySide6.QtCore import QAbstractNativeEventFilter, Qt
 from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPixmap
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
+try:
+    from shiboken6 import isValid as _qt_is_valid
+except Exception:  # noqa: BLE001
+    def _qt_is_valid(_obj) -> bool:
+        return True
 
 from .config import GLOBAL_HOTKEY
 from .ui.main_window import MainWindow
@@ -57,6 +62,62 @@ def _make_icon() -> QIcon:
     painter.drawText(pm.rect(), Qt.AlignCenter, "P")
     painter.end()
     return QIcon(pm)
+
+
+def _open_version_window(owner, version_mgr, *, window_cls=None):
+    windows = getattr(owner, "_version_windows", None)
+    if windows is None:
+        windows = []
+        owner._version_windows = windows
+
+    for window in list(windows):
+        try:
+            if not _qt_is_valid(window) or getattr(window, "_closing", False) or not window.isVisible():
+                windows.remove(window)
+                continue
+            window.raise_()
+            window.activateWindow()
+            return window
+        except RuntimeError:
+            if window in windows:
+                windows.remove(window)
+
+    if window_cls is None:
+        from .ui.version_window import VersionWindow
+        window_cls = VersionWindow
+    window = window_cls(version_mgr)
+    try:
+        window._closing_owner = owner
+    except Exception:  # noqa: BLE001
+        pass
+    bg_tasks = getattr(owner, "_bg_tasks", None)
+    if isinstance(bg_tasks, list):
+        try:
+            window._parent_bg_tasks = bg_tasks
+        except Exception:  # noqa: BLE001
+            pass
+    windows.append(window)
+    try:
+        window.destroyed.connect(
+            lambda _=None, w=window: windows.remove(w) if w in windows else None)
+    except AttributeError:
+        pass
+    window.show()
+    window.raise_()
+    window.activateWindow()
+    return window
+
+
+def _open_settings_dialog(owner, version_mgr, *, dialog_cls=None):
+    if dialog_cls is None:
+        from .ui.settings_dialog import SettingsDialog
+        dialog_cls = SettingsDialog
+    dialog = dialog_cls(
+        version_mgr,
+        owner,
+        on_rescan=getattr(owner, "_request_full_rescan", None),
+    )
+    return dialog.exec()
 
 
 class _HotkeyFilter(QAbstractNativeEventFilter):
@@ -157,16 +218,10 @@ def main() -> int:
     win._version_windows = []  # 防 GC 已打开的版本窗口
 
     def _open_version_mgr() -> None:
-        from .ui.version_window import VersionWindow
-        w = VersionWindow(version_mgr)
-        win._version_windows.append(w)
-        w.show()
-        w.raise_()
-        w.activateWindow()
+        _open_version_window(win, version_mgr)
 
     def _open_settings() -> None:
-        from .ui.settings_dialog import SettingsDialog
-        SettingsDialog(version_mgr, win).exec()
+        _open_settings_dialog(win, version_mgr)
 
     act_versions = QAction("版本管理…", app)
     act_versions.triggered.connect(_open_version_mgr)
