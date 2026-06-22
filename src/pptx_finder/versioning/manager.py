@@ -218,11 +218,12 @@ class VersionManager:
                     "doc_id": r["doc_id"],
                     "version_id": r["version_id"],
                     "page_no": r["page_no"],
-                    "doc_path": r["doc_path"] or r["doc_id"],
+                    "doc_path": r["doc_path"],
                     "ts": r["ts"] or 0,
                 }
                 for r in rows
-            ],
+                if r["doc_path"]  # 剔除 managed_docs 缺失的孤儿行：无有效路径不能安全恢复/导出
+            ],                    # （正常事务下 FTS 与 managed_docs 同写、一致，此分支不可达；防御性剔除）
         }
 
     # ---------- 误删 / 改坏找回 ----------

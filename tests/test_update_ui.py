@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import threading
+import time
+
 from PySide6.QtCore import QObject, Qt
 from PySide6.QtWidgets import QPushButton
 
@@ -363,3 +366,36 @@ def test_update_late_download_done_ignored_after_parent_closing(qtbot):
     assert ctrl._state == "downloading"
     assert chip.isEnabled() is False
     assert chip.text() == "downloading"
+
+
+def test_update_threads_have_stop(qtbot, tmp_path):
+    info = updater.UpdateInfo(version="0.9.1", notes="", changed=[], deleted=[])
+    dl = update_ui._DownloadThread("http://127.0.0.1:9", info, tmp_path / "s")
+    chk = update_ui._CheckThread("http://127.0.0.1:9")
+    dl.stop()
+    chk.stop()
+    assert dl._cancel is True and chk._cancel is True
+
+
+def test_controller_shutdown_stops_running_download(qtbot, tmp_path, monkeypatch):
+    """P1 回归：下载进行中关窗，shutdown() 必须停下真 QThread，否则「运行中被析构」崩溃。"""
+    started = threading.Event()
+
+    def slow_download(base_url, info, staging, progress=None, timeout=30, cancel=None):
+        started.set()
+        while not (cancel and cancel()):  # 尊重 cancel，模拟慢下载
+            time.sleep(0.01)
+        raise InterruptedError("cancelled")
+
+    monkeypatch.setattr(update_ui.updater, "download_delta", slow_download)
+    chip = QPushButton()
+    qtbot.addWidget(chip)
+    ctrl = UpdateController(chip, "http://127.0.0.1:9", lambda: None)
+    ctrl._info = updater.UpdateInfo(version="0.9.1", notes="", changed=[("a", "h", 1)], deleted=[])
+    ctrl._staging = tmp_path / "s"
+    ctrl._state = "available"
+    ctrl._start_download()                      # 启真 QThread 跑 slow_download
+    assert started.wait(2.0)                    # 下载线程确在跑
+    assert ctrl._dl.isRunning()
+    ctrl.shutdown(wait_ms=3000)                 # 模拟关窗收尾
+    assert not ctrl._dl.isRunning()             # 干净停下，不会运行中被析构

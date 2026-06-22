@@ -1,4 +1,4 @@
-﻿"""涓荤獥鍙ｏ細鍙屼富棰?+ 绮捐嚧缁撴灉椤癸紙鐒︾偣鍙屾€?鍗婇€忔槑楂樹寒/瀛楅噸灞傜骇锛? P0 浜や簰
+"""涓荤獥鍙ｏ細鍙屼富棰?+ 绮捐嚧缁撴灉椤癸紙鐒︾偣鍙屾€?鍗婇€忔槑楂樹寒/瀛楅噸灞傜骇锛? P0 浜や簰
 锛堝嵆鏃舵悳绱?/ 鍏ㄩ敭鐩樺鑸?/ 鍛戒腑椤电缉鐣ュ浘鏉?/ 绱㈠紩杩涘害鏉★級銆?
 
 鍙祴璇曟€э細conn 涓?render_worker 鍙敞鍏ワ紱do_index=False 鏃朵笉鍚姩纾佺洏绱㈠紩銆?
@@ -3290,6 +3290,12 @@ class MainWindow(QMainWindow):
         if self._search_worker is not None:
             self._search_worker.stop()
             self._search_worker.wait(self._SEARCH_SHUTDOWN_WAIT_MS)
+        # 增量更新的检查/下载线程：显式 stop+wait+terminate，防「QThread 运行中被析构」崩溃
+        # （它们也在 _bg_tasks 里走 light 预算，但那只 wait 不 terminate，下载>1s 关窗会崩）
+        if getattr(self, "_updater", None) is not None:
+            sd = getattr(self._updater, "shutdown", None)
+            if callable(sd):
+                sd()
         light_elapsed_ms = 0.0
         for t in list(self._bg_tasks):
             wait = getattr(t, "wait", None)

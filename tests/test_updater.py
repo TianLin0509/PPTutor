@@ -171,3 +171,13 @@ def test_helper_swap_real(tmp_path):
     assert (dest / "sub" / "keep.txt").read_text(encoding="utf-8") == "KEEP"  # 未列文件原封不动
     assert marker.exists()                                                    # 重启确实触发
     assert not staging.exists()                                               # staging 清理
+
+
+def test_download_delta_cancel_aborts_before_fetch(tmp_path):
+    """cancel() 返回真时在任何网络请求前就中止——关窗打断下载的基础，防 QThread 运行中析构崩溃。"""
+    info = updater.UpdateInfo(version="0.9.1", notes="",
+                              changed=[("a.txt", "deadbeef", 5)], deleted=[], raw={})
+    with pytest.raises(InterruptedError):
+        updater.download_delta("http://127.0.0.1:1/", info, tmp_path / "stg",
+                               cancel=lambda: True)
+    assert not (tmp_path / "stg" / "a.txt").exists()  # 取消在文件循环顶生效，未落任何文件

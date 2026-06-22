@@ -32,15 +32,23 @@ class _CheckThread(QThread):
     def __init__(self, base_url: str, parent=None):
         super().__init__(parent)
         self._url = base_url
+        self._cancel = False
+
+    def stop(self) -> None:
+        self._cancel = True
 
     def run(self) -> None:
         try:
             info = updater.check_for_update(self._url)
+            if self._cancel:
+                return
             if info is not None:
                 self.found.emit(info)
             else:
                 self.checked.emit()
         except Exception as exc:  # noqa: BLE001 网络/解析失败静默，但交给诊断记录
+            if self._cancel:
+                return
             self.failed.emit(f"{type(exc).__name__}: {exc}")
 
 
@@ -54,15 +62,24 @@ class _DownloadThread(QThread):
         self._url = base_url
         self._info = info
         self._staging = staging
+        self._cancel = False
+
+    def stop(self) -> None:
+        self._cancel = True
 
     def run(self) -> None:
         try:
             shutil.rmtree(self._staging, ignore_errors=True)
             updater.download_delta(
                 self._url, self._info, self._staging,
-                progress=lambda d, t: self.progress.emit(int(d * 100 / t) if t else 100))
+                progress=lambda d, t: self.progress.emit(int(d * 100 / t) if t else 100),
+                cancel=lambda: self._cancel)
+            if self._cancel:
+                return
             self.done.emit()
         except Exception as e:  # noqa: BLE001
+            if self._cancel:
+                return
             self.failed.emit(str(e))
 
 
@@ -117,6 +134,31 @@ class UpdateController(QObject):
             return not getattr(self.parent(), "_closing", False)
         except RuntimeError:
             return False
+
+    def shutdown(self, wait_ms: int = 3000) -> None:
+        """关窗收尾：停下并等待检查/下载线程，超时则 terminate。
+
+        修复 P1：这两个线程原先无 stop()，关窗只按 light 任务等 1s 且不 terminate，
+        下载中关窗会触发「QThread: Destroyed while thread is still running」崩溃。
+        """
+        for th in (self._check, self._dl):
+            stop = getattr(th, "stop", None)
+            if callable(stop):
+                try:
+                    stop()
+                except RuntimeError:
+                    pass
+        for th in (self._check, self._dl):
+            if th is None:
+                continue
+            try:
+                if not th.isRunning():
+                    continue
+                if not th.wait(wait_ms):
+                    th.terminate()
+                    th.wait(800)
+            except RuntimeError:
+                pass
 
     # ---------- 检查 ----------
     def start_check(self) -> None:

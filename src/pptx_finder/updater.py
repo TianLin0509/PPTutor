@@ -107,17 +107,21 @@ def fetch_remote_manifest(base_url: str, timeout: float = _CHECK_TIMEOUT) -> dic
 
 
 def download_delta(base_url: str, info: UpdateInfo, staging: Path,
-                   progress=None, timeout: float = _DL_TIMEOUT) -> Path:
+                   progress=None, timeout: float = _DL_TIMEOUT, cancel=None) -> Path:
     """下载 info.changed 的每个 files/<hash> 到 staging/<relpath> 并校验 sha256；
     最后把远端清单写成 staging/manifest.json（随更新落地为新本地清单）。
 
     progress(done_bytes, total_bytes) 可选回调（UI 进度条用）。校验失败抛 ValueError。
+    cancel() 可选：返回真则尽快中止（每块检查一次），抛 InterruptedError——供关窗时打断下载，
+    避免下载线程「运行中被析构」崩溃。
     """
     staging = Path(staging)
     staging.mkdir(parents=True, exist_ok=True)
     total = info.total_bytes
     done = 0
     for rel, h, _size in info.changed:
+        if cancel is not None and cancel():
+            raise InterruptedError("下载已取消")
         url = base_url.rstrip("/") + "/files/" + h
         dest = staging / rel
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -132,6 +136,8 @@ def download_delta(base_url: str, info: UpdateInfo, staging: Path,
                 done += len(chunk)
                 if progress:
                     progress(done, total)
+                if cancel is not None and cancel():
+                    raise InterruptedError("下载已取消")
         got = hasher.hexdigest()
         if got != h:
             raise ValueError(f"哈希校验失败 {rel}：期望 {h[:12]}… 实得 {got[:12]}…")

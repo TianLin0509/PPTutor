@@ -163,6 +163,7 @@ class SearchWorker(QThread):
                     req_id, query, mode_key = self._pending
                     self._pending = None
                     self._cancel_active = False
+                    self._active_conn = conn  # 在同一把锁内提前置位，消除「取消落在赋值之前」的窗口
                     with self._diag_lock:
                         self._diag["pending_query_chars"] = 0
                         self._diag["active_query_chars"] = len(query)
@@ -171,8 +172,6 @@ class SearchWorker(QThread):
                 error = None
                 results = []
                 try:
-                    with self._cv:
-                        self._active_conn = conn
                     results = self._apply_mode(search_mod.search(conn, query), mode_key)
                 except Exception as exc:  # noqa: BLE001
                     error = f"{type(exc).__name__}: {exc}"
