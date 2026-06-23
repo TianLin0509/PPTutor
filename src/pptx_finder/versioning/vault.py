@@ -57,12 +57,16 @@ def version_file(doc_id: str, version_id: str) -> Path:
     return _doc_dir(doc_id) / "versions" / f"{version_id}.pptx"
 
 
-def _file_hash(path: str) -> str:
+def file_hash(path: str) -> str:
     h = xxhash.xxh64()
     with open(ext_path(path), "rb") as f:
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _file_hash(path: str) -> str:
+    return file_hash(path)
 
 
 def _new_vid() -> str:
@@ -132,15 +136,24 @@ def _change_summary(conn, latest_vid: str, new_pages: list, new_pc: int, old_pc:
     return " · ".join(parts) if parts else "内容微调"
 
 
-def snapshot(conn, path: str, session_id: str = "") -> str | None:
+def snapshot(
+    conn,
+    path: str,
+    session_id: str = "",
+    doc_id: str | None = None,
+    base_version=None,
+    content_hash: str | None = None,
+) -> str | None:
     """对 path 当前内容拍快照（按页去重）；内容相对最新版未变则跳过（返回 None）。"""
     path = os.path.abspath(path)
     if not os.path.exists(path):
         return None
-    chash = _file_hash(path)
-    did = doc_id_for(path)
-    latest = store.latest_version(conn, did)
+    chash = content_hash or _file_hash(path)
+    did = doc_id or doc_id_for(path)
+    latest = base_version if base_version is not None else store.latest_version(conn, did)
     if latest is not None and latest["content_hash"] == chash:
+        store.upsert_doc(conn, did, path, datetime.datetime.now().timestamp())
+        conn.commit()
         return None
 
     vid = _new_vid()

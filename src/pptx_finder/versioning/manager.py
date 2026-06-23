@@ -1,12 +1,4 @@
-"""版本管理编排：全盘监听保存事件 → 谁变管谁 → 首次修改即建 v1。
-
-零操作负担：装了就全自动，不需选目录、不扫描存量（死 PPT 永不进库、绝不卡死）。
-只有两种 PPTX 进入管理：① 运行后新建的 ② 运行后被改存的老文件
-（改后这一版作为第一版，之前的历史不追踪——本来也没数据）。
-
-线程安全：watcher 子线程与 UI 主线程都经本类访问同一 SQLite 连接，
-所有 conn 操作用 RLock 串行（SQLite 单连接非线程安全）。
-"""
+"""Version-management orchestration for PPTutor."""
 from __future__ import annotations
 
 import datetime
@@ -19,8 +11,8 @@ from ..scanner import iter_ppt_files
 from ..text_tokenize import build_fts_match_exact
 from . import store, vault
 
-SESSION_GAP_SEC = 30 * 60  # 30 分钟内的连续保存算同一编辑会话（时间线折叠用）
-KEEP_PER_DOC = 50          # 每文档保留版本上限（超出按时间清理最旧的）
+SESSION_GAP_SEC = 30 * 60
+KEEP_PER_DOC = 50
 
 
 def _now() -> float:
@@ -31,70 +23,160 @@ def _sid(ts: float) -> str:
     return "s" + datetime.datetime.fromtimestamp(ts).strftime("%Y%m%d-%H%M")
 
 
+def _is_pptx(path: str) -> bool:
+    return os.path.splitext(path)[1].lower() == PPTX_EXT
+
+
 class VersionManager:
     def __init__(self, conn=None, on_snapshot=None):
         self._db_path = vault.db_path() if conn is None else None
         self._conn = conn or store.connect(self._db_path)
         store.init_db(self._conn)
-        # 独立只读连接：UI 主线程查版本/列文档走它，WAL 并发读、**不抢写锁**。
-        # 否则后台给大文件拍快照时 RLock 持锁 ~3s，主线程一查版本就冻结（压测 BUG 1）。
-        # 仅供 UI 主线程单线程使用；注入 conn（测试，单线程）则共用即可。
         if conn is None:
             self._read_conn = store.connect(self._db_path)
-            self._read_conn.isolation_level = None  # autocommit：每次 SELECT 读最新已提交快照
+            self._read_conn.isolation_level = None
         else:
             self._read_conn = conn
-        self._lock = threading.RLock()  # 可重入：restore 内部还会调 snapshot
+        self._lock = threading.RLock()
         self._watcher = None
-        self._on_snapshot = on_snapshot  # 留版成功回调(path, vid)，watcher 子线程触发
+        self._on_snapshot = on_snapshot
 
-    # ---------- 快照（保存触发 / 手动补录 共用） ----------
+    # ---------- Snapshot identity ----------
     def snapshot_now(self, path: str, notify: bool = True) -> str | None:
-        """对 path 当前内容拍快照。第一次见到该文件 → 建 v1；内容没变则跳过（返回 None）。
-
-        无「受管目录」概念：任何 .pptx 的保存都记录——这正是「谁变管谁」。
-        notify=True 时留版成功会触发 on_snapshot 回调（恢复留底等内部调用传 False）。
-        """
-        if os.path.splitext(path)[1].lower() != PPTX_EXT:
+        if not _is_pptx(path):
+            return None
+        path = os.path.abspath(path)
+        if not os.path.exists(path):
             return None
         with self._lock:
-            sid = self._session_id(path)
-            vid = vault.snapshot(self._conn, path, sid)
+            doc_id, base_version, content_hash = self._snapshot_identity(path)
+            sid = self._session_id_for_doc(doc_id)
+            vid = vault.snapshot(
+                self._conn,
+                path,
+                sid,
+                doc_id=doc_id,
+                base_version=base_version,
+                content_hash=content_hash,
+            )
             if vid:
-                self._enforce_quota(vault.doc_id_for(path))
-        # 锁外回调：避免回调里重入访问 conn；UI 侧自行把事件 marshal 回主线程
+                self._enforce_quota(doc_id)
         if vid and notify and self._on_snapshot is not None:
             try:
                 self._on_snapshot(path, vid)
             except Exception:  # noqa: BLE001
-                logging.getLogger(__name__).warning(
-                    "on_snapshot callback raised", exc_info=True)
+                logging.getLogger(__name__).warning("on_snapshot callback raised", exc_info=True)
         return vid
 
-    def _session_id(self, path: str) -> str:
-        latest = store.latest_version(self._conn, vault.doc_id_for(path))
+    def move_path(self, src_path: str, dest_path: str) -> bool:
+        """Bind a filesystem move/rename to the existing doc id when possible."""
+        if not _is_pptx(dest_path):
+            return False
+        src_path = os.path.abspath(src_path)
+        dest_path = os.path.abspath(dest_path)
+        if os.path.exists(src_path):
+            return False
+        with self._lock:
+            doc = store.get_doc_by_path(self._conn, src_path)
+            if not doc:
+                return False
+            store.upsert_doc(self._conn, doc["doc_id"], dest_path, _now())
+            self._conn.commit()
+            return True
+
+    def _snapshot_identity(self, path: str):
+        doc = store.get_doc_by_path(self._conn, path)
+        if doc:
+            doc_id = doc["doc_id"]
+            return doc_id, self._effective_latest_version_on_conn(self._conn, doc_id), None
+
+        content_hash = vault.file_hash(path)
+        candidates = store.find_versions_by_content_hash(self._conn, content_hash)
+        now = _now()
+
+        for version in candidates:
+            source_doc = store.get_doc(self._conn, version["doc_id"])
+            if source_doc and source_doc["path"] and not os.path.exists(source_doc["path"]):
+                store.upsert_doc(self._conn, version["doc_id"], path, now)
+                return (
+                    version["doc_id"],
+                    self._effective_latest_version_on_conn(self._conn, version["doc_id"]),
+                    content_hash,
+                )
+
+        for version in candidates:
+            source_doc = store.get_doc(self._conn, version["doc_id"])
+            if not source_doc:
+                continue
+            child_doc_id = vault.doc_id_for(path)
+            store.upsert_doc(self._conn, child_doc_id, path, now)
+            if not store.get_branch(self._conn, child_doc_id):
+                store.record_branch(
+                    self._conn,
+                    child_doc_id,
+                    version["doc_id"],
+                    version["version_id"],
+                    now,
+                    "copy/hash_match",
+                )
+            return (
+                child_doc_id,
+                self._effective_latest_version_on_conn(self._conn, child_doc_id),
+                content_hash,
+            )
+
+        doc_id = vault.doc_id_for(path)
+        return doc_id, store.latest_version(self._conn, doc_id), content_hash
+
+    def _doc_id_for_path_on_conn(self, conn, path: str) -> str:
+        doc = store.get_doc_by_path(conn, path)
+        return doc["doc_id"] if doc else vault.doc_id_for(path)
+
+    def _session_id_for_doc(self, doc_id: str) -> str:
+        latest = store.latest_version(self._conn, doc_id)
         now = _now()
         if latest is not None and (now - latest["ts"]) < SESSION_GAP_SEC:
             return latest["session_id"] or _sid(latest["ts"])
         return _sid(now)
 
-    def catch_up_root(self, root: str) -> int:
-        """把某目录下现存 .pptx 各建一版——手动补录 / 测试用。
+    @staticmethod
+    def _effective_versions_on_conn(conn, doc_id: str):
+        rows = list(store.list_versions(conn, doc_id))
+        branch = store.get_branch(conn, doc_id)
+        if branch:
+            rows.extend(
+                store.list_versions_through(
+                    conn,
+                    branch["parent_doc_id"],
+                    branch["branched_from_version_id"],
+                )
+            )
+            rows.sort(key=lambda r: (float(r["ts"] or 0), str(r["version_id"])), reverse=True)
+        return rows
 
-        生产流程靠 watcher 实时触发，绝不自动调用此方法（避免遍历卡死）。
-        """
+    @staticmethod
+    def _effective_latest_version_on_conn(conn, doc_id: str):
+        latest = store.latest_version(conn, doc_id)
+        if latest is not None:
+            return latest
+        branch = store.get_branch(conn, doc_id)
+        if branch:
+            return store.get_version(conn, branch["branched_from_version_id"])
+        return None
+
+    # ---------- Catch-up ----------
+    def catch_up_root(self, root: str) -> int:
         n = 0
         for p in iter_ppt_files([root]):
             if p.suffix.lower() == PPTX_EXT and self.snapshot_now(str(p)):
                 n += 1
         return n
 
-    # ---------- 查询（供 UI 主线程，走独立只读连接、不抢锁，绝不被快照阻塞） ----------
+    # ---------- Queries ----------
     def list_docs(self):
         return store.list_docs(self._read_conn)
 
     def list_docs_details(self) -> list[dict]:
-        """后台文档列表读取：生产态使用短生命周期连接，避免共享 UI 读连接。"""
         if self._db_path is None:
             with self._lock:
                 return list(store.list_docs(self._conn))
@@ -112,17 +194,26 @@ class VersionManager:
         return store.get_version(self._read_conn, version_id)
 
     def list_versions(self, path: str):
-        return store.list_versions(self._read_conn, vault.doc_id_for(path))
+        doc_id = self._doc_id_for_path_on_conn(self._read_conn, path)
+        return self._effective_versions_on_conn(self._read_conn, doc_id)
 
     def list_versions_details(self, path: str, limit: int | None = None) -> list[dict]:
-        """后台文件详情读取：按 path 查版本列表，生产态使用短生命周期连接。"""
-        return self.list_versions_by_doc_details(vault.doc_id_for(path), limit)
+        if self._db_path is None:
+            with self._lock:
+                doc_id = self._doc_id_for_path_on_conn(self._conn, path)
+                return self._list_versions_by_doc_details_on_conn(self._conn, doc_id, limit)
+        conn = store.connect(self._db_path)
+        try:
+            conn.isolation_level = None
+            doc_id = self._doc_id_for_path_on_conn(conn, path)
+            return self._list_versions_by_doc_details_on_conn(conn, doc_id, limit)
+        finally:
+            conn.close()
 
     def list_versions_by_doc(self, doc_id: str):
-        return store.list_versions(self._read_conn, doc_id)
+        return self._effective_versions_on_conn(self._read_conn, doc_id)
 
     def list_versions_by_doc_details(self, doc_id: str, limit: int | None = None) -> list[dict]:
-        """后台版本时间线读取：生产态使用短生命周期连接，避免共享 UI 读连接。"""
         if self._db_path is None:
             with self._lock:
                 return self._list_versions_by_doc_details_on_conn(self._conn, doc_id, limit)
@@ -133,50 +224,45 @@ class VersionManager:
         finally:
             conn.close()
 
-    @staticmethod
-    def _list_versions_by_doc_details_on_conn(conn, doc_id: str, limit: int | None) -> list[dict]:
-        rows = store.list_versions(conn, doc_id)
+    @classmethod
+    def _list_versions_by_doc_details_on_conn(cls, conn, doc_id: str, limit: int | None) -> list[dict]:
+        rows = cls._effective_versions_on_conn(conn, doc_id)
         if limit is not None:
             rows = rows[:max(0, int(limit))]
         return [
             {
                 "version_id": r["version_id"],
+                "doc_id": r["doc_id"],
                 "ts": r["ts"],
                 "page_count": r["page_count"],
+                "inherited": r["doc_id"] != doc_id,
             }
             for r in rows
         ]
 
-    # ---------- 恢复 / 导出 ----------
+    # ---------- Restore / export ----------
     def restore_to(self, path: str, version_id: str, dest: str | None = None) -> bool:
-        """恢复某版本。覆盖原文件前先把当前状态快照一版（绝不丢）。"""
         with self._lock:
-            did = vault.doc_id_for(path)
             target = dest or path
             if target == path and os.path.exists(path):
-                self.snapshot_now(path, notify=False)  # 恢复前留底，不当作用户改存通知
-            return vault.rebuild_to(did, version_id, target)
+                self.snapshot_now(path, notify=False)
+            version = store.get_version(self._conn, version_id)
+            if not version:
+                return False
+            return vault.rebuild_to(version["doc_id"], version_id, target)
 
     def export(self, path: str, version_id: str, dest: str) -> bool:
-        # 纯文件操作，不碰 conn
-        return vault.rebuild_to(vault.doc_id_for(path), version_id, dest)
+        with self._lock:
+            version = store.get_version(self._conn, version_id)
+            owner_doc_id = version["doc_id"] if version else self._doc_id_for_path_on_conn(self._conn, path)
+        return vault.rebuild_to(owner_doc_id, version_id, dest)
 
-    # ---------- 跨版本内容搜索 ----------
+    # ---------- Cross-version search ----------
     def search_history(self, query: str):
-        """返回历史版本命中：[(doc_id, version_id, page_no)]。
-
-        用精确匹配（不补 trigram）：version_pages_fts 无原文验证兜底，trigram 会假阳性
-        （搜 2026 误中只含 x202y026 碎片的历史页）。
-        """
         with self._lock:
             return store.search_versions(self._conn, build_fts_match_exact(query))
 
     def search_history_details(self, query: str, limit: int = 200) -> dict:
-        """后台跨版本搜索详情：使用独立连接一次性 join 文档/版本信息。
-
-        VersionWindow 的后台线程不能共享 UI 主线程专用的 _read_conn；这里在
-        生产态为每次后台搜索打开短生命周期连接，避免跨线程共用 SQLite cursor/conn。
-        """
         match = build_fts_match_exact(query)
         if not match:
             return {"query": query, "total": 0, "rows": []}
@@ -208,7 +294,7 @@ class VersionManager:
                 """,
                 (match, int(limit)),
             ).fetchall()
-        except Exception:  # noqa: BLE001 保持 search_history 的容错语义：坏查询/FTS 异常返回空
+        except Exception:  # noqa: BLE001
             return {"query": query, "total": 0, "rows": []}
         return {
             "query": query,
@@ -222,13 +308,12 @@ class VersionManager:
                     "ts": r["ts"] or 0,
                 }
                 for r in rows
-                if r["doc_path"]  # 剔除 managed_docs 缺失的孤儿行：无有效路径不能安全恢复/导出
-            ],                    # （正常事务下 FTS 与 managed_docs 同写、一致，此分支不可达；防御性剔除）
+                if r["doc_path"]
+            ],
         }
 
-    # ---------- 误删 / 改坏找回 ----------
+    # ---------- Deleted-file recovery ----------
     def scan_deleted(self) -> int:
-        """检查受管文档原文件是否还在，消失的标 deleted（但保留 vault）。"""
         with self._lock:
             n = 0
             for doc in store.list_docs(self._conn):
@@ -238,20 +323,19 @@ class VersionManager:
             return n
 
     def recover(self, doc_id: str, dest: str | None = None) -> bool:
-        """从版本库重建出最新版本到 dest（默认原路径）。"""
         with self._lock:
             doc = store.get_doc(self._conn, doc_id)
-            latest = store.latest_version(self._conn, doc_id)
+            latest = self._effective_latest_version_on_conn(self._conn, doc_id)
             if not doc or not latest:
                 return False
-            ok = vault.rebuild_to(doc_id, latest["version_id"], dest or doc["path"])
+            ok = vault.rebuild_to(latest["doc_id"], latest["version_id"], dest or doc["path"])
             if ok and (dest is None or dest == doc["path"]):
                 store.set_status(self._conn, doc_id, "active")
             return ok
 
-    # ---------- 配额（调用方已持锁） ----------
+    # ---------- Quota ----------
     def _enforce_quota(self, doc_id: str) -> None:
-        vers = store.list_versions(self._conn, doc_id)  # 按 ts 降序
+        vers = store.list_versions(self._conn, doc_id)
         if len(vers) <= KEEP_PER_DOC:
             return
         for v in vers[KEEP_PER_DOC:]:
@@ -262,16 +346,15 @@ class VersionManager:
                 pass
         self._conn.commit()
 
-    # ---------- 监听生命周期 ----------
+    # ---------- Watcher lifecycle ----------
     def start(self) -> None:
-        """应用启动：标记已删 + 起全盘实时监听。不扫描任何存量，绝不卡。"""
         self.scan_deleted()
         self._start_watcher()
 
     def _start_watcher(self) -> None:
         self._stop_watcher()
         from .watcher import VaultWatcher, default_watch_paths
-        self._watcher = VaultWatcher(default_watch_paths(), self.snapshot_now)
+        self._watcher = VaultWatcher(default_watch_paths(), self.snapshot_now, self.move_path)
         self._watcher.start()
 
     def _stop_watcher(self) -> None:
