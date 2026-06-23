@@ -187,9 +187,12 @@ class ReportOverlay(QWidget):
         self.export_btn.clicked.connect(self._export_clicked)
         head.addWidget(self.export_btn)
         self.close_btn = QPushButton("✕")
-        self.close_btn.setFixedWidth(30)
+        self.close_btn.setText("×")
+        self.close_btn.setFixedSize(34, 34)
         self.close_btn.setStyleSheet(
-            f"QPushButton{{background:transparent;color:{tok['ink3']};border:none;font-size:15px;}}")
+            f"QPushButton{{background:transparent;color:{tok['ink3']};border:none;"
+            "font-size:22px;font-weight:600;border-radius:8px;padding:0;}}"
+            "QPushButton:hover{background:rgba(255,69,58,0.9);color:#ffffff;}")
         self.close_btn.clicked.connect(self.close)
         head.addWidget(self.close_btn)
         self._card_lay.addLayout(head)

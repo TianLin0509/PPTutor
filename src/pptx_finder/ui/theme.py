@@ -108,18 +108,28 @@ QPushButton#winClose:hover { background: #E81123; color: #FFFFFF; }
 
 /* 顶栏 */
 QWidget#topBar { background: $panel; }
+QLabel#appLogo { background: transparent; border: none; }
 
 /* 搜索框 */
 QLineEdit#searchBox {
-  background: $field; border: 1.5px solid $bd; border-radius: ${radius}px;
-  padding: 0 12px; font-size: 15px; color: $ink1; selection-background-color: $acc;
+  background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 rgba($hl_r,$hl_g,$hl_b,0.12), stop:0.18 $field, stop:0.82 $field, stop:1 rgba(52,199,89,0.10));
+  border: 1.5px solid rgba($hl_r,$hl_g,$hl_b,0.34); border-radius: ${radius}px;
+  padding: 0 14px; font-size: 15px; color: $ink1; selection-background-color: $acc;
 }
-QLineEdit#searchBox:focus { border-color: $acc; }
+QLineEdit#searchBox:hover {
+  border-color: $bd2;
+  background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 rgba($hl_r,$hl_g,$hl_b,0.16), stop:0.5 $field, stop:1 rgba(52,199,89,0.12));
+}
+QLineEdit#searchBox:focus {
+  border-color: $acc;
+  background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 rgba($hl_r,$hl_g,$hl_b,0.22), stop:0.26 $field, stop:0.74 $field, stop:1 rgba($hl_r,$hl_g,$hl_b,0.16));
+}
 QLabel#queryHint { color: $ink3; font-size: 11.5px; background: transparent; padding: 5px 4px 0 40px; }
 
 /* 模式下拉 */
 QComboBox {
-  background: $field; border: 1px solid $bd; border-radius: 7px; padding: 4px 10px; color: $ink2;
+  background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 rgba($hl_r,$hl_g,$hl_b,0.10), stop:0.42 $field, stop:1 rgba($hl_r,$hl_g,$hl_b,0.06));
+  border: 1px solid rgba($hl_r,$hl_g,$hl_b,0.26); border-radius: 8px; padding: 4px 11px; color: $ink2;
 }
 QComboBox:hover { border-color: $bd2; }
 QComboBox::drop-down { border: none; width: 18px; }
@@ -158,11 +168,18 @@ QListWidget#resultList::item:selected { background: transparent; }
 /* 预览区 — 玻璃卡 */
 QWidget#previewPanel { background: $panel; border: 1px solid $bd; border-radius: ${radius}px; }
 QWidget#previewHeadBar { background: transparent; }
+QWidget#previewActions { background: transparent; }
 QLabel#previewImage { background: $field; border: 1px solid $bd; border-radius: ${radius}px; }
 QLabel#pathLabel { color: $ink2; font-size: 12px; }
 QLabel#metaLabel { color: $ink3; font-size: 11.5px; }
 QPushButton#linkBtn { background: transparent; border: 1px solid $bd2; border-radius: 7px; padding: 2px 10px; color: $acc; font-size: 11.5px; font-weight: 600; }
 QPushButton#linkBtn:hover { border-color: $acc; }
+QPushButton#detailAction {
+  background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 rgba($hl_r,$hl_g,$hl_b,0.20), stop:1 rgba($hl_r,$hl_g,$hl_b,0.08));
+  border: 1px solid $acc; border-radius: 8px; padding: 5px 13px; color: $acc; font-size: 12px; font-weight: 700;
+}
+QPushButton#detailAction:hover { background: rgba($hl_r,$hl_g,$hl_b,0.20); }
+QPushButton#detailAction:checked { background: $acc; color: $acctext; }
 
 /* 左侧列表 — 玻璃卡 */
 QWidget#listPane { background: $panel2; border: 1px solid $bd; border-radius: ${radius}px; }
@@ -184,7 +201,7 @@ QWidget#detailPanel { background: $panel2; border: 1px solid $bd; border-radius:
 #detailHead { background: $panel; border-bottom: 1px solid $bd; border-top-left-radius: ${radius}px; border-top-right-radius: ${radius}px; }
 QLabel#dtDot { color: $acc; font-size: 11px; background: transparent; }
 QLabel#dtTitle { color: $ink1; font-size: 13px; font-weight: 700; background: transparent; }
-QPushButton#dtClose { background: transparent; border: none; color: $ink3; font-size: 13px; border-radius: 6px; }
+QPushButton#dtClose { background: transparent; border: none; color: $ink3; font-size: 21px; font-weight: 600; border-radius: 8px; padding: 0; }
 QPushButton#dtClose:hover { background: rgba(255,69,58,0.9); color: #ffffff; }
 QTabWidget#detailTabs::pane { border: none; border-top: 1px solid $bd; background: transparent; }
 QTabBar::tab { background: transparent; color: $ink3; padding: 7px 18px; font-size: 12.5px; font-weight: 600; border: none; border-bottom: 2px solid transparent; }

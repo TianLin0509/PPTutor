@@ -14,8 +14,8 @@ import os
 import sys
 import time
 
-from PySide6.QtCore import QEvent, QMimeData, QPropertyAnimation, Qt, QStringListModel, QTimer, QUrl
-from PySide6.QtGui import QColor, QCursor, QIcon, QKeySequence, QPainter, QPen, QPixmap, QShortcut
+from PySide6.QtCore import QEvent, QMimeData, QPropertyAnimation, Qt, QStringListModel, QTimer, QUrl, Signal
+from PySide6.QtGui import QColor, QCursor, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QCompleter, QFrame, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMainWindow, QMenu, QProgressBar, QPushButton, QScrollArea,
@@ -98,7 +98,28 @@ def _app_logo() -> QPixmap:
     """鍝佺墝 logo锛歅PTutor 鍚夌ゥ鐗╋紙瀛﹀＋甯?+ 鎼滅储/PPT锛夛紝鍔犺浇鎵撳寘鍐?assets/logo.png銆?"""
     pm = QPixmap(_asset_path("logo.png"))
     if not pm.isNull():
-        return pm.scaled(28, 28, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        img = pm.toImage().convertToFormat(QImage.Format_ARGB32)
+        corners = [
+            img.pixelColor(0, 0),
+            img.pixelColor(max(0, img.width() - 1), 0),
+            img.pixelColor(0, max(0, img.height() - 1)),
+            img.pixelColor(max(0, img.width() - 1), max(0, img.height() - 1)),
+        ]
+        for y in range(img.height()):
+            for x in range(img.width()):
+                c = img.pixelColor(x, y)
+                if c.alpha() <= 0 or max(c.red(), c.green(), c.blue()) < 185:
+                    continue
+                if any(
+                    base.alpha() > 0
+                    and abs(c.red() - base.red()) <= 24
+                    and abs(c.green() - base.green()) <= 24
+                    and abs(c.blue() - base.blue()) <= 24
+                    for base in corners
+                ):
+                    c.setAlpha(0)
+                    img.setPixelColor(x, y, c)
+        return QPixmap.fromImage(img).scaled(28, 28, Qt.KeepAspectRatio, Qt.SmoothTransformation)
     fb = QPixmap(28, 28)
     fb.fill(Qt.transparent)
     return fb
@@ -269,6 +290,8 @@ def _thumb_placeholder(tok: dict) -> QPixmap:
 class ResultItem(QWidget):
     """鍗曟潯缁撴灉鍗＄墖锛氬乏缂╃暐鍥?棣栭〉/鍛戒腑椤? + 鍙?鏂囦欢鍚?+ 鍛戒腑椤佃兌鍥?+ 楂樹寒鐗囨 + mtime)銆?"""
 
+    activated = Signal()
+
     def __init__(self, r: FileResult, tok: dict, hlcss: str, ginfo: dict | None = None,
                  on_toggle_group=None):
         super().__init__()
@@ -378,6 +401,13 @@ class ResultItem(QWidget):
     def leaveEvent(self, e):  # noqa: N802
         if not self._sel:
             self._apply("normal", True)
+
+    def mouseDoubleClickEvent(self, e):  # noqa: N802
+        if e.button() == Qt.LeftButton:
+            self.activated.emit()
+            e.accept()
+            return
+        super().mouseDoubleClickEvent(e)
 
     def set_selected(self, sel: bool, active: bool = True) -> None:
         self._sel = sel
@@ -495,6 +525,7 @@ class MainWindow(QMainWindow):
         self._zoom = 1.0  # 棰勮缂╂斁锛?.0=閫傞厤绐楀彛锛?1 鏀惧ぇ鐪嬬粏鑺?
         self._to_tray_on_close = False
         self._thumb_btns: list[QToolButton] = []
+        self._last_result_activate_at = 0.0
         # 版本组折叠（#1）：默认折叠同一 MinHash 组的历史副本为一条，点「N 个历史版本」就地展开
         self._expanded_groups: set[int] = set()              # 当前已展开的 group_id
         self._group_others: dict[int, list] = {}             # group_id -> [(idx, FileResult), ...] 隐藏的历史版本
@@ -709,22 +740,17 @@ class MainWindow(QMainWindow):
         self.facet_btn.setToolTip("按时间 / 类型 / 页数 / 文件夹筛选")
         self.facet_btn.clicked.connect(self._toggle_facet)
         bar.addWidget(self.facet_btn)
+        self.settings_btn = QPushButton("设置")
+        self.settings_btn.setObjectName("ghost")
+        self.settings_btn.setMinimumHeight(42)
+        self.settings_btn.setToolTip("打开设置")
+        self.settings_btn.clicked.connect(self._open_settings_from_button)
+        bar.addWidget(self.settings_btn)
         self.theme_btn = QPushButton()
         self.theme_btn.setObjectName("ghost")
         self.theme_btn.setMinimumHeight(42)
         self.theme_btn.clicked.connect(self._show_theme_menu)
         bar.addWidget(self.theme_btn)
-        self.detail_btn = QPushButton("详情")
-        self.detail_btn.setObjectName("ghost")
-        self.detail_btn.setMinimumHeight(42)
-        self.detail_btn.setCheckable(True)
-        self.detail_btn.setToolTip("显示/隐藏 版本时间线 · 大纲 · 文件信息")
-        self.detail_btn.clicked.connect(self._toggle_detail)
-        bar.addWidget(self.detail_btn)
-        self._detail_dot = QLabel("●", self.detail_btn)
-        self._detail_dot.setObjectName("navDot")
-        self._detail_dot.setAttribute(Qt.WA_TransparentForMouseEvents)
-        self._detail_dot.hide()
         tl.addLayout(bar)
         self.query_hint = QLabel("")
         self.query_hint.setObjectName("queryHint")
@@ -759,6 +785,7 @@ class MainWindow(QMainWindow):
         self.result_list.setObjectName("resultList")
         self.result_list.currentItemChanged.connect(self._on_select)
         self.result_list.itemActivated.connect(self._on_activate)
+        self.result_list.itemDoubleClicked.connect(self._on_activate)
         self.result_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.result_list.customContextMenuRequested.connect(self._context_menu)
         ll.addWidget(self.result_list, 1)
@@ -884,12 +911,34 @@ class MainWindow(QMainWindow):
         self.copy_text_btn.setToolTip("复制当前预览页的文字（取自已索引内容，无需打开 PowerPoint）")
         self.copy_text_btn.clicked.connect(self._act_copy_page_text)
         self.copy_text_btn.hide()
-        pr.addWidget(self.copy_text_btn, 0)
         self.copy_path_btn = QPushButton("复制路径")
         self.copy_path_btn.setObjectName("linkBtn")
         self.copy_path_btn.clicked.connect(self._act_copy_path)
         self.copy_path_btn.hide()
-        pr.addWidget(self.copy_path_btn, 0)
+        action_box = QWidget()
+        action_box.setObjectName("previewActions")
+        action_lay = QVBoxLayout(action_box)
+        action_lay.setContentsMargins(0, 0, 0, 0)
+        action_lay.setSpacing(6)
+        action_row = QHBoxLayout()
+        action_row.setContentsMargins(0, 0, 0, 0)
+        action_row.setSpacing(6)
+        action_row.addWidget(self.copy_text_btn, 0)
+        action_row.addWidget(self.copy_path_btn, 0)
+        action_lay.addLayout(action_row)
+        self.detail_btn = QPushButton("查看详情")
+        self.detail_btn.setObjectName("detailAction")
+        self.detail_btn.setMinimumHeight(32)
+        self.detail_btn.setCheckable(True)
+        self.detail_btn.setToolTip("显示/隐藏版本时间线、大纲和文件信息")
+        self.detail_btn.clicked.connect(self._toggle_detail)
+        self.detail_btn.hide()
+        action_lay.addWidget(self.detail_btn)
+        self._detail_dot = QLabel("●", self.detail_btn)
+        self._detail_dot.setObjectName("navDot")
+        self._detail_dot.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self._detail_dot.hide()
+        pr.addWidget(action_box, 0, Qt.AlignTop)
         hv.addLayout(pr)
         self.meta_label = QLabel("")
         self.meta_label.setObjectName("metaLabel")
@@ -1070,7 +1119,7 @@ class MainWindow(QMainWindow):
     def _set_ops_enabled(self, on: bool) -> None:
         on = on and self._active_heavy_op is None and self._search_pending_req is None
         for w in (self.goto_btn, self.open_btn, self.folder_btn, self.clip_btn,
-                  self.copy_path_btn,
+                  self.copy_path_btn, self.copy_text_btn, self.detail_btn,
                   self.prev_btn, self.next_btn):
             w.setEnabled(on)
         for b in getattr(self, "_thumb_btns", []):
@@ -1108,11 +1157,13 @@ class MainWindow(QMainWindow):
             self.meta_label.setText("")
             self.copy_path_btn.hide()
             self.copy_text_btn.hide()
+            self.detail_btn.hide()
             return
         self.path_label.setText(_elide_middle(r.path))
         self.path_label.setToolTip(r.path)
         self.copy_path_btn.show()
         self.copy_text_btn.show()
+        self.detail_btn.show()
         parts = []
         sz = _fmt_size(r.size)
         if sz:
@@ -1678,6 +1729,13 @@ class MainWindow(QMainWindow):
         if not search_started:
             self._do_search()
 
+    def _open_settings_from_button(self) -> None:
+        cb = self._open_settings_cb
+        if callable(cb):
+            cb()
+            return
+        self._open_health_diagnostics()
+
     def _open_health_diagnostics(self) -> None:
         """闆剁粨鏋?璧锋鎬佺殑涓€閿帓鏌ュ叆鍙ｏ細鎵撳紑璁剧疆骞跺畾浣嶅埌鍋ュ悍璇婃柇銆?"""
         from .settings_dialog import SettingsDialog
@@ -1851,6 +1909,7 @@ class MainWindow(QMainWindow):
         item.setSizeHint(w.sizeHint())
         self.result_list.addItem(item)
         self.result_list.setItemWidget(item, w)
+        w.activated.connect(lambda item=item: self._activate_result_item(item))
         if ginfo and ginfo.get("count"):
             self._group_primary_item[ginfo["gid"]] = item  # 记录组主卡列表项，供就地展开定位
         self._request_thumb(w, idx)
@@ -1884,6 +1943,7 @@ class MainWindow(QMainWindow):
             item.setSizeHint(w.sizeHint())
             self.result_list.insertItem(base + 1 + k, item)
             self.result_list.setItemWidget(item, w)
+            w.activated.connect(lambda item=item: self._activate_result_item(item))
             # 成员是用户主动展开看的，直接请求缩略图（不受首屏 THUMB_FIRST 门限限制）
             key = (w.path, w.thumb_page)
             self._thumb_items[key] = w
@@ -2917,8 +2977,20 @@ class MainWindow(QMainWindow):
             self._refresh_history_model()
         self._open_at_page_bg(self._cur.path, self._view_page)
 
-    def _on_activate(self, _item) -> None:
+    def _activate_result_item(self, item: QListWidgetItem | None) -> None:
+        if item is not None and self.result_list.currentItem() is not item:
+            self.result_list.setCurrentItem(item)
+        self._activate_current_result()
+
+    def _activate_current_result(self) -> None:
+        now = time.monotonic()
+        if now - self._last_result_activate_at < 0.25:
+            return
+        self._last_result_activate_at = now
         self._act_goto()
+
+    def _on_activate(self, _item) -> None:
+        self._activate_result_item(_item)
 
     def _run_context_menu_action(self, render_gen: int, callback) -> None:
         if self._block_if_search_pending():

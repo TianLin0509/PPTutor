@@ -48,6 +48,9 @@ def test_overlay_constructs_and_exports_png(qtbot, tmp_path):
 
     ov = ro.ReportOverlay(report, theme.tok("cloud"))
     qtbot.addWidget(ov)
+    assert ov.close_btn.text() == "×"
+    assert ov.close_btn.width() >= 32
+    assert ov.close_btn.height() >= 32
     out = tmp_path / "report.png"
     assert ov.export_png(str(out)) is True
     assert out.exists() and out.stat().st_size > 0

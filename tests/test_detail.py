@@ -56,6 +56,16 @@ def test_detail_meta_shows_pages(qtbot):
     assert "12" in dp._meta_label.text()
 
 
+def test_detail_close_button_has_large_click_target(qtbot):
+    dp = DetailPanel(theme.tok("raycast"))
+    qtbot.addWidget(dp)
+    btn = dp.findChild(QPushButton, "dtClose")
+
+    assert btn.text() == "×"
+    assert btn.width() >= 32
+    assert btn.height() >= 32
+
+
 def test_detail_version_nodes(qtbot):
     dp = DetailPanel(theme.tok("raycast"))
     qtbot.addWidget(dp)

@@ -202,6 +202,49 @@ def _finish_fake_task(task):
     return result
 
 
+def test_settings_button_opens_settings_callback(qtbot, tmp_path):
+    win = MainWindow(conn=_index(tmp_path), render_worker=StubRender(), do_index=False)
+    qtbot.addWidget(win)
+    calls = []
+    win._open_settings_cb = lambda: calls.append("open")
+
+    qtbot.mouseClick(win.settings_btn, Qt.LeftButton)
+
+    assert calls == ["open"]
+
+
+def test_detail_button_lives_in_preview_actions(qtbot, tmp_path):
+    win = MainWindow(conn=_index(tmp_path), render_worker=StubRender(), do_index=False)
+    qtbot.addWidget(win)
+
+    assert win.detail_btn.objectName() == "detailAction"
+    assert win.detail_btn.parent().objectName() == "previewActions"
+    assert win.detail_btn.isHidden()
+
+    win.search_box.setText("\u6607\u817e")
+    win._do_search()
+    win.result_list.setCurrentRow(0)
+
+    assert not win.detail_btn.isHidden()
+    assert not win.copy_path_btn.isHidden()
+
+
+def test_double_click_result_opens_hit_page(qtbot, monkeypatch, tmp_path):
+    win = MainWindow(conn=_index(tmp_path), render_worker=StubRender(), do_index=False)
+    qtbot.addWidget(win)
+    opened = []
+    monkeypatch.setattr(win, "_open_at_page_bg", lambda path, page: opened.append((path, page)))
+
+    win.search_box.setText("\u6607\u817e")
+    win._do_search()
+    item = win.result_list.item(0)
+    widget = win.result_list.itemWidget(item)
+
+    widget.activated.emit()
+
+    assert opened == [(win._cur.path, 2)]
+
+
 def test_search_select_preview(qtbot, tmp_path):
     conn = _index(tmp_path)
     stub = StubRender()
