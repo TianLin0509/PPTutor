@@ -10,6 +10,7 @@ from PySide6.QtWidgets import QWidget
 
 import pptx_finder.ui.settings_dialog as settings_dialog_mod
 from pptx_finder.ui.settings_dialog import SettingsDialog
+from pptx_finder import config
 from pptx_finder.versioning.manager import VersionManager
 
 
@@ -30,6 +31,21 @@ def test_settings_builds_with_autostart_toggle(qtbot, mgr):
     assert "data_dir:" in dlg.diagnostic_text.toPlainText()
     assert "index:" in dlg.diagnostic_text.toPlainText()
     assert dlg.rescan_btn.isEnabled() is False
+
+
+def test_autostart_toggle_persists_preference(qtbot, mgr, monkeypatch, tmp_path):
+    monkeypatch.setenv("PPTX_FINDER_DATA_DIR", str(tmp_path / "cfg"))
+    calls = []
+    monkeypatch.setattr(settings_dialog_mod.autostart, "set_enabled", lambda on: calls.append(on) or True)
+
+    dlg = SettingsDialog(mgr)
+    qtbot.addWidget(dlg)
+    assert dlg.auto.isChecked() is True
+
+    dlg.auto.setChecked(False)
+
+    assert config.get_autostart() is False
+    assert calls == [False]
 
 
 def test_health_rescan_button_invokes_callback(qtbot, mgr):

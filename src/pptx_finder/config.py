@@ -7,6 +7,8 @@ import sys
 from pathlib import Path
 
 APP_NAME = "pptx-finder"
+DEFAULT_THEME = "cloud"
+DEFAULT_AUTOSTART = True
 
 
 def resource_path(*parts: str) -> Path:
@@ -114,13 +116,22 @@ def update_ui_settings(**changes) -> None:
         pass
 
 
-def get_theme(default: str = "cloud") -> str:
+def get_theme(default: str = DEFAULT_THEME) -> str:
     v = load_ui_settings().get("theme")
     return v if isinstance(v, str) and v else default
 
 
 def set_theme(name: str) -> None:
     update_ui_settings(theme=name)
+
+
+def get_autostart(default: bool = DEFAULT_AUTOSTART) -> bool:
+    v = load_ui_settings().get("autostart")
+    return v if isinstance(v, bool) else default
+
+
+def set_autostart(enabled: bool) -> None:
+    update_ui_settings(autostart=bool(enabled))
 
 
 def get_hotkey() -> str:

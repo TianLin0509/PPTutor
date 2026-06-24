@@ -71,7 +71,9 @@ from ..config import (
     cache_dir,
     data_dir,
     db_path,
+    get_autostart,
     get_hotkey,
+    set_autostart,
     set_hotkey,
 )
 from ..versioning import autostart
@@ -142,7 +144,7 @@ class SettingsDialog(QDialog):
 
         self.auto = QCheckBox("开机自动启动")
         self.auto.setToolTip("建议开启，这样关机后重新登录也能继续守护保存事件。")
-        self.auto.setChecked(autostart.is_enabled())
+        self.auto.setChecked(get_autostart())
         self.auto.toggled.connect(self._toggle_auto)
         lay.addWidget(self.auto)
 
@@ -248,6 +250,7 @@ class SettingsDialog(QDialog):
         return f"当前已在守护 {n} 个你改过的文件。"
 
     def _toggle_auto(self, on: bool) -> None:
+        set_autostart(on)
         autostart.set_enabled(on)
 
     def schedule_diagnostics_refresh(self, *, delay_ms: int = 0) -> None:
@@ -293,7 +296,7 @@ class SettingsDialog(QDialog):
             f"db_path: {db_path()}",
             f"cache_dir: {cache_dir()}",
             f"global_hotkey: {get_hotkey()}",
-            f"autostart: {'on' if autostart.is_enabled() else 'off'}",
+            f"autostart: preference={'on' if get_autostart() else 'off'} actual={'on' if autostart.is_enabled() else 'off'}",
             f"PPTX_FINDER_ROOTS: {os.environ.get('PPTX_FINDER_ROOTS', '') or '(auto fixed drives)'}",
             f"PPTX_FINDER_DATA_DIR: {os.environ.get('PPTX_FINDER_DATA_DIR', '') or '(default)'}",
             f"exclude_dirs: {len(EXCLUDE_DIR_NAMES)} rules",

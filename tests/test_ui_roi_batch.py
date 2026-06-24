@@ -197,12 +197,17 @@ def test_theme_is_light_flag():
 def test_hotkey_persist_and_merge_preserves_theme(monkeypatch, tmp_path):
     monkeypatch.setenv("PPTX_FINDER_DATA_DIR", str(tmp_path / "cfg"))
     assert config.get_hotkey() == config.GLOBAL_HOTKEY  # 默认值
+    assert config.get_theme() == "cloud"
+    assert config.get_autostart() is True
     config.set_theme("ocean")
     config.set_hotkey("Ctrl+Alt+J")
+    config.set_autostart(False)
     assert config.get_hotkey() == "Ctrl+Alt+J"
     assert config.get_theme() == "ocean"   # 合并写：设热键没清掉主题（修复旧整体覆写 bug）
+    assert config.get_autostart() is False
     config.set_theme("magma")
     assert config.get_hotkey() == "Ctrl+Alt+J"  # 设主题也没清掉热键
+    assert config.get_autostart() is False
 
 
 def test_set_hotkey_status_label(qtbot, tmp_path):

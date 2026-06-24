@@ -3,6 +3,7 @@ from __future__ import annotations
 from PySide6.QtWidgets import QWidget
 
 from pptx_finder import app as app_mod
+from pptx_finder import config
 
 
 def test_closed_version_window_not_kept_before_reopen(qtbot):
@@ -84,3 +85,25 @@ def test_settings_dialog_from_app_receives_rescan_callback(qtbot):
     assert created[0].parent is owner
     assert created[0].on_rescan is rescan
     assert created[0].exec_called is True
+
+
+def test_sync_autostart_preference_enables_default(monkeypatch, tmp_path):
+    monkeypatch.setenv("PPTX_FINDER_DATA_DIR", str(tmp_path / "cfg"))
+    calls = []
+    monkeypatch.setattr(app_mod.autostart, "is_enabled", lambda: False)
+    monkeypatch.setattr(app_mod.autostart, "set_enabled", lambda on: calls.append(on) or True)
+
+    assert config.get_autostart() is True
+    assert app_mod._sync_autostart_preference() is True
+    assert calls == [True]
+
+
+def test_sync_autostart_preference_respects_user_disabled(monkeypatch, tmp_path):
+    monkeypatch.setenv("PPTX_FINDER_DATA_DIR", str(tmp_path / "cfg"))
+    config.set_autostart(False)
+    calls = []
+    monkeypatch.setattr(app_mod.autostart, "is_enabled", lambda: True)
+    monkeypatch.setattr(app_mod.autostart, "set_enabled", lambda on: calls.append(on) or True)
+
+    assert app_mod._sync_autostart_preference() is True
+    assert calls == [False]

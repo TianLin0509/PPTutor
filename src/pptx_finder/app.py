@@ -21,14 +21,26 @@ except Exception:  # noqa: BLE001
     def _qt_is_valid(_obj) -> bool:
         return True
 
-from .config import get_hotkey
+from .config import get_autostart, get_hotkey
 from .ui.main_window import MainWindow
 from .ui.version_bridge import VersionBridge
+from .versioning import autostart
 from .versioning.manager import VersionManager
 
 WM_HOTKEY = 0x0312
 _MODS = {"CTRL": 0x0002, "CONTROL": 0x0002, "ALT": 0x0001, "SHIFT": 0x0004, "WIN": 0x0008}
 HOTKEY_ID = 1
+
+
+def _sync_autostart_preference() -> bool:
+    desired = get_autostart()
+    try:
+        if autostart.is_enabled() == desired:
+            return True
+        return autostart.set_enabled(desired)
+    except Exception:  # noqa: BLE001
+        logging.getLogger(__name__).warning("failed to sync autostart preference", exc_info=True)
+        return False
 
 
 def _parse_hotkey(spec: str) -> tuple[int, int | None]:
@@ -224,6 +236,7 @@ def main() -> int:
 
     win = MainWindow(do_index=True)
     win._to_tray_on_close = True
+    _sync_autostart_preference()
 
     # 版本管理：后台守护（保存即自动版本 / 离线补记 / 监听），不阻塞启动
     # 留版事件经 VersionBridge 跨线程信号送回 UI 主线程（更新盾牌 / 首次告知）
