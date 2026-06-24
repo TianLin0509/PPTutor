@@ -153,14 +153,33 @@ def scale(files: list[FileStat]) -> ScaleStat:
 
 @dataclass
 class PersonaStat:
-    """⑥ 人格称号：主称号 + 副标签。"""
+    """⑥ 人格称号：主称号 + 副标签 + 作息×产出 矩阵定位。"""
 
     title: str
     badges: list[str]
+    rhythm: str = ""   # 作息维度：夜猫子 / 周末战士 / 正常作息
+    output: str = ""   # 产出维度：囤积型 / 字海型 / 高产型 / 精修型
+    role: str = ""     # (作息×产出) 派生的角色定位
+
+
+# (作息, 产出) → 角色定位；未列中的组合用默认「全能型选手」
+_ROLE = {
+    ("夜猫子", "高产型"): "夜间作战参谋",
+    ("夜猫子", "字海型"): "深夜笔杆子",
+    ("夜猫子", "囤积型"): "午夜仓库管理员",
+    ("夜猫子", "精修型"): "挑灯夜战的工匠",
+    ("周末战士", "高产型"): "周末加班发动机",
+    ("周末战士", "囤积型"): "周末囤货狂",
+    ("周末战士", "精修型"): "周末细节控",
+    ("正常作息", "高产型"): "高效流水线",
+    ("正常作息", "字海型"): "正经码字机",
+    ("正常作息", "囤积型"): "稳健仓鼠",
+    ("正常作息", "精修型"): "细节控匠人",
+}
 
 
 def persona(night: NightOwlStat, drama: VersionDramaStat, sc: ScaleStat) -> PersonaStat:
-    """按派生指标阈值贴标签；命中里第一个作主称号，其余作副标签。"""
+    """按阈值贴标签（首个为主称号，其余副标签）；并给「作息×产出」矩阵定位 + 角色。"""
     avg_chars = sc.total_chars / sc.deck_count if sc.deck_count else 0
     candidates = [
         ("深夜画师", night.night_ratio >= 0.3),
@@ -172,9 +191,26 @@ def persona(night: NightOwlStat, drama: VersionDramaStat, sc: ScaleStat) -> Pers
         ("极简主义者", sc.deck_count > 0 and avg_chars < 200),
     ]
     hits = [name for name, ok in candidates if ok]
-    if hits:
-        return PersonaStat(title=hits[0], badges=hits[1:])
-    return PersonaStat(title="佛系做图人", badges=[])
+    title = hits[0] if hits else "佛系做图人"
+    badges = hits[1:] if hits else []
+    # 作息维度（夜 > 周末 > 正常）
+    if night.night_ratio >= 0.3:
+        rhythm = "夜猫子"
+    elif night.weekend_ratio >= 0.3:
+        rhythm = "周末战士"
+    else:
+        rhythm = "正常作息"
+    # 产出维度（囤积 > 字海 > 高产 > 精修）
+    if sc.deck_count >= 200:
+        output = "囤积型"
+    elif avg_chars >= 800:
+        output = "字海型"
+    elif sc.deck_count >= 50:
+        output = "高产型"
+    else:
+        output = "精修型"
+    role = _ROLE.get((rhythm, output), "全能型选手")
+    return PersonaStat(title=title, badges=badges, rhythm=rhythm, output=output, role=role)
 
 
 @dataclass

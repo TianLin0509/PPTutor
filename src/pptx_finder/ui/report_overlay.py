@@ -8,9 +8,10 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QEasingCurve, Qt, QVariantAnimation
 from PySide6.QtWidgets import (
-    QFileDialog, QFrame, QHBoxLayout, QLabel, QMessageBox, QPushButton, QScrollArea, QVBoxLayout, QWidget,
+    QApplication, QFileDialog, QFrame, QHBoxLayout, QLabel, QMessageBox, QPushButton,
+    QScrollArea, QVBoxLayout, QWidget,
 )
 try:
     from shiboken6 import isValid as _qt_is_valid
@@ -77,6 +78,101 @@ def _build_report_off_ui(conn, *, year=None):
     return stats.build_report(conn, year=year)
 
 
+# ---------- 固定暗黑胶片质感（不跟随 app 主题，保证报告/导出图始终高级一致） ----------
+FILM = {
+    "win": "#16131f", "card0": "#1d1a2a", "card1": "#15121e",
+    "bd": "rgba(255,255,255,0.09)",
+    "ink1": "#f4f1ea", "ink2": "#d7d2e0", "ink3": "#9a94a8", "ink4": "#7a7488",
+    "field": "#241f33", "canvas": "rgba(255,255,255,0.035)",
+    "acc": "#ff8c42", "accd": "#ff6b6b", "acctext": "#1a1320",
+    "hl_r": "255", "hl_g": "140", "hl_b": "66",
+    "roast": "#ff9f6b",
+}
+
+
+# ---------- 嘴替吐槽文案（纯函数，按阈值切档，可测） ----------
+
+def roast_night(ratio: float) -> str:
+    if ratio >= 0.45:
+        return "这哪是上班，这是修仙 —— 也给自己存一版「睡觉.pptx」吧"
+    if ratio >= 0.30:
+        return "深夜的灵感是真的，黑眼圈也是真的"
+    if ratio >= 0.10:
+        return "偶尔修仙，作息基本健康"
+    return "作息良好得有点可疑 —— 是不是偷偷换了小号肝？"
+
+
+def roast_curse(ratio: float) -> str:
+    if ratio >= 0.30:
+        return "「最终版」是你说过最大的谎 —— 后面还有 final、final2、真的final"
+    if ratio >= 0.10:
+        return "命名诚信度告急，建议成立「终版打假办公室」"
+    return "命名克制，难得的清流"
+
+
+def roast_weekend(count: int) -> str:
+    if count >= 500:
+        return "周末？那是用来加班的第六、第七个工作日"
+    if count >= 100:
+        return "周末偶尔也放不下鼠标"
+    return "周末基本能放过自己，给你点个赞"
+
+
+def roast_zombie(days: int) -> str:
+    if days >= 1000:
+        return f"吃灰 {days} 天，建议入土为安"
+    if days >= 365:
+        return f"沉睡 {days} 天，再不打开它要长蘑菇了"
+    return ""
+
+
+class RollNumber(QLabel):
+    """大数字滚动累加揭晓（0 → 终值，easeOutCubic）。fmt: 'int' / 'comma' / 'gb'。"""
+
+    def __init__(self, value: float, *, fmt: str = "comma", suffix: str = "",
+                 dur: int = 1100, parent=None):
+        super().__init__(parent)
+        self._value = float(value)
+        self._fmt = fmt
+        self._suffix = suffix
+        self._anim = QVariantAnimation(self)
+        self._anim.setStartValue(0.0)
+        self._anim.setEndValue(self._value)
+        self._anim.setDuration(dur)
+        self._anim.setEasingCurve(QEasingCurve.OutCubic)
+        self._anim.valueChanged.connect(lambda v: self._render(float(v)))
+        self._render(0.0)
+
+    def _text(self, v: float) -> str:
+        if self._fmt == "gb":
+            s = f"{v:.1f}"
+        elif self._fmt == "wan":
+            s = f"{v / 10000:.0f}万" if v >= 10000 else f"{int(round(v)):,}"
+        elif self._fmt == "comma":
+            s = f"{int(round(v)):,}"
+        else:
+            s = f"{int(round(v))}"
+        return s + self._suffix
+
+    def _render(self, v: float) -> None:
+        self.setText(self._text(v))
+
+    def start(self) -> None:
+        from .spotlight import animations_enabled
+        if not animations_enabled():
+            self.finish()
+            return
+        self._anim.start()
+
+    def finish(self) -> None:
+        """停动画、直接显示终值（导出前调用，避免抓到滚动中途的数字）。"""
+        try:
+            self._anim.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        self._render(self._value)
+
+
 # ---------- 浮层 ----------
 
 class ReportOverlay(QWidget):
@@ -84,7 +180,9 @@ class ReportOverlay(QWidget):
 
     def __init__(self, report, tok, parent=None, *, conn=None):
         super().__init__(parent)
+        tok = FILM  # 固定暗黑胶片质感，忽略传入主题（报告自成一套，导出图也始终高级一致）
         self._tok = tok
+        self._rolls: list[RollNumber] = []
         self._conn = conn
         self._closing_owner = parent
         self.current_report = report
@@ -107,7 +205,9 @@ class ReportOverlay(QWidget):
         self._card.setObjectName("repCard")
         self._card.setFixedWidth(480)
         self._card.setStyleSheet(
-            f"#repCard{{background:{tok['win']};border:1px solid {tok['bd']};border-radius:16px;}}")
+            "#repCard{background:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
+            f"stop:0 {tok['card0']},stop:1 {tok['card1']});"
+            f"border:1px solid {tok['bd']};border-radius:18px;}}")
         self._card_lay = QVBoxLayout(self._card)
         self._card_lay.setContentsMargins(24, 20, 24, 24)
         self._card_lay.setSpacing(13)
@@ -180,6 +280,15 @@ class ReportOverlay(QWidget):
                 b.clicked.connect(lambda _=False, y=yr: self.switch_year(y))
                 head.addWidget(b)
 
+        self.copy_btn = QPushButton("复制")
+        self.copy_btn.setToolTip("复制报告图片到剪贴板，可直接粘贴到微信 / 钉钉")
+        self.copy_btn.setCursor(Qt.PointingHandCursor)
+        self.copy_btn.setStyleSheet(
+            f"QPushButton{{background:{tok['field']};color:{tok['ink2']};border:1px solid {tok['bd']};"
+            f"border-radius:7px;padding:5px 11px;font-weight:600;}}"
+            f"QPushButton:hover{{border-color:{tok['acc']};color:{tok['acc']};}}")
+        self.copy_btn.clicked.connect(self._copy_clicked)
+        head.addWidget(self.copy_btn)
         self.export_btn = QPushButton("导出图片")
         self.export_btn.setStyleSheet(
             f"QPushButton{{background:{tok['acc']};color:{tok['acctext']};border:none;"
@@ -212,6 +321,7 @@ class ReportOverlay(QWidget):
             self._report_ready_for_export = False
             self._set_year_buttons_enabled(False)
             self.export_btn.setEnabled(False)
+            self.copy_btn.setEnabled(False)
             self._show_loading(year)
             task = BackgroundTask(
                 lambda year=year: _build_report_off_ui(self._conn, year=year),
@@ -267,6 +377,7 @@ class ReportOverlay(QWidget):
         if self._switch_inflight == (token, year):
             self._switch_inflight = None
         self._set_year_buttons_enabled(True)
+        self.copy_btn.setEnabled(True)
         if report is None:
             self._show_switch_error(year)
             return
@@ -297,64 +408,184 @@ class ReportOverlay(QWidget):
             it = self._content_lay.takeAt(0)
             if it.widget():
                 it.widget().deleteLater()
+        self._rolls = []
         report = self.current_report
-        tok = self._tok
-
-        scope = f"{self.current_year} 年" if self.current_year else "全部历史"
         if self._conn is not None:
             self._all_btn.setChecked(self.current_year is None)
             self._year_btn.setChecked(self.current_year is not None)
 
-        sc = report.scale
-        overview = QLabel(
-            f"{scope}　·　{report.deck_count} 份胶片　·　{sc.total_chars:,} 字　·　{human_bytes(sc.total_bytes)}")
-        overview.setStyleSheet(f"color:{tok['ink3']};background:transparent;border:none;font-size:12.5px;")
-        self._content_lay.addWidget(overview)
+        self._content_lay.addWidget(self._hero(report))
+        self._content_lay.addWidget(self._persona_hero(report.persona))   # 称号前置：最该被晒的一张
+        self._content_lay.addWidget(self._liver_card(report))
+        self._content_lay.addWidget(self._drama_card(report.drama))
+        self._content_lay.addWidget(self._scale_card(report.scale))
 
-        # 🔥 肝度（含热力图）
+        self._card.adjustSize()
+        for r in self._rolls:
+            r.start()
+
+    # ---- 卡片构建（暗黑胶片质感） ----
+    def _stat_box(self, value_widget, label: str) -> QFrame:
+        tok = self._tok
+        box = QFrame()
+        box.setStyleSheet(f"background:{tok['canvas']};border:1px solid {tok['bd']};border-radius:13px;")
+        bl = QVBoxLayout(box)
+        bl.setContentsMargins(13, 11, 13, 11)
+        bl.setSpacing(2)
+        value_widget.setStyleSheet(
+            f"color:{tok['ink1']};background:transparent;border:none;"
+            "font-size:22px;font-weight:800;font-family:'Consolas','SF Mono';")
+        bl.addWidget(value_widget)
+        cap = QLabel(label)
+        cap.setStyleSheet(f"color:{tok['ink3']};background:transparent;border:none;font-size:11px;")
+        bl.addWidget(cap)
+        return box
+
+    def _hero(self, report) -> QFrame:
+        tok = self._tok
+        sc = report.scale
+        scope = f"{self.current_year} 年" if self.current_year else "全部历史"
+        f = QFrame()
+        f.setStyleSheet("background:transparent;border:none;")
+        v = QVBoxLayout(f)
+        v.setContentsMargins(2, 2, 2, 0)
+        v.setSpacing(8)
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        n_decks = RollNumber(report.deck_count, fmt="comma")
+        n_chars = RollNumber(sc.total_chars, fmt="wan")
+        self._rolls.extend([n_decks, n_chars])
+        disk = QLabel(human_bytes(sc.total_bytes))   # 单位多变，用 human_bytes 静态显示
+        row.addWidget(self._stat_box(n_decks, "份胶片"))
+        row.addWidget(self._stat_box(n_chars, "累计码字"))
+        row.addWidget(self._stat_box(disk, "磁盘占用"))
+        v.addLayout(row)
+        head = QLabel(f"🎬 {scope} · 你和 {report.deck_count} 份胶片，一起肝了这一程")
+        head.setWordWrap(True)
+        head.setStyleSheet(f"color:{tok['ink3']};background:transparent;border:none;font-size:12px;")
+        v.addWidget(head)
+        return f
+
+    def _persona_hero(self, p) -> QFrame:
+        tok = self._tok
+        f = QFrame()
+        f.setStyleSheet(
+            "background:qlineargradient(x1:0,y1:0,x2:1,y2:1,"
+            "stop:0 rgba(255,140,66,0.16),stop:1 rgba(255,107,107,0.07));"
+            "border:1px solid rgba(255,140,66,0.32);border-radius:16px;")
+        v = QVBoxLayout(f)
+        v.setContentsMargins(17, 14, 17, 15)
+        v.setSpacing(3)
+        cap = QLabel("🏅 你的称号")
+        cap.setStyleSheet(
+            f"color:{tok['ink3']};background:transparent;border:none;font-size:11.5px;font-weight:700;")
+        v.addWidget(cap)
+        big = QLabel(p.title)
+        big.setStyleSheet(
+            f"color:{tok['acc']};background:transparent;border:none;font-size:26px;font-weight:800;")
+        v.addWidget(big)
+        if p.role:
+            role = QLabel(f"· {p.role} ·")
+            role.setStyleSheet(f"color:{tok['ink2']};background:transparent;border:none;font-size:13px;")
+            v.addWidget(role)
+        if p.rhythm and p.output:
+            mat = QLabel(f"作息 × 产出定位：<b style='color:{tok['ink2']}'>{p.rhythm} × {p.output}</b>")
+            mat.setTextFormat(Qt.RichText)
+            mat.setStyleSheet(f"color:{tok['ink3']};background:transparent;border:none;font-size:11.5px;")
+            v.addWidget(mat)
+        if p.badges:
+            chips = "　".join(f"#{b}" for b in p.badges)
+            badges = QLabel(chips)
+            badges.setStyleSheet(
+                f"color:{tok['acc']};background:transparent;border:none;font-size:11.5px;font-weight:700;")
+            v.addWidget(badges)
+        return f
+
+    def _roast_label(self, text: str) -> QLabel:
+        tok = self._tok
+        lab = QLabel(text)
+        lab.setWordWrap(True)
+        lab.setStyleSheet(
+            f"color:{tok['roast']};background:rgba(255,140,66,0.08);border:none;"
+            f"border-left:2px solid {tok['acc']};border-top-right-radius:7px;border-bottom-right-radius:7px;"
+            "padding:5px 10px;font-size:12px;")
+        return lab
+
+    def _liver_card(self, report) -> QFrame:
+        from .heatmap import peak_label
+        tok = self._tok
         n = report.night
         nlines = [
-            f"深夜胶片 <b>{n.night_count}</b> 份（{n.night_ratio:.0%}）　"
-            f"周末打工 <b>{n.weekend_count}</b> 次"
+            f"深夜胶片 <b>{n.night_count}</b> 份（{n.night_ratio:.0%}）　周末打工 <b>{n.weekend_count}</b> 次"
         ]
         if n.latest_name:
             nlines.append(f"最晚一次 <b>{hour_label(n.latest_hour)}</b> 改了《{n.latest_name}》")
-        liver = self._section("🔥 肝度", nlines)
-        liver.layout().addWidget(HeatmapWidget(
+        card = self._section("🔥 肝度", nlines)
+        lay = card.layout()
+        lay.addWidget(self._roast_label(
+            roast_night(n.night_ratio) + "　" + roast_weekend(n.weekend_count)))
+        hmw = HeatmapWidget(
             report.heatmap,
             accent=(int(tok["hl_r"]), int(tok["hl_g"]), int(tok["hl_b"])),
-            empty=tok["field"], ink=tok["ink3"]))
-        self._content_lay.addWidget(liver)
+            empty=tok["field"], ink=tok["ink3"])
+        lay.addWidget(hmw)
+        foot = QHBoxLayout()
+        if hmw.peak > 0 and hmw.peak_wd >= 0:
+            call = QLabel(
+                f"🕚 <b style='color:{tok['accd']}'>{peak_label(hmw.peak_wd, hmw.peak_hour)}</b> 是你的魔鬼时段")
+            call.setTextFormat(Qt.RichText)
+            call.setStyleSheet(f"color:{tok['roast']};background:transparent;border:none;font-size:11px;")
+            foot.addWidget(call, 1)
+        legend = QLabel(
+            "少 <span style='color:#ffd479'>■</span>"
+            "<span style='color:#ff8c42'>■</span><span style='color:#e8453c'>■</span> 多")
+        legend.setTextFormat(Qt.RichText)
+        legend.setStyleSheet(f"color:{tok['ink4']};background:transparent;border:none;font-size:10px;")
+        foot.addWidget(legend, 0)
+        lay.addLayout(foot)
+        return card
 
-        # 😅 改版名场面
-        d = report.drama
+    def _drama_card(self, d) -> QFrame:
         dlines = []
         if d.top_group_name:
             dlines.append(f"最能改奖：《{d.top_group_name}》存了 <b>{d.top_group_versions}</b> 版")
         dlines.append(
             f"终版诅咒：<b>{d.final_curse_count}</b> 份名带「最终/final/vN」（{d.final_curse_ratio:.0%}）")
         if d.zombie_name:
+            days = int((datetime.now().timestamp() - d.zombie_mtime) / 86400) if d.zombie_mtime else 0
             dlines.append(f"僵尸胶片：《{d.zombie_name}》吃灰最久")
-        self._content_lay.addWidget(self._section("😅 改版名场面", dlines))
+        else:
+            days = 0
+        card = self._section("😅 改版名场面", dlines)
+        lay = card.layout()
+        lay.addWidget(self._roast_label(roast_curse(d.final_curse_ratio)))
+        zr = roast_zombie(days)
+        if zr:
+            lay.addWidget(self._roast_label(zr))
+        return card
 
-        # 📊 规模仓鼠
+    def _scale_card(self, sc) -> QFrame:
         slines = []
         if sc.longest_name:
             slines.append(f"最长：《{sc.longest_name}》<b>{sc.longest_pages}</b> 页")
         slines.append(f"累计码字 {sc.total_chars:,} ≈ <b>{redmansion_equiv(sc.total_chars)}</b>")
         slines.append(f"磁盘占用 <b>{human_bytes(sc.total_bytes)}</b>")
-        self._content_lay.addWidget(self._section("📊 规模仓鼠", slines))
+        return self._section("📊 规模仓鼠", slines)
 
-        # 🏅 人格称号
-        p = report.persona
-        badge = "　·　".join(p.badges) if p.badges else "—"
-        plines = [
-            f"<span style='font-size:18px;font-weight:700;color:{tok['acc']};'>{p.title}</span>",
-            f"副标签：{badge}",
-        ]
-        self._content_lay.addWidget(self._section("🏅 你的称号", plines))
+    def _finish_rolls(self) -> None:
+        for r in getattr(self, "_rolls", []):
+            try:
+                r.finish()
+            except Exception:  # noqa: BLE001
+                pass
 
+    def _copy_clicked(self) -> None:
+        if not self._ui_alive() or self._switch_inflight is not None:
+            return   # 年度切换重算中：内容是 loading 占位，别抓到空卡
+        self._finish_rolls()
         self._card.adjustSize()
+        QApplication.clipboard().setPixmap(self._card.grab())
+        QMessageBox.information(self, "复制图片", "已复制报告图片，可粘贴到微信 / 钉钉")
 
     def _section(self, title: str, html_lines: list[str]) -> QFrame:
         tok = self._tok
@@ -387,6 +618,7 @@ class ReportOverlay(QWidget):
             return
         if not path.lower().endswith(".png"):
             path = f"{path}.png"
+        self._finish_rolls()
         self._card.adjustSize()
         image = self._card.grab().toImage()
         self._export_inflight = True
@@ -413,6 +645,7 @@ class ReportOverlay(QWidget):
         QMessageBox.information(self, "导出图片", "已导出图片" if ok else "导出失败")
 
     def export_png(self, path: str) -> bool:
+        self._finish_rolls()
         self._card.adjustSize()
         return bool(self._card.grab().save(path))
 
