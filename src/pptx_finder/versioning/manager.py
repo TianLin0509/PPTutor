@@ -471,6 +471,7 @@ class VersionManager:
                 "page_count": r["page_count"],
                 "changed": r["changed"],
                 "thumb_path": r["thumb_path"],
+                "session_id": (r["session_id"] if "session_id" in r.keys() else ""),
                 "inherited": r["doc_id"] != doc_id,
             }
             for r in rows

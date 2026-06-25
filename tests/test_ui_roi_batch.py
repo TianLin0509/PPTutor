@@ -84,6 +84,8 @@ def test_duplicate_copy_paths_are_summarized_on_single_result_card(qtbot, tmp_pa
     card = win.result_list.itemWidget(win.result_list.item(0))
     assert card._dup_badge is not None
     assert card._dup_badge.text() == "3 个路径"
+    assert card._dup_hint is not None
+    assert "另有 2 个完全相同副本" in card._dup_hint.text()
     assert "D:/backup/deck.pptx" in card.toolTip()
 
 

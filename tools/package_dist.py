@@ -19,7 +19,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from pptx_finder import __version__
 from pptx_finder.updater import MANIFEST_NAME, build_manifest
 
-DIST = ROOT / "dist" / "PPTutor"
+DIST = ROOT / "dist" / "PPT Doctor"
 LEAK_EXTS = {".pptx", ".ppt", ".db", ".db-wal", ".db-shm"}
 
 
@@ -37,17 +37,17 @@ def main() -> int:
         return 1
 
     # 刷新增量更新清单（随包发布，供自动更新比对）
-    m = build_manifest(DIST, __version__, f"PPTutor v{__version__}")
+    m = build_manifest(DIST, __version__, f"PPT Doctor v{__version__}")
     (DIST / MANIFEST_NAME).write_text(json.dumps(m, ensure_ascii=False, indent=0), encoding="utf-8")
 
-    out = ROOT / "dist" / f"PPTutor-v{__version__}.zip"
+    out = ROOT / "dist" / f"PPT-Doctor-v{__version__}.zip"
     if out.exists():
         out.unlink()
     n = 0
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
         for p in sorted(DIST.rglob("*")):
             if p.is_file():
-                z.write(p, str(Path("PPTutor") / p.relative_to(DIST)))
+                z.write(p, str(Path("PPT Doctor") / p.relative_to(DIST)))
                 n += 1
     mb = out.stat().st_size / 1024 / 1024
     print(f"[OK] 干净分发包: {out}")

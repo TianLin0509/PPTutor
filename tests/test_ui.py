@@ -416,6 +416,31 @@ def test_preview_request_uses_adaptive_first_paint_resolution(qtbot, tmp_path):
     assert render.calls[-1][3] < 2560
 
 
+def test_preview_uses_disk_cache_as_provisional_first_paint(qtbot, tmp_path, monkeypatch):
+    image = tmp_path / "cached.png"
+    pm = QPixmap(96, 54)
+    pm.fill(Qt.green)
+    assert pm.save(str(image))
+
+    conn = _index(tmp_path)
+    render = PendingRender()
+    win = MainWindow(conn=conn, render_worker=render, do_index=False)
+    qtbot.addWidget(win)
+    win._cur = _fake_results(1)[0]
+    win._view_page = 1
+    monkeypatch.setattr(
+        main_window_mod.renderer_mod,
+        "find_cached_render",
+        lambda path, page, min_long_edge=1, cache_key=None: image,
+    )
+
+    win._request_preview()
+
+    assert win._preview_provisional is True
+    assert win._cur_pixmap is not None and not win._cur_pixmap.isNull()
+    assert render.calls
+
+
 def test_neighbor_prefetch_is_low_priority_and_limited(qtbot, tmp_path):
     class PrefetchRender(QObject):
         rendered = Signal(int, str)

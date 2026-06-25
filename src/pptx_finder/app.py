@@ -306,6 +306,7 @@ def main() -> int:
 
     # 全局热键（可在设置里改；当前值持久化在 config.ui.json，默认 GLOBAL_HOTKEY）
     win._open_settings_cb = _open_settings          # 状态栏热键标签点击 → 打开设置
+    win._open_version_cb = lambda: _open_version_window(win, version_mgr)  # 搜索结果 → 版本历史（D3/D6）
     win._apply_hotkey = lambda spec: _apply_global_hotkey(app, win, spec)  # 设置页热重绑
     _apply_global_hotkey(app, win, get_hotkey())
 

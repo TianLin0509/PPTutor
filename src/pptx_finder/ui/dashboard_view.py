@@ -24,6 +24,7 @@ except Exception:  # noqa: BLE001
     def _qt_is_valid(_obj) -> bool:
         return True
 
+from ..health import human_bytes
 from .bg_task import BackgroundTask
 
 _log = logging.getLogger(__name__)
@@ -43,6 +44,35 @@ def _rgb_of(tok: dict) -> tuple[int, int, int]:
 
 def _ink(tok: dict, i: int) -> str:
     return tok.get(f"ink{i + 1}", ("#F0EEFC", "#C8C2E8", "#948CC0", "#6A6298")[i])
+
+
+def _health_color(score: int, tok: dict) -> str:
+    if score >= 85:
+        return tok.get("grn", "#34c759")
+    if score >= 60:
+        return "#ff9f0a"
+    return "#ff453a"
+
+
+def _scan_health_summary(conn) -> dict | None:
+    """后台顺带算一份库健康摘要（仅卡片所需字段）。失败返回 None，绝不打断仪表盘。"""
+    if conn is None:
+        return None
+    from .. import health as _health
+    try:
+        r = _health.scan_health(conn)
+        return {
+            "score": r.score,
+            "deck_count": r.deck_count,
+            "dup_groups": r.duplicate_groups_count,
+            "dup_redundant": r.duplicate_redundant,
+            "reclaimable": r.duplicate_reclaimable,
+            "zombie": r.zombie_count,
+            "parse_failed": r.parse_failed,
+        }
+    except Exception:  # noqa: BLE001
+        _log.warning("health scan failed in dashboard", exc_info=True)
+        return None
 
 
 def _conn_path(conn) -> str | None:
@@ -196,6 +226,7 @@ class DashboardView(QWidget):
         self._folders: list[tuple[str, int]] = []
         self._week: list[int] = [0] * 7
         self._recent: list[tuple[str, str, str]] = []
+        self._health: dict | None = None
         self._last_refresh_at = 0.0
         self._refresh_token = 0
         self._refresh_apply_token = 0
@@ -255,6 +286,9 @@ class DashboardView(QWidget):
             self._kpi_subs.append(sub)
             kpi.addWidget(card)
         root.addLayout(kpi)
+
+        # 库健康 banner（点击进体检中心）
+        root.addWidget(self._build_health_banner())
 
         # 2x2 图表网格
         grid = QGridLayout()
@@ -327,6 +361,62 @@ class DashboardView(QWidget):
         self._week_shield.setObjectName("dashSub")
         l.addWidget(self._week_shield)
         return w
+
+    def _build_health_banner(self) -> QFrame:
+        """库健康横条：一眼看见重复/僵尸/可回收，点击直达体检中心。"""
+        w = QFrame()
+        w.setObjectName("dashCard")
+        w.setCursor(Qt.PointingHandCursor)
+        w.mousePressEvent = lambda _e: self._open_health()  # 整条可点
+        w.setToolTip("点击打开库体检中心：重复回收 / 僵尸 / 终版诅咒 / 解析失败")
+        lay = QHBoxLayout(w)
+        lay.setContentsMargins(18, 12, 18, 12)
+        lay.setSpacing(12)
+        icon = QLabel("🩺")
+        icon.setStyleSheet("font-size:22px;background:transparent;")
+        lay.addWidget(icon)
+        col = QVBoxLayout()
+        col.setSpacing(1)
+        t = QLabel("库健康体检")
+        t.setObjectName("dashCardT")
+        col.addWidget(t)
+        self._health_status = QLabel("点击给整个库做次体检")
+        self._health_status.setObjectName("dashSub")
+        self._health_status.setWordWrap(True)
+        col.addWidget(self._health_status)
+        lay.addLayout(col, 1)
+        self._health_score = QLabel("")
+        self._health_score.setObjectName("kpiNum")
+        self._health_score.setToolTip("库健康分（0-100）")
+        lay.addWidget(self._health_score)
+        arrow = QLabel("›")
+        arrow.setObjectName("dashSub")
+        arrow.setStyleSheet("font-size:24px;font-weight:700;background:transparent;")
+        lay.addWidget(arrow)
+        return w
+
+    def _open_health(self) -> None:
+        fn = getattr(self._win, "_open_health_center", None)
+        if callable(fn):
+            fn()
+
+    def _render_health(self, h: dict | None) -> None:
+        if not h or not h.get("deck_count"):
+            self._health_status.setText("点击给整个库做次体检")
+            self._health_score.setText("")
+            return
+        score = int(h.get("score", 100))
+        self._health_score.setText(str(score))
+        self._health_score.setStyleSheet(
+            f"color:{_health_color(score, self._tok())}; font-weight:800; background:transparent;")
+        bits = []
+        if h.get("dup_redundant"):
+            bits.append(f"重复 {h.get('dup_groups', 0)} 组可回收 {human_bytes(h.get('reclaimable', 0))}")
+        if h.get("zombie"):
+            bits.append(f"僵尸 {h['zombie']}")
+        if h.get("parse_failed"):
+            bits.append(f"解析失败 {h['parse_failed']}")
+        self._health_status.setText("　·　".join(bits) if bits else "库很健康，没发现明显问题 ✅")
 
     # ---------- 数据 ----------
     def schedule_refresh(self, *, force: bool = False, delay_ms: int = 0) -> None:
@@ -493,10 +583,13 @@ class DashboardView(QWidget):
             except Exception:  # noqa: BLE001
                 _log.warning("recent_files failed in dashboard", exc_info=True)
 
+        health_summary = _scan_health_summary(conn)
+
         if own_conn and conn is not None:
             conn.close()
 
         return {
+            "health": health_summary,
             "kpi_vals": [
                 (f"{file_count:,}", "已索引文档", "全文可搜"),
                 (f"{guarded:,}" if guarded else "—", "版本快照", "PPT 版 git"),
@@ -519,6 +612,7 @@ class DashboardView(QWidget):
         self._week = list(payload.get("week") or [0] * 7)
         self._week_shield_text = str(payload.get("week_shield_text") or "")
         self._recent = list(payload.get("recent") or [])
+        self._health = payload.get("health")
 
     def _recompute(self) -> None:
         conn = self._conn()
@@ -652,6 +746,8 @@ class DashboardView(QWidget):
         if hasattr(self, "_week_shield"):
             self._week_shield.setText(getattr(self, "_week_shield_text", ""))
 
+        self._render_health(getattr(self, "_health", None))
+
         for ch in (getattr(self, "_donut", None), getattr(self, "_hbars", None),
                    getattr(self, "_spark", None)):
             if ch is not None:
@@ -672,6 +768,7 @@ class DashboardView(QWidget):
             if ch is not None:
                 ch.update()
         self._restyle()
+        self._render_health(getattr(self, "_health", None))
 
 
 def _rel_time(ts: float) -> str:

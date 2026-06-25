@@ -223,6 +223,7 @@ class ResultItem(QWidget):
         self._gid = ginfo.get("gid") if ginfo else None
         self._exp_btn = None  # 版本组展开器按钮（仅组主卡有），供就地切换文字 ▾/▴
         self._dup_badge = None
+        self._dup_hint = None
         is_member = bool(ginfo and ginfo.get("member"))
         vcount = int(ginfo.get("count", 0)) if ginfo else 0
         dup_paths = [p for p in (r.duplicate_paths or []) if p]
@@ -312,11 +313,20 @@ class ResultItem(QWidget):
         tm = _fmt_mtime(r.mtime)
         if tm:
             if len(dup_paths) > 1:
-                tm = f"{tm} · 同一文件存在于 {len(dup_paths)} 个路径"
+                tm = f"{tm} · 同一文件 · {len(dup_paths)} 个位置"
             t = QLabel(tm)
             t.setStyleSheet(f"font-size:11px;color:{tok['ink3']};background:transparent;")
             t.setToolTip("\n".join(dup_paths) if len(dup_paths) > 1 else "")
             lay.addWidget(t)
+        if len(dup_paths) > 1:
+            primary_path = dup_paths[0]
+            other_count = max(0, len(dup_paths) - 1)
+            hint = QLabel(f"当前打开：{_elide_middle(primary_path, 64)} · 另有 {other_count} 个完全相同副本")
+            hint.setObjectName("duplicatePathHint")
+            hint.setStyleSheet(f"font-size:10.5px;color:{tok['ink4']};background:transparent;")
+            hint.setToolTip("\n".join(dup_paths))
+            self._dup_hint = hint
+            lay.addWidget(hint)
         outer.addLayout(lay, 1)
         self._apply("normal", True)
 
@@ -399,7 +409,7 @@ class ResultItem(QWidget):
 
 class MainWindow(QMainWindow):
     _SEARCH_SLOW_HINT_MS = 1000
-    _AUTO_PREVIEW_DELAY_MS = 180
+    _AUTO_PREVIEW_DELAY_MS = 120
     _UI_LOOP_INTERVAL_MS = 250
     _UI_LOOP_SLOW_GAP_MS = 250
     _RECENT_CACHE_MS = 1000
@@ -488,6 +498,7 @@ class MainWindow(QMainWindow):
         self._startup_index_check_last_pages = 0
         self._startup_index_check_decision = "pending"
         self._startup_index_check_error = ""
+        self._index_rebuild_reason = ""
         self._version_shield_token = 0
         self._version_shield_inflight_token: int | None = None
         self._suppress_select_preview = False
@@ -515,6 +526,8 @@ class MainWindow(QMainWindow):
         self._group_primary_item: dict[int, QListWidgetItem] = {}   # group_id -> 组主卡列表项
         self._group_member_items: dict[int, list] = {}       # group_id -> 已插入的成员列表项（折叠时移除）
         self._open_settings_cb = None                        # app.py 注入：状态栏热键标签点击 → 打开设置（#2）
+        self._open_version_cb = None                         # app.py 注入：搜索结果 → 版本历史窗口（D6）
+        self._history_hint_query = ""                        # 跨版本搜命中提示对应的 query（D3）
 
         self._render = render_worker or RenderWorker(self)
         self._render.rendered.connect(self._on_rendered)
@@ -533,6 +546,7 @@ class MainWindow(QMainWindow):
             self._thumb.start()  # 娴嬭瘯 do_index=False 涓嶈捣鐪熸覆鏌撶嚎绋?
         self._thumb_cache: dict[tuple[str, int], QPixmap] = {}
         self._thumb_items: dict[tuple[str, int], ResultItem] = {}
+        self._thumb_requested_priority: dict[tuple[str, int], int] = {}
         self._version_mgr = version_mgr  # 鐗堟湰绠＄悊锛坅pp.py 娉ㄥ叆锛岃鎯呴潰鏉跨敤锛涘彲 None锛?
         self._facet_filters: dict[str, set] = {}  # 褰撳墠 facet 绛涢€夛紙08锛?
 
@@ -678,6 +692,7 @@ class MainWindow(QMainWindow):
             f"last_ms={self._startup_index_check_last_ms:.0f} "
             f"files={self._startup_index_check_last_files} "
             f"pages={self._startup_index_check_last_pages} "
+            f"rebuild={self._index_rebuild_reason or '-'} "
             f"error={self._startup_index_check_error or '-'}"
         )
         if self._version_mgr is not None and hasattr(self._version_mgr, "diagnostic_lines"):
@@ -798,6 +813,14 @@ class MainWindow(QMainWindow):
         self.result_list.customContextMenuRequested.connect(self._context_menu)
         self.result_list.verticalScrollBar().valueChanged.connect(self._schedule_visible_thumbs)
         ll.addWidget(self.result_list, 1)
+        self._history_hint = QLabel("")
+        self._history_hint.setObjectName("listHead")
+        self._history_hint.setCursor(Qt.PointingHandCursor)
+        self._history_hint.setWordWrap(True)
+        self._history_hint.setContentsMargins(12, 2, 12, 6)
+        self._history_hint.hide()
+        self._history_hint.mousePressEvent = lambda _e: self._open_history_hint()
+        ll.addWidget(self._history_hint)
         self._build_empty_hint(ll)
         # 鍒楄〃鍖虹敤 QStackedWidget 鍖呫€岀粨鏋滃垪琛?left銆嶄笌銆屼华琛ㄧ洏棣栧睆銆嶄簩閫変竴鍒囨崲锛?
         # left锛堝惈 result_list 鍙婂叏閮ㄤ俊鍙风粦瀹氾級鍘熸牱淇濈暀锛屼粎澶氫竴灞?stack 瀹瑰櫒銆?
@@ -1398,6 +1421,7 @@ class MainWindow(QMainWindow):
             self.list_head.show()
             self._select_first(delayed_preview=True)
             self._animate_list_in()
+            self._kick_history_search(query)
         else:
             self.list_head.hide()
             self._cur = None
@@ -1407,6 +1431,8 @@ class MainWindow(QMainWindow):
             self._update_preview_header(None)
             self._set_ops_enabled(False)
             self._show_empty_hint(query)
+            if hasattr(self, "_history_hint"):
+                self._history_hint.hide()
 
     def _animate_list_in(self) -> None:
         """结果出现时列表轻量淡入（#10 calm UI 功能性微动效）。动画结束即移除 effect，
@@ -1587,6 +1613,11 @@ class MainWindow(QMainWindow):
         self._diagnose_btn.setToolTip("查看索引库、扫描范围、数据目录和 PowerPoint 状态")
         self._diagnose_btn.clicked.connect(self._open_health_diagnostics)
         v.addWidget(self._diagnose_btn, 0, Qt.AlignCenter)
+        self._health_center_btn = QPushButton("🩺 给整个库做次体检")
+        self._health_center_btn.setObjectName("suggBtn")
+        self._health_center_btn.setToolTip("扫描重复 / 僵尸冷文件 / 终版诅咒 / 解析失败，并一键回收重复占用")
+        self._health_center_btn.clicked.connect(self._open_health_center)
+        v.addWidget(self._health_center_btn, 0, Qt.AlignCenter)
         self.empty_hint.hide()
         parent_layout.addWidget(self.empty_hint, 1)
 
@@ -1850,6 +1881,105 @@ class MainWindow(QMainWindow):
         dlg.raise_()
         dlg.activateWindow()
 
+    def _open_health_center(self) -> None:
+        """打开「库体检中心」：扫描重复 / 僵尸 / 诅咒 / 解析失败 + 一键回收重复占用。"""
+        from .. import health
+        from .health_window import HealthWindow
+
+        wins = getattr(self, "_health_windows", None)
+        if wins is None:
+            wins = []
+            self._health_windows = wins
+        for w in list(wins):
+            try:
+                if getattr(w, "_closing", False) or not w.isVisible():
+                    wins.remove(w)
+                    continue
+                w.refresh()
+                w.raise_()
+                w.activateWindow()
+                return
+            except RuntimeError:
+                if w in wins:
+                    wins.remove(w)
+
+        db_path = self._db_path
+
+        def _scan():
+            conn = db.connect(db_path)
+            try:
+                return health.scan_health(conn)
+            finally:
+                conn.close()
+
+        win = HealthWindow(self._tok, _scan, health.recycle_paths, self)
+        wins.append(win)
+        win.destroyed.connect(
+            lambda _=None, w=win: wins.remove(w) if w in wins else None)
+        win.show()
+        win.raise_()
+        win.activateWindow()
+
+    def _open_version_window_for(self, *, path: str | None = None, query: str | None = None):
+        """打开版本管理窗口，并按需定位到某文件 / 直接跨版本搜某词（D3 / D6）。"""
+        if self._version_mgr is None:
+            return
+        cb = getattr(self, "_open_version_cb", None)
+        if not callable(cb):
+            return
+        try:
+            win = cb()
+        except Exception:  # noqa: BLE001
+            return
+        if win is None:
+            return
+        if query:
+            fn = getattr(win, "search_history", None)
+            if callable(fn):
+                fn(query)
+        elif path:
+            fn = getattr(win, "focus_doc", None)
+            if callable(fn):
+                fn(path)
+
+    def _kick_history_search(self, query: str) -> None:
+        """主搜完成后顺带跨版本搜历史；命中则在结果区下方显「历史版本另有 N 处」提示（D3）。"""
+        if not hasattr(self, "_history_hint"):
+            return
+        self._history_hint.hide()
+        self._history_hint_query = ""
+        vm = self._version_mgr
+        q = (query or "").strip()
+        if vm is None or len(q) < 2 or not hasattr(vm, "search_history_details"):
+            return
+        seq = self._search_seq
+        task = BackgroundTask(lambda: vm.search_history_details(q, limit=200), "history-hint-search")
+        self._bg_tasks.append(task)
+        task.done.connect(lambda result, q=q, seq=seq: self._on_history_hint(seq, q, result))
+        task.finished.connect(
+            lambda task=task: self._bg_tasks.remove(task) if task in self._bg_tasks else None)
+        task.start()
+
+    def _on_history_hint(self, seq: int, query: str, result: object) -> None:
+        if self._closing or seq != self._search_seq:
+            return
+        if query != self.search_box.text().strip():
+            return
+        total = int(result.get("total", 0)) if isinstance(result, dict) else 0
+        if total <= 0:
+            self._history_hint.hide()
+            self._history_hint_query = ""
+            return
+        self._history_hint_query = query
+        self._history_hint.setText(
+            f"\U0001F4DC 历史版本里另有 {total} 处命中「{query}」 · 点击在版本管理中查看 →")
+        self._history_hint.show()
+
+    def _open_history_hint(self) -> None:
+        q = self._history_hint_query
+        if q:
+            self._open_version_window_for(query=q)
+
     def _request_full_rescan(self) -> bool:
         """鍋ュ悍璇婃柇閲岀殑涓€閿噸鎵叆鍙ｏ細鍙彂璧峰悗鍙扮储寮曪紝涓嶉樆濉炶缃璇濇銆?"""
         return self._start_indexing(None, None)
@@ -1900,6 +2030,7 @@ class MainWindow(QMainWindow):
         self.result_list.clear()
         self._thumb.clear()        # 涓㈠純涓婁竴鎵规湭娓插畬鐨勭缉鐣ュ浘璇锋眰
         self._thumb_items.clear()
+        self._thumb_requested_priority.clear()
         # 版本组折叠状态随每次重渲染复位（新搜索/排序/筛选/换肤都回折叠态）；展开是就地插入，不走这里
         self._group_primary_item = {}
         self._group_member_items = {}
@@ -1909,6 +2040,7 @@ class MainWindow(QMainWindow):
         hlcss = theme.highlight_css(self._theme)
         plan = self._build_render_plan(results)
         n = self._flush_plan(plan, 0, self._RENDER_FIRST, hlcss)  # 棣栧睆绔嬪嵆閾?
+        self._schedule_visible_thumbs()
         if n < len(plan):
             self._stream_plan_rest(plan, n, hlcss, self._render_gen)
 
@@ -2107,6 +2239,11 @@ class MainWindow(QMainWindow):
         return self._PRIORITY_TOP_THUMB_BASE + max(0, min(int(idx), self._THUMB_FIRST - 1))
 
     def _request_thumb_worker(self, path: str, page: int, *, priority: int) -> None:
+        key = (path, page)
+        old_priority = self._thumb_requested_priority.get(key)
+        if old_priority is not None:
+            return
+        self._thumb_requested_priority[key] = int(priority)
         try:
             self._thumb.request(path, page, priority=int(priority))
         except TypeError:
@@ -2162,6 +2299,7 @@ class MainWindow(QMainWindow):
         if self._closing:
             return
         key = (path, page)
+        self._thumb_requested_priority.pop(key, None)
         if key not in self._thumb_items:
             return
         w = self._thumb_items.pop(key, None)
@@ -2877,6 +3015,31 @@ class MainWindow(QMainWindow):
         self._cur_pixmap = None
         self._preview_provisional = False
 
+    def _show_cached_preview_placeholder(self, path: str, page: int) -> bool:
+        """Show any cached image immediately while the sharp preview renders."""
+        thumb = self._thumb_cache.get((path, page))
+        if thumb is not None and not thumb.isNull():
+            self._cur_pixmap = thumb
+            self._preview_provisional = True
+            self._stop_spinner()
+            self._update_pixmap()
+            return True
+        cached = None
+        try:
+            cached = renderer_mod.find_cached_render(path, page, min_long_edge=1)
+        except Exception:  # noqa: BLE001
+            cached = None
+        if cached is None or not os.path.exists(str(cached)):
+            return False
+        pm = QPixmap(str(cached))
+        if pm.isNull():
+            return False
+        self._cur_pixmap = pm
+        self._preview_provisional = True
+        self._stop_spinner()
+        self._update_pixmap()
+        return True
+
     def _request_preview(self) -> None:
         if not self._cur:
             return
@@ -2907,12 +3070,7 @@ class MainWindow(QMainWindow):
             b.setChecked(i < n and hits[i].page_no == page)
         # 娓愯繘寮忛瑙堬細璇ラ〉缂╃暐鍥惧凡缂撳瓨灏辩珛鍗虫斁澶ф樉绀轰綔鍗犱綅锛堢鍑哄唴瀹广€侀伄浣忔覆鏌撶瓑寰咃級锛岄珮娓呮覆鏌?
         # 濂藉悗鍦?_on_rendered 鏃犵紳鏇挎崲銆傚懡涓〉閫氬父宸叉湁缂╃暐鍥撅紙缁撴灉鍗＄墖宸︿晶閭ｅ紶灏辨槸瀹冿級銆?
-        thumb = self._thumb_cache.get((self._cur.path, page))
-        if thumb is not None and not thumb.isNull():
-            self._cur_pixmap = thumb
-            self._preview_provisional = True
-            self._update_pixmap()
-        else:
+        if not self._show_cached_preview_placeholder(self._cur.path, page):
             self._preview_provisional = False
             self._start_spinner()
         self._req_id += 1
@@ -3345,6 +3503,9 @@ class MainWindow(QMainWindow):
                                r.path, r.hits[0].page_no if r.hits else 1)))
         menu.addAction("打开所在文件夹", lambda _checked=False, r=r, gen=render_gen:
                        self._run_context_menu_action(gen, lambda: self._open_folder_path(r.path)))
+        if self._version_mgr is not None:
+            menu.addAction("📜 在版本管理中查看版本历史", lambda _checked=False, r=r:
+                           self._open_version_window_for(path=r.path))
         menu.addSeparator()
         menu.addAction("复制完整路径", lambda _checked=False, r=r, gen=render_gen:
                        self._run_context_menu_action(
@@ -3657,12 +3818,13 @@ class MainWindow(QMainWindow):
             page_count = int(stats.get("page_count", 0))
         except (TypeError, ValueError):
             page_count = 0
+        self._index_rebuild_reason = str(stats.get("index_rebuild_reason") or "")
         self._startup_index_check_last_files = file_count
         self._startup_index_check_last_pages = page_count
         if not isinstance(payload, dict):
             self._startup_index_check_error = "stats_unavailable"
         if file_count <= 0:
-            self._startup_index_check_decision = "start_scan"
+            self._startup_index_check_decision = "start_scan_rebuild" if self._index_rebuild_reason else "start_scan"
             self._start_indexing(roots, workers)
             return
         self._startup_index_check_decision = "use_existing"
@@ -3749,7 +3911,10 @@ class MainWindow(QMainWindow):
         self.index_bar.setRange(0, 0)
         self.index_bar.show()
         self.status_dot.hide()
-        self.status_label.setText(f"开始索引：{', '.join(roots)}")
+        if self._index_rebuild_reason:
+            self.status_label.setText("正在升级索引：需要重新整理一次，期间可边扫边搜")
+        else:
+            self.status_label.setText(f"开始索引：{', '.join(roots)}")
         self._indexer.start()
         return True
 
@@ -3780,7 +3945,8 @@ class MainWindow(QMainWindow):
             self.index_bar.setRange(0, 0)  # busy锛氳繘搴︽潯鏉ュ洖娴佸姩锛堟壂鎻忥紝鎬绘暟鏈煡锛?
             self.pct_label.setText("")
             if not preserve_search_status:
-                self.status_label.setText(f"扫描磁盘中…　{cur}（可边扫边搜）")
+                prefix = "升级索引中" if self._index_rebuild_reason else "扫描磁盘中"
+                self.status_label.setText(f"{prefix}…　{cur}（可边扫边搜）")
         else:
             self.index_bar.setRange(0, max(1, total))
             self.index_bar.setValue(done)
@@ -3794,6 +3960,13 @@ class MainWindow(QMainWindow):
         self._index_search_ready = True
         self._index_last_summary = dict(summary or {})
         self._index_status_cache = None
+        if self._index_rebuild_reason:
+            try:
+                db.delete_meta(self._conn, db.META_INDEX_REBUILD_REASON)
+                self._conn.commit()
+            except Exception:  # noqa: BLE001
+                pass
+            self._index_rebuild_reason = ""
         self.index_bar.hide()
         self.pct_label.setText("")
         celebrate = not getattr(self, "_index_celebrated", False)
@@ -3806,10 +3979,14 @@ class MainWindow(QMainWindow):
         if conn_path:
             own = db.connect(conn_path)
             try:
-                return dict(db.stats(own))
+                stats = dict(db.stats(own))
+                stats["index_rebuild_reason"] = db.meta_value(own, db.META_INDEX_REBUILD_REASON)
+                return stats
             finally:
                 own.close()
-        return dict(db.stats(self._conn))
+        stats = dict(db.stats(self._conn))
+        stats["index_rebuild_reason"] = db.meta_value(self._conn, db.META_INDEX_REBUILD_REASON)
+        return stats
 
     def _refresh_status(self, summary: dict | None = None, *, celebrate: bool = False) -> None:
         payload_summary = dict(summary or {}) if summary else None

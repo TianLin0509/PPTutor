@@ -76,6 +76,7 @@ class VersionWindow(QWidget):
         self._reload_docs_after_file_op = False
         self._pending_versions_after_file_op: tuple[int, str, object] | None = None
         self._closing = False
+        self.setObjectName("versionWin")
         self.setWindowTitle("版本管理 · PPT 版 git")
         self.resize(940, 580)
 
@@ -147,7 +148,18 @@ class VersionWindow(QWidget):
         root.addWidget(split, 1)
 
         self._update_file_ops_state()
+        self._apply_glass()
         self.schedule_reload_docs()
+
+    def _apply_glass(self) -> None:
+        """玻璃质感：给独立窗口套当前主题的纯色窗底（默认透明底在深色主题下显得「挫」）。"""
+        try:
+            from ..config import get_theme
+            from . import theme as _th
+            t = _th.tok(get_theme())
+            self.setStyleSheet(f"QWidget#versionWin {{ background: {t['win']}; }}")
+        except Exception:  # noqa: BLE001 样式失败不影响功能
+            pass
 
     def _ui_alive(self) -> bool:
         if self._closing or not _qt_is_valid(self):
@@ -460,24 +472,64 @@ class VersionWindow(QWidget):
             self._clear_version_preview("暂无版本记录")
             self._update_file_ops_state()
             return
+        # 按会话聚类（同 session_id 连续聚为一组；无 session_id 退化为按天），每组加分组头
+        groups: list[tuple[str, list]] = []
         for v in rows:
-            changed = str(_vget(v, "changed", "") or "").strip()
-            label = f"{_fmt_ts(_vget(v, 'ts', 0))}　·　{_vget(v, 'page_count', 0)} 页"
-            if changed:
-                label = f"{label}\n  ✎ {changed}"
-            it = QListWidgetItem(label)
-            doc_path = None
-            if isinstance(self._cur_doc, tuple) and self._cur_doc[0] == doc_id:
-                doc_path = self._cur_doc[1]
-            it.setData(Qt.UserRole, {
-                "version_id": _vget(v, "version_id", ""),
-                "doc_path": doc_path,
-                "changed": changed,
-                "thumb_path": _vget(v, "thumb_path", ""),
-            })
-            self.ver_list.addItem(it)
+            key = self._session_key(v)
+            if groups and groups[-1][0] == key:
+                groups[-1][1].append(v)
+            else:
+                groups.append((key, [v]))
+        for _key, vs in groups:
+            header = self._session_label(vs)
+            for j, v in enumerate(vs):
+                # 会话头作为该组首个版本项的前缀行：既呈现分组，又保持「每版一项、row 0 是版本」
+                self.ver_list.addItem(self._make_version_item(v, doc_id, header if j == 0 else ""))
         self.ver_list.setCurrentRow(0)
         self._update_file_ops_state()
+
+    def _session_key(self, v) -> str:
+        sid = str(_vget(v, "session_id", "") or "").strip()
+        if sid:
+            return "s:" + sid
+        ts = _vget(v, "ts", 0)
+        try:
+            return "d:" + datetime.datetime.fromtimestamp(float(ts or 0)).strftime("%Y-%m-%d")
+        except (OSError, OverflowError, ValueError):
+            return "d:?"
+
+    def _session_label(self, vs: list) -> str:
+        """会话分组头：日期 + 时间跨度 + 版本数（vs 为新→旧）。"""
+        n = len(vs)
+        try:
+            d_new = datetime.datetime.fromtimestamp(float(_vget(vs[0], "ts", 0) or 0))
+            d_old = datetime.datetime.fromtimestamp(float(_vget(vs[-1], "ts", 0) or 0))
+        except (OSError, OverflowError, ValueError):
+            return f"🗂 {n} 版"
+        if d_new.date() != d_old.date():
+            return f"🗂 {d_old.strftime('%m月%d日')} – {d_new.strftime('%m月%d日')}　·　{n} 版"
+        if n > 1:
+            return (f"🗂 {d_new.strftime('%m月%d日')}　"
+                    f"{d_old.strftime('%H:%M')}–{d_new.strftime('%H:%M')}　·　{n} 版")
+        return f"🗂 {d_new.strftime('%m月%d日 %H:%M')}　·　{n} 版"
+
+    def _make_version_item(self, v, doc_id: str, header: str = "") -> QListWidgetItem:
+        changed = str(_vget(v, "changed", "") or "").strip()
+        body = f"{_fmt_ts(_vget(v, 'ts', 0))}　·　{_vget(v, 'page_count', 0)} 页"
+        if changed:
+            body = f"{body}\n  ✎ {changed}"
+        label = f"{header}\n{body}" if header else body
+        it = QListWidgetItem(label)
+        doc_path = None
+        if isinstance(self._cur_doc, tuple) and self._cur_doc[0] == doc_id:
+            doc_path = self._cur_doc[1]
+        it.setData(Qt.UserRole, {
+            "version_id": _vget(v, "version_id", ""),
+            "doc_path": doc_path,
+            "changed": changed,
+            "thumb_path": _vget(v, "thumb_path", ""),
+        })
+        return it
 
     def _sel_version(self) -> str | None:
         ctx = self._sel_version_context()
@@ -631,6 +683,39 @@ class VersionWindow(QWidget):
             getattr(callback, "__self__", None) is self
             and getattr(callback, "__name__", "") == "schedule_reload_docs"
         )
+
+    def focus_doc(self, path: str) -> None:
+        """外部跳转：选中匹配该路径的受管文档（列表若还在后台加载则稍后重试一次）。"""
+        if not path:
+            return
+        target = os.path.abspath(str(path))
+
+        def _try() -> bool:
+            for i in range(self.doc_list.count()):
+                it = self.doc_list.item(i)
+                data = it.data(Qt.UserRole)
+                if isinstance(data, tuple) and len(data) >= 2 and data[1]:
+                    try:
+                        if os.path.abspath(str(data[1])) == target:
+                            self.doc_list.setCurrentRow(i)
+                            return True
+                    except (OSError, ValueError):
+                        pass
+            return False
+
+        if not _try():
+            QTimer.singleShot(450, _try)   # 文档列表可能还在后台加载
+        self.raise_()
+        self.activateWindow()
+
+    def search_history(self, query: str) -> None:
+        """外部跳转：在跨版本搜框里直接搜某词。"""
+        if not query:
+            return
+        self.search.setText(str(query))
+        self._do_search()
+        self.raise_()
+        self.activateWindow()
 
     def _do_search(self) -> None:
         if not self._ui_alive():

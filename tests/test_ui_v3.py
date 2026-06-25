@@ -208,6 +208,18 @@ def test_index_progress_three_states(qtbot, tmp_path):
     assert win.pct_label.text() == ""
 
 
+def test_index_rebuild_progress_explains_upgrade(qtbot, tmp_path):
+    conn = _mk(tmp_path)
+    win = MainWindow(conn=conn, render_worker=_Stub(), do_index=False)
+    qtbot.addWidget(win)
+    win._index_rebuild_reason = "index_version:4->5"
+
+    win._on_index_progress(0, -1, "已发现 100 个文件")
+
+    assert "升级索引中" in win.status_label.text()
+    assert "可边扫边搜" in win.status_label.text()
+
+
 def test_index_progress_ui_updates_are_throttled(qtbot, monkeypatch, tmp_path):
     monkeypatch.setattr(MainWindow, "_INDEX_PROGRESS_UI_MS", 100, raising=False)
     now = [100.0]

@@ -1,6 +1,6 @@
 """pptx-finder：本地 PPTX 内容搜索与预览助手。"""
 
-__version__ = "0.9.3"
+__version__ = "0.9.4"
 
 
 def main() -> int:

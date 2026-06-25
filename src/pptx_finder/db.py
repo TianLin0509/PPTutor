@@ -17,6 +17,7 @@ log = logging.getLogger(__name__)
 # 也兼作"强制重建"开关：v0.7.0 首启重扫会冻结 UI，多数人的库停在残缺态（部分文件 +
 # 已盖 v2 标记 → 不会自动重扫）；2→3 让修复版（重扫已不冻结）自动重建这些残缺库。
 INDEX_VERSION = "5"
+META_INDEX_REBUILD_REASON = "last_index_rebuild_reason"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS files(
@@ -111,11 +112,31 @@ def _migrate_index_version(conn: sqlite3.Connection) -> None:
         for t in ("files", "file_names_fts", "pages_fts", "pages_raw", "minhash"):
             conn.execute(f"DELETE FROM {t}")
         log.info("索引格式 %s→%s：已清空旧索引，将全量重建", stored, INDEX_VERSION)
+        set_meta(conn, META_INDEX_REBUILD_REASON, f"index_version:{stored or 'none'}->{INDEX_VERSION}")
+    else:
+        delete_meta(conn, META_INDEX_REBUILD_REASON)
     conn.execute(
         "INSERT INTO meta(key,value) VALUES('index_version',?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         (INDEX_VERSION,),
     )
+
+
+def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute(
+        "INSERT INTO meta(key,value) VALUES(?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, value),
+    )
+
+
+def meta_value(conn: sqlite3.Connection, key: str, default: str = "") -> str:
+    row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    return str(row["value"]) if row and row["value"] is not None else default
+
+
+def delete_meta(conn: sqlite3.Connection, key: str) -> None:
+    conn.execute("DELETE FROM meta WHERE key=?", (key,))
 
 
 def get_file_by_path(conn: sqlite3.Connection, path: str) -> sqlite3.Row | None:

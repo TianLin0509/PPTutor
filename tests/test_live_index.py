@@ -131,6 +131,40 @@ def test_startup_empty_index_check_runs_in_background(qtbot, monkeypatch, tmp_pa
     assert "files=0" in lines
 
 
+def test_startup_empty_index_with_rebuild_reason_is_explained(qtbot, monkeypatch, tmp_path):
+    tasks = _install_fake_background_task(monkeypatch)
+    starts = []
+
+    monkeypatch.setattr(main_window_mod, "LiveIndexer", _FakeLiveIndexer)
+    monkeypatch.setattr(
+        MainWindow,
+        "_start_indexing",
+        lambda self, roots, workers: starts.append((roots, workers)) or True,
+    )
+
+    conn = db.connect(tmp_path / "blank-upgrade.db")
+    db.init_db(conn)
+    db.set_meta(conn, db.META_INDEX_REBUILD_REASON, "index_version:4->5")
+    conn.commit()
+    win = MainWindow(
+        conn=conn,
+        render_worker=StubRender(),
+        thumb_worker=StubThumb(),
+        do_index=True,
+        roots=["C:/docs"],
+        workers=2,
+    )
+    qtbot.addWidget(win)
+    startup_task = next(t for t in tasks if t.label == "startup-index-check")
+
+    _finish_fake_task(startup_task)
+
+    assert starts == [(["C:/docs"], 2)]
+    lines = "\n".join(win.diagnostic_lines())
+    assert "decision=start_scan_rebuild" in lines
+    assert "rebuild=index_version:4->5" in lines
+
+
 def test_startup_existing_index_check_updates_status_without_scan(qtbot, monkeypatch, tmp_path):
     tasks = _install_fake_background_task(monkeypatch)
     starts = []

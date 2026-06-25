@@ -137,8 +137,16 @@ class SettingsDialog(QDialog):
         self._diag_extra_lines: list[str] = []
         self._powerpoint_inflight = False
         self._closing = False
+        self.setObjectName("settingsWin")
         self.setWindowTitle("设置 · PPT Doctor")
         self.resize(620, 430)
+        try:
+            from ..config import get_theme
+            from . import theme as _th
+            _t = _th.tok(get_theme())
+            self.setStyleSheet(f"QWidget#settingsWin {{ background: {_t['win']}; }}")
+        except Exception:  # noqa: BLE001 样式失败不影响功能
+            pass
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(18, 16, 18, 16)
