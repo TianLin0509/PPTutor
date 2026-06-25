@@ -16,6 +16,8 @@ from . import store, vault
 SESSION_GAP_SEC = 30 * 60
 KEEP_PER_DOC = 50
 _DIFF_SAMPLE_LIMIT = 6
+_DEFAULT_RECONCILE_INTERVAL_SEC = 300.0
+_DEFAULT_RECONCILE_BATCH_DOCS = 200
 
 
 def _now() -> float:
@@ -28,6 +30,20 @@ def _sid(ts: float) -> str:
 
 def _is_pptx(path: str) -> bool:
     return os.path.splitext(path)[1].lower() == PPTX_EXT
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
 
 
 def _token_set(text: str) -> set[str]:
@@ -117,6 +133,21 @@ class VersionManager:
         self._lock = threading.RLock()
         self._watcher = None
         self._on_snapshot = on_snapshot
+        self._reconcile_stop = threading.Event()
+        self._reconcile_thread: threading.Thread | None = None
+        self._reconcile_interval_sec = max(
+            0.0,
+            _env_float("PPTUTOR_VERSION_RECONCILE_SEC", _DEFAULT_RECONCILE_INTERVAL_SEC),
+        )
+        self._reconcile_batch_docs = max(
+            1,
+            _env_int("PPTUTOR_VERSION_RECONCILE_BATCH_DOCS", _DEFAULT_RECONCILE_BATCH_DOCS),
+        )
+        self._reconcile_cycles = 0
+        self._reconcile_snapshots = 0
+        self._reconcile_last_checked = 0
+        self._reconcile_last_ms = 0.0
+        self._reconcile_last_error = ""
 
     # ---------- Snapshot identity ----------
     def snapshot_now(self, path: str, notify: bool = True) -> str | None:
@@ -248,6 +279,49 @@ class VersionManager:
             if p.suffix.lower() == PPTX_EXT and self.snapshot_now(str(p)):
                 n += 1
         return n
+
+    def reconcile_known_docs(self, *, limit: int | None = None, notify: bool = True) -> int:
+        """Catch up managed files when filesystem watcher misses a save event.
+
+        This intentionally checks only already-managed docs. It first compares
+        the file mtime with the latest known version timestamp, so unchanged
+        decks do not get re-hashed.
+        """
+        max_docs = self._reconcile_batch_docs if limit is None else max(1, int(limit))
+        with self._lock:
+            docs = list(store.list_docs(self._conn))[:max_docs]
+        checked = 0
+        created = 0
+        start = datetime.datetime.now().timestamp()
+        try:
+            for doc in docs:
+                path = str(doc["path"] or "")
+                if not path or not _is_pptx(path):
+                    continue
+                if not os.path.exists(path):
+                    continue
+                checked += 1
+                with self._lock:
+                    latest = self._effective_latest_version_on_conn(self._conn, doc["doc_id"])
+                try:
+                    mtime = os.path.getmtime(path)
+                except OSError:
+                    continue
+                if latest is not None and mtime <= float(latest["ts"] or 0) + 0.5:
+                    continue
+                if self.snapshot_now(path, notify=notify):
+                    created += 1
+            return created
+        except Exception as exc:  # noqa: BLE001
+            self._reconcile_last_error = f"{type(exc).__name__}: {exc}"
+            logging.getLogger(__name__).warning("version reconcile failed", exc_info=True)
+            return created
+        finally:
+            elapsed = (datetime.datetime.now().timestamp() - start) * 1000.0
+            self._reconcile_cycles += 1
+            self._reconcile_snapshots += created
+            self._reconcile_last_checked = checked
+            self._reconcile_last_ms = elapsed
 
     # ---------- Queries ----------
     def list_docs(self):
@@ -512,6 +586,7 @@ class VersionManager:
     def start(self) -> None:
         self.scan_deleted()
         self._start_watcher()
+        self._start_reconcile_loop()
 
     def _start_watcher(self) -> None:
         self._stop_watcher()
@@ -519,10 +594,47 @@ class VersionManager:
         self._watcher = VaultWatcher(default_watch_paths(), self.snapshot_now, self.move_path)
         self._watcher.start()
 
+    def _start_reconcile_loop(self) -> None:
+        self._stop_reconcile_loop()
+        if self._reconcile_interval_sec <= 0:
+            return
+        self._reconcile_stop.clear()
+        self._reconcile_thread = threading.Thread(
+            target=self._reconcile_loop,
+            name="PPTutorVersionReconcile",
+            daemon=True,
+        )
+        self._reconcile_thread.start()
+
+    def _reconcile_loop(self) -> None:
+        while not self._reconcile_stop.wait(self._reconcile_interval_sec):
+            self.reconcile_known_docs()
+
+    def _stop_reconcile_loop(self) -> None:
+        self._reconcile_stop.set()
+        thread = self._reconcile_thread
+        self._reconcile_thread = None
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2)
+
     def _stop_watcher(self) -> None:
         if self._watcher is not None:
             self._watcher.stop()
             self._watcher = None
 
     def stop(self) -> None:
+        self._stop_reconcile_loop()
         self._stop_watcher()
+
+    def diagnostic_lines(self) -> list[str]:
+        alive = self._reconcile_thread is not None and self._reconcile_thread.is_alive()
+        return [
+            "version_reconcile: "
+            f"enabled={self._reconcile_interval_sec > 0} "
+            f"alive={alive} interval={self._reconcile_interval_sec:.0f}s "
+            f"batch={self._reconcile_batch_docs} cycles={self._reconcile_cycles} "
+            f"snapshots={self._reconcile_snapshots} "
+            f"last_checked={self._reconcile_last_checked} "
+            f"last_ms={self._reconcile_last_ms:.0f} "
+            f"error={self._reconcile_last_error or '-'}"
+        ]

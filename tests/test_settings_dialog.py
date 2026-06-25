@@ -29,8 +29,35 @@ def test_settings_builds_with_autostart_toggle(qtbot, mgr):
     assert "守护" in dlg.stat.text()       # 显示已守护文件数
     assert dlg.tabs.count() == 3
     assert "data_dir:" in dlg.diagnostic_text.toPlainText()
+    assert "diagnostic_summary:" in dlg.diagnostic_text.toPlainText()
     assert "index:" in dlg.diagnostic_text.toPlainText()
     assert dlg.rescan_btn.isEnabled() is False
+
+
+def test_diagnostic_summary_reports_no_obvious_issue():
+    lines = settings_dialog_mod._diagnostic_summary_lines([
+        "ui_loop: samples=4 last_gap=10 ms max_gap=20 ms slow_gaps=0",
+        "background_tasks: active=0 waiting=0 limit=4 total=1 failed=0 max_ms=2.0 p95_ms=2.0",
+        "renderer_ipc: enabled=True alive=False total=0 restarts=0 crashes=0 timeouts=0 last_ms=0.0 p95_ms=0.0",
+        "renderer_ipc_last_error: -",
+    ])
+
+    assert lines == ["diagnostic_summary: 未发现明显异常"]
+
+
+def test_diagnostic_summary_surfaces_stalls_and_renderer_errors():
+    lines = settings_dialog_mod._diagnostic_summary_lines([
+        "ui_loop: samples=4 last_gap=10 ms max_gap=900 ms slow_gaps=1",
+        "background_tasks: active=4 waiting=3 limit=4 total=8 failed=1 max_ms=2000.0 p95_ms=1000.0",
+        "renderer_ipc: enabled=True alive=True total=5 restarts=2 crashes=1 timeouts=1 last_ms=0.0 p95_ms=0.0",
+        "renderer_ipc_last_error: timeout after 75s",
+    ])
+
+    text = "\n".join(lines)
+    assert "发现" in text
+    assert "UI 主线程出现卡顿" in text
+    assert "后台任务正在排队" in text
+    assert "渲染子进程异常" in text
 
 
 def test_autostart_toggle_persists_preference(qtbot, mgr, monkeypatch, tmp_path):

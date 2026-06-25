@@ -34,3 +34,37 @@ def test_background_task_swallows_exception(qtbot):
     assert blocker.args == [None]          # 异常 → 结果 None，线程不崩
     task.wait(2000)
     assert "failed=" in "\n".join(bg_task.diagnostic_lines())
+
+
+def test_background_task_limits_concurrent_work(qtbot):
+    lock = threading.Lock()
+    release = threading.Event()
+    entered = 0
+    active = 0
+    max_active = 0
+
+    def fn():
+        nonlocal active, entered, max_active
+        with lock:
+            entered += 1
+            active += 1
+            max_active = max(max_active, active)
+        release.wait(timeout=3)
+        with lock:
+            active -= 1
+        return "ok"
+
+    limit = bg_task._MAX_CONCURRENT
+    tasks = [BackgroundTask(fn, label=f"limit-{i}") for i in range(limit + 3)]
+    for task in tasks:
+        task.start()
+
+    qtbot.waitUntil(lambda: entered >= limit, timeout=3000)
+    with lock:
+        assert max_active <= limit
+        assert entered == limit
+    assert "waiting=" in "\n".join(bg_task.diagnostic_lines())
+
+    release.set()
+    for task in tasks:
+        assert task.wait(5000)

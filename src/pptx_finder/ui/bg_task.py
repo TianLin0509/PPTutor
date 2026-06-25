@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from collections import deque
@@ -20,6 +21,12 @@ _samples: deque[float] = deque(maxlen=128)
 _total = 0
 _failed = 0
 _max_ms = 0.0
+try:
+    _MAX_CONCURRENT = max(1, int(os.environ.get("PPTUTOR_BG_TASKS", "4")))
+except ValueError:
+    _MAX_CONCURRENT = 4
+_gate = threading.BoundedSemaphore(_MAX_CONCURRENT)
+_waiting = 0
 
 
 def diagnostic_lines() -> list[str]:
@@ -29,8 +36,8 @@ def diagnostic_lines() -> list[str]:
         active_labels = [label or "task" for label, _start in _active.values()]
         return [
             "background_tasks: "
-            f"active={len(_active)} total={_total} failed={_failed} "
-            f"max_ms={_max_ms:.1f} p95_ms={p95:.1f}",
+            f"active={len(_active)} waiting={_waiting} limit={_MAX_CONCURRENT} "
+            f"total={_total} failed={_failed} max_ms={_max_ms:.1f} p95_ms={p95:.1f}",
             "background_active: " + (", ".join(active_labels[:8]) if active_labels else "-"),
         ]
 
@@ -48,11 +55,15 @@ class BackgroundTask(QThread):
         return self._label
 
     def run(self) -> None:
-        global _failed, _max_ms, _total
+        global _failed, _max_ms, _total, _waiting
         result = None
         ident = id(self)
+        with _diag_lock:
+            _waiting += 1
+        _gate.acquire()
         start = time.perf_counter()
         with _diag_lock:
+            _waiting -= 1
             _active[ident] = (self._label, start)
             _total += 1
         try:
@@ -67,4 +78,5 @@ class BackgroundTask(QThread):
                 _active.pop(ident, None)
                 _samples.append(elapsed)
                 _max_ms = max(_max_ms, elapsed)
+            _gate.release()
         self.done.emit(result)

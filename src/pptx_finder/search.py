@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import logging
+import re
 import sqlite3
 from collections import defaultdict
+from difflib import SequenceMatcher
 
 from . import cluster
 from .models import FileResult, SearchHit
@@ -16,6 +18,110 @@ W_REL = 0.60      # 内容相关度（bm25）
 W_RECENCY = 0.25  # 修改时间（越新越高）
 NAME_BONUS = 0.50  # 文件名命中加分
 MAX_HITS_PER_FILE = 10
+
+_EXT_RE = re.compile(r"\.(pptx?|potx?|ppsx?)$", re.IGNORECASE)
+_CAND_SPLIT_RE = re.compile(r"[^0-9A-Za-z\u4e00-\u9fff]+")
+_TEXT_CAND_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]{2,40}|[0-9A-Za-z]{3,40}|[\u4e00-\u9fff]{2,12}")
+
+
+def _stem_name(name: str) -> str:
+    return _EXT_RE.sub("", name or "").strip()
+
+
+def _candidate_parts(text: str) -> list[str]:
+    parts: list[str] = []
+    for p in _CAND_SPLIT_RE.split(text or ""):
+        p = p.strip()
+        if len(normalize(p)) >= 2:
+            parts.append(p)
+    return parts
+
+
+def _suggest_threshold(target_norm: str) -> float:
+    if target_norm.isascii():
+        return 0.72 if len(target_norm) <= 6 else 0.66
+    return 0.54 if len(target_norm) <= 4 else 0.50
+
+
+def _suggest_score(target_norm: str, cand_norm: str, weight: float) -> float:
+    if not target_norm or not cand_norm or target_norm == cand_norm:
+        return 0.0
+    ratio = SequenceMatcher(None, target_norm, cand_norm).ratio()
+    if target_norm in cand_norm or cand_norm in target_norm:
+        ratio += 0.18
+    # Very long candidates often look close only because they contain common words.
+    length_penalty = min(abs(len(cand_norm) - len(target_norm)) / max(len(target_norm), 1), 1.4) * 0.08
+    return ratio + weight - length_penalty
+
+
+def suggest_queries(
+    conn: sqlite3.Connection,
+    query: str,
+    *,
+    limit: int = 3,
+    max_files: int = 1200,
+    max_pages: int = 1200,
+) -> list[str]:
+    """Return lightweight zero-result query suggestions.
+
+    This is intentionally bounded and only called after a search misses. It uses
+    filenames first, then a small recent-page text sample, so normal typing never
+    pays this cost.
+    """
+    terms, phrases = parse_query(query)
+    pieces = [p.strip() for p in (phrases + terms) if p.strip()]
+    if not pieces:
+        return []
+    target = max(pieces, key=lambda p: len(normalize(p)))
+    target_norm = normalize(target).strip()
+    if len(target_norm) < 2 or (target_norm.isascii() and len(target_norm) < 3):
+        return []
+
+    best: dict[str, tuple[float, str]] = {}
+
+    def add_candidate(value: str, *, weight: float) -> None:
+        value = value.strip()
+        cand_norm = normalize(value).strip()
+        if len(cand_norm) < 2 or cand_norm == target_norm:
+            return
+        score = _suggest_score(target_norm, cand_norm, weight)
+        if score < _suggest_threshold(target_norm):
+            return
+        prev = best.get(cand_norm)
+        if prev is None or score > prev[0]:
+            best[cand_norm] = (score, value)
+
+    for row in conn.execute(
+        "SELECT name FROM files ORDER BY mtime DESC LIMIT ?",
+        (int(max_files),),
+    ):
+        stem = _stem_name(row["name"])
+        add_candidate(stem, weight=0.12)
+        for part in _candidate_parts(stem):
+            add_candidate(part, weight=0.06)
+
+    # Content terms help when the filename is generic ("template.pptx") but the
+    # user mistyped an in-slide term. The LIMIT keeps this a fallback, not a scan.
+    for row in conn.execute(
+        "SELECT raw_text FROM pages_raw WHERE raw_text IS NOT NULL AND raw_text<>'' "
+        "ORDER BY file_id DESC, page_no LIMIT ?",
+        (int(max_pages),),
+    ):
+        raw = row["raw_text"] or ""
+        for m in _TEXT_CAND_RE.finditer(raw):
+            add_candidate(m.group(0), weight=0.0)
+
+    suggestions: list[str] = []
+    seen: set[str] = set()
+    for _score, value in sorted(best.values(), key=lambda x: x[0], reverse=True):
+        suggested = query.replace(target, value, 1) if target in query else value
+        norm = normalize(suggested).strip()
+        if norm and norm not in seen and norm != normalize(query).strip():
+            seen.add(norm)
+            suggestions.append(suggested)
+        if len(suggestions) >= limit:
+            break
+    return suggestions
 
 
 def _snippet(conn: sqlite3.Connection, file_id: int, page_no: int,

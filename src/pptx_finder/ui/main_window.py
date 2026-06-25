@@ -506,6 +506,9 @@ class MainWindow(QMainWindow):
         self._empty_status_token = 0
         self._empty_status_inflight_token: int | None = None
         self._empty_status_inflight_mode: str | None = None
+        self._empty_suggest_token = 0
+        self._empty_suggest_inflight_token: int | None = None
+        self._empty_query_suggestion = ""
         self._startup_index_token = 0
         self._version_shield_token = 0
         self._version_shield_inflight_token: int | None = None
@@ -691,6 +694,11 @@ class MainWindow(QMainWindow):
                 f"error={summary.get('error', '') or '-'}")
         elif self._live_deferred_paths:
             lines.append(f"index_deferred_live: {len(self._live_deferred_paths)}")
+        if self._version_mgr is not None and hasattr(self._version_mgr, "diagnostic_lines"):
+            try:
+                lines.extend(self._version_mgr.diagnostic_lines())
+            except Exception as exc:  # noqa: BLE001
+                lines.append(f"version_reconcile: diagnostic_error={type(exc).__name__}")
         if hasattr(renderer_mod, "diagnostic_lines"):
             lines.extend(renderer_mod.diagnostic_lines())
         return lines
@@ -1563,6 +1571,7 @@ class MainWindow(QMainWindow):
         v.addWidget(self._empty_index_status)
         self._sugg_btns: dict[str, QPushButton] = {}
         for key, text in (
+            ("query", "搜这个试试"),
             ("unquote", "去掉引号再搜"),
             ("fewer", "只用第一个词"),
             ("allmode", "恢复全部范围"),
@@ -1695,7 +1704,9 @@ class MainWindow(QMainWindow):
         sugg = suggestion_keys(query, self._mode_key())
         for key, btn in self._sugg_btns.items():
             btn.setVisible(key in sugg)
+        self._sugg_btns["query"].hide()
         self.empty_hint.show()
+        self._set_empty_query_suggestion_async(query)
 
     def _show_start_hint(self) -> None:
         """鏃犳渶杩戞枃浠讹紙鍒氳 / 杩樺湪绱㈠紩锛夋椂鐨勮捣姝ュ紩瀵硷紝澶嶇敤 emptyHint 瀹瑰櫒锛堥殣钘忓缓璁寜閽級銆?"""
@@ -1704,6 +1715,9 @@ class MainWindow(QMainWindow):
         self._empty_query_label.setText("\u8fd8\u5728\u6574\u7406\u4f60\u7684 PPT...")
         self._empty_tip.setText("索引好后这里会列出最近文件；现在就能在上方搜索框直接搜你写过的字")
         self._set_empty_index_status_async()
+        self._empty_suggest_token += 1
+        self._empty_suggest_inflight_token = None
+        self._empty_query_suggestion = ""
         for btn in self._sugg_btns.values():
             btn.hide()
         self.empty_hint.show()
@@ -1714,13 +1728,19 @@ class MainWindow(QMainWindow):
                 self._empty_status_token += 1
                 self._empty_status_inflight_token = None
                 self._empty_status_inflight_mode = None
+                self._empty_suggest_token += 1
+                self._empty_suggest_inflight_token = None
+                self._empty_query_suggestion = ""
             self.empty_hint.hide()
             self.result_list.show()
 
     def _apply_suggestion(self, key: str) -> None:
         q = self.search_box.text()
         search_started = False
-        if key == "unquote":
+        if key == "query":
+            if self._empty_query_suggestion:
+                self.search_box.setText(self._empty_query_suggestion)
+        elif key == "unquote":
             for ch in ('"', "\u201c", "\u201d"):
                 q = q.replace(ch, "")
             self.search_box.setText(q)
@@ -1738,6 +1758,67 @@ class MainWindow(QMainWindow):
             search_started = self.mode.currentIndex() != old_index
         if not search_started:
             self._do_search()
+
+    def _load_query_suggestions(self, conn_path: str | None, query: str) -> list[str]:
+        if conn_path:
+            conn = db.connect(conn_path)
+            try:
+                return search_mod.suggest_queries(conn, query, limit=1)
+            finally:
+                conn.close()
+        return search_mod.suggest_queries(self._conn, query, limit=1)
+
+    def _set_empty_query_suggestion_async(self, query: str) -> None:
+        self._empty_suggest_token += 1
+        token = self._empty_suggest_token
+        self._empty_suggest_inflight_token = token
+        self._empty_query_suggestion = ""
+        conn_path = _sqlite_file_path(self._conn)
+        if not conn_path:
+            try:
+                suggestions = self._load_query_suggestions(conn_path, query)
+            except Exception:  # noqa: BLE001
+                suggestions = []
+            self._on_empty_query_suggestion_loaded(token, query, suggestions)
+            return
+        task = BackgroundTask(
+            lambda conn_path=conn_path, query=query: self._load_query_suggestions(conn_path, query),
+            "empty-query-suggest",
+        )
+        self._bg_tasks.append(task)
+        task.done.connect(
+            lambda payload, token=token, query=query:
+                self._on_empty_query_suggestion_loaded(token, query, payload)
+        )
+        task.finished.connect(
+            lambda task=task, token=token: self._finish_empty_query_suggestion(task, token))
+        task.start()
+
+    def _finish_empty_query_suggestion(self, task, token: int) -> None:
+        if task in self._bg_tasks:
+            self._bg_tasks.remove(task)
+        if self._empty_suggest_inflight_token == token:
+            self._empty_suggest_inflight_token = None
+
+    def _on_empty_query_suggestion_loaded(self, token: int, query: str, payload: object) -> None:
+        if self._closing or token != self._empty_suggest_token:
+            return
+        if self.empty_hint.isHidden() or self.search_box.text() != query:
+            return
+        suggestions = payload if isinstance(payload, list) else []
+        if not suggestions:
+            self._sugg_btns["query"].hide()
+            return
+        suggestion = str(suggestions[0]).strip()
+        if not suggestion:
+            self._sugg_btns["query"].hide()
+            return
+        self._empty_query_suggestion = suggestion
+        btn = self._sugg_btns["query"]
+        shown = _elide_middle(suggestion, 18)
+        btn.setText(f"搜「{shown}」")
+        btn.setToolTip(f"把搜索词改成：{suggestion}")
+        btn.show()
 
     def _open_settings_from_button(self) -> None:
         cb = self._open_settings_cb

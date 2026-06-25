@@ -4,6 +4,9 @@
 """
 from __future__ import annotations
 
+import os
+import time
+
 import fixtures_gen as fx
 
 from pptx_finder.parser import parse_pptx
@@ -35,6 +38,30 @@ def test_catch_up_root_builds_versions(tmp_path):
     assert mgr.catch_up_root(str(docs)) == 2
     assert len(mgr.list_versions(str(docs / "a.pptx"))) == 1
     assert len(mgr.list_versions(str(docs / "b.pptx"))) == 1
+
+
+def test_reconcile_known_docs_catches_missed_save(tmp_path):
+    p = tmp_path / "a.pptx"
+    fx.make_pptx(p, [{"body": "v1"}])
+    mgr = VersionManager(store.connect(tmp_path / "reconcile-vault.db"))
+    assert mgr.snapshot_now(str(p))
+
+    fx.make_pptx(p, [{"body": "v2 watcher missed"}])
+    future = time.time() + 3
+    os.utime(p, (future, future))
+
+    assert mgr.reconcile_known_docs() == 1
+    assert len(mgr.list_versions(str(p))) == 2
+
+
+def test_reconcile_known_docs_skips_unchanged_file(tmp_path):
+    p = tmp_path / "a.pptx"
+    fx.make_pptx(p, [{"body": "v1"}])
+    mgr = VersionManager(store.connect(tmp_path / "reconcile-skip-vault.db"))
+    assert mgr.snapshot_now(str(p))
+
+    assert mgr.reconcile_known_docs() == 0
+    assert len(mgr.list_versions(str(p))) == 1
 
 
 def test_save_creates_version_and_skips_unchanged(tmp_path):

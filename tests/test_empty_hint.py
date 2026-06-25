@@ -6,6 +6,7 @@ from PySide6.QtCore import Qt
 from test_ui import StubRender, _finish_fake_task, _index, _install_fake_background_task
 
 import pptx_finder.ui.main_window as main_window_mod
+from pptx_finder import search
 from pptx_finder.ui.main_window import MainWindow, _empty_suggestions
 
 
@@ -24,6 +25,32 @@ def test_suggestions_switch_filename():
 
 def test_suggestions_single_plain_in_filename_mode_can_restore_all_scope():
     assert _empty_suggestions("xyz", "仅文件名") == ["allmode"]
+
+
+def test_query_suggestions_find_close_filename(tmp_path):
+    conn = _index(tmp_path)
+
+    suggestions = search.suggest_queries(conn, "算力方按", limit=2)
+
+    assert suggestions
+    assert "算力方案" in suggestions[0]
+
+
+def test_zero_result_query_suggestion_can_be_applied(qtbot, tmp_path):
+    conn = _index(tmp_path)
+    win = MainWindow(conn=conn, render_worker=StubRender(), do_index=False)
+    qtbot.addWidget(win)
+
+    win.search_box.setText("算力方按")
+    win._do_search()
+
+    qtbot.waitUntil(lambda: not win._sugg_btns["query"].isHidden(), timeout=2000)
+    assert "算力方案" in win._empty_query_suggestion
+
+    qtbot.mouseClick(win._sugg_btns["query"], Qt.LeftButton)
+
+    assert win.result_list.count() == 1
+    assert win.empty_hint.isHidden()
 
 
 def test_zero_result_shows_hint(qtbot, tmp_path):
@@ -128,10 +155,10 @@ def test_empty_hint_index_status_loads_in_background(qtbot, monkeypatch, tmp_pat
     win._do_search()
 
     assert calls == []
-    assert tasks and tasks[-1].label == "empty-index-status-refresh"
+    status_task = next(task for task in tasks if task.label == "empty-index-status-refresh")
     assert "读取中" in win._empty_index_status.text()
 
-    _finish_fake_task(tasks[-1])
+    _finish_fake_task(status_task)
 
     assert calls == ["stats"]
     assert "已索引 2 个文件 / 3 页" in win._empty_index_status.text()
@@ -154,7 +181,7 @@ def test_empty_hint_reuses_inflight_status_refresh(qtbot, monkeypatch, tmp_path)
 
     win.search_box.setText("绝对不存在的词xyz123")
     win._do_search()
-    first_task = tasks[-1]
+    first_task = next(task for task in tasks if task.label == "empty-index-status-refresh")
     win.search_box.setText("还是不存在的词abc456")
     win._do_search()
     win.search_box.setText("继续不存在的词def789")
@@ -184,7 +211,7 @@ def test_stale_empty_index_status_does_not_update_hidden_hint(qtbot, monkeypatch
 
     win.search_box.setText("绝对不存在的词xyz123")
     win._do_search()
-    status_task = tasks[-1]
+    status_task = next(task for task in tasks if task.label == "empty-index-status-refresh")
     win.search_box.setText("昇腾")
     win._do_search()
 

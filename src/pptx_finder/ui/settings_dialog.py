@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections.abc import Callable
 import os
 import platform
+import re
 import sys
 from pathlib import Path
 
@@ -24,6 +25,45 @@ from PySide6.QtWidgets import (
 )
 
 _MOD_NAMES = ("Ctrl", "Alt", "Shift", "Win")
+
+
+def _diag_number(line: str, key: str) -> float:
+    m = re.search(rf"\b{re.escape(key)}=([0-9]+(?:\.[0-9]+)?)", line)
+    return float(m.group(1)) if m else 0.0
+
+
+def _diagnostic_summary_lines(lines: list[str]) -> list[str]:
+    issues: list[str] = []
+    for line in lines:
+        if line.startswith("ui_loop:"):
+            max_gap = _diag_number(line, "max_gap")
+            slow_gaps = _diag_number(line, "slow_gaps")
+            if max_gap >= 500 or slow_gaps > 0:
+                issues.append(f"UI 主线程出现卡顿：max_gap={max_gap:.0f} ms，slow_gaps={slow_gaps:.0f}")
+        elif line.startswith("background_tasks:"):
+            waiting = _diag_number(line, "waiting")
+            failed = _diag_number(line, "failed")
+            if waiting > 0:
+                issues.append(f"后台任务正在排队：waiting={waiting:.0f}")
+            if failed > 0:
+                issues.append(f"后台任务有失败记录：failed={failed:.0f}")
+        elif line.startswith("renderer_ipc:"):
+            crashes = _diag_number(line, "crashes")
+            timeouts = _diag_number(line, "timeouts")
+            if crashes > 0 or timeouts > 0:
+                issues.append(f"渲染子进程异常：crashes={crashes:.0f}，timeouts={timeouts:.0f}")
+        elif line.startswith("renderer_ipc_last_error:") and not line.rstrip().endswith("-"):
+            issues.append("最近一次渲染错误：" + line.split(":", 1)[1].strip())
+        elif line.startswith("version_reconcile:") and "error=-" not in line:
+            issues.append("版本兜底巡检异常：" + line)
+        elif "unavailable" in line:
+            issues.append("诊断项不可用：" + line)
+
+    if not issues:
+        return ["diagnostic_summary: 未发现明显异常"]
+    return [f"diagnostic_summary: 发现 {len(issues)} 个需要关注的问题"] + [
+        f"diagnostic_issue: {issue}" for issue in issues[:6]
+    ]
 
 
 class HotkeyEdit(QLineEdit):
@@ -359,6 +399,7 @@ class SettingsDialog(QDialog):
 
         for p in (data_dir(), cache_dir(), db_path()):
             lines.append(f"exists {Path(p).name}: {Path(p).exists()}")
+        lines = _diagnostic_summary_lines(lines) + lines
         return {"lines": lines, "guarded_docs": guarded_docs}
 
     def _on_diagnostics_ready(self, token: int, result: object) -> None:
