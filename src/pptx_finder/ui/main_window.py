@@ -699,6 +699,12 @@ class MainWindow(QMainWindow):
                 lines.extend(self._version_mgr.diagnostic_lines())
             except Exception as exc:  # noqa: BLE001
                 lines.append(f"version_reconcile: diagnostic_error={type(exc).__name__}")
+        for name, worker in (("render_worker", self._render), ("thumb_worker", self._thumb)):
+            if worker is not None and hasattr(worker, "diagnostic_lines"):
+                try:
+                    lines.extend(worker.diagnostic_lines())
+                except Exception as exc:  # noqa: BLE001
+                    lines.append(f"{name}: diagnostic_error={type(exc).__name__}")
         if hasattr(renderer_mod, "diagnostic_lines"):
             lines.extend(renderer_mod.diagnostic_lines())
         return lines

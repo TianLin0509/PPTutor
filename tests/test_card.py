@@ -94,6 +94,24 @@ def test_thumb_worker_upgrades_queued_duplicate_priority():
     assert first[0] == 5
     assert first[2] == ("a.pptx", 1)
     assert tw._queued_priority[("a.pptx", 1)] == 5
+    lines = "\n".join(tw.diagnostic_lines())
+    assert "queued=1" in lines
+    assert "upgraded=1" in lines
+    assert "completed=0/2" in lines
+
+
+def test_thumb_worker_diagnostics_track_clear_and_dedupe():
+    tw = ThumbWorker()
+
+    tw.request("a.pptx", 1, priority=5)
+    tw.request("a.pptx", 1, priority=50)
+    tw.request("b.pptx", 2, priority=60)
+    tw.clear()
+
+    lines = "\n".join(tw.diagnostic_lines())
+    assert "queued=0" in lines
+    assert "deduped=1" in lines
+    assert "cleared=2" in lines
 
 
 def test_thumb_worker_coalesces_inflight_duplicate_requests(qtbot, monkeypatch, tmp_path):

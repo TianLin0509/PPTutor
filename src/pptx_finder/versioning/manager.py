@@ -6,6 +6,7 @@ import logging
 import os
 import tempfile
 import threading
+from pathlib import Path
 
 from .. import renderer
 from ..config import PPTX_EXT
@@ -18,6 +19,8 @@ KEEP_PER_DOC = 50
 _DIFF_SAMPLE_LIMIT = 6
 _DEFAULT_RECONCILE_INTERVAL_SEC = 300.0
 _DEFAULT_RECONCILE_BATCH_DOCS = 200
+_DEFAULT_RECONCILE_BATCH_NEW_FILES = 120
+_FALSE_ENV = {"0", "false", "no", "off"}
 
 
 def _now() -> float:
@@ -143,9 +146,18 @@ class VersionManager:
             1,
             _env_int("PPTUTOR_VERSION_RECONCILE_BATCH_DOCS", _DEFAULT_RECONCILE_BATCH_DOCS),
         )
+        self._reconcile_batch_new_files = max(
+            0,
+            _env_int("PPTUTOR_VERSION_RECONCILE_BATCH_NEW_FILES", _DEFAULT_RECONCILE_BATCH_NEW_FILES),
+        )
+        self._reconcile_common_dirs = (
+            os.environ.get("PPTUTOR_VERSION_RECONCILE_COMMON_DIRS", "1").strip().lower()
+            not in _FALSE_ENV
+        )
         self._reconcile_cycles = 0
         self._reconcile_snapshots = 0
         self._reconcile_last_checked = 0
+        self._reconcile_last_new_checked = 0
         self._reconcile_last_ms = 0.0
         self._reconcile_last_error = ""
 
@@ -280,17 +292,29 @@ class VersionManager:
                 n += 1
         return n
 
-    def reconcile_known_docs(self, *, limit: int | None = None, notify: bool = True) -> int:
-        """Catch up managed files when filesystem watcher misses a save event.
+    def reconcile_known_docs(
+        self,
+        *,
+        limit: int | None = None,
+        notify: bool = True,
+        scan_new_files: bool = True,
+    ) -> int:
+        """Catch up when filesystem watcher misses save/create events.
 
-        This intentionally checks only already-managed docs. It first compares
-        the file mtime with the latest known version timestamp, so unchanged
-        decks do not get re-hashed.
+        Managed docs use an mtime guard before hashing. New-file catch-up is a
+        shallow, bounded scan of managed/common user directories, not a full
+        disk walk.
         """
         max_docs = self._reconcile_batch_docs if limit is None else max(1, int(limit))
         with self._lock:
             docs = list(store.list_docs(self._conn))[:max_docs]
+            known_paths = {
+                store.path_key(str(doc["path"] or ""))
+                for doc in docs
+                if str(doc["path"] or "")
+            }
         checked = 0
+        new_checked = 0
         created = 0
         start = datetime.datetime.now().timestamp()
         try:
@@ -311,6 +335,13 @@ class VersionManager:
                     continue
                 if self.snapshot_now(path, notify=notify):
                     created += 1
+            if scan_new_files and self._reconcile_batch_new_files > 0:
+                for path in self._iter_reconcile_new_file_candidates(docs, known_paths):
+                    new_checked += 1
+                    if self.snapshot_now(path, notify=notify):
+                        created += 1
+                    if new_checked >= self._reconcile_batch_new_files:
+                        break
             return created
         except Exception as exc:  # noqa: BLE001
             self._reconcile_last_error = f"{type(exc).__name__}: {exc}"
@@ -321,7 +352,59 @@ class VersionManager:
             self._reconcile_cycles += 1
             self._reconcile_snapshots += created
             self._reconcile_last_checked = checked
+            self._reconcile_last_new_checked = new_checked
             self._reconcile_last_ms = elapsed
+
+    def _reconcile_candidate_dirs(self, docs) -> list[str]:
+        dirs: dict[str, None] = {}
+        env_dirs = os.environ.get("PPTUTOR_VERSION_RECONCILE_DIRS", "")
+        for raw in env_dirs.split(os.pathsep):
+            raw = raw.strip()
+            if raw:
+                dirs[os.path.abspath(os.path.expanduser(raw))] = None
+        if self._reconcile_common_dirs:
+            home = Path.home()
+            for name in ("Desktop", "Documents", "Downloads"):
+                p = home / name
+                if p.is_dir():
+                    dirs[str(p)] = None
+        for doc in docs:
+            path = str(doc["path"] or "")
+            if path:
+                parent = os.path.dirname(os.path.abspath(path))
+                if parent:
+                    dirs[parent] = None
+        return list(dirs)
+
+    def _iter_reconcile_new_file_candidates(self, docs, known_paths: set[str]):
+        candidates: list[tuple[float, str]] = []
+        for directory in self._reconcile_candidate_dirs(docs):
+            try:
+                with os.scandir(directory) as it:
+                    for entry in it:
+                        if not entry.is_file():
+                            continue
+                        if not _is_pptx(entry.path):
+                            continue
+                        if os.path.basename(entry.path).startswith("~$"):
+                            continue
+                        key = store.path_key(entry.path)
+                        if key in known_paths:
+                            continue
+                        try:
+                            mtime = entry.stat().st_mtime
+                        except OSError:
+                            continue
+                        candidates.append((mtime, os.path.abspath(entry.path)))
+            except OSError:
+                continue
+        seen: set[str] = set()
+        for _mtime, path in sorted(candidates, reverse=True):
+            key = store.path_key(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            yield path
 
     # ---------- Queries ----------
     def list_docs(self):
@@ -632,9 +715,12 @@ class VersionManager:
             "version_reconcile: "
             f"enabled={self._reconcile_interval_sec > 0} "
             f"alive={alive} interval={self._reconcile_interval_sec:.0f}s "
-            f"batch={self._reconcile_batch_docs} cycles={self._reconcile_cycles} "
+            f"batch={self._reconcile_batch_docs} new_batch={self._reconcile_batch_new_files} "
+            f"common_dirs={self._reconcile_common_dirs} "
+            f"cycles={self._reconcile_cycles} "
             f"snapshots={self._reconcile_snapshots} "
             f"last_checked={self._reconcile_last_checked} "
+            f"last_new_checked={self._reconcile_last_new_checked} "
             f"last_ms={self._reconcile_last_ms:.0f} "
             f"error={self._reconcile_last_error or '-'}"
         ]

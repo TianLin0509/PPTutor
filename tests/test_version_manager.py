@@ -50,7 +50,7 @@ def test_reconcile_known_docs_catches_missed_save(tmp_path):
     future = time.time() + 3
     os.utime(p, (future, future))
 
-    assert mgr.reconcile_known_docs() == 1
+    assert mgr.reconcile_known_docs(scan_new_files=False) == 1
     assert len(mgr.list_versions(str(p))) == 2
 
 
@@ -60,8 +60,41 @@ def test_reconcile_known_docs_skips_unchanged_file(tmp_path):
     mgr = VersionManager(store.connect(tmp_path / "reconcile-skip-vault.db"))
     assert mgr.snapshot_now(str(p))
 
-    assert mgr.reconcile_known_docs() == 0
+    assert mgr.reconcile_known_docs(scan_new_files=False) == 0
     assert len(mgr.list_versions(str(p))) == 1
+
+
+def test_reconcile_known_docs_catches_new_file_in_managed_directory(tmp_path, monkeypatch):
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    p1 = docs / "a.pptx"
+    p2 = docs / "new-copy-missed-by-watcher.pptx"
+    monkeypatch.setenv("PPTUTOR_VERSION_RECONCILE_COMMON_DIRS", "0")
+    monkeypatch.setenv("PPTUTOR_VERSION_RECONCILE_DIRS", str(docs))
+    fx.make_pptx(p1, [{"body": "v1"}])
+    mgr = VersionManager(store.connect(tmp_path / "reconcile-new-vault.db"))
+    assert mgr.snapshot_now(str(p1))
+    fx.make_pptx(p2, [{"body": "new file watcher missed"}])
+
+    assert mgr.reconcile_known_docs() == 1
+    assert len(mgr.list_versions(str(p2))) == 1
+    assert "last_new_checked=1" in "\n".join(mgr.diagnostic_lines())
+
+
+def test_reconcile_known_docs_can_disable_new_file_scan(tmp_path, monkeypatch):
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    p1 = docs / "a.pptx"
+    p2 = docs / "new-copy-missed-by-watcher.pptx"
+    monkeypatch.setenv("PPTUTOR_VERSION_RECONCILE_COMMON_DIRS", "0")
+    monkeypatch.setenv("PPTUTOR_VERSION_RECONCILE_DIRS", str(docs))
+    fx.make_pptx(p1, [{"body": "v1"}])
+    mgr = VersionManager(store.connect(tmp_path / "reconcile-no-new-vault.db"))
+    assert mgr.snapshot_now(str(p1))
+    fx.make_pptx(p2, [{"body": "new file watcher missed"}])
+
+    assert mgr.reconcile_known_docs(scan_new_files=False) == 0
+    assert mgr.list_versions(str(p2)) == []
 
 
 def test_save_creates_version_and_skips_unchanged(tmp_path):

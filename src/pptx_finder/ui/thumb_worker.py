@@ -30,6 +30,14 @@ class ThumbWorker(QThread):
         self._active: set[tuple[str, int]] = set()
         self._stopping = False
         self._lock = threading.Lock()
+        self._requested = 0
+        self._completed = 0
+        self._failed = 0
+        self._cache_hits = 0
+        self._deduped = 0
+        self._upgraded = 0
+        self._cleared = 0
+        self._max_queue = 0
 
     def request(self, path: str, page_no: int, priority: int = _PRIORITY_DEFAULT) -> None:
         key = (path, page_no)
@@ -38,12 +46,18 @@ class ThumbWorker(QThread):
             if self._stopping:
                 return
             if key in self._active:
+                self._deduped += 1
                 return
             old_priority = self._queued_priority.get(key)
             if old_priority is not None and old_priority <= priority:
+                self._deduped += 1
                 return
+            if old_priority is not None and priority < old_priority:
+                self._upgraded += 1
+            self._requested += 1
             self._queued.add(key)
             self._queued_priority[key] = priority
+            self._max_queue = max(self._max_queue, len(self._queued))
         self._q.put((priority, next(self._seq), key))
 
     def clear(self) -> None:
@@ -55,6 +69,8 @@ class ThumbWorker(QThread):
                     self._q.put((10**9, next(self._seq), _STOP))
                     break
                 with self._lock:
+                    if item in self._queued:
+                        self._cleared += 1
                     self._queued.discard(item)
                     self._queued_priority.pop(item, None)
         except queue.Empty:
@@ -68,6 +84,8 @@ class ThumbWorker(QThread):
                 _priority, _seq, item = self._q.get_nowait()
                 if item is not _STOP:
                     with self._lock:
+                        if item in self._queued:
+                            self._cleared += 1
                         self._queued.discard(item)
                         self._queued_priority.pop(item, None)
         except queue.Empty:
@@ -83,10 +101,13 @@ class ThumbWorker(QThread):
                 path, page_no = item
                 with self._lock:
                     if self._queued_priority.get((path, page_no)) != priority:
+                        self._deduped += 1
                         continue
                     self._queued.discard((path, page_no))
                     self._queued_priority.pop((path, page_no), None)
                     self._active.add((path, page_no))
+                ok = False
+                cache_hit = False
                 try:
                     try:
                         png = renderer.find_cached_render(path, page_no, min_long_edge=self._long_edge)
@@ -98,11 +119,32 @@ class ThumbWorker(QThread):
                                 hi_priority=False,
                                 priority=priority,
                             )
+                        else:
+                            cache_hit = True
                     except Exception:  # noqa: BLE001
                         png = None
+                    ok = bool(png)
                     self.thumb_rendered.emit(path, page_no, str(png) if png else "")
                 finally:
                     with self._lock:
+                        self._completed += 1
+                        if not ok:
+                            self._failed += 1
+                        if cache_hit:
+                            self._cache_hits += 1
                         self._active.discard((path, page_no))
         finally:
             renderer.shutdown()
+
+    def diagnostic_lines(self) -> list[str]:
+        with self._lock:
+            return [
+                "thumb_worker: "
+                f"queued={len(self._queued)} active={len(self._active)} "
+                f"stopping={self._stopping}",
+                "thumb_worker_stats: "
+                f"completed={self._completed}/{self._requested} "
+                f"failed={self._failed} cache_hits={self._cache_hits} "
+                f"deduped={self._deduped} upgraded={self._upgraded} "
+                f"cleared={self._cleared} max_queue={self._max_queue}",
+            ]

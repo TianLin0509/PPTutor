@@ -144,6 +144,23 @@ def test_prefetch_dedupes_pending_pages():
     w.prefetch("f.pptx", 2)
 
     assert list(w._prefetch) == [("f.pptx", 2, None, 960, RenderWorker._PRIORITY_PREFETCH)]
+    lines = "\n".join(w.diagnostic_lines())
+    assert "prefetch_pending=1" in lines
+    assert "deduped=2" in lines
+
+
+def test_render_worker_diagnostics_track_preview_clearing_prefetch():
+    w = RenderWorker()
+
+    w.prefetch("f.pptx", 2)
+    w.prefetch("f.pptx", 3)
+    w.request(1, "f.pptx", 1)
+
+    lines = "\n".join(w.diagnostic_lines())
+    assert "preview_pending=True" in lines
+    assert "prefetch_pending=0" in lines
+    assert "preview=0/1" in lines
+    assert "cleared=2" in lines
 
 
 def test_prefetch_dedupes_inflight_page(qtbot, monkeypatch, tmp_path):

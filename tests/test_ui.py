@@ -1334,6 +1334,31 @@ def test_ui_loop_diagnostics_records_max_gap(qtbot, tmp_path):
     assert "slow_gaps=1" in lines
 
 
+def test_diagnostics_include_render_and_thumb_worker_lines(qtbot, tmp_path):
+    conn = _index(tmp_path)
+
+    class RenderWithDiagnostics(StubRender):
+        def diagnostic_lines(self):
+            return ["render_worker: preview_pending=False", "render_worker_stats: preview=1/1"]
+
+    class ThumbWithDiagnostics(StubThumb):
+        def diagnostic_lines(self):
+            return ["thumb_worker: queued=0 active=0", "thumb_worker_stats: completed=1/1"]
+
+    win = MainWindow(
+        conn=conn,
+        render_worker=RenderWithDiagnostics(),
+        thumb_worker=ThumbWithDiagnostics(),
+        do_index=False,
+    )
+    qtbot.addWidget(win)
+
+    lines = "\n".join(win.diagnostic_lines())
+
+    assert "render_worker: preview_pending=False" in lines
+    assert "thumb_worker: queued=0 active=0" in lines
+
+
 def test_ui_loop_diagnostics_flags_noticeable_mid_sized_gap(qtbot, tmp_path):
     conn = _index(tmp_path)
     win = MainWindow(conn=conn, render_worker=StubRender(), do_index=False)
