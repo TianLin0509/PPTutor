@@ -65,7 +65,7 @@ def test_overlay_uses_larger_responsive_card(qtbot, tmp_path):
     conn.commit()
     report = stats.build_report(conn, year=None)
     parent = QWidget()
-    parent.resize(1500, 900)
+    parent.resize(1500, 1400)
     qtbot.addWidget(parent)
 
     ov = ro.ReportOverlay(report, theme.tok("cloud"), parent=parent, conn=conn)
@@ -73,7 +73,7 @@ def test_overlay_uses_larger_responsive_card(qtbot, tmp_path):
 
     assert ov._card.width() == 1140
     assert ov._scroll.width() >= 1140
-    assert ov._scroll.maximumHeight() >= 780
+    assert ov._scroll.maximumHeight() == 1230
 
 
 def test_export_button_saves_png(qtbot, tmp_path, monkeypatch):

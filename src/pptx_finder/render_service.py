@@ -52,20 +52,36 @@ def serve(sock: socket.socket, token: str) -> int:
     """Serve JSON-line requests on an already connected socket."""
     # Mark this process before importing renderer in request handlers.
     os.environ["PPTUTOR_RENDERER_CHILD"] = "1"
+    try:
+        sock.settimeout(None)
+    except OSError:
+        return 0
     with sock:
         f = sock.makefile("rwb", buffering=0)
-        f.write(_json_dumps({"type": "hello", "token": token, "pid": os.getpid()}))
+        try:
+            f.write(_json_dumps({"type": "hello", "token": token, "pid": os.getpid()}))
+        except OSError:
+            return 0
         while True:
-            line = f.readline()
+            try:
+                line = f.readline()
+            except OSError:
+                break
             if not line:
                 break
             try:
                 req = json.loads(line.decode("utf-8"))
             except Exception as exc:  # noqa: BLE001
-                f.write(_json_dumps({"id": None, "ok": False, "error": f"bad json: {exc}"}))
+                try:
+                    f.write(_json_dumps({"id": None, "ok": False, "error": f"bad json: {exc}"}))
+                except OSError:
+                    break
                 continue
             resp = handle_request(req)
-            f.write(_json_dumps(resp))
+            try:
+                f.write(_json_dumps(resp))
+            except OSError:
+                break
             if resp.get("shutdown"):
                 break
     return 0
@@ -85,9 +101,14 @@ def main(argv: list[str] | None = None) -> int:
         print("usage: --renderer-worker <port> <token>", file=sys.stderr)
         return 2
 
-    sock = socket.create_connection(("127.0.0.1", port), timeout=10)
+    try:
+        sock = socket.create_connection(("127.0.0.1", port), timeout=10)
+    except OSError:
+        return 0
     try:
         return serve(sock, token)
+    except OSError:
+        return 0
     finally:
         # Best-effort direct COM cleanup in case the shutdown command was not sent.
         try:
