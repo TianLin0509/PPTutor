@@ -3,8 +3,8 @@ from __future__ import annotations
 
 import datetime
 
-from PySide6.QtCore import QObject, Signal
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QObject, Signal, Qt
+from PySide6.QtWidgets import QApplication, QWidget
 import pytest
 
 import fixtures_gen as fx
@@ -12,7 +12,7 @@ import fixtures_gen as fx
 from pptx_finder import db, indexer, search as search_mod
 import pptx_finder.ui.main_window as main_window_mod
 from pptx_finder.ui.main_window import (
-    MainWindow, _elide_middle, _fmt_mtime, _fmt_size,
+    MainWindow, _elide_middle, _file_mime_for_path, _fmt_mtime, _fmt_size,
 )
 
 
@@ -100,6 +100,81 @@ def test_copy_to_clipboard_sets_file_url(qtbot, tmp_path):
 
 
 # ---- 预览顶栏：路径 + 大小 + 页数 + 时间 ----
+def test_file_drag_mime_uses_local_file_url(tmp_path):
+    p = tmp_path / "send-me.pptx"
+    p.write_bytes(b"pptx")
+
+    md = _file_mime_for_path(str(p))
+
+    assert md.hasUrls()
+    assert md.urls()[0].toLocalFile().replace("/", "\\") == str(p)
+    assert md.text() == str(p)
+
+
+def test_result_card_drag_exports_source_file_url(qtbot, tmp_path, monkeypatch):
+    p = tmp_path / "drag-source.pptx"
+    p.write_bytes(b"pptx")
+    r = main_window_mod.FileResult(
+        file_id=1,
+        path=str(p),
+        name=p.name,
+        ext=".pptx",
+        mtime=0,
+        size=4,
+        page_count=1,
+        status="ok",
+        score=1.0,
+        name_hit=True,
+        hits=[],
+    )
+    w = main_window_mod.ResultItem(r, main_window_mod.theme.tok("cloud"), "")
+    qtbot.addWidget(w)
+    drags = []
+
+    class FakeDrag:
+        def __init__(self, parent):
+            self.parent = parent
+            self.mime = None
+            self.action = None
+            drags.append(self)
+
+        def setMimeData(self, mime):
+            self.mime = mime
+
+        def setPixmap(self, _pixmap):
+            pass
+
+        def setHotSpot(self, _point):
+            pass
+
+        def exec(self, action):
+            self.action = action
+            return action
+
+    monkeypatch.setattr(main_window_mod, "QDrag", FakeDrag)
+
+    w._start_file_drag()
+
+    assert drags
+    assert drags[0].action == Qt.CopyAction
+    assert drags[0].mime.hasUrls()
+    assert drags[0].mime.urls()[0].toLocalFile().replace("/", "\\") == str(p)
+
+
+def test_main_resize_keeps_stats_overlay_filled(qtbot, tmp_path):
+    conn = _mk(tmp_path)
+    win = MainWindow(conn=conn, render_worker=_Stub(), do_index=False)
+    qtbot.addWidget(win)
+    overlay = QWidget(win)
+    win._stats_overlay = overlay
+    overlay.resize(10, 10)
+
+    win.show()
+    win.resize(900, 700)
+
+    qtbot.waitUntil(lambda: overlay.size() == win.size(), timeout=1000)
+
+
 def test_preview_header_shows_path_and_size(qtbot, tmp_path):
     conn = _mk(tmp_path)
     win = MainWindow(conn=conn, render_worker=_Stub(), do_index=False)

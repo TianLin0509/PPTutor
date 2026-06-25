@@ -14,8 +14,8 @@ import os
 import sys
 import time
 
-from PySide6.QtCore import QEvent, QMimeData, QPropertyAnimation, Qt, QStringListModel, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QCursor, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap, QShortcut
+from PySide6.QtCore import QEvent, QMimeData, QPoint, QPropertyAnimation, Qt, QStringListModel, QTimer, QUrl, Signal
+from PySide6.QtGui import QColor, QCursor, QDrag, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QCompleter, QFrame, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMainWindow, QMenu, QProgressBar, QPushButton, QScrollArea,
@@ -195,18 +195,29 @@ def _thumb_placeholder(tok: dict) -> QPixmap:
     return pm
 
 
+def _file_mime_for_path(path: str) -> QMimeData:
+    mime = QMimeData()
+    clean = str(path or "")
+    if clean:
+        mime.setUrls([QUrl.fromLocalFile(clean)])
+        mime.setText(clean)
+    return mime
+
+
 class ResultItem(QWidget):
     """鍗曟潯缁撴灉鍗＄墖锛氬乏缂╃暐鍥?棣栭〉/鍛戒腑椤? + 鍙?鏂囦欢鍚?+ 鍛戒腑椤佃兌鍥?+ 楂樹寒鐗囨 + mtime)銆?"""
 
     activated = Signal()
 
     def __init__(self, r: FileResult, tok: dict, hlcss: str, ginfo: dict | None = None,
-                 on_toggle_group=None):
+                 on_toggle_group=None, on_select=None):
         super().__init__()
         self.setAttribute(Qt.WA_StyledBackground, True)
         self._tok = tok
         self._sel = False
         self.path = r.path
+        self._on_select = on_select
+        self._drag_start_pos: QPoint | None = None
         self.thumb_page = r.hits[0].page_no if r.hits else 1
         # 版本组：ginfo 为组主卡时带 count（折叠起来的历史版本数）；为成员行时 member=True
         self._gid = ginfo.get("gid") if ginfo else None
@@ -310,12 +321,49 @@ class ResultItem(QWidget):
         if not self._sel:
             self._apply("normal", True)
 
+    def mousePressEvent(self, e):  # noqa: N802
+        if e.button() == Qt.LeftButton:
+            self._drag_start_pos = e.position().toPoint()
+            if callable(self._on_select):
+                self._on_select()
+            e.accept()
+            return
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):  # noqa: N802
+        if self._drag_start_pos is not None and e.buttons() & Qt.LeftButton:
+            delta = e.position().toPoint() - self._drag_start_pos
+            if delta.manhattanLength() >= QApplication.startDragDistance():
+                self._drag_start_pos = None
+                self._start_file_drag()
+                e.accept()
+                return
+        super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):  # noqa: N802
+        if e.button() == Qt.LeftButton:
+            self._drag_start_pos = None
+        super().mouseReleaseEvent(e)
+
     def mouseDoubleClickEvent(self, e):  # noqa: N802
         if e.button() == Qt.LeftButton:
             self.activated.emit()
             e.accept()
             return
         super().mouseDoubleClickEvent(e)
+
+    def _start_file_drag(self) -> None:
+        if not self.path:
+            return
+        drag = QDrag(self)
+        drag.setMimeData(_file_mime_for_path(self.path))
+        pm = self.grab()
+        if not pm.isNull():
+            if pm.width() > 280:
+                pm = pm.scaledToWidth(280, Qt.SmoothTransformation)
+            drag.setPixmap(pm)
+            drag.setHotSpot(QPoint(min(24, pm.width()), min(24, pm.height())))
+        drag.exec(Qt.CopyAction)
 
     def set_selected(self, sel: bool, active: bool = True) -> None:
         self._sel = sel
@@ -1932,7 +1980,14 @@ class MainWindow(QMainWindow):
         item = QListWidgetItem()
         item.setData(Qt.UserRole, idx)
         item.setToolTip(r.path)
-        w = ResultItem(r, self._tok, hlcss, ginfo=ginfo, on_toggle_group=self._toggle_version_group)
+        w = ResultItem(
+            r,
+            self._tok,
+            hlcss,
+            ginfo=ginfo,
+            on_toggle_group=self._toggle_version_group,
+            on_select=lambda item=item: self.result_list.setCurrentItem(item),
+        )
         item.setSizeHint(w.sizeHint())
         self.result_list.addItem(item)
         self.result_list.setItemWidget(item, w)
@@ -1966,7 +2021,13 @@ class MainWindow(QMainWindow):
             item = QListWidgetItem()
             item.setData(Qt.UserRole, oidx)
             item.setToolTip(orr.path)
-            w = ResultItem(orr, self._tok, hlcss, ginfo={"member": True, "gid": gid})
+            w = ResultItem(
+                orr,
+                self._tok,
+                hlcss,
+                ginfo={"member": True, "gid": gid},
+                on_select=lambda item=item: self.result_list.setCurrentItem(item),
+            )
             item.setSizeHint(w.sizeHint())
             self.result_list.insertItem(base + 1 + k, item)
             self.result_list.setItemWidget(item, w)
@@ -3018,6 +3079,8 @@ class MainWindow(QMainWindow):
             self._reposition_toast()
         if getattr(self, "_welcome", None) is not None:
             self._welcome.resize(self.size())
+        if getattr(self, "_stats_overlay", None) is not None:
+            self._stats_overlay.resize(self.size())
 
     def changeEvent(self, e):  # noqa: N802
         if e.type() == QEvent.ActivationChange and self._cur_item_widget is not None:

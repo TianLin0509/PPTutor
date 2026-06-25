@@ -56,6 +56,26 @@ def test_overlay_constructs_and_exports_png(qtbot, tmp_path):
     assert out.exists() and out.stat().st_size > 0
 
 
+def test_overlay_uses_larger_responsive_card(qtbot, tmp_path):
+    conn = db.connect(tmp_path / "i.db")
+    db.init_db(conn)
+    db.upsert_file(conn, path="/large-report.pptx", name="large-report.pptx", ext=".pptx",
+                   size=2_000_000, mtime=_ts(2026, 6, 1, 2), content_hash="h",
+                   page_count=88, status="ok", error="", indexed_at=0)
+    conn.commit()
+    report = stats.build_report(conn, year=None)
+    parent = QWidget()
+    parent.resize(1200, 900)
+    qtbot.addWidget(parent)
+
+    ov = ro.ReportOverlay(report, theme.tok("cloud"), parent=parent, conn=conn)
+    qtbot.addWidget(ov)
+
+    assert ov._card.width() == 760
+    assert ov._scroll.width() >= 760
+    assert ov._scroll.maximumHeight() >= 780
+
+
 def test_export_button_saves_png(qtbot, tmp_path, monkeypatch):
     conn = db.connect(tmp_path / "i.db")
     db.init_db(conn)

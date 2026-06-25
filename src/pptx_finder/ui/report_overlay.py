@@ -25,6 +25,11 @@ from .bg_task import BackgroundTask
 from .heatmap import HeatmapWidget
 
 _RED_MANSION_CHARS = 730_000  # 《红楼梦》约 73 万字
+_CARD_TARGET_WIDTH = 760
+_CARD_MIN_WIDTH = 420
+_OVERLAY_MARGIN = 96
+_SCROLL_CHROME_WIDTH = 18
+_SCROLL_MAX_HEIGHT = 820
 
 
 # ---------- 文案格式化（纯函数，可测） ----------
@@ -203,7 +208,6 @@ class ReportOverlay(QWidget):
 
         self._card = QFrame()
         self._card.setObjectName("repCard")
-        self._card.setFixedWidth(480)
         self._card.setStyleSheet(
             "#repCard{background:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
             f"stop:0 {tok['card0']},stop:1 {tok['card1']});"
@@ -220,19 +224,28 @@ class ReportOverlay(QWidget):
         self._card_lay.addWidget(self._content)
         self._fill_content()
 
-        scroll = QScrollArea()
-        scroll.setWidget(self._card)
-        scroll.setWidgetResizable(False)
-        scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.setFixedWidth(self._card.width() + 18)
-        scroll.setMaximumHeight(700)
-        scroll.setStyleSheet("background:transparent;")
+        self._scroll = QScrollArea()
+        self._scroll.setWidget(self._card)
+        self._scroll.setWidgetResizable(False)
+        self._scroll.setFrameShape(QFrame.NoFrame)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._scroll.setStyleSheet("background:transparent;")
+        self._resize_report_card()
 
         outer = QVBoxLayout(self)
-        outer.addWidget(scroll, alignment=Qt.AlignCenter)
+        outer.addWidget(self._scroll, alignment=Qt.AlignCenter)
         if parent is not None:
             self.setGeometry(parent.rect())
+            self._resize_report_card()
+
+    def _resize_report_card(self) -> None:
+        parent = self.parentWidget()
+        w = self.width() or (parent.width() if parent is not None else 980)
+        h = self.height() or (parent.height() if parent is not None else 860)
+        card_w = min(_CARD_TARGET_WIDTH, max(_CARD_MIN_WIDTH, w - _OVERLAY_MARGIN))
+        self._card.setFixedWidth(card_w)
+        self._scroll.setFixedWidth(card_w + _SCROLL_CHROME_WIDTH)
+        self._scroll.setMaximumHeight(min(_SCROLL_MAX_HEIGHT, max(420, h - _OVERLAY_MARGIN)))
 
     def _ui_alive(self) -> bool:
         if self._closing or not _qt_is_valid(self):
@@ -254,6 +267,10 @@ class ReportOverlay(QWidget):
         except RuntimeError:
             pass
         super().closeEvent(event)
+
+    def resizeEvent(self, event):  # noqa: N802
+        super().resizeEvent(event)
+        self._resize_report_card()
 
     # ---- 构建 ----
     def _build_header(self) -> None:
