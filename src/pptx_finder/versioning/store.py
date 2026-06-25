@@ -1,4 +1,4 @@
-"""SQLite metadata store for the PPTutor vault."""
+"""SQLite metadata store for the PPT Doctor vault."""
 from __future__ import annotations
 
 import os

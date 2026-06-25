@@ -209,7 +209,7 @@ def _apply_global_hotkey(app, win, spec: str) -> bool:
 def main() -> int:
     multiprocessing.freeze_support()  # PyInstaller 下多进程必需
     try:  # 任务栏用窗口图标(吉祥物)而非默认 python/exe 图标，需显式 AppUserModelID
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("PPTutor")
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("PPTDoctor")
     except Exception:  # noqa: BLE001 非 Windows / 旧系统静默跳过
         pass
     from .logging_setup import configure_logging
@@ -258,7 +258,7 @@ def main() -> int:
 
     # 托盘
     tray = QSystemTrayIcon(icon, app)
-    tray.setToolTip("PPTutor · PPT 查询助手")
+    tray.setToolTip("PPT Doctor · PPT 查询助手")
     menu = QMenu()
     act_show = QAction("显示主窗口", app)
     act_show.triggered.connect(lambda: _toggle_window(win))

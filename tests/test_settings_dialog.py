@@ -24,6 +24,7 @@ def mgr():
 def test_settings_builds_with_autostart_toggle(qtbot, mgr):
     dlg = SettingsDialog(mgr)
     qtbot.addWidget(dlg)
+    assert "PPT Doctor" in dlg.windowTitle()
     qtbot.waitUntil(lambda: "data_dir:" in dlg.diagnostic_text.toPlainText(), timeout=1000)
     assert dlg.auto is not None          # 自启开关存在
     assert "守护" in dlg.stat.text()       # 显示已守护文件数

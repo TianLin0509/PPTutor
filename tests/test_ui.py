@@ -131,6 +131,7 @@ def test_primary_ui_text_stays_readable_chinese(qtbot, tmp_path):
         *[button.toolTip() for button in title_buttons if button is not None],
     ]
     joined = "\n".join(texts)
+    assert "PPT Doctor" in joined
 
     assert "PPT 查询助手" in joined
     assert "输入你记得的文字" in joined

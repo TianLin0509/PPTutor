@@ -22,7 +22,7 @@ if __name__ == "__main__":
         from pptx_finder.selftest import run_selftest
         raise SystemExit(run_selftest(sys.argv))
 
-    # 增量更新链路自检：`PPTutor.exe --update-check <base_url> <report.json>`
+    # 增量更新链路自检：`PPT Doctor.exe --update-check <base_url> <report.json>`
     # 在 frozen 真实环境验证 urllib/清单比对/增量下载/sha256（headless，不应用、不弹 GUI）。
     if "--update-check" in sys.argv:
         from pptx_finder.updater import run_update_check

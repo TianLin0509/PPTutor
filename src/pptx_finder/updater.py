@@ -259,7 +259,7 @@ def check_for_update(base_url: str) -> UpdateInfo | None:
 
 
 def run_update_check(argv: list[str]) -> int:
-    """`PPTutor.exe --update-check <base_url> <report.json>`：headless 检查 + 下载到 staging，
+    """`PPT Doctor.exe --update-check <base_url> <report.json>`：headless 检查 + 下载到 staging，
     写报告。用于打包态 E2E 验证 frozen 的 urllib/清单/增量下载/sha256 链路（不弹 GUI、不应用）。
     """
     i = argv.index("--update-check")

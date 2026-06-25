@@ -23,7 +23,7 @@ def _target() -> str:
     if getattr(sys, "frozen", False):
         return exe
     # 源码态：尽量指向已打包的 exe（开发期自启意义不大，仅兜底）
-    guess = Path.cwd() / "dist" / "PPTutor" / "PPTutor.exe"
+    guess = Path.cwd() / "dist" / "PPT Doctor" / "PPT Doctor.exe"
     return str(guess) if guess.exists() else exe
 
 
@@ -42,7 +42,7 @@ def set_enabled(on: bool) -> bool:
         sh = win32com.client.Dispatch("WScript.Shell")
         sc = sh.CreateShortcut(str(lnk))
         sc.TargetPath = _target()
-        sc.Description = "PPTutor · 后台守护 PPT 版本"
+        sc.Description = "PPT Doctor · 后台守护 PPT 版本"
         sc.Save()
         return True
     except Exception:  # noqa: BLE001

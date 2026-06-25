@@ -1,8 +1,8 @@
 <div align="center">
 
-<img src="assets/logo.png" width="120" alt="PPTutor logo">
+<img src="assets/logo.png" width="120" alt="PPT Doctor logo">
 
-# PPTutor
+# PPT Doctor
 
 **本地 PPTX 全文搜索 · 命中页预览 · 自动版本管理 桌面应用**
 
@@ -23,7 +23,7 @@
 
 ## 🚀 用法
 
-绿色免安装，双击 `PPTutor.exe` 即用。首次自动后台全盘建索引（边扫边搜）。
+绿色免安装，双击 `PPT Doctor.exe` 即用。首次自动后台全盘建索引（边扫边搜）。
 
 源码运行：
 
@@ -34,7 +34,7 @@ uv run python -m pptx_finder
 打包：
 
 ```bash
-uv run pyinstaller pptx-finder.spec --noconfirm    # → dist/PPTutor/PPTutor.exe
+uv run pyinstaller pptx-finder.spec --noconfirm    # → dist/PPT Doctor/PPT Doctor.exe
 ```
 
 ## 🧱 技术栈
@@ -48,4 +48,4 @@ Python 3.12 · PySide6 · SQLite FTS5（每页一行存页码定位）· OpenCC 
 
 ---
 
-<div align="center"><sub>PPTutor · 你的 PPT 小助教 🎓</sub></div>
+<div align="center"><sub>PPT Doctor · 你的 PPT 小助教 🎓</sub></div>

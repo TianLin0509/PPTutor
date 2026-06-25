@@ -1,4 +1,4 @@
-"""Synthetic benchmark for PPTutor render scheduling policies.
+"""Synthetic benchmark for PPT Doctor render scheduling policies.
 
 This does not automate PowerPoint. It models the queueing cost we can control:
 task ordering, render resolution, and background prefetch eagerness. Real COM

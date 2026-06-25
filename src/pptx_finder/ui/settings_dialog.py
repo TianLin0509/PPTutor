@@ -137,7 +137,7 @@ class SettingsDialog(QDialog):
         self._diag_extra_lines: list[str] = []
         self._powerpoint_inflight = False
         self._closing = False
-        self.setWindowTitle("设置 · PPTutor")
+        self.setWindowTitle("设置 · PPT Doctor")
         self.resize(620, 430)
 
         lay = QVBoxLayout(self)

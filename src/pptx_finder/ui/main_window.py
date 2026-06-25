@@ -405,7 +405,7 @@ class MainWindow(QMainWindow):
     def __init__(self, conn=None, render_worker=None, thumb_worker=None, version_mgr=None,
                  do_index=True, roots: list[str] | None = None, workers: int | None = None):
         super().__init__()
-        self.setWindowTitle(f"PPTutor · PPT 查询助手   v{__version__}")
+        self.setWindowTitle(f"PPT Doctor · PPT 查询助手   v{__version__}")
         self.setWindowIcon(QIcon(_asset_path("logo.png")))  # 绐楀彛鏍囬/浠诲姟鏍忓浘鏍?
         self.resize(1180, 760)
         self._title_h = 40  # 鑷粯鐜荤拑鏍囬鏍忛珮搴︼紙nativeEvent 鎷栧姩鍖?缂╂斁杈瑰垽瀹氱敤锛?
@@ -699,7 +699,7 @@ class MainWindow(QMainWindow):
         logo = QLabel()
         logo.setObjectName("appLogo")
         logo.setPixmap(_app_logo())
-        logo.setToolTip("PPTutor")
+        logo.setToolTip("PPT Doctor")
         bar.addWidget(logo)
         self.search_box = QLineEdit()
         self.search_box.setObjectName("searchBox")
@@ -1005,7 +1005,7 @@ class MainWindow(QMainWindow):
         l.setSpacing(9)
         dot = QLabel("◆")
         dot.setObjectName("gtDot")
-        name = QLabel("PPTutor")
+        name = QLabel("PPT Doctor")
         name.setObjectName("gtName")
         ver = QLabel(f"v{__version__}")
         ver.setObjectName("gtVer")

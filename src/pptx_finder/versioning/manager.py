@@ -1,4 +1,4 @@
-"""Version-management orchestration for PPTutor."""
+"""Version-management orchestration for PPT Doctor."""
 from __future__ import annotations
 
 import datetime
@@ -684,7 +684,7 @@ class VersionManager:
         self._reconcile_stop.clear()
         self._reconcile_thread = threading.Thread(
             target=self._reconcile_loop,
-            name="PPTutorVersionReconcile",
+            name="PPTDoctorVersionReconcile",
             daemon=True,
         )
         self._reconcile_thread.start()
