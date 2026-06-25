@@ -25,7 +25,7 @@ from .bg_task import BackgroundTask
 from .heatmap import HeatmapWidget
 
 _RED_MANSION_CHARS = 730_000  # 《红楼梦》约 73 万字
-_CARD_TARGET_WIDTH = 760
+_CARD_TARGET_WIDTH = 1140
 _CARD_MIN_WIDTH = 420
 _OVERLAY_MARGIN = 96
 _SCROLL_CHROME_WIDTH = 18
