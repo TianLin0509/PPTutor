@@ -1261,6 +1261,7 @@ class MainWindow(QMainWindow):
         self._debounce.stop()
         query = self.search_box.text().strip()
         self._search_seq += 1
+        self._cancel_render_work_for_new_search()
         self._cancel_auto_preview()
         self._update_query_hint(query)
         if not query:
@@ -1285,8 +1286,6 @@ class MainWindow(QMainWindow):
         self._status_refresh_token += 1
         req_id = self._search_seq
         self._search_pending_req = req_id
-        self._render_gen += 1
-        self._thumb.clear()
         self.result_list.setEnabled(False)
         self._set_result_refine_enabled(False)
         has_visible_results = self.result_list.count() > 0 and not self.result_list.isHidden()
@@ -1300,7 +1299,6 @@ class MainWindow(QMainWindow):
             self._cur = None
             self._clear_detail_load_inflight()
             self._clear_detail_panel_selection()
-            self._invalidate_preview_request()
             self.result_list.clear()
             self._hide_empty_hint()
             self.result_count.setText("搜索中…")
@@ -1312,6 +1310,16 @@ class MainWindow(QMainWindow):
         self._search_slow_hint_query = query
         self._search_slow_hint_timer.setInterval(self._SEARCH_SLOW_HINT_MS)
         self._search_slow_hint_timer.start()
+
+    def _cancel_render_work_for_new_search(self) -> None:
+        self._render_gen += 1
+        if hasattr(self, "_visible_thumb_timer"):
+            self._visible_thumb_timer.stop()
+        self._invalidate_preview_request(clear_deferred=False)
+        for worker in (getattr(self, "_thumb", None), getattr(self, "_render", None)):
+            clear = getattr(worker, "clear", None)
+            if callable(clear):
+                clear()
 
     def _clear_search_pending(self) -> None:
         self._search_pending_req = None
@@ -2822,8 +2830,9 @@ class MainWindow(QMainWindow):
     def _stop_spinner(self) -> None:
         self._spin_timer.stop()
 
-    def _invalidate_preview_request(self) -> None:
-        self._preview_deferred_due_to_busy = False
+    def _invalidate_preview_request(self, *, clear_deferred: bool = True) -> None:
+        if clear_deferred:
+            self._preview_deferred_due_to_busy = False
         self._req_id += 1
         if hasattr(self, "_spin_timer"):
             self._stop_spinner()

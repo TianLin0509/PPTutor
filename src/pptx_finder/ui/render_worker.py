@@ -38,6 +38,7 @@ class RenderWorker(QThread):
         self._prefetch_failed = 0
         self._prefetch_deduped = 0
         self._prefetch_cleared = 0
+        self._preview_cleared = 0
         self._warm_requested = 0
         self._warm_completed = 0
         self._max_prefetch_queue = 0
@@ -87,6 +88,18 @@ class RenderWorker(QThread):
                 return
             self._warm_requested += 1
             self._warm = True
+            self._cv.notify()
+
+    def clear(self) -> None:
+        """Discard queued render work that is no longer relevant to the current search."""
+        with self._cv:
+            if self._preview is not None:
+                self._preview_cleared += 1
+            self._preview = None
+            self._warm = False
+            self._prefetch_cleared += len(self._prefetch)
+            self._prefetch.clear()
+            self._prefetch_pending_keys.clear()
             self._cv.notify()
 
     def stop(self) -> None:
@@ -178,7 +191,7 @@ class RenderWorker(QThread):
                 f"warm_pending={self._warm} stopping={self._stopping}",
                 "render_worker_stats: "
                 f"preview={self._preview_completed}/{self._preview_requested} "
-                f"preview_failed={self._preview_failed} "
+                f"preview_failed={self._preview_failed} preview_cleared={self._preview_cleared} "
                 f"prefetch={self._prefetch_completed}/{self._prefetch_requested} "
                 f"prefetch_failed={self._prefetch_failed} "
                 f"deduped={self._prefetch_deduped} cleared={self._prefetch_cleared} "

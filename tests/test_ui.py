@@ -39,6 +39,15 @@ class StubRender(QObject):
         self.rendered.emit(req_id, "")
 
 
+class ClearableRender(StubRender):
+    def __init__(self):
+        super().__init__()
+        self.clears = 0
+
+    def clear(self):
+        self.clears += 1
+
+
 class PendingRender(QObject):
     rendered = Signal(int, str)
 
@@ -81,6 +90,17 @@ class PendingSearchWorker:
 
     def wait(self, _ms: int):
         return True
+
+
+class ObservingSearchWorker(PendingSearchWorker):
+    def __init__(self, observer):
+        super().__init__()
+        self._observer = observer
+        self.observed: list[tuple[int, int, int]] = []
+
+    def request(self, req_id: int, query: str, mode_key: str):
+        self.observed.append(self._observer())
+        super().request(req_id, query, mode_key)
 
 
 def _index(tmp_path):
@@ -1108,6 +1128,49 @@ def test_deferred_live_refresh_yields_before_rerun(qtbot, monkeypatch, tmp_path)
     assert scheduled
     assert scheduled[-1][0] >= 1
     assert win._live_refresh_after_search is False
+
+
+def test_new_search_clears_stale_render_queues_before_request(qtbot, tmp_path):
+    conn = _index(tmp_path)
+    render = ClearableRender()
+    thumb = StubThumb()
+    win = MainWindow(conn=conn, render_worker=render, thumb_worker=thumb, do_index=False)
+    qtbot.addWidget(win)
+    pending = ObservingSearchWorker(lambda: (render.clears, thumb.clears, win._req_id))
+    win._search_worker = pending
+    render.clears = 0
+    thumb.clears = 0
+    old_req_id = win._req_id
+    old_render_gen = win._render_gen
+
+    old_block = win.search_box.blockSignals(True)
+    win.search_box.setText("new query")
+    win.search_box.blockSignals(old_block)
+    win._do_search()
+
+    assert pending.requests == [(win._search_seq, "new query", "all")]
+    assert pending.observed == [(1, 1, old_req_id + 1)]
+    assert render.clears == 1
+    assert thumb.clears == 1
+    assert win._render_gen == old_render_gen + 1
+
+
+def test_old_preview_result_is_ignored_after_new_search(qtbot, tmp_path):
+    conn = _index(tmp_path)
+    render = ClearableRender()
+    thumb = StubThumb()
+    win = MainWindow(conn=conn, render_worker=render, thumb_worker=thumb, do_index=False)
+    qtbot.addWidget(win)
+    win._search_worker = PendingSearchWorker()
+    old_req_id = win._req_id
+
+    old_block = win.search_box.blockSignals(True)
+    win.search_box.setText("new query")
+    win.search_box.blockSignals(old_block)
+    win._do_search()
+    render.rendered.emit(old_req_id, "C:/stale-preview.png")
+
+    assert win._cur_pixmap is None
 
 
 def test_large_result_rendering_batches_first_frame_and_thumbnails(qtbot, tmp_path):

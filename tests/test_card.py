@@ -114,6 +114,28 @@ def test_thumb_worker_diagnostics_track_clear_and_dedupe():
     assert "cleared=2" in lines
 
 
+def test_render_worker_clear_discards_pending_preview_and_prefetch():
+    from pptx_finder.ui.render_worker import RenderWorker
+
+    rw = RenderWorker()
+    rw.prefetch("old-a.pptx", 1, priority=200)
+    rw.prefetch("old-b.pptx", 2, priority=201)
+    rw.request(7, "old-preview.pptx", 3)
+    rw.prewarm()
+
+    rw.clear()
+
+    assert rw._preview is None
+    assert list(rw._prefetch) == []
+    assert rw._prefetch_pending_keys == set()
+    assert rw._warm is False
+    lines = "\n".join(rw.diagnostic_lines())
+    assert "preview_pending=False" in lines
+    assert "prefetch_pending=0" in lines
+    assert "preview_cleared=1" in lines
+    assert "cleared=2" in lines
+
+
 def test_thumb_worker_coalesces_inflight_duplicate_requests(qtbot, monkeypatch, tmp_path):
     calls = []
     started = threading.Event()
