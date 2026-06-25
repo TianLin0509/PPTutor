@@ -1954,7 +1954,7 @@ def test_manual_search_cancels_pending_debounce(qtbot, tmp_path):
 
 def test_keyboard_nav(qtbot, tmp_path):
     """search_box 上按 ↑↓ 移动结果选中。"""
-    conn = _index_multi(tmp_path, {f"f{i}.pptx": ["共同词 算力 集群"] for i in range(3)})
+    conn = _index_multi(tmp_path, {f"f{i}.pptx": [f"共同词 算力 集群 唯一{i}"] for i in range(3)})
     win = MainWindow(conn=conn, render_worker=StubRender(), do_index=False)
     qtbot.addWidget(win)
     win.search_box.setText("算力 集群")

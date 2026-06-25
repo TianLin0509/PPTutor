@@ -3,10 +3,16 @@ from __future__ import annotations
 import shutil
 
 import fixtures_gen as fx
+import pytest
 
 from pptx_finder.parser import parse_pptx
 from pptx_finder.versioning import store, vault
 from pptx_finder.versioning.manager import VersionManager
+
+
+@pytest.fixture(autouse=True)
+def _isolated_version_data_dir(monkeypatch, tmp_path):
+    monkeypatch.setenv("PPTX_FINDER_DATA_DIR", str(tmp_path / "appdata"))
 
 
 def _mgr():

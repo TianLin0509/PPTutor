@@ -222,8 +222,12 @@ class ResultItem(QWidget):
         # 版本组：ginfo 为组主卡时带 count（折叠起来的历史版本数）；为成员行时 member=True
         self._gid = ginfo.get("gid") if ginfo else None
         self._exp_btn = None  # 版本组展开器按钮（仅组主卡有），供就地切换文字 ▾/▴
+        self._dup_badge = None
         is_member = bool(ginfo and ginfo.get("member"))
         vcount = int(ginfo.get("count", 0)) if ginfo else 0
+        dup_paths = [p for p in (r.duplicate_paths or []) if p]
+        if len(dup_paths) > 1:
+            self.setToolTip("同一文件存在于这些路径：\n" + "\n".join(dup_paths))
 
         outer = QHBoxLayout(self)
         outer.setContentsMargins(11 + (24 if is_member else 0), 9, 12, 9)  # 历史版本行左缩进，视觉归属上方组主卡
@@ -281,6 +285,15 @@ class ResultItem(QWidget):
             exp.clicked.connect(lambda _=False, g=self._gid: on_toggle_group(g))
             self._exp_btn = exp
             row.addWidget(exp, 0)
+        if len(dup_paths) > 1:
+            dup = QLabel(f"{len(dup_paths)} 个路径")
+            dup.setObjectName("duplicatePathBadge")
+            dup.setToolTip("同一文件的完全相同副本")
+            dup.setStyleSheet(
+                f"font-size:10.5px;font-weight:700;color:{tok['grn']};"
+                f"border:1px solid {tok['bd2']};border-radius:6px;padding:1px 7px;background:transparent;")
+            self._dup_badge = dup
+            row.addWidget(dup, 0)
         lay.addLayout(row)
 
         # 绗?2 琛岋細楂樹寒鐗囨锛堝唴瀹瑰懡涓級/ 鑰佹牸寮忚鏄庯紙.ppt锛?
@@ -298,8 +311,11 @@ class ResultItem(QWidget):
         # 绗?3 琛岋細淇敼鏃堕棿锛堟樉寮忎綋鐜版柊鏃э級
         tm = _fmt_mtime(r.mtime)
         if tm:
+            if len(dup_paths) > 1:
+                tm = f"{tm} · 同一文件存在于 {len(dup_paths)} 个路径"
             t = QLabel(tm)
             t.setStyleSheet(f"font-size:11px;color:{tok['ink3']};background:transparent;")
+            t.setToolTip("\n".join(dup_paths) if len(dup_paths) > 1 else "")
             lay.addWidget(t)
         outer.addLayout(lay, 1)
         self._apply("normal", True)

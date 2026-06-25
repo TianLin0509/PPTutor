@@ -66,6 +66,27 @@ def test_version_group_collapsed_by_default(qtbot, tmp_path):
     assert "2 个历史版本" in pw._exp_btn.text()
 
 
+def test_duplicate_copy_paths_are_summarized_on_single_result_card(qtbot, tmp_path):
+    win = MainWindow(conn=_index_multi(tmp_path, {"x.pptx": ["占位"]}),
+                     render_worker=StubRender(), do_index=False)
+    qtbot.addWidget(win)
+    dup = FileResult(
+        file_id=1, path="C:/deck.pptx", name="deck.pptx", ext=".pptx",
+        mtime=1000, size=1, page_count=2, status="ok", score=1.0,
+        name_hit=False, hits=[SearchHit(1, "命中片段")],
+        content_hash="sha256:" + "a" * 64,
+        duplicate_paths=["C:/deck.pptx", "D:/backup/deck.pptx", "E:/share/deck.pptx"],
+    )
+
+    _render(win, [dup])
+
+    assert win.result_list.count() == 1
+    card = win.result_list.itemWidget(win.result_list.item(0))
+    assert card._dup_badge is not None
+    assert card._dup_badge.text() == "3 个路径"
+    assert "D:/backup/deck.pptx" in card.toolTip()
+
+
 def test_version_group_expand_and_collapse(qtbot, tmp_path):
     win = MainWindow(conn=_index_multi(tmp_path, {"x.pptx": ["占位"]}),
                      render_worker=StubRender(), do_index=False)

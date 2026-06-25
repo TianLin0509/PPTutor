@@ -102,7 +102,7 @@ def test_build_fts_match_exact_no_trigram():
 
 # B06 facet 筛到 0：计数不留陈旧值 + 显示空状态提示
 def test_facet_zero_empty_state(qtbot, tmp_path):
-    conn = _build(tmp_path, {"甲.pptx": ["通用词内容"], "乙.pptx": ["通用词内容"]})
+    conn = _build(tmp_path, {"甲.pptx": ["通用词内容 甲"], "乙.pptx": ["通用词内容 乙"]})
     win = MainWindow(conn=conn, render_worker=StubRender(), do_index=False)
     qtbot.addWidget(win)
     win.show()

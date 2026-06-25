@@ -73,3 +73,5 @@ class FileResult:
     # P1 版本归组
     group_id: int | None = None
     is_latest: bool = False
+    content_hash: str = ""
+    duplicate_paths: list[str] = field(default_factory=list)

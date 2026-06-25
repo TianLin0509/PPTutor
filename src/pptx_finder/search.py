@@ -315,7 +315,7 @@ def search(conn: sqlite3.Connection, query: str, scope: str | None = None,
             file_id=row["id"], path=row["path"], name=row["name"], ext=row["ext"],
             mtime=row["mtime"], size=row["size"], page_count=row["page_count"],
             status=row["status"], score=score, name_hit=name_hit, hits=hits,
-            group_id=gmap.get(row["id"]),
+            content_hash=row["content_hash"] or "", group_id=gmap.get(row["id"]),
         ))
 
     # 文件名命中硬优先：文件名命中的永远排在纯内容命中之前（name_hit 作主键），同类内按分排
@@ -344,4 +344,43 @@ def search(conn: sqlite3.Connection, query: str, scope: str | None = None,
     final: list[FileResult] = []
     for key in order:
         final.extend(grouped[key])
-    return final[:limit]
+    return _collapse_exact_duplicates(final)[:limit]
+
+
+def _is_exact_hash(value: str) -> bool:
+    return bool(value and value.startswith("sha256:") and len(value) == len("sha256:") + 64)
+
+
+def _collapse_exact_duplicates(results: list[FileResult]) -> list[FileResult]:
+    """Collapse byte-identical PPTX copies into the first-ranked result.
+
+    Search ranking has already decided which copy is most relevant for this query.
+    We keep that row as the actionable primary path, while preserving all locations
+    in duplicate_paths for UI display.
+    """
+    by_hash: dict[str, list[FileResult]] = defaultdict(list)
+    for r in results:
+        if _is_exact_hash(r.content_hash):
+            by_hash[r.content_hash].append(r)
+
+    duplicate_sets = {h: rs for h, rs in by_hash.items() if len(rs) > 1}
+    if not duplicate_sets:
+        for r in results:
+            r.duplicate_paths = []
+        return results
+
+    seen: set[str] = set()
+    collapsed: list[FileResult] = []
+    for r in results:
+        group = duplicate_sets.get(r.content_hash)
+        if not group:
+            r.duplicate_paths = []
+            collapsed.append(r)
+            continue
+        if r.content_hash in seen:
+            continue
+        seen.add(r.content_hash)
+        ordered = [r] + [x for x in group if x is not r]
+        r.duplicate_paths = [x.path for x in ordered]
+        collapsed.append(r)
+    return collapsed

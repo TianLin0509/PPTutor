@@ -1,6 +1,9 @@
 """集成：版本归组后，search 结果应带 group_id、标最新版、同组聚集相邻。"""
 from __future__ import annotations
 
+import shutil
+import zipfile
+
 import fixtures_gen as fx
 
 from pptx_finder import cluster, db, indexer, search
@@ -31,3 +34,43 @@ def test_version_grouping_in_results(tmp_path):
     latest = [r for r in res if r.is_latest]
     assert len(latest) == 1
     assert "终稿" in latest[0].name
+
+
+def test_exact_duplicate_copies_are_collapsed_in_search_results(tmp_path):
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    src = docs / "AI方案.pptx"
+    copy = docs / "备份" / "AI方案-copy.pptx"
+    copy.parent.mkdir()
+    fx.make_pptx(src, [{"body": "AI 精准搜索 副本聚合"}])
+    shutil.copyfile(src, copy)
+
+    conn = db.connect(tmp_path / "i.db")
+    db.init_db(conn)
+    indexer.update_index(conn, [str(docs)], workers=1)
+
+    res = search.search(conn, "副本聚合")
+
+    assert len(res) == 1
+    assert set(res[0].duplicate_paths) == {str(src), str(copy)}
+    assert res[0].content_hash.startswith("sha256:")
+
+
+def test_same_text_but_different_pptx_bytes_are_not_collapsed(tmp_path):
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    a = docs / "AI方案A.pptx"
+    b = docs / "AI方案B.pptx"
+    fx.make_pptx(a, [{"body": "AI 精准搜索 相同文本"}])
+    fx.make_pptx(b, [{"body": "AI 精准搜索 相同文本"}])
+    with zipfile.ZipFile(b, "a") as zf:
+        zf.comment = b"different bytes"
+
+    conn = db.connect(tmp_path / "i.db")
+    db.init_db(conn)
+    indexer.update_index(conn, [str(docs)], workers=1)
+
+    res = search.search(conn, "相同文本")
+
+    assert len(res) == 2
+    assert all(not r.duplicate_paths for r in res)

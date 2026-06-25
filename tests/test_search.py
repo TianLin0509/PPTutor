@@ -71,7 +71,7 @@ def test_filename_search_uses_normalized_name_index(tmp_path):
 def test_init_db_migrates_existing_files_table_without_name_norm(tmp_path):
     conn = db.connect(tmp_path / "old.db")
     conn.executescript(
-        """
+        f"""
         CREATE TABLE files(
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           path TEXT UNIQUE NOT NULL,
@@ -86,7 +86,7 @@ def test_init_db_migrates_existing_files_table_without_name_norm(tmp_path):
           indexed_at REAL DEFAULT 0
         );
         CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
-        INSERT INTO meta(key,value) VALUES('index_version','4');
+        INSERT INTO meta(key,value) VALUES('index_version','{db.INDEX_VERSION}');
         INSERT INTO files(path,name,ext,size,mtime,content_hash,page_count,status,error,indexed_at)
         VALUES('C:/deck.pptx','deck.pptx','.pptx',1,1,'hash',1,'ok','',1);
         """

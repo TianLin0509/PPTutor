@@ -158,11 +158,11 @@ def test_two_stage_filename_searchable_before_content(tmp_path):
     assert r2 and r2[0].hits              # 内容现在可搜
 
 
-def test_index_one_uses_lightweight_hash(tmp_path):
-    """免全量 hash：content_hash 用 size:mtime 派生（不读文件内容）。"""
+def test_index_one_records_exact_content_hash(tmp_path):
+    """解析阶段记录真实 sha256，用于识别完全相同副本。"""
     p = tmp_path / "x.pptx"
     _mk(p, ["内容"])
     res = indexer._index_one(str(p))
     assert res["status"] == "ok"
-    assert ":" in res["content_hash"]     # mtime:size 派生
-    assert str(res["size"]) in res["content_hash"]
+    assert res["content_hash"].startswith("sha256:")
+    assert len(res["content_hash"]) == len("sha256:") + 64

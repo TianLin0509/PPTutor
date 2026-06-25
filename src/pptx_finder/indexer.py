@@ -1,8 +1,8 @@
 """索引构建：流式扫描 + 两阶段渐进 + 并行解析（walk 与解析流水线化）。
 
 设计（v0.3 优化）：
-- 免首次全量 hash：用 (size, mtime) 派生轻量标识判断变化，不读文件内容
-  （首次索引没有旧记录可比，读全量纯属浪费 IO）。
+- 增量快筛仍用 (size, mtime)，避免每次扫描都读完整文件；
+  解析阶段顺手计算 sha256 内容指纹，用于识别完全相同副本。
 - 两阶段渐进：阶段 1 流式登记文件名（status=pending，秒级可按名搜）；
   阶段 2 并行解析内容、升级为 ok。
 - 流水线：边扫描边登记、边投递解析，walk 的磁盘 IO 与解析的 CPU 重叠。
@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import logging
+import hashlib
 import os
 import sqlite3
 import time
@@ -42,11 +43,19 @@ def _stat_hash(size: int, mtime: float) -> str:
     return f"{mtime}:{size}"
 
 
+def _file_sha256(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return "sha256:" + h.hexdigest()
+
+
 def _index_one(path: str) -> dict[str, Any]:
     """worker：解压 + 提取文本 + 逐页分词。返回可 pickle 的紧凑结果。
 
-    不读全量算 hash（首次索引无旧记录可比，纯属浪费 IO）；
-    变更检测交给上层 (size, mtime) 快筛。
+    变更检测交给上层 (size, mtime) 快筛；走到这里说明需要解析，
+    顺手计算完整文件 sha256，供搜索结果折叠完全相同副本。
     """
     st = os.stat(ext_path(path))
     res: dict[str, Any] = {
@@ -55,7 +64,7 @@ def _index_one(path: str) -> dict[str, Any]:
         "ext": os.path.splitext(path)[1].lower(),
         "size": st.st_size,
         "mtime": st.st_mtime,
-        "content_hash": _stat_hash(st.st_size, st.st_mtime),
+        "content_hash": _file_sha256(ext_path(path)),
         "status": "ok",
         "error": "",
         "page_count": 0,
