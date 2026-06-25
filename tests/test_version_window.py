@@ -1,6 +1,8 @@
 ﻿from __future__ import annotations
 
 import pptx_finder.ui.version_window as version_window_mod
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QPixmap
 from pptx_finder.ui.version_window import VersionWindow
 
 
@@ -243,6 +245,92 @@ def test_version_window_auto_selects_first_loaded_version_and_enables_actions(qt
     assert win.ver_list.currentRow() == 0
     assert win.btn_restore.isEnabled()
     assert win.btn_export.isEnabled()
+
+
+def test_version_window_version_row_shows_summary_and_cached_preview(qtbot, tmp_path, monkeypatch):
+    monkeypatch.setattr(version_window_mod.QTimer, "singleShot", lambda *_args: None)
+    image = tmp_path / "version.png"
+    pm = QPixmap(48, 27)
+    pm.fill(Qt.green)
+    assert pm.save(str(image))
+    win = VersionWindow(FakeVersionManager())
+    qtbot.addWidget(win)
+    win._cur_doc = ("doc1", "C:/deck-a.pptx", "active")
+
+    win._on_versions_loaded(
+        0,
+        "doc1",
+        [{
+            "version_id": "v1",
+            "ts": 1_700_000_000,
+            "page_count": 12,
+            "changed": "summary-one",
+            "thumb_path": str(image),
+        }],
+    )
+
+    assert "summary-one" in win.ver_list.item(0).text()
+    pixmap = win.version_preview.pixmap()
+    assert pixmap is not None and not pixmap.isNull()
+
+
+def test_version_window_preview_runs_in_background_and_updates_item(qtbot, tmp_path, monkeypatch):
+    monkeypatch.setattr(version_window_mod.QTimer, "singleShot", lambda *_args: None)
+    image = tmp_path / "preview.png"
+    pm = QPixmap(48, 27)
+    pm.fill(Qt.yellow)
+    assert pm.save(str(image))
+    tasks = []
+    calls = []
+
+    class FakeSignal:
+        def __init__(self):
+            self.callbacks = []
+
+        def connect(self, callback):
+            self.callbacks.append(callback)
+
+        def emit(self, value=None):
+            for callback in list(self.callbacks):
+                if value is None:
+                    callback()
+                else:
+                    callback(value)
+
+    class FakeTask:
+        def __init__(self, fn, label="", parent=None):
+            self.fn = fn
+            self.label = label
+            self.done = FakeSignal()
+            self.finished = FakeSignal()
+
+        def start(self):
+            tasks.append(self)
+
+    class PreviewMgr(FakeVersionManager):
+        def ensure_version_preview(self, version_id: str):
+            calls.append(version_id)
+            return str(image)
+
+    monkeypatch.setattr(version_window_mod, "BackgroundTask", FakeTask, raising=False)
+    win = VersionWindow(PreviewMgr())
+    qtbot.addWidget(win)
+    win._cur_doc = ("doc1", "C:/deck-a.pptx", "active")
+    win._on_versions_loaded(0, "doc1", [{"version_id": "v1", "ts": 1_700_000_000, "page_count": 12}])
+    tasks.clear()
+
+    win.btn_preview.click()
+
+    assert len(tasks) == 1
+    assert tasks[0].label == "version-preview"
+    result = tasks[0].fn()
+    tasks[0].done.emit(result)
+    data = win.ver_list.item(0).data(Qt.UserRole)
+    assert data["thumb_path"] == str(image)
+    pixmap = win.version_preview.pixmap()
+    assert pixmap is not None and not pixmap.isNull()
+    tasks[0].finished.emit()
+    assert calls == ["v1"]
 
 
 def test_version_window_history_search_auto_selects_first_result_and_enables_actions(qtbot, monkeypatch):

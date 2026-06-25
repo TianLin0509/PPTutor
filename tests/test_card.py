@@ -78,9 +78,22 @@ def test_thumb_worker_stop_discards_pending_before_stop_signal():
 
     tw.stop()
 
-    assert tw._q.get_nowait() is _STOP
+    assert tw._q.get_nowait()[2] is _STOP
     assert tw._q.empty()
     assert tw._queued == set()
+    assert tw._queued_priority == {}
+
+
+def test_thumb_worker_upgrades_queued_duplicate_priority():
+    tw = ThumbWorker()
+
+    tw.request("a.pptx", 1, priority=90)
+    tw.request("a.pptx", 1, priority=5)
+
+    first = tw._q.get_nowait()
+    assert first[0] == 5
+    assert first[2] == ("a.pptx", 1)
+    assert tw._queued_priority[("a.pptx", 1)] == 5
 
 
 def test_thumb_worker_coalesces_inflight_duplicate_requests(qtbot, monkeypatch, tmp_path):
@@ -89,7 +102,7 @@ def test_thumb_worker_coalesces_inflight_duplicate_requests(qtbot, monkeypatch, 
     release = threading.Event()
     lock = threading.Lock()
 
-    def fake_render(path, page_no, cache_key=None, long_edge=480, hi_priority=False):
+    def fake_render(path, page_no, cache_key=None, long_edge=480, hi_priority=False, priority=None):
         with lock:
             calls.append((path, page_no, long_edge))
         started.set()
@@ -117,10 +130,39 @@ def test_thumb_worker_coalesces_inflight_duplicate_requests(qtbot, monkeypatch, 
         tw.wait(3000)
 
 
+def test_thumb_worker_reuses_cached_large_preview_before_com(qtbot, monkeypatch, tmp_path):
+    cached = tmp_path / "cached.png"
+    cached.write_bytes(b"png")
+    calls: list[tuple[str, int]] = []
+
+    def fake_cached(path, page_no, cache_key=None, min_long_edge=1):
+        calls.append((path, page_no))
+        return cached
+
+    def fail_render(*_args, **_kwargs):
+        raise AssertionError("thumbnail should reuse cached preview")
+
+    monkeypatch.setattr(renderer, "find_cached_render", fake_cached)
+    monkeypatch.setattr(renderer, "render_page", fail_render)
+    monkeypatch.setattr(renderer, "shutdown", lambda: None)
+
+    tw = ThumbWorker()
+    tw.start()
+    try:
+        with qtbot.waitSignal(tw.thumb_rendered, timeout=1000) as rendered:
+            tw.request("a.pptx", 1, priority=5)
+
+        assert rendered.args == ["a.pptx", 1, str(cached)]
+        assert calls == [("a.pptx", 1)]
+    finally:
+        tw.stop()
+        tw.wait(3000)
+
+
 def test_thumb_worker_render_error_emits_failure_and_worker_survives(qtbot, monkeypatch, tmp_path):
     calls: list[tuple[str, int]] = []
 
-    def fake_render(path, page_no, cache_key=None, long_edge=480, hi_priority=False):
+    def fake_render(path, page_no, cache_key=None, long_edge=480, hi_priority=False, priority=None):
         calls.append((path, page_no))
         if path == "bad.pptx":
             raise RuntimeError("thumbnail render failed")

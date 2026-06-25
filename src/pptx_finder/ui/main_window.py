@@ -493,6 +493,7 @@ class MainWindow(QMainWindow):
         self._detail_load_inflight_token: int | None = None
         self._detail_load_inflight_path: str | None = None
         self._detail_load_inflight_file_id: int | None = None
+        self._version_preview_inflight: set[str] = set()
         self._detail_dot_token = 0
         self._detail_dot_inflight_token: int | None = None
         self._detail_dot_inflight_path: str | None = None
@@ -578,6 +579,10 @@ class MainWindow(QMainWindow):
         self._detail_update_timer.timeout.connect(
             lambda: self._run_detail_update(self._detail_update_token)
         )
+        self._visible_thumb_timer = QTimer(self)
+        self._visible_thumb_timer.setSingleShot(True)
+        self._visible_thumb_timer.setInterval(40)
+        self._visible_thumb_timer.timeout.connect(self._request_visible_thumbs)
         self._detail_dot_timer = QTimer(self)
         self._detail_dot_timer.setSingleShot(True)
         self._detail_dot_timer.setInterval(self._DETAIL_DOT_DELAY_MS)
@@ -788,6 +793,7 @@ class MainWindow(QMainWindow):
         self.result_list.itemDoubleClicked.connect(self._on_activate)
         self.result_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.result_list.customContextMenuRequested.connect(self._context_menu)
+        self.result_list.verticalScrollBar().valueChanged.connect(self._schedule_visible_thumbs)
         ll.addWidget(self.result_list, 1)
         self._build_empty_hint(ll)
         # 鍒楄〃鍖虹敤 QStackedWidget 鍖呫€岀粨鏋滃垪琛?left銆嶄笌銆屼华琛ㄧ洏棣栧睆銆嶄簩閫変竴鍒囨崲锛?
@@ -810,6 +816,7 @@ class MainWindow(QMainWindow):
         self.detail_panel.setWindowFlags(Qt.Tool | Qt.FramelessWindowHint)
         self.detail_panel.restore_requested.connect(self._act_restore_version)
         self.detail_panel.export_requested.connect(self._act_export_version)
+        self.detail_panel.preview_requested.connect(self._request_version_preview)
         self.detail_panel.page_requested.connect(self._act_goto_page)
         self.detail_panel.hide()
         split.setStretchFactor(0, 0)
@@ -1787,10 +1794,18 @@ class MainWindow(QMainWindow):
     # 瓒呭嚭閮ㄥ垎鐢ㄤ簨浠跺惊鐜垎鎵?娴佸紡"琛ュ叆鈥斺€旈涓粨鏋滄渶蹇嚭鐜帮紝鏁翠綋浠?< 3s銆?
     _RENDER_FIRST = 16
     _RENDER_CHUNK = 16
-    _THUMB_FIRST = 16
+    _THUMB_FIRST = 100
     _THUMB_CACHE_MAX = 256
     _HIT_NAV_MAX = 12
     _RENDER_YIELD_MS = 1
+    _PREVIEW_MIN_EDGE = 1200
+    _PREVIEW_MAX_EDGE = 1600
+    _PREFETCH_EDGE = 960
+    _PRIORITY_RIGHT_PREVIEW = 0
+    _PRIORITY_VISIBLE_THUMB = 5
+    _PRIORITY_TOP_THUMB_BASE = 10
+    _PRIORITY_NEIGHBOR_PREFETCH = 220
+    _NEIGHBOR_PREFETCH_MAX = 2
 
     def _render_results(self, results: list[FileResult]) -> None:
         self.result_list.setEnabled(True)
@@ -1951,7 +1966,11 @@ class MainWindow(QMainWindow):
             if cached is not None and not cached.isNull():
                 w.set_thumbnail(cached)
             else:
-                self._thumb.request(w.path, w.thumb_page)
+                self._request_thumb_worker(
+                    w.path,
+                    w.thumb_page,
+                    priority=self._PRIORITY_VISIBLE_THUMB,
+                )
             inserted.append(item)
         self._group_member_items[gid] = inserted
         self._expanded_groups.add(gid)
@@ -1981,7 +2000,60 @@ class MainWindow(QMainWindow):
             self._thumb_cache[key] = cached
             w.set_thumbnail(cached)
         elif idx < self._THUMB_FIRST:
-            self._thumb.request(w.path, w.thumb_page)
+            self._request_thumb_worker(
+                w.path,
+                w.thumb_page,
+                priority=self._thumb_priority_for_index(idx),
+            )
+
+    def _thumb_priority_for_index(self, idx: int) -> int:
+        return self._PRIORITY_TOP_THUMB_BASE + max(0, min(int(idx), self._THUMB_FIRST - 1))
+
+    def _request_thumb_worker(self, path: str, page: int, *, priority: int) -> None:
+        try:
+            self._thumb.request(path, page, priority=int(priority))
+        except TypeError:
+            self._thumb.request(path, page)
+
+    def _schedule_visible_thumbs(self) -> None:
+        if self._closing:
+            return
+        self._visible_thumb_timer.start()
+
+    def _request_visible_thumbs(self) -> None:
+        if self._closing or self.result_list.isHidden():
+            return
+        viewport = self.result_list.viewport().rect()
+        count = self.result_list.count()
+        if count <= 0:
+            return
+        top_item = self.result_list.itemAt(1, 1)
+        bottom_item = self.result_list.itemAt(1, max(1, viewport.height() - 1))
+        top = self.result_list.row(top_item) if top_item is not None else max(0, self.result_list.currentRow())
+        bottom = self.result_list.row(bottom_item) if bottom_item is not None else min(count - 1, top + 32)
+        start = max(0, top - 2)
+        end = min(count, max(top, bottom) + 3)
+        for row in range(start, end):
+            item = self.result_list.item(row)
+            if item is None or item.data(Qt.UserRole) is None:
+                continue
+            rect = self.result_list.visualItemRect(item)
+            if not rect.isValid() or not rect.intersects(viewport):
+                continue
+            w = self.result_list.itemWidget(item)
+            if not isinstance(w, ResultItem):
+                continue
+            key = (w.path, w.thumb_page)
+            self._thumb_items[key] = w
+            cached = self._thumb_cache.get(key)
+            if cached is not None and not cached.isNull():
+                w.set_thumbnail(cached)
+            else:
+                self._request_thumb_worker(
+                    w.path,
+                    w.thumb_page,
+                    priority=self._PRIORITY_VISIBLE_THUMB,
+                )
 
     def _remember_thumb(self, key: tuple[str, int], pm: QPixmap) -> None:
         self._thumb_cache.pop(key, None)
@@ -2354,6 +2426,56 @@ class MainWindow(QMainWindow):
             self.detail_panel.set_outline([])
         self._set_ops_enabled(self._cur is not None)
 
+    def _request_version_preview(self, version_id: str) -> None:
+        if not version_id or self._version_mgr is None:
+            return
+        if not hasattr(self._version_mgr, "ensure_version_preview"):
+            return
+        if self._block_if_file_op_active():
+            return
+        if version_id in self._version_preview_inflight:
+            return
+        cur = self._cur
+        if cur is None or self.detail_panel.isHidden():
+            return
+
+        token = self._detail_update_token
+        path = cur.path
+        file_id = cur.file_id
+        self._version_preview_inflight.add(version_id)
+        self.detail_panel.set_version_preview_loading(version_id)
+        version_mgr = self._version_mgr
+        task = BackgroundTask(lambda: version_mgr.ensure_version_preview(version_id), "version-preview")
+        self._bg_tasks.append(task)
+        task.done.connect(
+            lambda image_path, token=token, path=path, file_id=file_id, version_id=version_id:
+            self._on_version_preview_ready(token, path, file_id, version_id, image_path)
+        )
+        task.finished.connect(lambda task=task, version_id=version_id: self._finish_version_preview(task, version_id))
+        task.start()
+
+    def _finish_version_preview(self, task, version_id: str) -> None:
+        self._version_preview_inflight.discard(version_id)
+        if task in self._bg_tasks:
+            self._bg_tasks.remove(task)
+
+    def _on_version_preview_ready(
+        self,
+        token: int,
+        path: str,
+        file_id: int,
+        version_id: str,
+        image_path: object,
+    ) -> None:
+        cur = self._cur
+        if self._closing or token != self._detail_update_token:
+            return
+        if self.detail_panel.isHidden() or cur is None:
+            return
+        if cur.path != path or cur.file_id != file_id:
+            return
+        self.detail_panel.set_version_preview(version_id, str(image_path) if image_path else None)
+
     def _run_bg(self, fn, on_done=None, label: str = "") -> bool:
         """鎶婂彲鑳介樆濉?UI 鐨勯噸娲讳涪鍚庡彴绾跨▼璺戯紝瀹屾垚缁忎俊鍙峰洖涓荤嚎绋嬨€備富绾跨▼鍙?start() 鍗宠繑鍥炪€?"""
         heavy = label in {"restore", "export", "open"}
@@ -2639,7 +2761,41 @@ class MainWindow(QMainWindow):
             self._preview_provisional = False
             self._start_spinner()
         self._req_id += 1
-        self._render.request(self._req_id, self._cur.path, page, cache_key=None)
+        self._request_render(
+            self._req_id,
+            self._cur.path,
+            page,
+            long_edge=self._preview_long_edge(),
+            priority=self._PRIORITY_RIGHT_PREVIEW,
+        )
+
+    def _preview_long_edge(self) -> int:
+        try:
+            vp = self.scroll.viewport().size()
+            edge = int(max(vp.width(), vp.height()) * 1.25)
+        except Exception:  # noqa: BLE001
+            edge = self._PREVIEW_MAX_EDGE
+        return max(self._PREVIEW_MIN_EDGE, min(self._PREVIEW_MAX_EDGE, edge))
+
+    def _request_render(self, req_id: int, path: str, page: int, *, long_edge: int, priority: int) -> None:
+        try:
+            self._render.request(req_id, path, page, cache_key=None, long_edge=long_edge, priority=priority)
+        except TypeError:
+            try:
+                self._render.request(req_id, path, page, cache_key=None, long_edge=long_edge)
+            except TypeError:
+                self._render.request(req_id, path, page, cache_key=None)
+
+    def _prefetch_render(self, path: str, page: int, *, long_edge: int, priority: int) -> None:
+        if not hasattr(self._render, "prefetch"):
+            return
+        try:
+            self._render.prefetch(path, page, long_edge=long_edge, priority=priority)
+        except TypeError:
+            try:
+                self._render.prefetch(path, page, long_edge=long_edge)
+            except TypeError:
+                self._render.prefetch(path, page)
 
     def _maybe_prewarm_render(self) -> None:
         if self._closing or not self._owns_render:
@@ -2726,16 +2882,23 @@ class MainWindow(QMainWindow):
             return  # 娴嬭瘯娉ㄥ叆鐨?StubRender 鏃犳鏂规硶
         total = self._cur.page_count or 0
         cur = self._view_page
-        order: list[int] = [h.page_no for h in (self._cur.hits or []) if h.page_no != cur]
-        order += [cur + 1, cur - 1]  # 鍏跺畠鍛戒腑椤典紭鍏堬紝鍐嶅墠鍚庣浉閭婚〉
+        order: list[int] = [cur + 1, cur - 1]
+        order += [h.page_no for h in (self._cur.hits or []) if h.page_no != cur]
         seen = {cur}
+        queued = 0
         for p in order:
             if p in seen or p < 1 or (total and p > total):
                 continue
             seen.add(p)
-            if len(seen) > 7:  # 闄愰噺锛屽埆杩囧害棰勬覆鏌?
+            if queued >= self._NEIGHBOR_PREFETCH_MAX:
                 break
-            self._render.prefetch(self._cur.path, p)
+            self._prefetch_render(
+                self._cur.path,
+                p,
+                long_edge=self._PREFETCH_EDGE,
+                priority=self._PRIORITY_NEIGHBOR_PREFETCH,
+            )
+            queued += 1
 
     def _update_pixmap(self) -> None:
         if self._cur_pixmap is None:
@@ -3579,6 +3742,8 @@ class MainWindow(QMainWindow):
     def _shutdown(self) -> None:
         self._closing = True
         self._render_gen += 1
+        if hasattr(self, "_visible_thumb_timer"):
+            self._visible_thumb_timer.stop()
         if self._search_worker is not None:
             self._search_worker.stop()
             self._search_worker.wait(self._SEARCH_SHUTDOWN_WAIT_MS)

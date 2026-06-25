@@ -4,8 +4,10 @@ from __future__ import annotations
 import datetime
 import logging
 import os
+import tempfile
 import threading
 
+from .. import renderer
 from ..config import PPTX_EXT
 from ..scanner import iter_ppt_files
 from ..text_tokenize import build_fts_match_exact
@@ -235,10 +237,52 @@ class VersionManager:
                 "doc_id": r["doc_id"],
                 "ts": r["ts"],
                 "page_count": r["page_count"],
+                "changed": r["changed"],
+                "thumb_path": r["thumb_path"],
                 "inherited": r["doc_id"] != doc_id,
             }
             for r in rows
         ]
+
+    def ensure_version_preview(self, version_id: str, page_no: int = 1, long_edge: int = 360) -> str | None:
+        """Render and cache a small PNG preview for one historical version."""
+        with self._lock:
+            version = store.get_version(self._conn, version_id)
+            if not version:
+                return None
+            cached = str(version["thumb_path"] or "")
+            if cached and os.path.exists(cached):
+                return cached
+            doc_id = version["doc_id"]
+
+        fd, tmp = tempfile.mkstemp(suffix=".pptx")
+        os.close(fd)
+        try:
+            if not vault.rebuild_to(doc_id, version_id, tmp):
+                return None
+            page = max(1, int(page_no))
+            try:
+                png = renderer.render_page(
+                    tmp,
+                    page,
+                    cache_key=f"version-{version_id}-p{page}",
+                    long_edge=long_edge,
+                    hi_priority=False,
+                )
+            finally:
+                renderer.close_current_presentation()
+            if not png or not os.path.exists(png):
+                return None
+            out = str(png)
+            with self._lock:
+                store.set_version_thumb_path(self._conn, version_id, out)
+                self._conn.commit()
+            return out
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
     # ---------- Restore / export ----------
     def restore_to(self, path: str, version_id: str, dest: str | None = None) -> bool:

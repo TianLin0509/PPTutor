@@ -369,6 +369,81 @@ def test_startup_render_prewarm_runs_when_idle(qtbot, tmp_path):
     assert prewarms == ["prewarm"]
 
 
+def test_preview_request_uses_adaptive_first_paint_resolution(qtbot, tmp_path):
+    class AdaptiveRender(QObject):
+        rendered = Signal(int, str)
+
+        def __init__(self):
+            super().__init__()
+            self.calls: list[tuple[int, str, int, int]] = []
+
+        def request(self, req_id: int, path: str, page_no: int, cache_key=None, long_edge=0):
+            self.calls.append((req_id, path, page_no, int(long_edge)))
+
+    conn = _index(tmp_path)
+    render = AdaptiveRender()
+    win = MainWindow(conn=conn, render_worker=render, do_index=False)
+    qtbot.addWidget(win)
+    win.resize(1180, 760)
+    win._cur = _fake_results(1)[0]
+    win._view_page = 1
+
+    win._request_preview()
+
+    assert render.calls
+    assert MainWindow._PREVIEW_MIN_EDGE <= render.calls[-1][3] <= MainWindow._PREVIEW_MAX_EDGE
+    assert render.calls[-1][3] < 2560
+
+
+def test_neighbor_prefetch_is_low_priority_and_limited(qtbot, tmp_path):
+    class PrefetchRender(QObject):
+        rendered = Signal(int, str)
+
+        def __init__(self):
+            super().__init__()
+            self.prefetches: list[tuple[str, int, int, int]] = []
+
+        def request(self, req_id: int, path: str, page_no: int, cache_key=None):
+            pass
+
+        def prefetch(self, path: str, page_no: int, cache_key=None, long_edge=0, priority=0):
+            self.prefetches.append((path, page_no, int(long_edge), int(priority)))
+
+        def stop(self):
+            pass
+
+        def wait(self, _ms: int):
+            return True
+
+    conn = _index(tmp_path)
+    render = PrefetchRender()
+    win = MainWindow(conn=conn, render_worker=render, do_index=False)
+    qtbot.addWidget(win)
+    win._owns_render = True
+    win._cur = FileResult(
+        file_id=1,
+        path="C:/deck.pptx",
+        name="deck.pptx",
+        ext=".pptx",
+        mtime=0,
+        size=1,
+        page_count=10,
+        status="ok",
+        score=1,
+        name_hit=False,
+        hits=[SearchHit(8, "hit"), SearchHit(9, "hit")],
+    )
+    win._view_page = 3
+
+    win._prefetch_neighbors()
+
+    assert render.prefetches == [
+        ("C:/deck.pptx", 4, win._PREFETCH_EDGE, win._PRIORITY_NEIGHBOR_PREFETCH),
+        ("C:/deck.pptx", 2, win._PREFETCH_EDGE, win._PRIORITY_NEIGHBOR_PREFETCH),
+    ]
+    assert win._PRIORITY_NEIGHBOR_PREFETCH > win._PRIORITY_TOP_THUMB_BASE + win._THUMB_FIRST
+
+
 def test_facet_change_auto_preview_is_delayed(qtbot, monkeypatch, tmp_path):
     monkeypatch.setattr(MainWindow, "_AUTO_PREVIEW_DELAY_MS", 80)
     conn = _index_multi(
@@ -1047,10 +1122,58 @@ def test_large_result_rendering_batches_first_frame_and_thumbnails(qtbot, tmp_pa
     assert win._RENDER_FIRST <= 16
     assert win._RENDER_CHUNK <= 16
     assert win.result_list.count() == win._RENDER_FIRST
-    assert len(thumb.requests) - initial_thumb_requests <= 16
+    assert len(thumb.requests) - initial_thumb_requests <= win._RENDER_FIRST
 
     qtbot.waitUntil(lambda: win.result_list.count() == 80, timeout=5000)
-    assert len(thumb.requests) - initial_thumb_requests <= 16
+    assert len(thumb.requests) - initial_thumb_requests <= win._THUMB_FIRST
+
+
+def test_thumbnail_requests_are_prioritized_by_result_rank(qtbot, tmp_path):
+    class PriorityThumb(QObject):
+        thumb_rendered = Signal(str, int, str)
+
+        def __init__(self):
+            super().__init__()
+            self.requests: list[tuple[str, int, int]] = []
+
+        def request(self, path: str, page_no: int, priority: int = 0):
+            self.requests.append((path, page_no, int(priority)))
+
+        def clear(self):
+            pass
+
+    conn = _index(tmp_path)
+    thumb = PriorityThumb()
+    win = MainWindow(conn=conn, render_worker=StubRender(), thumb_worker=thumb, do_index=False)
+    qtbot.addWidget(win)
+
+    win._render_results(_fake_results(24))
+
+    priorities = [priority for _path, _page, priority in thumb.requests]
+    assert len(priorities) >= 3
+    assert priorities[:3] == [
+        win._PRIORITY_TOP_THUMB_BASE,
+        win._PRIORITY_TOP_THUMB_BASE + 1,
+        win._PRIORITY_TOP_THUMB_BASE + 2,
+    ]
+    assert priorities == sorted(priorities)
+    assert max(priorities) < win._PRIORITY_NEIGHBOR_PREFETCH
+
+
+def test_visible_thumbnail_refresh_scans_only_visible_window(qtbot, tmp_path):
+    conn = _index(tmp_path)
+    thumb = StubThumb()
+    win = MainWindow(conn=conn, render_worker=StubRender(), thumb_worker=thumb, do_index=False)
+    qtbot.addWidget(win)
+    win.resize(1180, 760)
+
+    win._flush_plan([("i", i, r, None) for i, r in enumerate(_fake_results(80))], 0, 80, "")
+    thumb.requests.clear()
+
+    win._request_visible_thumbs()
+
+    assert win.result_list.count() == 80
+    assert len(thumb.requests) <= 24
 
 
 def test_thumbnail_cache_is_bounded(qtbot, monkeypatch, tmp_path):
@@ -2338,6 +2461,12 @@ def test_copy_file_to_clipboard_does_not_sleep_in_ui_thread(qtbot, monkeypatch, 
         raise AssertionError("copy file must not sleep in the UI thread")
 
     monkeypatch.setattr(main_window_mod.time, "sleep", fail_sleep)
+    monkeypatch.setattr(win, "_set_file_clipboard", lambda _path: None)
+    monkeypatch.setattr(
+        win,
+        "_confirm_file_clipboard",
+        lambda _path, _token, _remaining: win._toast("已复制文件到剪贴板"),
+    )
 
     win._act_copy_clipboard()
 
@@ -2370,6 +2499,8 @@ def test_copy_file_to_clipboard_does_not_probe_filesystem_in_ui_thread(qtbot, mo
 
     monkeypatch.setattr(main_window_mod.os.path, "exists", fake_exists)
     monkeypatch.setattr(win, "_run_bg", fake_run_bg)
+    monkeypatch.setattr(win, "_set_file_clipboard", lambda _path: None)
+    monkeypatch.setattr(win, "_confirm_file_clipboard", lambda _path, _token, _remaining: None)
 
     win._act_copy_clipboard()
 

@@ -45,11 +45,19 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    _ensure_column(conn, "versions", "changed", "TEXT DEFAULT ''")
+    _ensure_column(conn, "versions", "thumb_path", "TEXT DEFAULT ''")
     # Backfill path aliases for existing vaults created before doc_paths existed.
     for row in conn.execute("SELECT doc_id, path, created_at, updated_at FROM managed_docs").fetchall():
         ts = row["updated_at"] or row["created_at"] or 0
         record_path(conn, row["doc_id"], row["path"], ts, "current")
     conn.commit()
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, decl: str) -> None:
+    cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
 
 def path_key(path: str) -> str:
@@ -128,6 +136,10 @@ def add_version(conn, version_id, doc_id, ts, session_id, page_count, size, cont
            VALUES(?,?,?,?,?,?,?,?)""",
         (version_id, doc_id, ts, session_id, page_count, size, content_hash, changed),
     )
+
+
+def set_version_thumb_path(conn, version_id: str, thumb_path: str) -> None:
+    conn.execute("UPDATE versions SET thumb_path=? WHERE version_id=?", (thumb_path, version_id))
 
 
 def list_versions(conn, doc_id: str):

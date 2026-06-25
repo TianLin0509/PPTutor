@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import fixtures_gen as fx
 import pptx_finder.ui.main_window as main_window_mod
-from PySide6.QtWidgets import QFileDialog, QPushButton
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QPixmap
+from PySide6.QtWidgets import QFileDialog, QLabel, QPushButton
 from test_ui import PendingSearchWorker, StubRender, _index
 
 from pptx_finder import db, indexer
@@ -73,6 +75,34 @@ def test_detail_version_nodes(qtbot):
                 {"version_id": "v2", "ts": 2000, "page_count": 22}]
     dp.update_for(_fr(), versions)
     assert len(dp._version_nodes) == 2
+
+
+def test_detail_version_node_shows_summary_preview_and_emits_request(qtbot, tmp_path):
+    image = tmp_path / "version.png"
+    pm = QPixmap(48, 27)
+    pm.fill(Qt.red)
+    assert pm.save(str(image))
+
+    dp = DetailPanel(theme.tok("raycast"))
+    qtbot.addWidget(dp)
+    fired = []
+    dp.preview_requested.connect(lambda version_id: fired.append(version_id))
+
+    dp.update_for(
+        _fr(),
+        [{"version_id": "v9", "ts": 3000, "page_count": 24, "changed": "summary-one", "thumb_path": str(image)}],
+    )
+
+    assert any("summary-one" in label.text() for label in dp.findChildren(QLabel, "verChanged"))
+    preview_labels = dp.findChildren(QLabel, "verPreview")
+    assert len(preview_labels) == 1
+    pixmap = preview_labels[0].pixmap()
+    assert pixmap is not None and not pixmap.isNull()
+
+    buttons = dp.findChildren(QPushButton, "verPreviewBtn")
+    assert len(buttons) == 1
+    buttons[0].click()
+    assert fired == ["v9"]
 
 
 def test_detail_no_version_no_nodes(qtbot):
@@ -215,6 +245,66 @@ def test_mainwindow_select_updates_detail(qtbot, tmp_path):
     win._do_search()
     win.result_list.setCurrentRow(0)
     qtbot.waitUntil(lambda: len(win.detail_panel._version_nodes) >= 1, timeout=1000)
+
+
+def test_mainwindow_version_preview_runs_in_background_and_dedupes(qtbot, tmp_path, monkeypatch):
+    image = tmp_path / "preview.png"
+    pm = QPixmap(48, 27)
+    pm.fill(Qt.blue)
+    assert pm.save(str(image))
+    tasks = []
+    calls = []
+
+    class FakeSignal:
+        def __init__(self):
+            self.callbacks = []
+
+        def connect(self, callback):
+            self.callbacks.append(callback)
+
+        def emit(self, value=None):
+            for callback in list(self.callbacks):
+                if value is None:
+                    callback()
+                else:
+                    callback(value)
+
+    class FakeTask:
+        def __init__(self, fn, label="", parent=None):
+            self.fn = fn
+            self.label = label
+            self.done = FakeSignal()
+            self.finished = FakeSignal()
+
+        def start(self):
+            tasks.append(self)
+
+    class PreviewMgr(StubVerMgr):
+        def ensure_version_preview(self, version_id):
+            calls.append(version_id)
+            return str(image)
+
+    monkeypatch.setattr(main_window_mod, "BackgroundTask", FakeTask, raising=False)
+
+    win = MainWindow(conn=_index(tmp_path), render_worker=StubRender(), version_mgr=PreviewMgr(), do_index=False)
+    qtbot.addWidget(win)
+    win._cur = _fr(path="C:/deck-a.pptx")
+    win.detail_panel.show()
+    win.detail_panel.update_for(win._cur, [{"version_id": "v1", "ts": 1000, "page_count": 5}])
+    tasks.clear()
+
+    win._request_version_preview("v1")
+    win._request_version_preview("v1")
+
+    assert len(tasks) == 1
+    assert tasks[0].label == "version-preview"
+    result = tasks[0].fn()
+    tasks[0].done.emit(result)
+    pixmap = win.detail_panel._version_preview_labels["v1"].pixmap()
+    assert pixmap is not None and not pixmap.isNull()
+    tasks[0].finished.emit()
+    assert calls == ["v1"]
+    assert "v1" not in win._version_preview_inflight
 
 
 def test_mainwindow_detail_update_loads_versions_in_background(qtbot, tmp_path, monkeypatch):

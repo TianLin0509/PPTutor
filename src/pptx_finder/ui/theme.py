@@ -217,9 +217,13 @@ QLabel#verTitle { color: $ink2; font-size: 12px; font-weight: 600; background: t
 QLabel#verTs { color: $ink4; font-size: 10.5px; background: transparent; }
 QLabel#verUp { color: $grn; font-size: 10px; font-weight: 700; background: transparent; }
 QLabel#verDn { color: #ff7a6b; font-size: 10px; font-weight: 700; background: transparent; }
+QLabel#verPreview { background: $field; border: 1px solid $bd2; border-radius: 6px; color: $ink4; font-size: 10.5px; }
+QLabel#versionPreview { background: $field; border: 1px solid $bd2; border-radius: 6px; color: $ink4; font-size: 11px; }
 QPushButton#verBtn { background: transparent; border: 1px solid $bd2; border-radius: 5px; padding: 2px 9px; color: $ink2; font-size: 11px; }
 QPushButton#verBtn:hover { border-color: $acc; color: $acc; }
 QPushButton#verBtnPri { background: $acc; border: 1px solid $acc; border-radius: 5px; padding: 2px 9px; color: $acctext; font-size: 11px; font-weight: 600; }
+QPushButton#verPreviewBtn { background: transparent; border: 1px solid $bd2; border-radius: 5px; padding: 3px 10px; color: $ink2; font-size: 11px; }
+QPushButton#verPreviewBtn:hover { border-color: $acc; color: $acc; }
 QPushButton#outlineItem { background: transparent; border: none; text-align: left; padding: 4px 6px; color: $ink2; font-size: 11.5px; border-radius: 5px; }
 QPushButton#outlineItem:hover { background: $hover; color: $acc; }
 QLabel#listHead { color: $ink3; font-size: 11.5px; font-weight: 600; background: transparent; }

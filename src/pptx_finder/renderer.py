@@ -11,6 +11,7 @@ import contextlib
 import logging
 import os
 import threading
+import time
 from pathlib import Path
 
 import xxhash
@@ -27,19 +28,33 @@ _state = threading.local()
 _cv = threading.Condition()
 _busy = False        # COM 通道当前是否被占用
 _hi_waiting = 0      # 排队中的高优先(预览)请求数
+_waiting_by_priority: dict[int, int] = {}
+_FAILED_TTL_SEC = 90.0
+_failed_until: dict[tuple[str, int, str, int], float] = {}
 
 
 @contextlib.contextmanager
-def _com_slot(hi_priority: bool):
-    """获取 COM 渲染单槽。预览(hi_priority=True)优先：低优先(缩略图)在有预览排队时
-    一律让路，且不抢先堆到锁队列上——预览随时能插到下一个执行。"""
+def _com_slot(hi_priority: bool, priority: int | None = None):
+    """Acquire the single COM render slot.
+
+    Lower numeric priority wins. ``hi_priority`` remains compatible with older
+    callers and maps to priority 0.
+    """
     global _busy, _hi_waiting
+    if priority is None:
+        priority = 0 if hi_priority else 100
+    priority = int(priority)
     with _cv:
         if hi_priority:
             _hi_waiting += 1
-        # 等到通道空闲；低优先还需等到没有预览在排队（让预览插队）
-        while _busy or (not hi_priority and _hi_waiting > 0):
+        _waiting_by_priority[priority] = _waiting_by_priority.get(priority, 0) + 1
+        while _busy or any(p < priority and n > 0 for p, n in _waiting_by_priority.items()):
             _cv.wait()
+        n = _waiting_by_priority.get(priority, 0) - 1
+        if n > 0:
+            _waiting_by_priority[priority] = n
+        else:
+            _waiting_by_priority.pop(priority, None)
         if hi_priority:
             _hi_waiting -= 1
         _busy = True
@@ -108,12 +123,55 @@ def default_cache_key(path: str) -> str | None:
     return xxhash.xxh64(raw.encode("utf-8")).hexdigest()
 
 
+def close_current_presentation() -> None:
+    """Release the presentation currently held by this renderer without quitting PowerPoint."""
+    _close_pres()
+
+
+def find_cached_render(
+    path: str,
+    page_no: int,
+    cache_key: str | None = None,
+    min_long_edge: int = 1,
+) -> Path | None:
+    """Return an existing cached render that is sharp enough for this request."""
+    path = os.path.abspath(path)
+    if cache_key is None:
+        cache_key = default_cache_key(path)
+        if cache_key is None:
+            return None
+    min_long_edge = int(min_long_edge)
+    prefix = f"{cache_key}_{page_no}_"
+    best: tuple[int, Path] | None = None
+    for candidate in cache_dir().glob(f"{prefix}*.png"):
+        if not candidate.is_file():
+            continue
+        try:
+            if candidate.stat().st_size <= 0:
+                continue
+        except OSError:
+            continue
+        stem = candidate.stem
+        if not stem.startswith(prefix):
+            continue
+        try:
+            edge = int(stem[len(prefix):])
+        except ValueError:
+            continue
+        if edge < min_long_edge:
+            continue
+        if best is None or edge > best[0]:
+            best = (edge, candidate)
+    return best[1] if best is not None else None
+
+
 def render_page(
     path: str,
     page_no: int,
     cache_key: str | None = None,
     long_edge: int = 2560,
     hi_priority: bool = False,
+    priority: int | None = None,
 ) -> Path | None:
     """导出 path 第 page_no 页（1-based）为高清 PNG，返回缓存路径；失败返回 None。
 
@@ -129,10 +187,17 @@ def render_page(
     out = cache_dir() / f"{cache_key}_{page_no}_{long_edge}.png"
     if out.exists() and out.stat().st_size > 0:
         return out
+    cached = find_cached_render(path, page_no, cache_key=cache_key, min_long_edge=long_edge)
+    if cached is not None:
+        return cached
     if not os.path.exists(path):
         return None
 
-    with _com_slot(hi_priority):  # COM 串行单槽（预览优先抢占缩略图）
+    fail_key = (path, int(page_no), cache_key, int(long_edge))
+    if time.monotonic() < _failed_until.get(fail_key, 0.0):
+        return None
+
+    with _com_slot(hi_priority, priority):  # COM 串行单槽（预览优先抢占缩略图）
         try:
             app = _get_app()
             pres = _open_pres(app, path, cache_key)  # 复用已打开的同文件，免重复 Open
@@ -142,9 +207,13 @@ def render_page(
             width = long_edge
             height = max(1, int(round(width * getattr(_state, "pres_ratio", 9 / 16))))
             pres.Slides(page_no).Export(str(out), "PNG", width, height)
-            return out if (out.exists() and out.stat().st_size > 0) else None
+            if out.exists() and out.stat().st_size > 0:
+                _failed_until.pop(fail_key, None)
+                return out
+            return None
         except Exception as e:  # noqa: BLE001
             log.warning("render_page failed path=%s page=%s: %s", path, page_no, e)
+            _failed_until[fail_key] = time.monotonic() + _FAILED_TTL_SEC
             _close_pres()       # 关掉可能损坏的 pres
             _state.app = None   # 丢弃可能已损坏的 COM 实例，下次重建干净实例
             return None

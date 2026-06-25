@@ -9,6 +9,7 @@ import datetime
 import os
 
 from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
@@ -39,6 +40,13 @@ def _fmt_ts(ts: float) -> str:
         return ""
 
 
+def _vget(v, key, default=""):
+    try:
+        return v[key]
+    except (KeyError, IndexError, TypeError):
+        return default
+
+
 class VersionWindow(QWidget):
     _FILE_OP_BUSY_NOTICE = "已有文件操作正在进行，请稍候…"
 
@@ -57,6 +65,8 @@ class VersionWindow(QWidget):
         self._docs_tasks: list[BackgroundTask] = []
         self._search_tasks: list[BackgroundTask] = []
         self._version_tasks: list[BackgroundTask] = []
+        self._version_preview_tasks: list[BackgroundTask] = []
+        self._version_preview_inflight: set[str] = set()
         self._file_tasks: list[BackgroundTask] = []
         self._closing_owner = parent
         self._parent_bg_tasks = getattr(parent, "_bg_tasks", None)
@@ -104,8 +114,21 @@ class VersionWindow(QWidget):
         self.right_title.setStyleSheet("font-weight:700;")
         rl.addWidget(self.right_title)
         self.ver_list = QListWidget()
-        self.ver_list.currentItemChanged.connect(lambda *_args: self._update_file_ops_state())
+        self.ver_list.currentItemChanged.connect(lambda *_args: self._on_version_selection_changed())
         rl.addWidget(self.ver_list, 1)
+        preview_row = QHBoxLayout()
+        self.version_preview = QLabel("选择版本后可生成预览")
+        self.version_preview.setObjectName("versionPreview")
+        self.version_preview.setFixedSize(180, 101)
+        self.version_preview.setAlignment(Qt.AlignCenter)
+        preview_row.addWidget(self.version_preview)
+        preview_ops = QVBoxLayout()
+        self.btn_preview = QPushButton("生成预览")
+        self.btn_preview.clicked.connect(self._preview_selected_version)
+        preview_ops.addWidget(self.btn_preview)
+        preview_ops.addStretch(1)
+        preview_row.addLayout(preview_ops, 1)
+        rl.addLayout(preview_row)
         ops = QHBoxLayout()
         self.btn_restore = QPushButton("恢复此版本（覆盖当前）")
         self.btn_restore.setObjectName("primary")
@@ -159,7 +182,7 @@ class VersionWindow(QWidget):
 
     def _set_file_ops_enabled(self, enabled: bool) -> None:
         if not enabled:
-            for btn in (self.btn_restore, self.btn_export, self.btn_recover):
+            for btn in (self.btn_restore, self.btn_export, self.btn_recover, self.btn_preview):
                 btn.setEnabled(False)
             return
         self._update_file_ops_state()
@@ -172,17 +195,99 @@ class VersionWindow(QWidget):
 
     def _update_file_ops_state(self) -> None:
         on = not self._active_file_op
-        has_version = self._sel_version_context() is not None
+        ctx = self._sel_version_context()
+        has_version = ctx is not None
+        version_id = ctx[0] if ctx else ""
         recoverable = isinstance(self._cur_doc, tuple) and self._cur_doc[2] == "deleted"
         self.btn_restore.setEnabled(on and has_version)
         self.btn_export.setEnabled(on and has_version)
         self.btn_recover.setEnabled(on and recoverable)
+        self.btn_preview.setEnabled(
+            on
+            and has_version
+            and hasattr(self._mgr, "ensure_version_preview")
+            and version_id not in self._version_preview_inflight
+        )
 
     def _block_if_file_op_active(self) -> bool:
         if not self._active_file_op:
             return False
         self.right_title.setText(self._FILE_OP_BUSY_NOTICE)
         return True
+
+    def _on_version_selection_changed(self) -> None:
+        self._update_file_ops_state()
+        self._show_selected_version_preview()
+
+    def _clear_version_preview(self, text: str = "选择版本后可生成预览") -> None:
+        self.version_preview.setPixmap(QPixmap())
+        self.version_preview.setText(text)
+        self.version_preview.setToolTip("")
+
+    def _set_version_preview_image(self, image_path: str | None) -> bool:
+        if not image_path:
+            self._clear_version_preview("暂无预览")
+            return False
+        pm = QPixmap(str(image_path))
+        if pm.isNull():
+            self._clear_version_preview("预览不可用")
+            return False
+        self.version_preview.setText("")
+        self.version_preview.setPixmap(
+            pm.scaled(self.version_preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        )
+        self.version_preview.setToolTip(str(image_path))
+        return True
+
+    def _show_selected_version_preview(self) -> None:
+        it = self.ver_list.currentItem()
+        data = it.data(Qt.UserRole) if it is not None else None
+        if not isinstance(data, dict) or not data.get("version_id"):
+            self._clear_version_preview()
+            return
+        thumb_path = str(data.get("thumb_path") or "")
+        if not self._set_version_preview_image(thumb_path):
+            self._clear_version_preview("点击生成预览")
+
+    def _preview_selected_version(self) -> None:
+        ctx = self._sel_version_context()
+        if not ctx or not hasattr(self._mgr, "ensure_version_preview"):
+            return
+        if self._block_if_file_op_active():
+            return
+        version_id = ctx[0]
+        if version_id in self._version_preview_inflight:
+            return
+        self._version_preview_inflight.add(version_id)
+        self._clear_version_preview("预览生成中...")
+        self._update_file_ops_state()
+        task = BackgroundTask(lambda: self._mgr.ensure_version_preview(version_id), "version-preview", self)
+        self._track_bg_task(task, self._version_preview_tasks)
+        task.done.connect(lambda image_path, version_id=version_id: self._on_version_preview_ready(version_id, image_path))
+        task.finished.connect(
+            lambda task=task, version_id=version_id: self._finish_version_preview(task, version_id))
+        task.start()
+
+    def _finish_version_preview(self, task, version_id: str) -> None:
+        self._version_preview_inflight.discard(version_id)
+        self._forget_bg_task(task, self._version_preview_tasks)
+        if self._ui_alive():
+            self._update_file_ops_state()
+
+    def _on_version_preview_ready(self, version_id: str, image_path: object) -> None:
+        if not self._ui_alive():
+            return
+        image = str(image_path) if image_path else ""
+        for i in range(self.ver_list.count()):
+            item = self.ver_list.item(i)
+            data = item.data(Qt.UserRole)
+            if isinstance(data, dict) and data.get("version_id") == version_id:
+                new_data = dict(data)
+                new_data["thumb_path"] = image
+                item.setData(Qt.UserRole, new_data)
+                break
+        if self._sel_version() == version_id:
+            self._set_version_preview_image(image)
 
     def _defer_doc_reload_if_file_op_active(self) -> bool:
         if not self._active_file_op:
@@ -205,6 +310,7 @@ class VersionWindow(QWidget):
         self._versions_inflight_doc_id = None
         self.doc_list.clear()
         self.ver_list.clear()
+        self._clear_version_preview()
         self.right_title.setText("正在加载版本文档…")
         it = QListWidgetItem("正在加载版本文档…")
         it.setData(Qt.UserRole, None)
@@ -303,6 +409,7 @@ class VersionWindow(QWidget):
         self._versions_load_token += 1
         token = self._versions_load_token
         self.ver_list.clear()
+        self._clear_version_preview("正在加载版本时间线...")
         it = QListWidgetItem("正在加载版本时间线…")
         it.setData(Qt.UserRole, None)
         self.ver_list.addItem(it)
@@ -316,6 +423,8 @@ class VersionWindow(QWidget):
                     "version_id": v["version_id"],
                     "ts": v["ts"],
                     "page_count": v["page_count"],
+                    "changed": _vget(v, "changed", ""),
+                    "thumb_path": _vget(v, "thumb_path", ""),
                 }
                 for v in self._mgr.list_versions_by_doc(doc_id)
             ]
@@ -348,14 +457,24 @@ class VersionWindow(QWidget):
             it = QListWidgetItem("暂无版本记录")
             it.setData(Qt.UserRole, None)
             self.ver_list.addItem(it)
+            self._clear_version_preview("暂无版本记录")
             self._update_file_ops_state()
             return
         for v in rows:
-            it = QListWidgetItem(f"{_fmt_ts(v['ts'])}　·　{v['page_count']} 页")
+            changed = str(_vget(v, "changed", "") or "").strip()
+            label = f"{_fmt_ts(_vget(v, 'ts', 0))}　·　{_vget(v, 'page_count', 0)} 页"
+            if changed:
+                label = f"{label}\n  ✎ {changed}"
+            it = QListWidgetItem(label)
             doc_path = None
             if isinstance(self._cur_doc, tuple) and self._cur_doc[0] == doc_id:
                 doc_path = self._cur_doc[1]
-            it.setData(Qt.UserRole, {"version_id": v["version_id"], "doc_path": doc_path})
+            it.setData(Qt.UserRole, {
+                "version_id": _vget(v, "version_id", ""),
+                "doc_path": doc_path,
+                "changed": changed,
+                "thumb_path": _vget(v, "thumb_path", ""),
+            })
             self.ver_list.addItem(it)
         self.ver_list.setCurrentRow(0)
         self._update_file_ops_state()

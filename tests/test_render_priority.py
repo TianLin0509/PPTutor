@@ -53,6 +53,22 @@ class _FakeApp:
         self.Presentations = _FakeApp._Presentations()
 
 
+class _BrokenSlide:
+    def Export(self, out, fmt, w, h):
+        raise RuntimeError("export failed")
+
+
+class _BrokenSlides(_FakeSlides):
+    def __call__(self, i):
+        return _BrokenSlide()
+
+
+class _BrokenPres(_FakePres):
+    def __init__(self):
+        self.Slides = _BrokenSlides(5)
+        self.PageSetup = _FakePageSetup()
+
+
 def test_preview_preempts_thumbnails(tmp_path, monkeypatch):
     monkeypatch.setattr(renderer, "cache_dir", lambda: tmp_path)
     monkeypatch.setattr(renderer, "_get_app", lambda: _FakeApp())
@@ -93,3 +109,70 @@ def test_preview_preempts_thumbnails(tmp_path, monkeypatch):
     # 单槽状态归零（每次 finally 都释放）
     assert renderer._hi_waiting == 0
     assert renderer._busy is False
+    assert renderer._waiting_by_priority == {}
+
+
+def test_numeric_priority_orders_waiting_render_tasks(tmp_path, monkeypatch):
+    monkeypatch.setattr(renderer, "cache_dir", lambda: tmp_path)
+    monkeypatch.setattr(renderer, "_get_app", lambda: _FakeApp())
+    src = tmp_path / "x.pptx"
+    src.write_bytes(b"dummy")
+
+    done: list[tuple[str, float]] = []
+    lk = threading.Lock()
+
+    def record(label):
+        with lk:
+            done.append((label, time.perf_counter()))
+
+    def task(label, priority):
+        renderer.render_page(
+            str(src),
+            1,
+            cache_key=label,
+            long_edge=480,
+            hi_priority=False,
+            priority=priority,
+        )
+        record(label)
+
+    blocker = threading.Thread(target=task, args=("blocker", 100))
+    blocker.start()
+    time.sleep(0.05)
+    prefetch = threading.Thread(target=task, args=("prefetch", 220))
+    visible_thumb = threading.Thread(target=task, args=("visible_thumb", 5))
+    prefetch.start()
+    visible_thumb.start()
+    for t in (blocker, prefetch, visible_thumb):
+        t.join()
+
+    order = [label for label, _ in sorted(done, key=lambda x: x[1])]
+    assert order.index("visible_thumb") < order.index("prefetch")
+    assert renderer._waiting_by_priority == {}
+
+
+def test_failed_render_is_short_circuited_by_ttl(tmp_path, monkeypatch):
+    monkeypatch.setattr(renderer, "cache_dir", lambda: tmp_path)
+    renderer._failed_until.clear()
+    renderer.close_current_presentation()
+    src = tmp_path / "broken.pptx"
+    src.write_bytes(b"dummy")
+    opens = 0
+
+    class BrokenApp:
+        class PresentationsImpl:
+            def Open(self, path, ReadOnly=1, WithWindow=0):
+                nonlocal opens
+                opens += 1
+                return _BrokenPres()
+
+        def __init__(self):
+            self.Presentations = BrokenApp.PresentationsImpl()
+
+    monkeypatch.setattr(renderer, "_get_app", lambda: BrokenApp())
+
+    assert renderer.render_page(str(src), 1, cache_key="broken", long_edge=480) is None
+    assert opens == 1
+    assert renderer.render_page(str(src), 1, cache_key="broken", long_edge=480) is None
+    assert opens == 1
+    renderer._failed_until.clear()

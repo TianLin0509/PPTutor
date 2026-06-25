@@ -34,16 +34,31 @@ class AsyncRender(QObject):
     def __init__(self, png: Path):
         super().__init__()
         self.png = str(png)
-        self.requests: list[tuple[int, str, int]] = []
-        self.prefetches: list[tuple[str, int]] = []
+        self.requests: list[tuple[int, str, int, int, int]] = []
+        self.prefetches: list[tuple[str, int, int, int]] = []
         self.stopped = False
 
-    def request(self, req_id: int, path: str, page_no: int, cache_key: str | None = None) -> None:
-        self.requests.append((req_id, path, page_no))
+    def request(
+        self,
+        req_id: int,
+        path: str,
+        page_no: int,
+        cache_key: str | None = None,
+        long_edge: int = 0,
+        priority: int = 0,
+    ) -> None:
+        self.requests.append((req_id, path, page_no, int(long_edge), int(priority)))
         QTimer.singleShot(5, lambda req_id=req_id: self.rendered.emit(req_id, self.png))
 
-    def prefetch(self, path: str, page_no: int, cache_key: str | None = None) -> None:
-        self.prefetches.append((path, page_no))
+    def prefetch(
+        self,
+        path: str,
+        page_no: int,
+        cache_key: str | None = None,
+        long_edge: int = 0,
+        priority: int = 0,
+    ) -> None:
+        self.prefetches.append((path, page_no, int(long_edge), int(priority)))
 
     def prewarm(self) -> None:
         return None
@@ -64,12 +79,12 @@ class AsyncThumb(QObject):
     def __init__(self, png: Path):
         super().__init__()
         self.png = str(png)
-        self.requests: list[tuple[str, int]] = []
+        self.requests: list[tuple[str, int, int]] = []
         self.clears = 0
         self.stopped = False
 
-    def request(self, path: str, page: int) -> None:
-        self.requests.append((path, page))
+    def request(self, path: str, page: int, priority: int = 0) -> None:
+        self.requests.append((path, page, int(priority)))
         QTimer.singleShot(5, lambda path=path, page=page: self.thumb_rendered.emit(path, page, self.png))
 
     def clear(self) -> None:
@@ -89,6 +104,13 @@ def pump(ms: int) -> None:
     loop = QEventLoop()
     QTimer.singleShot(ms, loop.quit)
     loop.exec()
+
+
+def gap_stats(gaps: list[float]) -> tuple[float, float]:
+    if not gaps:
+        return 0.0, 0.0
+    ordered = sorted(gaps)
+    return round(max(gaps), 2), round(ordered[int(len(ordered) * 0.95)], 2)
 
 
 def make_decks(root: Path) -> None:
@@ -155,6 +177,9 @@ def main() -> int:
     pump(300)
     if win._indexer is None or not win._indexer.isFinished():
         raise RuntimeError("indexing did not finish within stress deadline")
+    startup_max_gap, startup_p95_gap = gap_stats(gaps)
+    gaps.clear()
+    last["t"] = time.perf_counter()
 
     queries = [
         "算力", "AI", "预算", "客户", "版本", "芯片", "不存在的词",
@@ -197,6 +222,7 @@ def main() -> int:
     screenshot = ROOT / "artifacts" / "stress_user_flow.png"
     screenshot.parent.mkdir(exist_ok=True)
     win.grab().save(str(screenshot))
+    interaction_max_gap, interaction_p95_gap = gap_stats(gaps)
 
     result = {
         "ok": True,
@@ -206,8 +232,10 @@ def main() -> int:
         "render_prefetches": len(render.prefetches),
         "thumb_requests": len(thumb.requests),
         "thumb_clears": thumb.clears,
-        "event_loop_max_gap_ms": round(max(gaps or [0.0]), 2),
-        "event_loop_p95_gap_ms": round(sorted(gaps)[int(len(gaps) * 0.95)] if gaps else 0.0, 2),
+        "startup_event_loop_max_gap_ms": startup_max_gap,
+        "startup_event_loop_p95_gap_ms": startup_p95_gap,
+        "interaction_event_loop_max_gap_ms": interaction_max_gap,
+        "interaction_event_loop_p95_gap_ms": interaction_p95_gap,
         "screenshot": str(screenshot),
         "data_dir": str(data_dir),
         "deck_dir": str(decks),

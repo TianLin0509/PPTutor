@@ -17,33 +17,50 @@ from .. import renderer
 
 class RenderWorker(QThread):
     rendered = Signal(int, str)  # request_id, png_path（失败为空串）
-    _PREFETCH_IDLE_GRACE_SEC = 0.06
+    _PREFETCH_IDLE_GRACE_SEC = 0.18
+    _PRIORITY_PREVIEW = 0
+    _PRIORITY_PREFETCH = 220
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._cv = threading.Condition()
-        self._preview = None  # (req_id, path, page, key)，仅留最新
-        self._prefetch: collections.deque = collections.deque()  # (path, page, key)
-        self._prefetch_pending_keys: set[tuple[str, int, str | None]] = set()
-        self._prefetch_active_keys: set[tuple[str, int, str | None]] = set()
+        self._preview = None  # (req_id, path, page, key, long_edge, priority)，仅留最新
+        self._prefetch: collections.deque = collections.deque()  # (path, page, key, long_edge, priority)
+        self._prefetch_pending_keys: set[tuple[str, int, str | None, int, int]] = set()
+        self._prefetch_active_keys: set[tuple[str, int, str | None, int, int]] = set()
         self._warm = False
         self._stopping = False
 
-    def request(self, req_id: int, path: str, page_no: int, cache_key: str | None = None) -> None:
+    def request(
+        self,
+        req_id: int,
+        path: str,
+        page_no: int,
+        cache_key: str | None = None,
+        long_edge: int = 1600,
+        priority: int = _PRIORITY_PREVIEW,
+    ) -> None:
         with self._cv:
-            self._preview = (req_id, path, page_no, cache_key)
+            self._preview = (req_id, path, page_no, cache_key, int(long_edge), int(priority))
             self._warm = False  # 用户已在等真实预览；预热此时只会抢占等待路径
             self._prefetch.clear()  # 新预览 → 旧页的预取全作废
             self._prefetch_pending_keys.clear()
             self._cv.notify()
 
-    def prefetch(self, path: str, page_no: int, cache_key: str | None = None) -> None:
+    def prefetch(
+        self,
+        path: str,
+        page_no: int,
+        cache_key: str | None = None,
+        long_edge: int = 960,
+        priority: int = _PRIORITY_PREFETCH,
+    ) -> None:
         """后台预渲染某页填缓存（低优先、不发信号）；新预览到来会清空待预取。"""
-        key = (path, page_no, cache_key)
+        key = (path, page_no, cache_key, int(long_edge), int(priority))
         with self._cv:
             if key in self._prefetch_pending_keys or key in self._prefetch_active_keys:
                 return
-            self._prefetch.append((path, page_no, cache_key))
+            self._prefetch.append((path, page_no, cache_key, int(long_edge), int(priority)))
             self._prefetch_pending_keys.add(key)
             self._cv.notify()
 
@@ -92,16 +109,30 @@ class RenderWorker(QThread):
                     except Exception:  # noqa: BLE001
                         pass
                 elif kind == "preview":
-                    req_id, path, page_no, key = data
+                    req_id, path, page_no, key, long_edge, priority = data
                     try:
-                        png = renderer.render_page(path, page_no, cache_key=key, hi_priority=True)
+                        png = renderer.render_page(
+                            path,
+                            page_no,
+                            cache_key=key,
+                            long_edge=long_edge,
+                            hi_priority=True,
+                            priority=priority,
+                        )
                     except Exception:  # noqa: BLE001
                         png = None
                     self.rendered.emit(req_id, str(png) if png else "")
                 else:  # prefetch：低优先填缓存，不发信号、被预览随时抢占
-                    path, page_no, key = data
+                    path, page_no, key, long_edge, priority = data
                     try:
-                        renderer.render_page(path, page_no, cache_key=key, hi_priority=False)
+                        renderer.render_page(
+                            path,
+                            page_no,
+                            cache_key=key,
+                            long_edge=long_edge,
+                            hi_priority=False,
+                            priority=priority,
+                        )
                     except Exception:  # noqa: BLE001
                         pass
                     finally:

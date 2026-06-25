@@ -6,6 +6,7 @@ from __future__ import annotations
 import datetime
 
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea, QTabWidget, QVBoxLayout, QWidget,
 )
@@ -40,6 +41,7 @@ def _vget(v, key, default=""):
 class DetailPanel(QWidget):
     restore_requested = Signal(str, str)  # path, version_id
     export_requested = Signal(str, str)
+    preview_requested = Signal(str)
     page_requested = Signal(int)          # 大纲点击 → 跳到该页
 
     def __init__(self, tok: dict, parent=None):
@@ -49,6 +51,7 @@ class DetailPanel(QWidget):
         self._path = None
         self._drag_off = None
         self._version_nodes: list[QWidget] = []
+        self._version_preview_labels: dict[str, QLabel] = {}
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -156,11 +159,12 @@ class DetailPanel(QWidget):
         self._meta_label.setText("← 选中左侧文件查看详情")
         self._clear(self._version_box)
         self._version_nodes = []
+        self._version_preview_labels = {}
         self._clear(self._outline_box)
 
     def set_file_actions_enabled(self, enabled: bool) -> None:
         for btn in self.findChildren(QPushButton):
-            if btn.objectName() in {"verBtn", "verBtnPri", "outlineItem"}:
+            if btn.objectName() in {"verBtn", "verBtnPri", "verPreviewBtn", "outlineItem"}:
                 btn.setEnabled(enabled)
 
     def update_for(self, r, versions: list) -> None:
@@ -176,6 +180,7 @@ class DetailPanel(QWidget):
 
         self._clear(self._version_box)
         self._version_nodes = []
+        self._version_preview_labels = {}
         if not versions:
             tip = QLabel("还没有历史版本\n用 PowerPoint 改一改、保存一下，就会自动留版本——全盘自动，无需任何设置")
             tip.setObjectName("detailMuted")
@@ -230,7 +235,53 @@ class DetailPanel(QWidget):
             sub.addWidget(cl)
         sub.addStretch(1)
         lay.addLayout(sub)
+
+        preview = QHBoxLayout()
+        preview.setSpacing(8)
+        thumb = QLabel("生成预览")
+        thumb.setObjectName("verPreview")
+        thumb.setFixedSize(124, 70)
+        thumb.setAlignment(Qt.AlignCenter)
+        thumb.setToolTip("历史版本第 1 页预览")
+        if vid:
+            self._version_preview_labels[vid] = thumb
+        preview.addWidget(thumb)
+        bp = QPushButton("预览")
+        bp.setObjectName("verPreviewBtn")
+        bp.setEnabled(bool(vid))
+        bp.clicked.connect(lambda _=False, _v=vid: self.preview_requested.emit(_v))
+        preview.addWidget(bp, 0, Qt.AlignTop)
+        preview.addStretch(1)
+        lay.addLayout(preview)
+
+        thumb_path = str(_vget(v, "thumb_path", "") or "")
+        if vid and thumb_path:
+            self.set_version_preview(vid, thumb_path)
         return w
+
+    def set_version_preview_loading(self, version_id: str) -> None:
+        lbl = self._version_preview_labels.get(version_id)
+        if lbl is None:
+            return
+        lbl.setPixmap(QPixmap())
+        lbl.setText("预览生成中...")
+
+    def set_version_preview(self, version_id: str, image_path: str | None) -> None:
+        lbl = self._version_preview_labels.get(version_id)
+        if lbl is None:
+            return
+        if not image_path:
+            lbl.setPixmap(QPixmap())
+            lbl.setText("预览失败")
+            return
+        pm = QPixmap(str(image_path))
+        if pm.isNull():
+            lbl.setPixmap(QPixmap())
+            lbl.setText("预览失败")
+            return
+        lbl.setText("")
+        lbl.setPixmap(pm.scaled(lbl.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        lbl.setToolTip(str(image_path))
 
     def set_outline(self, titles: list) -> None:
         """titles: [(page_no, title)]，点击跳到该页预览。"""

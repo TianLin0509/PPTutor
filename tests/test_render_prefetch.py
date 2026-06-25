@@ -12,7 +12,7 @@ def _fake_renderer(monkeypatch, tmp_path, delay=0.05):
     calls: list[tuple[int, bool]] = []
     lock = threading.Lock()
 
-    def fake_render(path, page_no, cache_key=None, long_edge=2560, hi_priority=False):
+    def fake_render(path, page_no, cache_key=None, long_edge=2560, hi_priority=False, priority=None):
         with lock:
             calls.append((page_no, hi_priority))
         time.sleep(delay)
@@ -32,7 +32,7 @@ def test_preview_then_prefetch(qtbot, monkeypatch, tmp_path):
             w.request(1, "f.pptx", 1)        # 预览 page1
         w.prefetch("f.pptx", 2)
         w.prefetch("f.pptx", 3)
-        qtbot.wait(350)                       # 等预取跑完
+        qtbot.wait(600)                       # 等预取跑完（含低优先空闲等待）
         with lock:
             got = list(calls)
         assert (1, True) in got               # 预览走高优先
@@ -71,7 +71,7 @@ def test_preview_cancels_queued_prewarm(qtbot, monkeypatch, tmp_path):
             events.append(("warm", None, None))
         return object()
 
-    def fake_render(path, page_no, cache_key=None, long_edge=2560, hi_priority=False):
+    def fake_render(path, page_no, cache_key=None, long_edge=2560, hi_priority=False, priority=None):
         with lock:
             events.append(("preview", page_no, hi_priority))
         return tmp_path / f"{page_no}.png"
@@ -109,7 +109,7 @@ def test_preview_preempts_prefetch_during_idle_grace(qtbot, monkeypatch, tmp_pat
     calls: list[tuple[int, bool]] = []
     lock = threading.Lock()
 
-    def fake_render(path, page_no, cache_key=None, long_edge=2560, hi_priority=False):
+    def fake_render(path, page_no, cache_key=None, long_edge=2560, hi_priority=False, priority=None):
         with lock:
             calls.append((page_no, hi_priority))
         time.sleep(0.05)
@@ -143,7 +143,7 @@ def test_prefetch_dedupes_pending_pages():
     w.prefetch("f.pptx", 2)
     w.prefetch("f.pptx", 2)
 
-    assert list(w._prefetch) == [("f.pptx", 2, None)]
+    assert list(w._prefetch) == [("f.pptx", 2, None, 960, RenderWorker._PRIORITY_PREFETCH)]
 
 
 def test_prefetch_dedupes_inflight_page(qtbot, monkeypatch, tmp_path):
@@ -152,7 +152,7 @@ def test_prefetch_dedupes_inflight_page(qtbot, monkeypatch, tmp_path):
     release = threading.Event()
     lock = threading.Lock()
 
-    def fake_render(path, page_no, cache_key=None, long_edge=2560, hi_priority=False):
+    def fake_render(path, page_no, cache_key=None, long_edge=2560, hi_priority=False, priority=None):
         with lock:
             calls.append((path, page_no, cache_key, hi_priority))
         started.set()
@@ -183,7 +183,7 @@ def test_prefetch_dedupes_inflight_page(qtbot, monkeypatch, tmp_path):
 def test_preview_render_error_emits_failure_and_worker_survives(qtbot, monkeypatch, tmp_path):
     calls: list[int] = []
 
-    def fake_render(path, page_no, cache_key=None, long_edge=2560, hi_priority=False):
+    def fake_render(path, page_no, cache_key=None, long_edge=2560, hi_priority=False, priority=None):
         calls.append(page_no)
         if page_no == 7:
             raise RuntimeError("COM render failed")

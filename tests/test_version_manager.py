@@ -132,6 +132,68 @@ def test_list_versions_details_uses_fresh_connection_not_ui_read_conn(tmp_path):
     assert rows[0]["page_count"] == 1
 
 
+def test_list_versions_details_includes_summary_and_preview_fields(tmp_path):
+    p = tmp_path / "a.pptx"
+    fx.make_pptx(p, [{"body": "v1"}])
+    mgr = VersionManager(store.connect(tmp_path / "summary-vault.db"))
+    assert mgr.snapshot_now(str(p))
+    fx.make_pptx(p, [{"body": "v2 changed"}])
+    assert mgr.snapshot_now(str(p))
+
+    rows = mgr.list_versions_details(str(p))
+
+    assert len(rows) == 2
+    assert rows[0]["changed"]
+    assert "thumb_path" in rows[0]
+
+
+def test_version_store_init_migrates_preview_columns(tmp_path):
+    conn = store.connect(tmp_path / "old-vault.db")
+    conn.execute(
+        """CREATE TABLE versions(
+           version_id TEXT PRIMARY KEY, doc_id TEXT NOT NULL, ts REAL DEFAULT 0,
+           session_id TEXT DEFAULT '', page_count INTEGER DEFAULT 0, size INTEGER DEFAULT 0,
+           content_hash TEXT DEFAULT ''
+        )"""
+    )
+
+    store.init_db(conn)
+
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(versions)").fetchall()}
+    assert {"changed", "thumb_path"} <= cols
+
+
+def test_ensure_version_preview_renders_and_caches(tmp_path, monkeypatch):
+    p = tmp_path / "a.pptx"
+    fx.make_pptx(p, [{"body": "v1"}])
+    mgr = VersionManager(store.connect(tmp_path / "preview-vault.db"))
+    assert mgr.snapshot_now(str(p))
+    version_id = mgr.list_versions(str(p))[0]["version_id"]
+    fake_png = tmp_path / "fake-preview.png"
+    calls = []
+    closed = []
+
+    def fake_render(path, page_no, cache_key=None, long_edge=0, hi_priority=False, priority=None):
+        calls.append((path, page_no, cache_key, long_edge, hi_priority))
+        fake_png.write_bytes(b"png")
+        return fake_png
+
+    monkeypatch.setattr("pptx_finder.versioning.manager.renderer.render_page", fake_render)
+    monkeypatch.setattr("pptx_finder.versioning.manager.renderer.close_current_presentation", lambda: closed.append(True))
+
+    first = mgr.ensure_version_preview(version_id)
+    second = mgr.ensure_version_preview(version_id)
+    row = store.get_version(mgr._conn, version_id)
+
+    assert first == str(fake_png)
+    assert second == str(fake_png)
+    assert row["thumb_path"] == str(fake_png)
+    assert len(calls) == 1
+    assert calls[0][1] == 1
+    assert calls[0][3] == 360
+    assert closed == [True]
+
+
 def test_list_docs_details_uses_fresh_connection_not_ui_read_conn(tmp_path):
     p = tmp_path / "a.pptx"
     fx.make_pptx(p, [{"body": "v1"}])
