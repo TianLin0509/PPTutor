@@ -28,6 +28,12 @@ if __name__ == "__main__":
         from pptx_finder.updater import run_update_check
         raise SystemExit(run_update_check(sys.argv))
 
+    # Isolated PowerPoint renderer host. The GUI process starts this same exe
+    # with a localhost IPC port so COM crashes do not bring down the main UI.
+    if "--renderer-worker" in sys.argv:
+        from pptx_finder.render_service import main as render_worker_main
+        raise SystemExit(render_worker_main(sys.argv))
+
     from pptx_finder.app import main
 
     raise SystemExit(main())

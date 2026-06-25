@@ -110,6 +110,32 @@ def test_parallel_workers(tmp_path):
     assert len(_fts_files(conn, "并行解析测试")) == 3
 
 
+def test_db_maintain_optimizes_fts_without_error(tmp_path):
+    conn = db.connect(tmp_path / "i.db")
+    db.init_db(conn)
+    fid = db.upsert_file(
+        conn,
+        path=str(tmp_path / "a.pptx"),
+        name="a.pptx",
+        ext=".pptx",
+        size=1,
+        mtime=1,
+        content_hash="h",
+        page_count=1,
+        status="ok",
+        error="",
+        indexed_at=1,
+    )
+    db.replace_pages(conn, fid, [(1, "hello world", "hello world")])
+    conn.commit()
+
+    result = db.maintain(conn)
+
+    assert result["error"] == ""
+    assert result["fts_optimized"] >= 1
+    assert result["checkpointed"] is True
+
+
 def test_two_stage_filename_searchable_before_content(tmp_path):
     """两阶段渐进：文件名先可搜，内容解析后才可搜。"""
     from pptx_finder import search as sm

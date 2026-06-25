@@ -57,6 +57,58 @@ def version_file(doc_id: str, version_id: str) -> Path:
     return _doc_dir(doc_id) / "versions" / f"{version_id}.pptx"
 
 
+def manifest_for(doc_id: str, version_id: str | None) -> dict:
+    if not version_id:
+        return {}
+    mf = _manifest_path(doc_id, version_id)
+    if not mf.exists():
+        return {}
+    try:
+        return json.loads(mf.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _part_bucket(name: str) -> str:
+    n = name.lower()
+    if n.startswith("ppt/slides/slide") and n.endswith(".xml"):
+        return "slides"
+    if n.startswith("ppt/notesslides/"):
+        return "notes"
+    if n.startswith("ppt/media/"):
+        return "media"
+    if n.startswith("ppt/charts/"):
+        return "charts"
+    if n.startswith("ppt/diagrams/"):
+        return "diagrams"
+    if n.startswith("ppt/theme/"):
+        return "theme"
+    if n.startswith("ppt/slidelayouts/") or n.startswith("ppt/slidemasters/"):
+        return "layout"
+    return "other"
+
+
+def manifest_diff(doc_id: str, old_version_id: str | None, new_version_id: str) -> dict:
+    new_parts = dict(manifest_for(doc_id, new_version_id).get("parts") or {})
+    old_parts = dict(manifest_for(doc_id, old_version_id).get("parts") or {}) if old_version_id else {}
+    old_names = set(old_parts)
+    new_names = set(new_parts)
+    added = new_names - old_names
+    removed = old_names - new_names
+    changed = {name for name in (old_names & new_names) if old_parts.get(name) != new_parts.get(name)}
+    buckets: dict[str, dict[str, int]] = {}
+    for kind, names in (("added", added), ("removed", removed), ("changed", changed)):
+        for name in names:
+            row = buckets.setdefault(_part_bucket(name), {"added": 0, "removed": 0, "changed": 0})
+            row[kind] += 1
+    return {
+        "added_parts": len(added),
+        "removed_parts": len(removed),
+        "changed_parts": len(changed),
+        "buckets": buckets,
+    }
+
+
 def file_hash(path: str) -> str:
     h = xxhash.xxh64()
     with open(ext_path(path), "rb") as f:

@@ -210,6 +210,33 @@ def stats(conn: sqlite3.Connection) -> dict:
     return {"file_count": fc, "page_count": pc}
 
 
+def maintain(conn: sqlite3.Connection) -> dict:
+    """Run cheap SQLite maintenance after indexing.
+
+    FTS optimize merges segment b-trees and keeps long-running local indexes from
+    slowly degrading. The WAL checkpoint is non-destructive and bounded by the
+    busy timeout on the connection.
+    """
+    result = {"fts_optimized": 0, "checkpointed": False, "error": ""}
+    try:
+        for table in ("file_names_fts", "pages_fts"):
+            try:
+                conn.execute(f"INSERT INTO {table}({table}) VALUES('optimize')")
+                result["fts_optimized"] += 1
+            except sqlite3.DatabaseError as exc:
+                log.debug("fts optimize skipped for %s: %s", table, exc)
+        conn.commit()
+        try:
+            conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            result["checkpointed"] = True
+        except sqlite3.DatabaseError as exc:
+            log.debug("wal checkpoint skipped: %s", exc)
+        conn.commit()
+    except Exception as exc:  # noqa: BLE001
+        result["error"] = f"{type(exc).__name__}: {exc}"
+    return result
+
+
 def recent_files(conn: sqlite3.Connection, limit: int = 20) -> list:
     """最近修改的文件（空查询默认视图）。返回无命中片段的 FileResult，按 mtime 降序。"""
     from .models import FileResult

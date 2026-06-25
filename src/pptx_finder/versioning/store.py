@@ -167,6 +167,24 @@ def latest_version(conn, doc_id: str):
     ).fetchone()
 
 
+def previous_version(conn, doc_id: str, ts: float, version_id: str):
+    return conn.execute(
+        """SELECT * FROM versions
+           WHERE doc_id=?
+             AND (ts < ? OR (ts = ? AND version_id < ?))
+           ORDER BY ts DESC, version_id DESC
+           LIMIT 1""",
+        (doc_id, ts, ts, version_id),
+    ).fetchone()
+
+
+def version_pages(conn, version_id: str):
+    return conn.execute(
+        "SELECT page_no, content FROM version_pages_fts WHERE version_id=? ORDER BY page_no",
+        (version_id,),
+    ).fetchall()
+
+
 def find_versions_by_content_hash(conn, content_hash: str):
     if not content_hash:
         return []

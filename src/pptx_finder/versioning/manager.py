@@ -15,6 +15,7 @@ from . import store, vault
 
 SESSION_GAP_SEC = 30 * 60
 KEEP_PER_DOC = 50
+_DIFF_SAMPLE_LIMIT = 6
 
 
 def _now() -> float:
@@ -27,6 +28,80 @@ def _sid(ts: float) -> str:
 
 def _is_pptx(path: str) -> bool:
     return os.path.splitext(path)[1].lower() == PPTX_EXT
+
+
+def _token_set(text: str) -> set[str]:
+    return {tok for tok in str(text or "").split() if tok.strip()}
+
+
+def _page_text_diff(old_pages, new_pages) -> dict:
+    old = {int(r["page_no"]): str(r["content"] or "") for r in old_pages}
+    new = {int(r["page_no"]): str(r["content"] or "") for r in new_pages}
+    old_keys = set(old)
+    new_keys = set(new)
+    added_pages = sorted(new_keys - old_keys)
+    removed_pages = sorted(old_keys - new_keys)
+    changed_pages = []
+    added_terms: list[str] = []
+    removed_terms: list[str] = []
+    for page in sorted(old_keys & new_keys):
+        if old.get(page) == new.get(page):
+            continue
+        changed_pages.append(page)
+        old_terms = _token_set(old.get(page, ""))
+        new_terms = _token_set(new.get(page, ""))
+        for tok in sorted(new_terms - old_terms):
+            if tok not in added_terms:
+                added_terms.append(tok)
+        for tok in sorted(old_terms - new_terms):
+            if tok not in removed_terms:
+                removed_terms.append(tok)
+    return {
+        "added_pages": added_pages,
+        "removed_pages": removed_pages,
+        "changed_pages": changed_pages,
+        "added_terms": added_terms[:_DIFF_SAMPLE_LIMIT],
+        "removed_terms": removed_terms[:_DIFF_SAMPLE_LIMIT],
+    }
+
+
+def _diff_summary(version, previous, text_diff: dict, package_diff: dict) -> list[str]:
+    lines: list[str] = []
+    if previous is None:
+        lines.append("首个版本，可作为恢复基线。")
+    page_delta = int(version["page_count"] or 0) - (int(previous["page_count"] or 0) if previous else 0)
+    if page_delta > 0:
+        lines.append(f"新增 {page_delta} 页。")
+    elif page_delta < 0:
+        lines.append(f"减少 {abs(page_delta)} 页。")
+    changed_pages = text_diff.get("changed_pages") or []
+    if changed_pages:
+        sample = ", ".join(f"P{p}" for p in changed_pages[:8])
+        lines.append(f"文本改动 {len(changed_pages)} 页：{sample}。")
+    if text_diff.get("added_pages"):
+        lines.append("新增页面：" + ", ".join(f"P{p}" for p in text_diff["added_pages"][:8]) + "。")
+    if text_diff.get("removed_pages"):
+        lines.append("删除页面：" + ", ".join(f"P{p}" for p in text_diff["removed_pages"][:8]) + "。")
+    buckets = package_diff.get("buckets") or {}
+    media = buckets.get("media") or {}
+    if any(media.get(k, 0) for k in ("added", "removed", "changed")):
+        lines.append(
+            "图片/媒体变化："
+            f"+{media.get('added', 0)} -{media.get('removed', 0)} 改{media.get('changed', 0)}。"
+        )
+    charts = buckets.get("charts") or {}
+    if any(charts.get(k, 0) for k in ("added", "removed", "changed")):
+        lines.append(
+            "图表变化："
+            f"+{charts.get('added', 0)} -{charts.get('removed', 0)} 改{charts.get('changed', 0)}。"
+        )
+    if not lines:
+        changed_parts = int(package_diff.get("changed_parts") or 0)
+        if changed_parts:
+            lines.append(f"结构/样式微调：{changed_parts} 个内部部件变化。")
+        else:
+            lines.append("未检测到明显文本或页面变化。")
+    return lines[:6]
 
 
 class VersionManager:
@@ -283,6 +358,49 @@ class VersionManager:
                 os.unlink(tmp)
             except OSError:
                 pass
+
+    def describe_version_diff(self, version_id: str) -> dict:
+        if self._db_path is None:
+            with self._lock:
+                return self._describe_version_diff_on_conn(self._conn, version_id)
+        conn = store.connect(self._db_path)
+        try:
+            conn.isolation_level = None
+            return self._describe_version_diff_on_conn(conn, version_id)
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _describe_version_diff_on_conn(conn, version_id: str) -> dict:
+        version = store.get_version(conn, version_id)
+        if not version:
+            return {"version_id": version_id, "ok": False, "lines": ["版本不存在或已被清理。"]}
+        previous = store.previous_version(
+            conn,
+            version["doc_id"],
+            float(version["ts"] or 0),
+            version["version_id"],
+        )
+        old_pages = store.version_pages(conn, previous["version_id"]) if previous is not None else []
+        new_pages = store.version_pages(conn, version_id)
+        text_diff = _page_text_diff(old_pages, new_pages)
+        package_diff = vault.manifest_diff(
+            version["doc_id"],
+            previous["version_id"] if previous is not None else None,
+            version_id,
+        )
+        lines = _diff_summary(version, previous, text_diff, package_diff)
+        return {
+            "version_id": version_id,
+            "ok": True,
+            "previous_version_id": previous["version_id"] if previous is not None else "",
+            "page_count": int(version["page_count"] or 0),
+            "previous_page_count": int(previous["page_count"] or 0) if previous is not None else 0,
+            "changed": str(version["changed"] or ""),
+            "text": text_diff,
+            "package": package_diff,
+            "lines": lines,
+        }
 
     # ---------- Restore / export ----------
     def restore_to(self, path: str, version_id: str, dest: str | None = None) -> bool:

@@ -1,20 +1,22 @@
-"""版本归组：MinHash-LSH 近似重复检测，把同一份 PPT 的多个版本聚为一组。
+"""Lightweight near-duplicate grouping for PPT versions.
 
-纯本地、无大模型。全文字符级 shingle 的 Jaccard 相似度 ≥ 阈值即判同源
-（用户场景：版本间通常仅少数页差异，Jaccard 多在 0.85~0.97）。
-差异定位（精确到第几页）属 P2，本模块不做。
+This replaces the previous datasketch dependency with an in-repo MinHash +
+banding implementation. It keeps the same public API while avoiding numpy/scipy
+in packaged builds.
 """
 from __future__ import annotations
 
 import sqlite3
+import struct
 
-from datasketch import MinHash, MinHashLSH
+import xxhash
 
 from .text_tokenize import normalize
 
-NUM_PERM = 128
+NUM_PERM = 64
 THRESHOLD = 0.8
 SHINGLE_K = 4
+BAND_SIZE = 4
 
 
 def _shingles(text: str, k: int = SHINGLE_K) -> set[str]:
@@ -24,11 +26,22 @@ def _shingles(text: str, k: int = SHINGLE_K) -> set[str]:
     return {t[i:i + k] for i in range(len(t) - k + 1)}
 
 
-def minhash_of(text: str) -> MinHash:
-    m = MinHash(num_perm=NUM_PERM)
-    for sh in _shingles(text):
-        m.update(sh.encode("utf-8"))
-    return m
+def _hash(seed: int, value: str) -> int:
+    return xxhash.xxh64_intdigest(value, seed=seed)
+
+
+def minhash_of(text: str) -> tuple[int, ...]:
+    shingles = _shingles(text)
+    if not shingles:
+        return ()
+    sig: list[int] = []
+    for seed in range(NUM_PERM):
+        sig.append(min(_hash(seed, sh) for sh in shingles))
+    return tuple(sig)
+
+
+def _sig_bytes(sig: tuple[int, ...]) -> bytes:
+    return b"".join(struct.pack("<Q", x & ((1 << 64) - 1)) for x in sig)
 
 
 def _file_text(conn: sqlite3.Connection, file_id: int) -> str:
@@ -38,23 +51,48 @@ def _file_text(conn: sqlite3.Connection, file_id: int) -> str:
     return "\n".join((r["raw_text"] or "") for r in rows)
 
 
+def _jaccard(a: set[str], b: set[str]) -> float:
+    if not a and not b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def _candidate_pairs(signatures: dict[int, tuple[int, ...]]) -> set[tuple[int, int]]:
+    buckets: dict[tuple[int, tuple[int, ...]], list[int]] = {}
+    for fid, sig in signatures.items():
+        if len(sig) < BAND_SIZE:
+            continue
+        for start in range(0, len(sig), BAND_SIZE):
+            band = sig[start:start + BAND_SIZE]
+            if len(band) == BAND_SIZE:
+                buckets.setdefault((start, band), []).append(fid)
+    pairs: set[tuple[int, int]] = set()
+    for members in buckets.values():
+        if len(members) < 2:
+            continue
+        members = sorted(set(members))
+        for i, a in enumerate(members):
+            for b in members[i + 1:]:
+                pairs.add((a, b))
+    return pairs
+
+
 def compute_groups(conn: sqlite3.Connection) -> dict[int, int]:
-    """对全库 status='ok' 文件聚类，写入 minhash 表的 group_id。
-    返回 {file_id: group_id}，仅含多成员组（单文件不归组）。
-    """
+    """Cluster status='ok' files and write group_id into the minhash table."""
     file_ids = [r["id"] for r in conn.execute("SELECT id FROM files WHERE status='ok'")]
-    lsh = MinHashLSH(threshold=THRESHOLD, num_perm=NUM_PERM)
-    mhs: dict[int, MinHash] = {}
+    signatures: dict[int, tuple[int, ...]] = {}
+    shingles: dict[int, set[str]] = {}
     for fid in file_ids:
         text = _file_text(conn, fid)
-        if not text.strip():
+        sh = _shingles(text)
+        if not sh:
             continue
-        m = minhash_of(text)
-        mhs[fid] = m
-        lsh.insert(str(fid), m)
+        shingles[fid] = sh
+        signatures[fid] = minhash_of(text)
 
-    # 并查集：把相似对连通成组
-    parent = {fid: fid for fid in mhs}
+    parent = {fid: fid for fid in signatures}
 
     def find(x: int) -> int:
         while parent[x] != x:
@@ -65,23 +103,19 @@ def compute_groups(conn: sqlite3.Connection) -> dict[int, int]:
     def union(a: int, b: int) -> None:
         parent[find(a)] = find(b)
 
-    for fid, m in mhs.items():
-        for other in lsh.query(m):
-            o = int(other)
-            if o != fid:
-                union(fid, o)
+    for a, b in _candidate_pairs(signatures):
+        if _jaccard(shingles[a], shingles[b]) >= THRESHOLD:
+            union(a, b)
 
     components: dict[int, list[int]] = {}
-    for fid in mhs:
+    for fid in signatures:
         components.setdefault(find(fid), []).append(fid)
 
-    # 写库：保存签名；多成员组分配稳定 group_id（成员最小 id），单成员置 NULL
-    for fid, m in mhs.items():
-        sig = m.hashvalues.astype("uint64").tobytes()
+    for fid, sig in signatures.items():
         conn.execute(
             "INSERT INTO minhash(file_id, sig, group_id) VALUES(?,?,NULL) "
             "ON CONFLICT(file_id) DO UPDATE SET sig=excluded.sig, group_id=NULL",
-            (fid, sig),
+            (fid, _sig_bytes(sig)),
         )
     result: dict[int, int] = {}
     for members in components.values():
@@ -96,7 +130,7 @@ def compute_groups(conn: sqlite3.Connection) -> dict[int, int]:
 
 
 def group_map(conn: sqlite3.Connection) -> dict[int, int]:
-    """读取 file_id -> group_id（仅多成员组）。"""
+    """Read file_id -> group_id for multi-member groups."""
     return {
         r["file_id"]: r["group_id"]
         for r in conn.execute("SELECT file_id, group_id FROM minhash WHERE group_id IS NOT NULL")

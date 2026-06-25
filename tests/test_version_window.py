@@ -63,6 +63,10 @@ class FakeVersionManager:
         self.calls.append(("restore_to", path, version_id))
         return True
 
+    def describe_version_diff(self, version_id: str):
+        self.calls.append(("describe_version_diff", version_id))
+        return {"lines": ["文本改动 1 页：P1。"]}
+
     def export(self, path: str, version_id: str, dest: str):
         self.calls.append(("export", path, version_id, dest))
         return True
@@ -1867,6 +1871,7 @@ def test_version_window_export_skips_save_dialog_when_file_op_active(qtbot, monk
 def test_version_window_restore_runs_in_background(qtbot, monkeypatch):
     tasks = []
     infos = []
+    questions = []
     refreshes = []
 
     class FakeSignal:
@@ -1892,7 +1897,11 @@ def test_version_window_restore_runs_in_background(qtbot, monkeypatch):
 
     monkeypatch.setattr(version_window_mod, "BackgroundTask", FakeTask, raising=False)
     monkeypatch.setattr(version_window_mod.QMessageBox, "information", lambda *args: infos.append(args))
-    monkeypatch.setattr(version_window_mod.QMessageBox, "question", lambda *args: version_window_mod.QMessageBox.Yes)
+    monkeypatch.setattr(
+        version_window_mod.QMessageBox,
+        "question",
+        lambda *args: questions.append(args) or version_window_mod.QMessageBox.Yes,
+    )
     monkeypatch.setattr(version_window_mod.os.path, "exists", lambda _path: True)
     mgr = FakeVersionManager()
     win = VersionWindow(mgr)
@@ -1910,6 +1919,7 @@ def test_version_window_restore_runs_in_background(qtbot, monkeypatch):
 
     assert not any(call[0] == "restore_to" for call in mgr.calls if isinstance(call, tuple))
     assert tasks and tasks[-1].label == "version-restore"
+    assert questions and "文本改动 1 页" in questions[-1][2]
     assert not win.btn_restore.isEnabled()
 
     result = tasks[-1].fn()

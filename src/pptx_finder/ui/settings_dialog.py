@@ -77,6 +77,7 @@ from ..config import (
     set_hotkey,
 )
 from ..versioning import autostart
+from . import bg_task
 from .bg_task import BackgroundTask
 
 
@@ -319,6 +320,10 @@ class SettingsDialog(QDialog):
                 lines.extend(update_controller.diagnostic_lines())
         except Exception as exc:  # noqa: BLE001
             lines.append(f"update: unavailable ({type(exc).__name__}: {exc})")
+        try:
+            lines.extend(bg_task.diagnostic_lines())
+        except Exception as exc:  # noqa: BLE001
+            lines.append(f"background_tasks: unavailable ({type(exc).__name__}: {exc})")
         return lines
 
     def _version_doc_count_off_ui(self) -> int:
@@ -337,6 +342,13 @@ class SettingsDialog(QDialog):
             finally:
                 own.close()
             lines.append(f"index: {s['file_count']} files / {s['page_count']} pages")
+            dbp = Path(db_path())
+            walp = Path(str(dbp) + "-wal")
+            lines.append(
+                "index_storage: "
+                f"db={dbp.stat().st_size if dbp.exists() else 0} bytes "
+                f"wal={walp.stat().st_size if walp.exists() else 0} bytes"
+            )
         except Exception as exc:  # noqa: BLE001
             lines.append(f"index: unavailable ({type(exc).__name__}: {exc})")
         try:

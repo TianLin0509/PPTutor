@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import sys
 import threading
 import time
 from pathlib import Path
@@ -123,8 +124,25 @@ def default_cache_key(path: str) -> str | None:
     return xxhash.xxh64(raw.encode("utf-8")).hexdigest()
 
 
+def _ipc_enabled() -> bool:
+    try:
+        from .render_client import should_use_ipc
+
+        return should_use_ipc()
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def close_current_presentation() -> None:
     """Release the presentation currently held by this renderer without quitting PowerPoint."""
+    if _ipc_enabled():
+        try:
+            from . import render_client
+
+            render_client.close_current_presentation()
+            return
+        except Exception:  # noqa: BLE001
+            pass
     _close_pres()
 
 
@@ -165,7 +183,7 @@ def find_cached_render(
     return best[1] if best is not None else None
 
 
-def render_page(
+def _render_page_direct(
     path: str,
     page_no: int,
     cache_key: str | None = None,
@@ -220,7 +238,65 @@ def render_page(
         # 不再每次 Close——保持打开供同文件翻页复用（shutdown 统一关）
 
 
+def render_page(
+    path: str,
+    page_no: int,
+    cache_key: str | None = None,
+    long_edge: int = 2560,
+    hi_priority: bool = False,
+    priority: int | None = None,
+) -> Path | None:
+    """Render a page, using a child process in packaged GUI builds."""
+    if not _ipc_enabled():
+        return _render_page_direct(
+            path,
+            page_no,
+            cache_key=cache_key,
+            long_edge=long_edge,
+            hi_priority=hi_priority,
+            priority=priority,
+        )
+
+    path = os.path.abspath(path)
+    if cache_key is None:
+        cache_key = default_cache_key(path)
+        if cache_key is None:
+            return None
+    out = cache_dir() / f"{cache_key}_{page_no}_{long_edge}.png"
+    try:
+        if out.exists() and out.stat().st_size > 0:
+            return out
+    except OSError:
+        pass
+    cached = find_cached_render(path, page_no, cache_key=cache_key, min_long_edge=long_edge)
+    if cached is not None:
+        return cached
+    if not os.path.exists(path):
+        return None
+    try:
+        from . import render_client
+
+        return render_client.render_page(
+            path,
+            page_no,
+            cache_key=cache_key,
+            long_edge=long_edge,
+            hi_priority=hi_priority,
+            priority=priority,
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("renderer ipc failed path=%s page=%s: %s", path, page_no, e)
+        return None
+
+
 def shutdown() -> None:
+    if _ipc_enabled():
+        try:
+            from . import render_client
+
+            render_client.shutdown()
+        except Exception:  # noqa: BLE001
+            pass
     """退出 PowerPoint 实例并释放 COM。应用退出 / 渲染线程结束时调用。"""
     _close_pres()  # 关掉保持打开的 Presentation
     app = getattr(_state, "app", None)
@@ -237,3 +313,14 @@ def shutdown() -> None:
         pythoncom.CoUninitialize()
     except Exception:  # noqa: BLE001
         pass
+
+
+def diagnostic_lines() -> list[str]:
+    if not _ipc_enabled():
+        return [f"renderer_ipc: enabled=False frozen={bool(getattr(sys, 'frozen', False))}"]
+    try:
+        from . import render_client
+
+        return render_client.diagnostic_lines()
+    except Exception as e:  # noqa: BLE001
+        return [f"renderer_ipc: enabled=True unavailable ({type(e).__name__}: {e})"]

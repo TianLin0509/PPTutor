@@ -189,6 +189,67 @@ def test_main_window_version_restore_skips_confirm_when_search_pending(qtbot, tm
     assert queued == []
 
 
+def test_main_window_version_restore_loads_diff_before_confirm(qtbot, tmp_path, monkeypatch):
+    tasks = []
+    confirms = []
+    queued = []
+    calls = []
+    diff = {"lines": ["文本改动 1 页：P1。"]}
+
+    class FakeSignal:
+        def __init__(self):
+            self.callbacks = []
+
+        def connect(self, callback):
+            self.callbacks.append(callback)
+
+        def emit(self, value=None):
+            for callback in list(self.callbacks):
+                if value is None:
+                    callback()
+                else:
+                    callback(value)
+
+    class FakeTask:
+        def __init__(self, fn, label="", parent=None):
+            self.fn = fn
+            self.label = label
+            self.done = FakeSignal()
+            self.finished = FakeSignal()
+
+        def start(self):
+            tasks.append(self)
+
+    class DiffMgr(StubVerMgr):
+        def describe_version_diff(self, version_id):
+            calls.append(("diff", version_id))
+            return diff
+
+        def restore_to(self, p, v, dest=None):
+            calls.append(("restore", p, v, dest))
+            return True
+
+    monkeypatch.setattr(main_window_mod, "BackgroundTask", FakeTask, raising=False)
+    win = MainWindow(conn=_index(tmp_path), render_worker=StubRender(), version_mgr=DiffMgr(), do_index=False)
+    qtbot.addWidget(win)
+    monkeypatch.setattr(win, "_confirm_restore", lambda got=None: confirms.append(got) or True)
+    monkeypatch.setattr(win, "_run_bg", lambda fn, on_done=None, label="": queued.append((fn, on_done, label)) or True)
+    tasks.clear()
+
+    win._act_restore_version("C:/deck-a.pptx", "v1")
+
+    assert len(tasks) == 1
+    assert tasks[0].label == "version-restore-diff"
+    result = tasks[0].fn()
+    tasks[0].done.emit(result)
+    assert confirms == [diff]
+    assert queued and queued[-1][2] == "restore"
+    assert queued[-1][0]() is True
+    tasks[0].finished.emit()
+    assert ("C:/deck-a.pptx", "v1") not in win._restore_diff_inflight
+    assert calls == [("diff", "v1"), ("restore", "C:/deck-a.pptx", "v1", None)]
+
+
 def test_detail_version_actions_disabled_during_search_pending(qtbot, tmp_path):
     vm = StubVerMgr(versions=[{"version_id": "v1", "ts": 1000, "page_count": 5}], managed=True)
     win = MainWindow(conn=_index(tmp_path), render_worker=StubRender(), version_mgr=vm, do_index=False)

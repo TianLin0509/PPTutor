@@ -20,6 +20,7 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=['PIL', 'Pillow', 'pptx', 'tkinter', 'matplotlib', 'pandas', 'IPython', 'pytest',
+              'datasketch', 'numpy', 'scipy',
               'PySide6.QtQuick', 'PySide6.QtQml', 'PySide6.QtQuickWidgets', 'PySide6.QtQuick3D',
               'PySide6.QtWebEngineCore', 'PySide6.QtWebEngineWidgets', 'PySide6.QtWebChannel',
               'PySide6.QtMultimedia', 'PySide6.QtMultimediaWidgets', 'PySide6.QtPdf',
@@ -31,8 +32,8 @@ a = Analysis(
 pyz = PYZ(a.pure)
 
 # —— 体积优化：剔除搜索 app 用不到的 Qt 模块 DLL + 软件 OpenGL 兜底（QWidget 纯光栅渲染）。
-# 只保留 Qt6Core/Gui/Widgets/Network(单实例)/Svg 等必需项；datasketch 的 scipy 是版本归组硬
-# 依赖，保留。删 DLL 后已 frozen 自检 + 启动冒烟验证 UI 正常。
+# 只保留 Qt6Core/Gui/Widgets/Network(单实例)/Svg 等必需项；版本归组已改为内置轻量
+# MinHash，datasketch/numpy/scipy 不再进入打包产物。
 _DROP = (
     'opengl32sw', 'd3dcompiler',
     'qt6quick', 'qt6qml', 'qml', 'qt6pdf', 'qt6webengine', 'qt6webchannel', 'qt6websockets',

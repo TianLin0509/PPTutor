@@ -519,7 +519,16 @@ class VersionWindow(QWidget):
         if not path:
             QMessageBox.warning(self, "恢复", "找不到该版本对应的文档路径")
             return
-        if QMessageBox.question(self, "恢复", f"用此版本恢复：\n{os.path.basename(path)}\n（若当前文件存在，会先自动留一版，不会丢）") != QMessageBox.Yes:
+        msg = f"用此版本恢复：\n{os.path.basename(path)}\n\n若当前文件存在，会先自动留一版，不会丢。"
+        if hasattr(self._mgr, "describe_version_diff"):
+            try:
+                diff = self._mgr.describe_version_diff(vid)
+                lines = [str(x).strip() for x in (diff.get("lines") or []) if str(x).strip()]
+                if lines:
+                    msg = "这版的主要变化：\n" + "\n".join(f"• {line}" for line in lines[:6]) + "\n\n" + msg
+            except Exception:  # noqa: BLE001
+                pass
+        if QMessageBox.question(self, "恢复", msg) != QMessageBox.Yes:
             return
         self._run_file_op(
             "version-restore",

@@ -67,5 +67,9 @@ class IndexWorker(QThread):
                 cluster.compute_groups(conn)  # 版本归组（后台，失败不影响搜索就绪）
             except Exception as e:  # noqa: BLE001
                 log.warning("compute_groups failed: %s", e)
+            try:
+                db.maintain(conn)
+            except Exception as e:  # noqa: BLE001
+                log.warning("db maintenance failed: %s", e)
         finally:
             conn.close()

@@ -29,7 +29,7 @@ try:
 except Exception:  # noqa: BLE001
     _WIN = False
 
-from .. import actions, db, history, search as search_mod, updater, __version__
+from .. import actions, db, history, renderer as renderer_mod, search as search_mod, updater, __version__
 from ..config import (
     data_dir, db_path as cfg_db_path, get_hotkey, get_theme, is_first_run,
     mark_welcomed, set_theme as cfg_set_theme, update_base_url,
@@ -494,6 +494,7 @@ class MainWindow(QMainWindow):
         self._detail_load_inflight_path: str | None = None
         self._detail_load_inflight_file_id: int | None = None
         self._version_preview_inflight: set[str] = set()
+        self._restore_diff_inflight: set[tuple[str, str]] = set()
         self._detail_dot_token = 0
         self._detail_dot_inflight_token: int | None = None
         self._detail_dot_inflight_path: str | None = None
@@ -690,6 +691,8 @@ class MainWindow(QMainWindow):
                 f"error={summary.get('error', '') or '-'}")
         elif self._live_deferred_paths:
             lines.append(f"index_deferred_live: {len(self._live_deferred_paths)}")
+        if hasattr(renderer_mod, "diagnostic_lines"):
+            lines.extend(renderer_mod.diagnostic_lines())
         return lines
 
     # ---------- UI ----------
@@ -2551,6 +2554,23 @@ class MainWindow(QMainWindow):
             return
         if self._block_if_file_op_active():
             return
+        key = (path, version_id)
+        if key in self._restore_diff_inflight:
+            return
+        if hasattr(self._version_mgr, "describe_version_diff"):
+            self._restore_diff_inflight.add(key)
+            self._toast("正在读取该版本的改动...")
+            version_mgr = self._version_mgr
+            task = BackgroundTask(lambda: version_mgr.describe_version_diff(version_id), "version-restore-diff")
+            self._bg_tasks.append(task)
+            task.done.connect(
+                lambda diff, path=path, version_id=version_id: self._begin_restore_with_diff(path, version_id, diff)
+            )
+            task.finished.connect(
+                lambda task=task, key=key: self._finish_restore_diff_task(task, key)
+            )
+            task.start()
+            return
         if not self._confirm_restore():
             return
         self._toast("正在恢复...")
@@ -2565,6 +2585,34 @@ class MainWindow(QMainWindow):
 
         self._run_bg(lambda: self._restore_version_off_ui(path, version_id), _after, "restore")
 
+    def _finish_restore_diff_task(self, task, key: tuple[str, str]) -> None:
+        self._restore_diff_inflight.discard(key)
+        if task in self._bg_tasks:
+            self._bg_tasks.remove(task)
+
+    def _begin_restore_with_diff(self, path: str, version_id: str, diff: object | None) -> None:
+        if self._closing or self._version_mgr is None:
+            return
+        if self._active_heavy_op is not None or self._search_pending_req is not None:
+            return
+        try:
+            confirmed = self._confirm_restore(diff)
+        except TypeError:
+            confirmed = self._confirm_restore()
+        if not confirmed:
+            return
+        self._toast("正在恢复版本...")
+
+        def _after(ok):
+            if ok == "locked":
+                self._toast("无法恢复：该文件正被 PowerPoint 打开，请先关闭后再试")
+                return
+            self._toast("已恢复到该版本（当前内容已自动留底）" if ok else "恢复失败")
+            if ok:
+                self._update_detail(force=True)
+
+        self._run_bg(lambda: self._restore_version_off_ui(path, version_id), _after, "restore")
+
     def _restore_version_off_ui(self, path: str, version_id: str):
         if os.path.exists(path):
             try:
@@ -2574,14 +2622,26 @@ class MainWindow(QMainWindow):
                 return "locked"
         return bool(self._version_mgr.restore_to(path, version_id))
 
-    def _confirm_restore(self) -> bool:
+    def _restore_diff_text(self, diff: object | None) -> str:
+        if not isinstance(diff, dict):
+            return ""
+        lines = [str(x).strip() for x in (diff.get("lines") or []) if str(x).strip()]
+        if not lines:
+            return ""
+        return "这版的主要变化：\n" + "\n".join(f"• {line}" for line in lines[:6])
+
+    def _confirm_restore(self, diff: object | None = None) -> bool:
         """鎭㈠鍓嶅弸濂界‘璁わ細寮鸿皟銆屼細鑷姩鐣欏簳銆侀殢鏃跺垏鍥炪€嶏紝闄嶄綆鐮村潖鎬ф搷浣滅殑蹇冪悊璐熸媴銆?"""
         from PySide6.QtWidgets import QMessageBox
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Question)
         box.setWindowTitle("恢复到这个版本？")
         box.setText("会用这个历史版本覆盖当前文件。")
-        box.setInformativeText("别担心：覆盖前会自动把当前内容也留一版，之后随时能再切回来。")
+        info = "别担心：覆盖前会自动把当前内容也留一版，之后随时能再切回来。"
+        diff_text = self._restore_diff_text(diff)
+        if diff_text:
+            info = diff_text + "\n\n" + info
+        box.setInformativeText(info)
         yes = box.addButton("恢复", QMessageBox.AcceptRole)
         box.addButton("取消", QMessageBox.RejectRole)
         box.exec()

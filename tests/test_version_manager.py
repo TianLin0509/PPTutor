@@ -147,6 +147,29 @@ def test_list_versions_details_includes_summary_and_preview_fields(tmp_path):
     assert "thumb_path" in rows[0]
 
 
+def test_describe_version_diff_reports_text_pages_and_media(tmp_path):
+    p = tmp_path / "a.pptx"
+    fx.make_pptx(p, [{"body": "alpha beta"}, {"body": "stable"}])
+    mgr = VersionManager(store.connect(tmp_path / "diff-vault.db"))
+    assert mgr.snapshot_now(str(p))
+    fx.make_pptx(p, [{"body": "alpha gamma"}, {"body": "stable"}, {"body": "new page"}])
+    assert mgr.snapshot_now(str(p))
+    latest = mgr.list_versions(str(p))[0]["version_id"]
+
+    diff = mgr.describe_version_diff(latest)
+
+    assert diff["ok"] is True
+    assert diff["previous_version_id"]
+    assert diff["page_count"] == 3
+    assert diff["previous_page_count"] == 2
+    assert diff["text"]["changed_pages"] == [1]
+    assert diff["text"]["added_pages"] == [3]
+    assert "gamma" in diff["text"]["added_terms"]
+    assert "beta" in diff["text"]["removed_terms"]
+    assert diff["package"]["changed_parts"] >= 1
+    assert any("文本改动" in line or "新增" in line for line in diff["lines"])
+
+
 def test_version_store_init_migrates_preview_columns(tmp_path):
     conn = store.connect(tmp_path / "old-vault.db")
     conn.execute(
