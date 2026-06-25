@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-EXE = ROOT / "dist" / "pptx-finder" / "pptx-finder.exe"
+EXE = Path(os.environ.get("PPTUTOR_EXE", "")) if os.environ.get("PPTUTOR_EXE") else ROOT / "dist" / "PPTutor" / "PPTutor.exe"
 sys.path.insert(0, str(ROOT / "tests"))
 sys.path.insert(0, str(ROOT / "src"))
 

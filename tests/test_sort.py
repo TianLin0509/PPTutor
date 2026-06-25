@@ -6,6 +6,7 @@ from test_ui import StubRender
 
 from pptx_finder.models import FileResult
 from pptx_finder.ui.main_window import MainWindow, _sort_results
+from pptx_finder.ui import result_utils
 
 
 def _fr(name: str, mtime: float, score: float) -> FileResult:
@@ -27,6 +28,14 @@ def test_sort_by_name():
 def test_sort_relevance_keeps_original_order():
     rs = [_fr("a", 100, 0.9), _fr("b", 300, 0.1)]
     assert [r.name for r in _sort_results(rs, "relevance")] == ["a", "b"]
+
+
+def test_main_window_sort_helper_reexports_result_utils():
+    rs = [_fr("b", 200, 0.1), _fr("a", 100, 0.2)]
+
+    assert [r.name for r in _sort_results(rs, "name")] == [
+        r.name for r in result_utils.sort_results(rs, "name")
+    ]
 
 
 def test_ui_sort_switch(qtbot, tmp_path):

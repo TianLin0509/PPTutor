@@ -42,6 +42,15 @@ from .index_worker import IndexWorker
 from .live_indexer import LiveIndexer
 from .path_helpers import ensure_pptx_suffix
 from .render_worker import RenderWorker
+from .result_utils import (
+    empty_suggestions as _empty_suggestions,
+    facet_counts,
+    facet_filter,
+    group_by_time,
+    mode_key_from_text as _mode_key_from_text,
+    sort_results as _sort_results,
+    time_bucket as _time_bucket,
+)
 from .search_worker import SearchWorker
 from .thumb_worker import ThumbWorker
 from .detail_panel import DetailPanel
@@ -171,107 +180,6 @@ def _elide_middle(s: str, maxlen: int = 72) -> str:
     head = (maxlen - 1) * 2 // 3
     tail = maxlen - 1 - head
     return s[:head] + "\u2026" + s[-tail:]
-
-
-def _mode_key_from_text(mode: str) -> str:
-    if mode in {"filename", "仅文件名"} or "文件名" in mode:
-        return "filename"
-    if mode in {"content", "仅内容"} or "内容" in mode:
-        return "content"
-    return "all"
-
-
-def _empty_suggestions(query: str, mode: str) -> list[str]:
-    """闆剁粨鏋滄椂閫傜敤鐨勮ˉ鏁戝缓璁?key锛涗繚鐣欑粰娴嬭瘯鍜屾棫璋冪敤锛屽疄闄呴€昏緫璧?query_explain銆?"""
-    return suggestion_keys(query, _mode_key_from_text(mode))
-
-
-def _sort_results(results: list, key: str) -> list:
-    """缁撴灉鎺掑簭锛歳elevance 淇濇寔鍘熷簭 / recent 鎸?mtime 闄嶅簭 / name 鎸夋枃浠跺悕鍗囧簭銆?"""
-    if key == "recent":
-        return sorted(results, key=lambda r: r.mtime, reverse=True)
-    if key == "name":
-        return sorted(results, key=lambda r: r.name.lower())
-    return list(results)
-
-
-def _time_bucket(mtime: float, now_ts: float) -> str:
-    """鎸?mtime 褰掑叆鏃堕棿妗讹細浠婂ぉ / 鏄ㄥぉ / 鏈懆 / 鏈湀 / 鏇存棭銆?"""
-    now = datetime.datetime.fromtimestamp(now_ts)
-    try:
-        dt = datetime.datetime.fromtimestamp(mtime)
-    except (OSError, OverflowError, ValueError):
-        return "更早"
-    d = (now.date() - dt.date()).days
-    if d <= 0:
-        return "今天"
-    if d == 1:
-        return "昨天"
-    if d < 7:
-        return "本周"
-    if d < 30:
-        return "本月"
-    return "更早"
-
-
-def group_by_time(results: list, now_ts: float) -> list:
-    """鎸?mtime 鍒嗘椂闂存《锛屼繚鎸佽緭鍏ラ『搴忋€傝繑鍥?[(label, [items]), ...]銆?"""
-    buckets: dict[str, list] = {}
-    order: list[str] = []
-    for r in results:
-        label = _time_bucket(r.mtime, now_ts)
-        if label not in buckets:
-            buckets[label] = []
-            order.append(label)
-        buckets[label].append(r)
-    return [(label, buckets[label]) for label in order]
-
-
-def _page_bucket(pc: int) -> str:
-    if pc <= 10:
-        return "1-10"
-    if pc <= 30:
-        return "10-30"
-    return "30+"
-
-
-def _folder_of(path: str) -> str:
-    d = os.path.basename(os.path.dirname(path))
-    return d or path
-
-
-def _facet_type(r) -> str:
-    return "pptx" if (r.ext or "").lower() == ".pptx" else "ppt"
-
-
-def facet_counts(results: list, now_ts: float) -> dict:
-    """鎸夌淮搴﹁仛鍚堟暟閲忥細time/type/page/folder 鈫?[(bucket, count)]锛堜繚鎸佸嚭鐜伴『搴忥級銆?"""
-    dims: dict[str, dict] = {"time": {}, "type": {}, "page": {}, "folder": {}}
-
-    def bump(d, k):
-        d[k] = d.get(k, 0) + 1
-
-    for r in results:
-        bump(dims["time"], _time_bucket(r.mtime, now_ts))
-        bump(dims["type"], _facet_type(r))
-        bump(dims["page"], _page_bucket(r.page_count or 0))
-        bump(dims["folder"], _folder_of(r.path))
-    return {k: list(v.items()) for k, v in dims.items()}
-
-
-def facet_filter(results: list, filters: dict, now_ts: float) -> list:
-    """澶氱淮 AND 杩囨护锛涙煇缁村害鏈€?涓嶉檺璇ョ淮搴︺€?"""
-    def ok(r):
-        if filters.get("time") and _time_bucket(r.mtime, now_ts) not in filters["time"]:
-            return False
-        if filters.get("type") and _facet_type(r) not in filters["type"]:
-            return False
-        if filters.get("page") and _page_bucket(r.page_count or 0) not in filters["page"]:
-            return False
-        if filters.get("folder") and _folder_of(r.path) not in filters["folder"]:
-            return False
-        return True
-    return [r for r in results if ok(r)]
 
 
 def _thumb_placeholder(tok: dict) -> QPixmap:
@@ -510,6 +418,12 @@ class MainWindow(QMainWindow):
         self._empty_suggest_inflight_token: int | None = None
         self._empty_query_suggestion = ""
         self._startup_index_token = 0
+        self._startup_index_check_started_at = 0.0
+        self._startup_index_check_last_ms = 0.0
+        self._startup_index_check_last_files = 0
+        self._startup_index_check_last_pages = 0
+        self._startup_index_check_decision = "pending"
+        self._startup_index_check_error = ""
         self._version_shield_token = 0
         self._version_shield_inflight_token: int | None = None
         self._suppress_select_preview = False
@@ -694,6 +608,14 @@ class MainWindow(QMainWindow):
                 f"error={summary.get('error', '') or '-'}")
         elif self._live_deferred_paths:
             lines.append(f"index_deferred_live: {len(self._live_deferred_paths)}")
+        lines.append(
+            "startup_index_check: "
+            f"decision={self._startup_index_check_decision} "
+            f"last_ms={self._startup_index_check_last_ms:.0f} "
+            f"files={self._startup_index_check_last_files} "
+            f"pages={self._startup_index_check_last_pages} "
+            f"error={self._startup_index_check_error or '-'}"
+        )
         if self._version_mgr is not None and hasattr(self._version_mgr, "diagnostic_lines"):
             try:
                 lines.extend(self._version_mgr.diagnostic_lines())
@@ -3600,6 +3522,9 @@ class MainWindow(QMainWindow):
     def _schedule_startup_index_check(self, roots: list[str] | None, workers: int | None) -> None:
         self._startup_index_token += 1
         token = self._startup_index_token
+        self._startup_index_check_started_at = time.monotonic()
+        self._startup_index_check_decision = "checking"
+        self._startup_index_check_error = ""
         conn_path = _sqlite_file_path(self._conn)
         if not conn_path:
             try:
@@ -3632,13 +3557,27 @@ class MainWindow(QMainWindow):
         if self._closing or token != self._startup_index_token:
             return
         stats = dict(payload or {}) if isinstance(payload, dict) else {}
+        self._startup_index_check_last_ms = (
+            (time.monotonic() - self._startup_index_check_started_at) * 1000.0
+            if self._startup_index_check_started_at else 0.0
+        )
         try:
             file_count = int(stats.get("file_count", 0))
         except (TypeError, ValueError):
             file_count = 0
+        try:
+            page_count = int(stats.get("page_count", 0))
+        except (TypeError, ValueError):
+            page_count = 0
+        self._startup_index_check_last_files = file_count
+        self._startup_index_check_last_pages = page_count
+        if not isinstance(payload, dict):
+            self._startup_index_check_error = "stats_unavailable"
         if file_count <= 0:
+            self._startup_index_check_decision = "start_scan"
             self._start_indexing(roots, workers)
             return
+        self._startup_index_check_decision = "use_existing"
         self._apply_status_stats(None, stats)
 
     def _index_file_live(self, path: str) -> None:

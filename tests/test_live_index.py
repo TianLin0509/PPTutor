@@ -125,6 +125,10 @@ def test_startup_empty_index_check_runs_in_background(qtbot, monkeypatch, tmp_pa
 
     assert calls == ["stats"]
     assert starts == [(["C:/docs"], 2)]
+    lines = "\n".join(win.diagnostic_lines())
+    assert "startup_index_check:" in lines
+    assert "decision=start_scan" in lines
+    assert "files=0" in lines
 
 
 def test_startup_existing_index_check_updates_status_without_scan(qtbot, monkeypatch, tmp_path):
@@ -157,6 +161,11 @@ def test_startup_existing_index_check_updates_status_without_scan(qtbot, monkeyp
 
     assert starts == []
     assert "索引就绪：4 个文件 · 9 页" in win.status_label.text()
+    lines = "\n".join(win.diagnostic_lines())
+    assert "startup_index_check:" in lines
+    assert "decision=use_existing" in lines
+    assert "files=4" in lines
+    assert "pages=9" in lines
 
 
 def test_live_indexer_async_off_main_thread(qtbot, tmp_path):
