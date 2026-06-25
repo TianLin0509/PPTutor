@@ -36,16 +36,31 @@ pyz = PYZ(a.pure)
 # MinHash，datasketch/numpy/scipy 不再进入打包产物。
 _DROP = (
     'opengl32sw', 'd3dcompiler',
+    'opencc/clib/lib', 'opencc/clib/include', 'opencc/clib/bin',
     'qt6quick', 'qt6qml', 'qml', 'qt6pdf', 'qt6webengine', 'qt6webchannel', 'qt6websockets',
     'qt63d', 'qt6quick3d', 'qt6multimedia', 'qt6charts', 'qt6datavisualization', 'qt6designer',
     'qt6opengl', 'qt6virtualkeyboard', 'qt6sensors', 'qt6bluetooth', 'qt6nfc', 'qt6positioning',
     'qt6serialport', 'qt6serialbus', 'qt6sql', 'qt6test', 'qt6help', 'qt6spatialaudio',
     'qt6texttospeech', 'qt6remoteobjects', 'qt6scxml', 'qt6statemachine', 'qt6labs',
+    'pyside6/plugins/platforms/qdirect2d', 'pyside6/plugins/platforms/qoffscreen',
+    'pyside6/plugins/platforms/qminimal',
+    'pyside6/plugins/imageformats/qwebp', 'pyside6/plugins/imageformats/qtiff',
+    'pyside6/plugins/imageformats/qicns', 'pyside6/plugins/imageformats/qpdf',
+    'pyside6/plugins/imageformats/qtga', 'pyside6/plugins/imageformats/qwbmp',
+)
+
+_KEEP_TRANSLATIONS = (
+    'qtbase_zh_cn.qm',
+    'qtbase_zh_tw.qm',
+    'qt_zh_cn.qm',
+    'qt_zh_tw.qm',
 )
 
 
 def _keep(entry):
     n = entry[0].replace('\\', '/').lower()
+    if 'pyside6/translations/' in n:
+        return n.rsplit('/', 1)[-1] in _KEEP_TRANSLATIONS
     return not any(d in n for d in _DROP)
 
 
