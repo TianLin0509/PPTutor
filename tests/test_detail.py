@@ -5,7 +5,7 @@ import fixtures_gen as fx
 import pptx_finder.ui.main_window as main_window_mod
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QPixmap
-from PySide6.QtWidgets import QFileDialog, QLabel, QPushButton
+from PySide6.QtWidgets import QFileDialog, QLabel, QPushButton, QWidget
 from test_ui import PendingSearchWorker, StubRender, _index
 
 from pptx_finder import db, indexer
@@ -56,6 +56,42 @@ def test_detail_meta_shows_pages(qtbot):
     qtbot.addWidget(dp)
     dp.update_for(_fr(page_count=12), versions=[])
     assert "12" in dp._meta_label.text()
+
+
+def test_detail_slim_button_emits_selected_path(qtbot):
+    dp = DetailPanel(theme.tok("raycast"))
+    qtbot.addWidget(dp)
+    fired = []
+    dp.slim_requested.connect(lambda path: fired.append(path))
+    dp.update_for(_fr(path="C:/deck-a.pptx"), versions=[])
+
+    dp._slim_btn.click()
+
+    assert fired == ["C:/deck-a.pptx"]
+    dp.clear_selection()
+    assert dp._slim_btn.isEnabled() is False
+
+
+def test_detail_slim_button_follows_file_action_enabled(qtbot):
+    dp = DetailPanel(theme.tok("raycast"))
+    qtbot.addWidget(dp)
+    fired = []
+    dp.slim_requested.connect(lambda path: fired.append(path))
+    dp.update_for(_fr(path="C:/deck-a.pptx"), versions=[])
+
+    dp.set_file_actions_enabled(False)
+    assert dp._slim_btn.isEnabled() is False
+    dp._slim_btn.click()
+    assert fired == []
+
+    dp.set_file_actions_enabled(True)
+    assert dp._slim_btn.isEnabled() is True
+    dp._slim_btn.click()
+    assert fired == ["C:/deck-a.pptx"]
+
+    dp.update_for(_fr(path="C:/deck-a.pdf"), versions=[])
+    dp.set_file_actions_enabled(True)
+    assert dp._slim_btn.isEnabled() is False
 
 
 def test_detail_close_button_has_large_click_target(qtbot):
@@ -295,6 +331,100 @@ def test_mainwindow_detail_toggle(qtbot, tmp_path):
     assert win.detail_panel.isHidden()
     win._toggle_detail()
     assert not win.detail_panel.isHidden()
+
+
+def test_mainwindow_opens_slim_window(qtbot, tmp_path, monkeypatch):
+    opened = []
+    deck = tmp_path / "deck-a.pptx"
+    fx.make_pptx(deck, [{"body": "瘦身入口"}])
+
+    class FakeSlimWindow(QWidget):
+        def __init__(self, tok, path, parent=None):
+            super().__init__(parent)
+            self._path = path
+            self._closing = False
+            opened.append(path)
+
+        def show(self):
+            super().show()
+
+        def isVisible(self):
+            return True
+
+        def raise_(self):
+            pass
+
+        def activateWindow(self):
+            pass
+
+    import pptx_finder.ui.slim_window as slim_window_mod
+
+    monkeypatch.setattr(slim_window_mod, "SlimWindow", FakeSlimWindow)
+    win = MainWindow(conn=_index(tmp_path), render_worker=StubRender(), do_index=False)
+    qtbot.addWidget(win)
+
+    win._open_slim_window(str(deck))
+    win._open_slim_window(str(deck))
+
+    assert opened == [str(deck)]
+    assert len(win._slim_windows) == 1
+
+
+def test_mainwindow_blocks_slim_window_when_source_missing(qtbot, tmp_path, monkeypatch):
+    opened = []
+    toasts = []
+
+    class FakeSlimWindow(QWidget):
+        def __init__(self, tok, path, parent=None):
+            super().__init__(parent)
+            opened.append(path)
+
+    import pptx_finder.ui.slim_window as slim_window_mod
+
+    monkeypatch.setattr(slim_window_mod, "SlimWindow", FakeSlimWindow)
+    win = MainWindow(conn=_index(tmp_path), render_worker=StubRender(), do_index=False)
+    qtbot.addWidget(win)
+    win._toast = lambda msg, ms=1600: toasts.append(msg)
+
+    win._open_slim_window(str(tmp_path / "missing.pptx"))
+
+    assert opened == []
+    assert toasts and "文件已移动或删除" in toasts[-1]
+
+
+def test_mainwindow_blocks_slim_window_during_pending_search(qtbot, tmp_path, monkeypatch):
+    opened = []
+    toasts = []
+    deck = tmp_path / "deck-a.pptx"
+    fx.make_pptx(deck, [{"body": "搜索 pending"}])
+
+    class FakeSlimWindow(QWidget):
+        def __init__(self, tok, path, parent=None):
+            super().__init__(parent)
+            opened.append(path)
+
+    import pptx_finder.ui.slim_window as slim_window_mod
+
+    monkeypatch.setattr(slim_window_mod, "SlimWindow", FakeSlimWindow)
+    win = MainWindow(conn=_index(tmp_path), render_worker=StubRender(), do_index=False)
+    qtbot.addWidget(win)
+    win._toast = lambda msg, ms=1600: toasts.append(msg)
+    win._search_pending_req = 1
+
+    win._open_slim_window(str(deck))
+
+    assert opened == []
+    assert toasts and "搜索还在进行" in toasts[-1]
+
+
+def test_mainwindow_treats_slim_create_as_heavy_shutdown_task(qtbot, tmp_path):
+    class FakeTask:
+        _label = "ppt-slim-create"
+
+    win = MainWindow(conn=_index(tmp_path), render_worker=StubRender(), do_index=False)
+    qtbot.addWidget(win)
+
+    assert win._bg_task_shutdown_wait_ms(FakeTask()) == win._BG_HEAVY_SHUTDOWN_WAIT_MS
 
 
 def test_mainwindow_select_updates_detail(qtbot, tmp_path):

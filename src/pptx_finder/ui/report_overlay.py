@@ -6,9 +6,10 @@
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
-from PySide6.QtCore import QEasingCurve, Qt, QVariantAnimation
+from PySide6.QtCore import QPoint, QRect, QEasingCurve, Qt, QVariantAnimation
+from PySide6.QtGui import QPainter, QPixmap, QRegion
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QFrame, QHBoxLayout, QLabel, QMessageBox, QPushButton,
     QScrollArea, QVBoxLayout, QWidget,
@@ -30,6 +31,19 @@ _CARD_MIN_WIDTH = 420
 _OVERLAY_MARGIN = 96
 _SCROLL_CHROME_WIDTH = 18
 _SCROLL_MAX_HEIGHT = 1230
+_CARD_HEIGHT_RATIO = 0.80
+_CARD_MIN_HEIGHT = 420
+
+_SCOPE_ALL = "all"
+_SCOPE_YEAR = "year"
+_SCOPE_MONTH = "month"
+_SCOPE_WEEK = "week"
+_SCOPE_LABELS = {
+    _SCOPE_ALL: "全部历史",
+    _SCOPE_YEAR: "本年",
+    _SCOPE_MONTH: "本月",
+    _SCOPE_WEEK: "本周",
+}
 
 
 # ---------- 文案格式化（纯函数，可测） ----------
@@ -62,6 +76,36 @@ def _this_year() -> int:
     return datetime.now().year
 
 
+def _month_bounds(now: datetime | None = None) -> tuple[float, float]:
+    now = now or datetime.now()
+    start = datetime(now.year, now.month, 1)
+    if now.month == 12:
+        end = datetime(now.year + 1, 1, 1)
+    else:
+        end = datetime(now.year, now.month + 1, 1)
+    return start.timestamp(), end.timestamp()
+
+
+def _week_bounds(now: datetime | None = None) -> tuple[float, float]:
+    now = now or datetime.now()
+    start_day = now.date() - timedelta(days=now.weekday())
+    start = datetime(start_day.year, start_day.month, start_day.day)
+    end = start + timedelta(days=7)
+    return start.timestamp(), end.timestamp()
+
+
+def _scope_query(scope: str, year: int | None = None) -> tuple[int | None, float | None, float | None]:
+    if scope == _SCOPE_YEAR:
+        return year if year is not None else _this_year(), None, None
+    if scope == _SCOPE_MONTH:
+        since, until = _month_bounds()
+        return None, since, until
+    if scope == _SCOPE_WEEK:
+        since, until = _week_bounds()
+        return None, since, until
+    return None, None, None
+
+
 def _conn_path(conn) -> str | None:
     try:
         row = conn.execute("PRAGMA database_list").fetchone()
@@ -72,15 +116,20 @@ def _conn_path(conn) -> str | None:
         return None
 
 
-def _build_report_off_ui(conn, *, year=None):
+def _build_report_off_ui(conn, *, year=None, since_ts=None, until_ts=None):
+    kwargs = {"year": year}
+    if since_ts is not None:
+        kwargs["since_ts"] = since_ts
+    if until_ts is not None:
+        kwargs["until_ts"] = until_ts
     path = _conn_path(conn)
     if path:
         own = db.connect(path)
         try:
-            return stats.build_report(own, year=year)
+            return stats.build_report(own, **kwargs)
         finally:
             own.close()
-    return stats.build_report(conn, year=year)
+    return stats.build_report(conn, **kwargs)
 
 
 # ---------- 固定暗黑胶片质感（不跟随 app 主题，保证报告/导出图始终高级一致） ----------
@@ -192,11 +241,13 @@ class ReportOverlay(QWidget):
         self._closing_owner = parent
         self.current_report = report
         self.current_year = report.scope_year
+        self.current_scope = _SCOPE_YEAR if report.scope_year is not None else _SCOPE_ALL
         self._switch_token = 0
-        self._switch_inflight: tuple[int, int | None] | None = None
+        self._switch_inflight: tuple[int, str, int | None] | None = None
         self._report_ready_for_export = True
         self._export_inflight = False
         self._report_tasks: list[BackgroundTask] = []
+        self._scope_buttons: dict[str, QPushButton] = {}
         self._parent_bg_tasks = getattr(parent, "_bg_tasks", None)
         if not isinstance(self._parent_bg_tasks, list):
             self._parent_bg_tasks = None
@@ -221,19 +272,19 @@ class ReportOverlay(QWidget):
         self._content_lay = QVBoxLayout(self._content)
         self._content_lay.setContentsMargins(0, 0, 0, 0)
         self._content_lay.setSpacing(13)
-        self._card_lay.addWidget(self._content)
-        self._fill_content()
-
         self._scroll = QScrollArea()
-        self._scroll.setWidget(self._card)
-        self._scroll.setWidgetResizable(False)
+        self._scroll.setWidget(self._content)
+        self._scroll.setWidgetResizable(True)
         self._scroll.setFrameShape(QFrame.NoFrame)
         self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._scroll.setStyleSheet("background:transparent;")
+        self._card_lay.addWidget(self._scroll, 1)
+        self._fill_content()
         self._resize_report_card()
 
         outer = QVBoxLayout(self)
-        outer.addWidget(self._scroll, alignment=Qt.AlignCenter)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(self._card, alignment=Qt.AlignCenter)
         if parent is not None:
             self.setGeometry(parent.rect())
             self._resize_report_card()
@@ -243,9 +294,10 @@ class ReportOverlay(QWidget):
         w = self.width() or (parent.width() if parent is not None else 980)
         h = self.height() or (parent.height() if parent is not None else 860)
         card_w = min(_CARD_TARGET_WIDTH, max(_CARD_MIN_WIDTH, w - _OVERLAY_MARGIN))
+        card_h = min(_SCROLL_MAX_HEIGHT, max(_CARD_MIN_HEIGHT, int(h * _CARD_HEIGHT_RATIO)))
         self._card.setFixedWidth(card_w)
-        self._scroll.setFixedWidth(card_w + _SCROLL_CHROME_WIDTH)
-        self._scroll.setMaximumHeight(min(_SCROLL_MAX_HEIGHT, max(420, h - _OVERLAY_MARGIN)))
+        self._card.setFixedHeight(card_h)
+        self._scroll.setMinimumHeight(260)
 
     def _ui_alive(self) -> bool:
         if self._closing or not _qt_is_valid(self):
@@ -281,27 +333,35 @@ class ReportOverlay(QWidget):
             f"font-size:17px;font-weight:700;color:{tok['ink1']};background:transparent;border:none;")
         head.addWidget(self._title, 1)
 
-        # 年度切换（仅当给定 conn 可重算时）
+        # 范围切换（仅当给定 conn 可重算时）
         if self._conn is not None:
             self._all_btn = QPushButton("全部")
             self._year_btn = QPushButton("本年")
+            self._month_btn = QPushButton("本月")
+            self._week_btn = QPushButton("本周")
             chip_css = (
-                f"QPushButton{{background:{tok['field']};color:{tok['ink3']};border:1px solid {tok['bd']};"
-                f"border-radius:980px;padding:3px 11px;font-size:12px;}}"
-                f"QPushButton:checked{{background:rgba({tok['hl_r']},{tok['hl_g']},{tok['hl_b']},0.16);"
+                f"QPushButton{{background:{tok['field']};color:{tok['ink3']};border:1px solid #343041;"
+                f"border-radius:9px;padding:3px 11px;font-size:12px;}}"
+                f"QPushButton:checked{{background:#3a2830;"
                 f"color:{tok['acc']};border-color:{tok['acc']};}}")
-            for b, yr in ((self._all_btn, None), (self._year_btn, _this_year())):
+            for b, scope in (
+                (self._all_btn, _SCOPE_ALL),
+                (self._year_btn, _SCOPE_YEAR),
+                (self._month_btn, _SCOPE_MONTH),
+                (self._week_btn, _SCOPE_WEEK),
+            ):
                 b.setCheckable(True)
                 b.setCursor(Qt.PointingHandCursor)
                 b.setStyleSheet(chip_css)
-                b.clicked.connect(lambda _=False, y=yr: self.switch_year(y))
+                b.clicked.connect(lambda _=False, s=scope: self.switch_scope(s))
+                self._scope_buttons[scope] = b
                 head.addWidget(b)
 
         self.copy_btn = QPushButton("复制")
         self.copy_btn.setToolTip("复制报告图片到剪贴板，可直接粘贴到微信 / 钉钉")
         self.copy_btn.setCursor(Qt.PointingHandCursor)
         self.copy_btn.setStyleSheet(
-            f"QPushButton{{background:{tok['field']};color:{tok['ink2']};border:1px solid {tok['bd']};"
+            f"QPushButton{{background:{tok['field']};color:{tok['ink2']};border:1px solid #343041;"
             f"border-radius:7px;padding:5px 11px;font-weight:600;}}"
             f"QPushButton:hover{{border-color:{tok['acc']};color:{tok['acc']};}}")
         self.copy_btn.clicked.connect(self._copy_clicked)
@@ -317,87 +377,104 @@ class ReportOverlay(QWidget):
         self.close_btn.setFixedSize(34, 34)
         self.close_btn.setStyleSheet(
             f"QPushButton{{background:transparent;color:{tok['ink3']};border:none;"
-            "font-size:22px;font-weight:600;border-radius:8px;padding:0;}}"
-            "QPushButton:hover{background:rgba(255,69,58,0.9);color:#ffffff;}")
+            "font-size:22px;font-weight:600;border-radius:8px;padding:0;}"
+            "QPushButton:hover{background:#ff453a;color:#ffffff;}")
         self.close_btn.clicked.connect(self.close)
         head.addWidget(self.close_btn)
         self._card_lay.addLayout(head)
 
     def switch_year(self, year: int | None) -> None:
+        self.switch_scope(_SCOPE_ALL if year is None else _SCOPE_YEAR, year=year)
+
+    def switch_scope(self, scope: str, *, year: int | None = None) -> None:
         if not self._ui_alive():
             return
-        if year == self.current_year and self.current_report.scope_year == year:
+        if scope not in _SCOPE_LABELS:
+            scope = _SCOPE_ALL
+        query_year, since_ts, until_ts = _scope_query(scope, year)
+        if scope == self.current_scope and query_year == self.current_year:
             return
         if self._switch_inflight is not None:
             return
-        self.current_year = year
+        self.current_scope = scope
+        self.current_year = query_year
         if self._conn is not None:
             self._switch_token += 1
             token = self._switch_token
-            self._switch_inflight = (token, year)
+            self._switch_inflight = (token, scope, query_year)
             self._report_ready_for_export = False
-            self._set_year_buttons_enabled(False)
+            self._set_scope_buttons_enabled(False)
             self.export_btn.setEnabled(False)
             self.copy_btn.setEnabled(False)
-            self._show_loading(year)
+            self._show_loading(scope, query_year)
             task = BackgroundTask(
-                lambda year=year: _build_report_off_ui(self._conn, year=year),
+                lambda year=query_year, since_ts=since_ts, until_ts=until_ts:
+                    _build_report_off_ui(self._conn, year=year, since_ts=since_ts, until_ts=until_ts),
                 "stats-report-switch",
                 None,
             )
             self._track_report_task(task)
             task.done.connect(
-                lambda report, token=token, year=year: self._on_report_switched(token, year, report))
+                lambda report, token=token, scope=scope, year=query_year:
+                    self._on_report_switched(token, scope, year, report))
             task.finished.connect(
                 lambda task=task: self._forget_report_task(task))
             task.start()
         else:
             self._fill_content()
 
-    def _set_year_buttons_enabled(self, enabled: bool) -> None:
-        for btn_name in ("_all_btn", "_year_btn"):
-            btn = getattr(self, btn_name, None)
-            if btn is not None:
-                btn.setEnabled(enabled)
+    def _set_scope_buttons_enabled(self, enabled: bool) -> None:
+        for btn in self._scope_buttons.values():
+            btn.setEnabled(enabled)
 
-    def _show_loading(self, year: int | None) -> None:
+    def _set_scope_buttons_checked(self) -> None:
+        for scope, btn in self._scope_buttons.items():
+            btn.setChecked(scope == self.current_scope)
+
+    def _scope_text(self, scope: str | None = None, year: int | None = None) -> str:
+        scope = scope or self.current_scope
+        year = self.current_year if year is None else year
+        if scope == _SCOPE_YEAR and year is not None:
+            return f"{year} 年"
+        return _SCOPE_LABELS.get(scope, _SCOPE_LABELS[_SCOPE_ALL])
+
+    def _show_loading(self, scope: str, year: int | None) -> None:
         while self._content_lay.count():
             it = self._content_lay.takeAt(0)
             if it.widget():
                 it.widget().deleteLater()
         if self._conn is not None:
-            self._all_btn.setChecked(year is None)
-            self._year_btn.setChecked(year is not None)
-        scope = f"{year} 年" if year else "全部历史"
-        lab = QLabel(f"正在生成 {scope} 胶片报告…")
+            self._set_scope_buttons_checked()
+        scope_text = self._scope_text(scope, year)
+        lab = QLabel(f"正在生成 {scope_text} 胶片报告…")
         lab.setWordWrap(True)
         lab.setStyleSheet(f"color:{self._tok['ink3']};background:transparent;border:none;font-size:12.5px;")
         self._content_lay.addWidget(lab)
 
-    def _show_switch_error(self, year: int | None) -> None:
+    def _show_switch_error(self, scope: str, year: int | None) -> None:
         while self._content_lay.count():
             it = self._content_lay.takeAt(0)
             if it.widget():
                 it.widget().deleteLater()
         if self._conn is not None:
-            self._all_btn.setChecked(year is None)
-            self._year_btn.setChecked(year is not None)
-        scope = f"{year} 年" if year else "全部历史"
-        lab = QLabel(f"{scope}胶片报告生成失败，请稍后重试。")
+            self._set_scope_buttons_checked()
+        scope_text = self._scope_text(scope, year)
+        lab = QLabel(f"{scope_text}胶片报告生成失败，请稍后重试。")
         lab.setWordWrap(True)
         lab.setStyleSheet(f"color:{self._tok['ink3']};background:transparent;border:none;font-size:12.5px;")
         self._content_lay.addWidget(lab)
 
-    def _on_report_switched(self, token: int, year: int | None, report: object) -> None:
+    def _on_report_switched(self, token: int, scope: str, year: int | None, report: object) -> None:
         if not self._ui_alive() or token != self._switch_token:
             return
-        if self._switch_inflight == (token, year):
+        if self._switch_inflight == (token, scope, year):
             self._switch_inflight = None
-        self._set_year_buttons_enabled(True)
+        self._set_scope_buttons_enabled(True)
         self.copy_btn.setEnabled(True)
         if report is None:
-            self._show_switch_error(year)
+            self._show_switch_error(scope, year)
             return
+        self.current_scope = scope
         self.current_year = year
         self.current_report = report
         self._fill_content()
@@ -428,8 +505,7 @@ class ReportOverlay(QWidget):
         self._rolls = []
         report = self.current_report
         if self._conn is not None:
-            self._all_btn.setChecked(self.current_year is None)
-            self._year_btn.setChecked(self.current_year is not None)
+            self._set_scope_buttons_checked()
 
         self._content_lay.addWidget(self._hero(report))
         self._content_lay.addWidget(self._persona_hero(report.persona))   # 称号前置：最该被晒的一张
@@ -437,7 +513,7 @@ class ReportOverlay(QWidget):
         self._content_lay.addWidget(self._drama_card(report.drama))
         self._content_lay.addWidget(self._scale_card(report.scale))
 
-        self._card.adjustSize()
+        self._content.adjustSize()
         for r in self._rolls:
             r.start()
 
@@ -461,7 +537,7 @@ class ReportOverlay(QWidget):
     def _hero(self, report) -> QFrame:
         tok = self._tok
         sc = report.scale
-        scope = f"{self.current_year} 年" if self.current_year else "全部历史"
+        scope = self._scope_text()
         f = QFrame()
         f.setStyleSheet("background:transparent;border:none;")
         v = QVBoxLayout(f)
@@ -596,12 +672,79 @@ class ReportOverlay(QWidget):
             except Exception:  # noqa: BLE001
                 pass
 
+    def _grab_full_report_pixmap(self):
+        """Grab the fixed-height card as a full report image, including scrolled content."""
+        self._finish_rolls()
+        self._content_lay.activate()
+        self._content.adjustSize()
+        self._card_lay.activate()
+
+        app = QApplication.instance()
+        if app is not None:
+            app.processEvents()
+
+        content_min = self._content.minimumSize()
+        content_max = self._content.maximumSize()
+        content_size = self._content.size()
+        scroll_value = self._scroll.verticalScrollBar().value()
+
+        try:
+            margins = self._card_lay.contentsMargins()
+            top_to_scroll = self._scroll.geometry().top()
+            if top_to_scroll <= 0:
+                header_item = self._card_lay.itemAt(0)
+                header_h = header_item.sizeHint().height() if header_item is not None else 0
+                top_to_scroll = margins.top() + header_h + self._card_lay.spacing()
+
+            content_hint = self._content_lay.sizeHint()
+            content_w = max(self._scroll.viewport().width(), self._content.width(), content_hint.width())
+            content_h = max(content_hint.height(), self._content.sizeHint().height(), self._content.height())
+            scroll_x = self._scroll.geometry().left()
+            full_w = max(self._card.width(), scroll_x + content_w + margins.right())
+            full_h = max(top_to_scroll + content_h + margins.bottom(), self._card.height())
+
+            self._scroll.verticalScrollBar().setValue(0)
+            self._content.setMinimumSize(content_w, content_h)
+            self._content.resize(content_w, content_h)
+            self._content_lay.activate()
+            if app is not None:
+                app.processEvents()
+
+            dpr = max(1.0, float(self._card.devicePixelRatioF()))
+            pixmap = QPixmap(int(full_w * dpr), int(full_h * dpr))
+            pixmap.setDevicePixelRatio(dpr)
+            pixmap.fill(Qt.transparent)
+            painter = QPainter(pixmap)
+            try:
+                bg = QFrame()
+                bg.setObjectName("repCard")
+                bg.setAttribute(Qt.WA_StyledBackground, True)
+                bg.setStyleSheet(self._card.styleSheet())
+                bg.resize(full_w, full_h)
+                bg.ensurePolished()
+                bg.render(painter, QPoint(0, 0))
+
+                header_h = min(top_to_scroll, self._card.height())
+                self._card.render(
+                    painter,
+                    QPoint(0, 0),
+                    QRegion(QRect(0, 0, self._card.width(), header_h)),
+                )
+                self._content.render(painter, QPoint(scroll_x, top_to_scroll))
+            finally:
+                painter.end()
+            return pixmap
+        finally:
+            self._content.setMinimumSize(content_min)
+            self._content.setMaximumSize(content_max)
+            self._content.resize(content_size)
+            self._scroll.verticalScrollBar().setValue(scroll_value)
+            self._card_lay.activate()
+
     def _copy_clicked(self) -> None:
         if not self._ui_alive() or self._switch_inflight is not None:
             return   # 年度切换重算中：内容是 loading 占位，别抓到空卡
-        self._finish_rolls()
-        self._card.adjustSize()
-        QApplication.clipboard().setPixmap(self._card.grab())
+        QApplication.clipboard().setPixmap(self._grab_full_report_pixmap())
         QMessageBox.information(self, "复制图片", "已复制报告图片，可粘贴到微信 / 钉钉")
 
     def _section(self, title: str, html_lines: list[str]) -> QFrame:
@@ -628,16 +771,14 @@ class ReportOverlay(QWidget):
     def _export_clicked(self) -> None:
         if not self._ui_alive() or self._export_inflight or not self.export_btn.isEnabled():
             return
-        scope = str(self.current_year) if self.current_year is not None else "全部历史"
+        scope = self._scope_text().replace(" ", "")
         default_name = f"胶片报告_{scope}.png"
         path, _ = QFileDialog.getSaveFileName(self, "导出胶片报告图片", default_name, "PNG Image (*.png)")
         if not path:
             return
         if not path.lower().endswith(".png"):
             path = f"{path}.png"
-        self._finish_rolls()
-        self._card.adjustSize()
-        image = self._card.grab().toImage()
+        image = self._grab_full_report_pixmap().toImage()
         self._export_inflight = True
         self.export_btn.setEnabled(False)
         old_text = self.export_btn.text()
@@ -662,9 +803,7 @@ class ReportOverlay(QWidget):
         QMessageBox.information(self, "导出图片", "已导出图片" if ok else "导出失败")
 
     def export_png(self, path: str) -> bool:
-        self._finish_rolls()
-        self._card.adjustSize()
-        return bool(self._card.grab().save(path))
+        return bool(self._grab_full_report_pixmap().save(path))
 
     def keyPressEvent(self, e):  # noqa: N802
         if e.key() == Qt.Key_Escape:

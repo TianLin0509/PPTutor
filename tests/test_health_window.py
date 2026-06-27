@@ -1,6 +1,8 @@
 """库体检窗口 HealthWindow：渲染 + 一键回收流程（注入假 scan/recycle，不碰真文件/真回收站）。"""
 from __future__ import annotations
 
+from PySide6.QtWidgets import QWidget
+
 from pptx_finder import health
 from pptx_finder.ui import health_window as hw
 
@@ -72,3 +74,37 @@ def test_health_window_recycle_recycles_redundant(qtbot, monkeypatch):
     qtbot.waitUntil(lambda: "paths" in captured, timeout=4000)
     # 只回收冗余副本（保留 keep），不动 keep_path
     assert captured["paths"] == ["/dup1.pptx", "/dup2.pptx"]
+
+
+def test_health_window_notifies_parent_after_recycle(qtbot, monkeypatch):
+    parent = QWidget()
+    qtbot.addWidget(parent)
+    callbacks: list[dict] = []
+    parent._after_health_recycle = lambda result: callbacks.append(dict(result))
+
+    def recycle(paths):
+        return {
+            "ok": True,
+            "recycled": len(paths),
+            "recycled_paths": list(paths),
+            "failed": [],
+            "freed_bytes": 2000,
+        }
+
+    monkeypatch.setattr(hw.QMessageBox, "question", lambda *a, **k: hw.QMessageBox.Yes)
+    monkeypatch.setattr(hw.QMessageBox, "information", lambda *a, **k: None)
+
+    scans = [_report_with_dups(), _report_clean()]
+    win = hw.HealthWindow(
+        {"win": "#101010"},
+        lambda: scans.pop(0) if scans else _report_clean(),
+        recycle,
+        parent,
+    )
+    qtbot.addWidget(win)
+    qtbot.waitUntil(lambda: win._recycle_btn is not None, timeout=4000)
+
+    win._recycle_selected()
+
+    qtbot.waitUntil(lambda: bool(callbacks), timeout=4000)
+    assert callbacks[0]["recycled_paths"] == ["/dup1.pptx", "/dup2.pptx"]

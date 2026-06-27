@@ -426,7 +426,10 @@ class MainWindow(QMainWindow):
     _BG_LIGHT_SHUTDOWN_TOTAL_WAIT_MS = 1000
     _SEARCH_SHUTDOWN_WAIT_MS = 500
     _BG_HEAVY_SHUTDOWN_WAIT_MS = 3000
-    _BG_HEAVY_LABELS = {"open", "restore", "export", "version-restore", "version-export", "version-recover"}
+    _BG_HEAVY_LABELS = {
+        "open", "restore", "export", "version-restore", "version-export", "version-recover",
+        "ppt-slim-analyze", "ppt-slim-create",
+    }
 
     def __init__(self, conn=None, render_worker=None, thumb_worker=None, version_mgr=None,
                  do_index=True, roots: list[str] | None = None, workers: int | None = None):
@@ -844,6 +847,7 @@ class MainWindow(QMainWindow):
         self.detail_panel.export_requested.connect(self._act_export_version)
         self.detail_panel.preview_requested.connect(self._request_version_preview)
         self.detail_panel.page_requested.connect(self._act_goto_page)
+        self.detail_panel.slim_requested.connect(self._open_slim_window)
         self.detail_panel.hide()
         split.setStretchFactor(0, 0)
         split.setStretchFactor(1, 5)
@@ -1881,6 +1885,57 @@ class MainWindow(QMainWindow):
         dlg.raise_()
         dlg.activateWindow()
 
+    def _health_db_path(self) -> str:
+        return _sqlite_file_path(self._conn) or self._db_path
+
+    def _recycle_health_paths_and_sync_index(self, paths: list[str]) -> dict:
+        from .. import health
+
+        res = dict(health.recycle_paths(paths) or {})
+        recycled_paths = [
+            str(p) for p in (res.get("recycled_paths") or [])
+            if p
+        ]
+        deleted = 0
+        if recycled_paths:
+            conn = db.connect(self._health_db_path())
+            try:
+                for path in recycled_paths:
+                    if db.get_file_by_path(conn, path) is not None:
+                        deleted += 1
+                    db.delete_file(conn, path)
+                conn.commit()
+            except Exception as exc:  # noqa: BLE001 索引同步失败不能影响回收站可撤销语义
+                res["index_error"] = f"{type(exc).__name__}: {exc}"
+            finally:
+                conn.close()
+        res["index_deleted"] = deleted
+        return res
+
+    def _after_health_recycle(self, result: object) -> None:
+        if self._closing or not isinstance(result, dict):
+            return
+        try:
+            deleted = int(result.get("index_deleted", 0) or 0)
+        except (TypeError, ValueError):
+            deleted = 0
+        if result.get("index_error"):
+            self._toast("文件已进回收站，但索引同步失败；稍后全量扫描会自动修正")
+        if deleted <= 0:
+            return
+        self._index_status_cache = None
+        self._recent_cache = None
+        self._recent_cache_at = 0.0
+        self._refresh_status({"indexed": 0, "deleted": deleted})
+        if self.search_box.text().strip():
+            self._do_search()
+        elif self._showing_recent:
+            self._show_recent(dashboard_force_refresh=True, recent_force_refresh=True)
+        elif getattr(self, "dashboard", None) is not None:
+            schedule = getattr(self.dashboard, "schedule_refresh", None)
+            if callable(schedule):
+                schedule(force=True)
+
     def _open_health_center(self) -> None:
         """打开「库体检中心」：扫描重复 / 僵尸 / 诅咒 / 解析失败 + 一键回收重复占用。"""
         from .. import health
@@ -1903,7 +1958,7 @@ class MainWindow(QMainWindow):
                 if w in wins:
                     wins.remove(w)
 
-        db_path = self._db_path
+        db_path = self._health_db_path()
 
         def _scan():
             conn = db.connect(db_path)
@@ -1912,13 +1967,59 @@ class MainWindow(QMainWindow):
             finally:
                 conn.close()
 
-        win = HealthWindow(self._tok, _scan, health.recycle_paths, self)
+        win = HealthWindow(self._tok, _scan, self._recycle_health_paths_and_sync_index, self)
         wins.append(win)
         win.destroyed.connect(
             lambda _=None, w=win: wins.remove(w) if w in wins else None)
         win.show()
         win.raise_()
         win.activateWindow()
+
+    def _open_slim_window(self, path: str | None = None) -> None:
+        if self._block_if_search_pending():
+            return
+        if self._block_if_file_op_active():
+            return
+        target = path or (self._cur.path if self._cur is not None else "")
+        if not target:
+            return
+        if not str(target).lower().endswith(".pptx"):
+            self._toast("PPT 瘦身目前只支持 .pptx 文件")
+            return
+        target = os.path.abspath(str(target))
+        if not os.path.exists(target):
+            self._toast("文件已移动或删除，无法瘦身")
+            return
+        from .slim_window import SlimWindow
+
+        wins = getattr(self, "_slim_windows", None)
+        if wins is None:
+            wins = []
+            self._slim_windows = wins
+        norm = os.path.normcase(os.path.abspath(target))
+        for w in list(wins):
+            try:
+                if getattr(w, "_closing", False) or not w.isVisible():
+                    wins.remove(w)
+                    continue
+                if os.path.normcase(os.path.abspath(getattr(w, "_path", ""))) == norm:
+                    w.raise_()
+                    w.activateWindow()
+                    return
+            except RuntimeError:
+                if w in wins:
+                    wins.remove(w)
+        win = SlimWindow(self._tok, target, self)
+        wins.append(win)
+        win.destroyed.connect(lambda _=None, w=win: wins.remove(w) if w in wins else None)
+        win.show()
+        win.raise_()
+        win.activateWindow()
+
+    def _after_slim_created(self, result: object) -> None:
+        output_path = getattr(result, "output_path", "")
+        if output_path:
+            self._toast(f"已生成瘦身副本：{os.path.basename(output_path)}")
 
     def _open_version_window_for(self, *, path: str | None = None, query: str | None = None):
         """打开版本管理窗口，并按需定位到某文件 / 直接跨版本搜某词（D3 / D6）。"""
@@ -3503,6 +3604,9 @@ class MainWindow(QMainWindow):
                                r.path, r.hits[0].page_no if r.hits else 1)))
         menu.addAction("打开所在文件夹", lambda _checked=False, r=r, gen=render_gen:
                        self._run_context_menu_action(gen, lambda: self._open_folder_path(r.path)))
+        if str(r.path).lower().endswith(".pptx"):
+            menu.addAction("PPT 瘦身体检", lambda _checked=False, r=r, gen=render_gen:
+                           self._run_context_menu_action(gen, lambda: self._open_slim_window(r.path)))
         if self._version_mgr is not None:
             menu.addAction("📜 在版本管理中查看版本历史", lambda _checked=False, r=r:
                            self._open_version_window_for(path=r.path))

@@ -1722,7 +1722,10 @@ def test_shutdown_treats_version_file_ops_as_heavy_background_tasks(qtbot, tmp_p
         def __init__(self, label: str):
             self._label = label
 
-    for label in ("version-restore", "version-export", "version-recover"):
+    for label in (
+        "version-restore", "version-export", "version-recover",
+        "ppt-slim-analyze", "ppt-slim-create",
+    ):
         assert win._bg_task_shutdown_wait_ms(FakeTask(label)) == win._BG_HEAVY_SHUTDOWN_WAIT_MS
 
 

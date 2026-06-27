@@ -250,3 +250,22 @@ def test_build_report_all_history_assembles_everything(tmp_path):
     assert rep.scope_year is None
     assert rep.persona.title
     assert len(rep.heatmap) == 7
+
+
+def test_build_report_filters_by_time_window(tmp_path):
+    conn = db.connect(tmp_path / "i.db")
+    db.init_db(conn)
+    _put(conn, "before.pptx", _ts(2026, 5, 31, 23))
+    _put(conn, "inside-a.pptx", _ts(2026, 6, 1, 0))
+    _put(conn, "inside-b.pptx", _ts(2026, 6, 15, 12))
+    _put(conn, "after.pptx", _ts(2026, 7, 1, 0))
+    conn.commit()
+
+    rep = stats.build_report(
+        conn,
+        since_ts=_ts(2026, 6, 1, 0),
+        until_ts=_ts(2026, 7, 1, 0),
+    )
+
+    assert rep.deck_count == 2
+    assert rep.scope_year is None

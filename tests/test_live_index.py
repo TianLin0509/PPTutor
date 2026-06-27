@@ -60,6 +60,41 @@ def test_index_single_missing_file(tmp_path):
     assert indexer.index_single(conn, str(tmp_path / "nope.pptx")) is False
 
 
+def test_health_recycle_sync_deletes_recycled_paths_from_index(qtbot, monkeypatch, tmp_path):
+    docs = tmp_path / "d"
+    docs.mkdir()
+    keep = docs / "keep.pptx"
+    dup = docs / "dup.pptx"
+    fx.make_pptx(keep, [{"body": "重复清理保留项"}])
+    fx.make_pptx(dup, [{"body": "重复清理待删除项"}])
+    dbp = tmp_path / "i.db"
+    conn = db.connect(dbp)
+    db.init_db(conn)
+    indexer.update_index(conn, [str(docs)], workers=1)
+    win = MainWindow(conn=conn, render_worker=StubRender(), thumb_worker=StubThumb(), do_index=False)
+    qtbot.addWidget(win)
+
+    def fake_recycle(paths):
+        assert paths == [str(dup)]
+        return {
+            "ok": True,
+            "recycled": 1,
+            "recycled_paths": [str(dup)],
+            "failed": [],
+            "freed_bytes": dup.stat().st_size,
+        }
+
+    monkeypatch.setattr("pptx_finder.health.recycle_paths", fake_recycle)
+
+    result = win._recycle_health_paths_and_sync_index([str(dup)])
+
+    assert result["index_deleted"] == 1
+    assert db.get_file_by_path(win._conn, str(dup)) is None
+    assert db.get_file_by_path(win._conn, str(keep)) is not None
+    assert not search.search(win._conn, "重复清理待删除项")
+    assert search.search(win._conn, "重复清理保留项")
+
+
 def test_live_index_via_snapshot(qtbot, tmp_path):
     """on_version_snapshot（watcher 事件）应把新建文件实时并入搜索索引。"""
     conn = _index(tmp_path)

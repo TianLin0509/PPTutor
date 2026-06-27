@@ -353,4 +353,11 @@ class HealthWindow(QWidget):
             QMessageBox.warning(
                 self, "回收未完成",
                 f"已回收 {n} 份（{human_bytes(freed)}）；部分未成功：{res.get('error', '') or '请稍后重试'}")
+        owner = self._closing_owner
+        try:
+            hook = getattr(owner, "_after_health_recycle", None)
+        except RuntimeError:
+            hook = None
+        if callable(hook):
+            hook(res)
         self.refresh()

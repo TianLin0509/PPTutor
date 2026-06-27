@@ -5,7 +5,8 @@ from datetime import datetime
 from types import SimpleNamespace
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QWidget
+from PySide6.QtGui import QImage
+from PySide6.QtWidgets import QFrame, QWidget
 
 from pptx_finder import db, stats
 from pptx_finder.ui import report_overlay as ro
@@ -14,6 +15,31 @@ from pptx_finder.ui import theme
 
 def _ts(y, mo, d, h):
     return datetime(y, mo, d, h).timestamp()
+
+
+def _add_export_sentinel(ov: ro.ReportOverlay) -> None:
+    sentinel = QFrame()
+    sentinel.setObjectName("fullExportSentinel")
+    sentinel.setAttribute(Qt.WA_StyledBackground, True)
+    sentinel.setFixedHeight(96)
+    sentinel.setStyleSheet("#fullExportSentinel{background:#00ff00;border:none;border-radius:0;}")
+    ov._content_lay.addWidget(sentinel)
+    ov._content.adjustSize()
+
+
+def _assert_green_sentinel_visible(image: QImage) -> None:
+    assert not image.isNull()
+    green_hits = 0
+    y0 = max(0, image.height() - 180)
+    step_x = max(1, image.width() // 28)
+    for y in range(y0, image.height()):
+        for x in range(12, max(13, image.width() - 12), step_x):
+            color = image.pixelColor(x, y)
+            if color.green() > 200 and color.red() < 80 and color.blue() < 80:
+                green_hits += 1
+                if green_hits >= 8:
+                    return
+    assert green_hits >= 8
 
 
 def test_human_bytes_gb():
@@ -56,6 +82,67 @@ def test_overlay_constructs_and_exports_png(qtbot, tmp_path):
     assert out.exists() and out.stat().st_size > 0
 
 
+def test_export_png_captures_full_scroll_content(qtbot, tmp_path):
+    conn = db.connect(tmp_path / "i.db")
+    db.init_db(conn)
+    fid = db.upsert_file(conn, path="/full-export.pptx", name="full-export.pptx", ext=".pptx",
+                         size=2_000_000, mtime=_ts(2026, 6, 1, 2), content_hash="h",
+                         page_count=88, status="ok", error="", indexed_at=0)
+    db.replace_pages(conn, fid, [(1, "full export path " * 240, "t")])
+    conn.commit()
+    report = stats.build_report(conn, year=None)
+    parent = QWidget()
+    parent.resize(900, 560)
+    qtbot.addWidget(parent)
+
+    ov = ro.ReportOverlay(report, theme.tok("cloud"), parent=parent)
+    qtbot.addWidget(ov)
+    _add_export_sentinel(ov)
+
+    visible_card_height = int(ov._card.height() * ov._card.devicePixelRatioF())
+    out = tmp_path / "full-report.png"
+
+    assert ov.export_png(str(out)) is True
+    image = QImage(str(out))
+
+    assert image.height() > visible_card_height
+    _assert_green_sentinel_visible(image)
+
+
+def test_copy_clicked_captures_full_scroll_content(qtbot, tmp_path, monkeypatch):
+    conn = db.connect(tmp_path / "i.db")
+    db.init_db(conn)
+    fid = db.upsert_file(conn, path="/full-copy.pptx", name="full-copy.pptx", ext=".pptx",
+                         size=2_000_000, mtime=_ts(2026, 6, 1, 2), content_hash="h",
+                         page_count=88, status="ok", error="", indexed_at=0)
+    db.replace_pages(conn, fid, [(1, "full copy path " * 240, "t")])
+    conn.commit()
+    report = stats.build_report(conn, year=None)
+    parent = QWidget()
+    parent.resize(900, 560)
+    qtbot.addWidget(parent)
+    messages = []
+    monkeypatch.setattr(
+        ro,
+        "QMessageBox",
+        SimpleNamespace(information=lambda *args, **kwargs: messages.append(args)),
+        raising=False,
+    )
+
+    ov = ro.ReportOverlay(report, theme.tok("cloud"), parent=parent)
+    qtbot.addWidget(ov)
+    _add_export_sentinel(ov)
+
+    visible_card_height = int(ov._card.height() * ov._card.devicePixelRatioF())
+
+    ov._copy_clicked()
+    image = ro.QApplication.clipboard().pixmap().toImage()
+
+    assert messages
+    assert image.height() > visible_card_height
+    _assert_green_sentinel_visible(image)
+
+
 def test_overlay_uses_larger_responsive_card(qtbot, tmp_path):
     conn = db.connect(tmp_path / "i.db")
     db.init_db(conn)
@@ -72,8 +159,12 @@ def test_overlay_uses_larger_responsive_card(qtbot, tmp_path):
     qtbot.addWidget(ov)
 
     assert ov._card.width() == 1140
-    assert ov._scroll.width() >= 1140
-    assert ov._scroll.maximumHeight() == 1230
+    assert ov._card.height() == 1120
+    assert ov.close_btn.parentWidget() is ov._card
+    assert ov._scroll.widget() is ov._content
+    assert ov.close_btn not in ov._scroll.findChildren(QWidget)
+    assert ov._month_btn.text() == "本月"
+    assert ov._week_btn.text() == "本周"
 
 
 def test_export_button_saves_png(qtbot, tmp_path, monkeypatch):
@@ -254,6 +345,65 @@ def test_overlay_year_switch_builds_in_background(qtbot, tmp_path, monkeypatch):
 
     assert calls == [2026]
     assert ov.current_year == 2026
+
+
+def test_overlay_month_and_week_filters_build_with_time_windows(qtbot, tmp_path, monkeypatch):
+    conn = db.connect(tmp_path / "i.db")
+    db.init_db(conn)
+    db.upsert_file(conn, path="/a.pptx", name="a.pptx", ext=".pptx", size=1000,
+                   mtime=_ts(2026, 6, 10, 2), content_hash="h", page_count=5,
+                   status="ok", error="", indexed_at=0)
+    conn.commit()
+    report = stats.build_report(conn, year=None)
+    calls = []
+    tasks = []
+
+    class FakeSignal:
+        def __init__(self):
+            self.callbacks = []
+
+        def connect(self, callback):
+            self.callbacks.append(callback)
+
+        def emit(self, *args):
+            for callback in list(self.callbacks):
+                callback(*args)
+
+    class FakeTask:
+        def __init__(self, fn, label="", parent=None):
+            self.fn = fn
+            self.label = label
+            self.done = FakeSignal()
+            self.finished = FakeSignal()
+
+        def start(self):
+            tasks.append(self)
+
+    def fake_build_report(_conn, *, year=None, since_ts=None, until_ts=None):
+        calls.append((year, since_ts, until_ts))
+        return report
+
+    monkeypatch.setattr(ro, "BackgroundTask", FakeTask, raising=False)
+    monkeypatch.setattr(ro.stats, "build_report", fake_build_report)
+    monkeypatch.setattr(ro, "_month_bounds", lambda: (10.0, 20.0), raising=False)
+    monkeypatch.setattr(ro, "_week_bounds", lambda: (30.0, 40.0), raising=False)
+
+    ov = ro.ReportOverlay(report, theme.tok("cloud"), conn=conn)
+    qtbot.addWidget(ov)
+
+    ov.switch_scope(ro._SCOPE_MONTH)
+    assert tasks[-1].label == "stats-report-switch"
+    assert ov._month_btn.isChecked()
+    tasks[-1].done.emit(tasks[-1].fn())
+    assert calls[-1] == (None, 10.0, 20.0)
+    assert ov.current_scope == ro._SCOPE_MONTH
+
+    ov.switch_scope(ro._SCOPE_WEEK)
+    assert tasks[-1].label == "stats-report-switch"
+    assert ov._week_btn.isChecked()
+    tasks[-1].done.emit(tasks[-1].fn())
+    assert calls[-1] == (None, 30.0, 40.0)
+    assert ov.current_scope == ro._SCOPE_WEEK
 
 
 def test_overlay_tasks_registered_for_parent_shutdown(qtbot, tmp_path, monkeypatch):
@@ -453,7 +603,7 @@ def test_overlay_year_switch_ignores_new_switch_while_inflight(qtbot, tmp_path, 
 
     switch_tasks = [task for task in tasks if task.label == "stats-report-switch"]
     assert switch_tasks == [first_task]
-    assert ov._switch_inflight == (1, 2026)
+    assert ov._switch_inflight == (1, ro._SCOPE_YEAR, 2026)
     assert ov.current_year == 2026
 
 

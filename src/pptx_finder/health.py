@@ -195,7 +195,7 @@ def _shell_recycle(abs_paths: list[str]) -> tuple[int, bool]:
 
 
 def recycle_paths(paths: list[str]) -> dict:
-    """把若干文件送系统回收站（可撤销），返回 {ok, recycled, failed, freed_bytes}。
+    """把若干文件送系统回收站（可撤销），返回 {ok, recycled, recycled_paths, failed, freed_bytes}。
 
     freed_bytes 在删除前按实际消失的文件统计（删后无法 getsize），保证准确。
     """
@@ -220,13 +220,15 @@ def recycle_paths(paths: list[str]) -> dict:
             sizes[ap] = 0
 
     if not targets:
-        return {"ok": True, "recycled": 0, "failed": [], "freed_bytes": 0, "error": ""}
+        return {"ok": True, "recycled": 0, "recycled_paths": [],
+                "failed": [], "freed_bytes": 0, "error": ""}
 
     try:
         rc, aborted = _shell_recycle(targets)
     except Exception as exc:  # noqa: BLE001 回收失败不能抛进 UI
         return {"ok": False, "recycled": 0, "failed": list(targets),
-                "freed_bytes": 0, "error": f"{type(exc).__name__}: {exc}"}
+                "recycled_paths": [], "freed_bytes": 0,
+                "error": f"{type(exc).__name__}: {exc}"}
 
     removed = [p for p in targets if not os.path.exists(p)]
     failed = [p for p in targets if os.path.exists(p)]
@@ -234,6 +236,7 @@ def recycle_paths(paths: list[str]) -> dict:
     return {
         "ok": not failed and rc == 0 and not aborted,
         "recycled": len(removed),
+        "recycled_paths": removed,
         "failed": failed,
         "freed_bytes": freed,
         "error": "" if not failed else f"shell rc={rc} aborted={aborted}",

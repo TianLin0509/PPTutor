@@ -128,6 +128,8 @@ def test_recycle_paths_sends_to_bin(tmp_path, monkeypatch):
     res = health.recycle_paths([str(f1), str(f2)])
     assert res["ok"] is True
     assert res["recycled"] == 2
+    assert res["recycled_paths"] == [os.path.abspath(str(f1)), os.path.abspath(str(f2))]
+    assert res["failed"] == []
     assert res["freed_bytes"] == 300
     assert not f1.exists() and not f2.exists()
 
@@ -142,6 +144,7 @@ def test_recycle_paths_handles_shell_error(tmp_path, monkeypatch):
     res = health.recycle_paths([str(f1)])
     assert res["ok"] is False
     assert "no shell" in res["error"]
+    assert res["recycled_paths"] == []
     assert f1.exists()           # 失败不应删掉文件
 
 
@@ -157,6 +160,7 @@ def test_recycle_paths_partial(tmp_path, monkeypatch):
     res = health.recycle_paths([str(f1), str(f2)])
     assert res["ok"] is False
     assert res["recycled"] == 1
+    assert res["recycled_paths"] == [os.path.abspath(str(f1))]
     assert res["freed_bytes"] == 100
     assert [os.path.basename(p) for p in res["failed"]] == ["b.pptx"]
 
@@ -175,3 +179,11 @@ def test_recycle_paths_dedupes_and_skips_missing(tmp_path, monkeypatch):
     res = health.recycle_paths([str(f1), str(f1), str(tmp_path / "ghost.pptx")])
     assert seen["n"] == 1         # 去重 + 跳过不存在
     assert res["recycled"] == 1
+    assert res["recycled_paths"] == [os.path.abspath(str(f1))]
+
+
+def test_recycle_paths_empty_returns_recycled_paths():
+    res = health.recycle_paths([])
+    assert res["ok"] is True
+    assert res["recycled"] == 0
+    assert res["recycled_paths"] == []

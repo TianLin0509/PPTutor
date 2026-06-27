@@ -251,11 +251,25 @@ def fetch_file_stats(conn: sqlite3.Connection) -> list[FileStat]:
     ]
 
 
-def build_report(conn: sqlite3.Connection, *, year: int | None = None) -> Report:
-    """组装完整报告。year 给定则只统计该自然年修改的文件；None 为全部历史。"""
+def build_report(
+    conn: sqlite3.Connection,
+    *,
+    year: int | None = None,
+    since_ts: float | None = None,
+    until_ts: float | None = None,
+) -> Report:
+    """组装完整报告。
+
+    year 给定则只统计该自然年修改的文件；since_ts / until_ts 用于本月、本周等滚动时间窗。
+    until_ts 按半开区间处理，避免边界文件被相邻窗口重复统计。
+    """
     files = fetch_file_stats(conn)
     if year is not None:
         files = [f for f in files if datetime.fromtimestamp(f.mtime).year == year]
+    if since_ts is not None:
+        files = [f for f in files if f.mtime >= since_ts]
+    if until_ts is not None:
+        files = [f for f in files if f.mtime < until_ts]
     night = night_owl(files)
     sc = scale(files)
     drama = version_drama(files)

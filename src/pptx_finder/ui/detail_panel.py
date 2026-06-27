@@ -43,6 +43,7 @@ class DetailPanel(QWidget):
     export_requested = Signal(str, str)
     preview_requested = Signal(str)
     page_requested = Signal(int)          # 大纲点击 → 跳到该页
+    slim_requested = Signal(str)          # 单文件 PPT 瘦身体检
 
     def __init__(self, tok: dict, parent=None):
         super().__init__(parent)
@@ -50,6 +51,7 @@ class DetailPanel(QWidget):
         self._tok = tok
         self._path = None
         self._drag_off = None
+        self._file_actions_enabled = True
         self._version_nodes: list[QWidget] = []
         self._version_preview_labels: dict[str, QLabel] = {}
 
@@ -108,6 +110,16 @@ class DetailPanel(QWidget):
         self._meta_label.setObjectName("detailMeta")
         self._meta_label.setWordWrap(True)
         lay.addWidget(self._meta_label)
+        action_row = QHBoxLayout()
+        action_row.setContentsMargins(0, 0, 0, 0)
+        action_row.addStretch(1)
+        self._slim_btn = QPushButton("PPT 瘦身")
+        self._slim_btn.setObjectName("detailAction")
+        self._slim_btn.setToolTip("分析体积来源，并生成一个不覆盖源文件的瘦身副本")
+        self._slim_btn.setEnabled(False)
+        self._slim_btn.clicked.connect(lambda: self._path and self.slim_requested.emit(self._path))
+        action_row.addWidget(self._slim_btn)
+        lay.addLayout(action_row)
         lay.addSpacing(2)
         lay.addWidget(self._sec_title("📍 版本时间线"))
         ver_c = QWidget()
@@ -157,18 +169,26 @@ class DetailPanel(QWidget):
     def clear_selection(self) -> None:
         self._path = None
         self._meta_label.setText("← 选中左侧文件查看详情")
+        self._sync_slim_button()
         self._clear(self._version_box)
         self._version_nodes = []
         self._version_preview_labels = {}
         self._clear(self._outline_box)
 
     def set_file_actions_enabled(self, enabled: bool) -> None:
+        self._file_actions_enabled = bool(enabled)
         for btn in self.findChildren(QPushButton):
             if btn.objectName() in {"verBtn", "verBtnPri", "verPreviewBtn", "outlineItem"}:
                 btn.setEnabled(enabled)
+        self._sync_slim_button()
+
+    def _sync_slim_button(self) -> None:
+        is_pptx = bool(self._path and str(self._path).lower().endswith(".pptx"))
+        self._slim_btn.setEnabled(self._file_actions_enabled and is_pptx)
 
     def update_for(self, r, versions: list) -> None:
         self._path = r.path
+        self._sync_slim_button()
         parts = []
         sz = _fmt_size(r.size)
         if sz:
