@@ -12,13 +12,14 @@ def _fake_renderer(monkeypatch, tmp_path, delay=0.05):
     calls: list[tuple[int, bool]] = []
     lock = threading.Lock()
 
-    def fake_render(path, page_no, cache_key=None, long_edge=2560, hi_priority=False, priority=None):
+    def fake_render(path, page_no, cache_key=None, long_edge=2560, hi_priority=False, priority=None, **_kwargs):
         with lock:
             calls.append((page_no, hi_priority))
         time.sleep(delay)
         return tmp_path / f"{page_no}.png"
 
     monkeypatch.setattr(renderer, "render_page", fake_render)
+    monkeypatch.setattr(renderer, "background_powerpoint_allowed", lambda: True, raising=False)
     monkeypatch.setattr(renderer, "shutdown", lambda: None)
     return calls, lock
 
@@ -37,6 +38,43 @@ def test_preview_then_prefetch(qtbot, monkeypatch, tmp_path):
             got = list(calls)
         assert (1, True) in got               # 预览走高优先
         assert (2, False) in got and (3, False) in got  # 预取走低优先、确实渲染填缓存
+    finally:
+        w.stop()
+        w.wait(3000)
+
+
+def test_preview_uses_snapshot_but_prefetch_does_not(qtbot, monkeypatch, tmp_path):
+    calls: list[tuple[int, bool, bool]] = []
+    lock = threading.Lock()
+
+    def fake_render(
+        path,
+        page_no,
+        cache_key=None,
+        long_edge=2560,
+        hi_priority=False,
+        priority=None,
+        use_snapshot=False,
+    ):
+        with lock:
+            calls.append((page_no, bool(hi_priority), bool(use_snapshot)))
+        return tmp_path / f"{page_no}.png"
+
+    monkeypatch.setattr(renderer, "render_page", fake_render)
+    monkeypatch.setattr(renderer, "background_powerpoint_allowed", lambda: True, raising=False)
+    monkeypatch.setattr(renderer, "shutdown", lambda: None)
+
+    w = RenderWorker()
+    w.start()
+    try:
+        with qtbot.waitSignal(w.rendered, timeout=1000):
+            w.request(1, "f.pptx", 1)
+        w.prefetch("f.pptx", 2)
+        qtbot.wait(350)
+        with lock:
+            got = list(calls)
+        assert (1, True, True) in got
+        assert (2, False, False) in got
     finally:
         w.stop()
         w.wait(3000)
@@ -71,7 +109,7 @@ def test_preview_cancels_queued_prewarm(qtbot, monkeypatch, tmp_path):
             events.append(("warm", None, None))
         return object()
 
-    def fake_render(path, page_no, cache_key=None, long_edge=2560, hi_priority=False, priority=None):
+    def fake_render(path, page_no, cache_key=None, long_edge=2560, hi_priority=False, priority=None, **_kwargs):
         with lock:
             events.append(("preview", page_no, hi_priority))
         return tmp_path / f"{page_no}.png"
@@ -96,6 +134,26 @@ def test_preview_cancels_queued_prewarm(qtbot, monkeypatch, tmp_path):
         w.wait(3000)
 
 
+def test_prewarm_routes_through_renderer_safety_gate(qtbot, monkeypatch):
+    events: list[str] = []
+
+    def forbidden_direct_com():
+        raise AssertionError("prewarm must not bypass renderer safety gate")
+
+    monkeypatch.setattr(renderer, "_get_app", forbidden_direct_com)
+    monkeypatch.setattr(renderer, "prewarm", lambda: events.append("prewarm"), raising=False)
+    monkeypatch.setattr(renderer, "shutdown", lambda: None)
+
+    w = RenderWorker()
+    w.prewarm()
+    try:
+        w.start()
+        qtbot.waitUntil(lambda: events == ["prewarm"], timeout=1000)
+    finally:
+        w.stop()
+        w.wait(3000)
+
+
 def test_prewarm_skips_when_preview_is_pending():
     w = RenderWorker()
 
@@ -109,7 +167,7 @@ def test_preview_preempts_prefetch_during_idle_grace(qtbot, monkeypatch, tmp_pat
     calls: list[tuple[int, bool]] = []
     lock = threading.Lock()
 
-    def fake_render(path, page_no, cache_key=None, long_edge=2560, hi_priority=False, priority=None):
+    def fake_render(path, page_no, cache_key=None, long_edge=2560, hi_priority=False, priority=None, **_kwargs):
         with lock:
             calls.append((page_no, hi_priority))
         time.sleep(0.05)
@@ -117,6 +175,7 @@ def test_preview_preempts_prefetch_during_idle_grace(qtbot, monkeypatch, tmp_pat
 
     monkeypatch.setattr(RenderWorker, "_PREFETCH_IDLE_GRACE_SEC", 0.2, raising=False)
     monkeypatch.setattr(renderer, "render_page", fake_render)
+    monkeypatch.setattr(renderer, "background_powerpoint_allowed", lambda: True, raising=False)
     monkeypatch.setattr(renderer, "shutdown", lambda: None)
 
     w = RenderWorker()
@@ -169,7 +228,7 @@ def test_prefetch_dedupes_inflight_page(qtbot, monkeypatch, tmp_path):
     release = threading.Event()
     lock = threading.Lock()
 
-    def fake_render(path, page_no, cache_key=None, long_edge=2560, hi_priority=False, priority=None):
+    def fake_render(path, page_no, cache_key=None, long_edge=2560, hi_priority=False, priority=None, **_kwargs):
         with lock:
             calls.append((path, page_no, cache_key, hi_priority))
         started.set()
@@ -177,6 +236,7 @@ def test_prefetch_dedupes_inflight_page(qtbot, monkeypatch, tmp_path):
         return tmp_path / f"{page_no}.png"
 
     monkeypatch.setattr(renderer, "render_page", fake_render)
+    monkeypatch.setattr(renderer, "background_powerpoint_allowed", lambda: True, raising=False)
     monkeypatch.setattr(renderer, "shutdown", lambda: None)
 
     w = RenderWorker()
@@ -200,7 +260,7 @@ def test_prefetch_dedupes_inflight_page(qtbot, monkeypatch, tmp_path):
 def test_preview_render_error_emits_failure_and_worker_survives(qtbot, monkeypatch, tmp_path):
     calls: list[int] = []
 
-    def fake_render(path, page_no, cache_key=None, long_edge=2560, hi_priority=False, priority=None):
+    def fake_render(path, page_no, cache_key=None, long_edge=2560, hi_priority=False, priority=None, **_kwargs):
         calls.append(page_no)
         if page_no == 7:
             raise RuntimeError("COM render failed")
@@ -220,6 +280,24 @@ def test_preview_render_error_emits_failure_and_worker_survives(qtbot, monkeypat
             w.request(2, "ok.pptx", 8)
         assert recovered.args == [2, str(tmp_path / "8.png")]
         assert calls == [7, 8]
+    finally:
+        w.stop()
+        w.wait(3000)
+
+
+def test_prefetch_skips_powerpoint_when_background_render_is_blocked(qtbot, monkeypatch, tmp_path):
+    calls: list[str] = []
+
+    monkeypatch.setattr(renderer, "background_powerpoint_allowed", lambda: False, raising=False)
+    monkeypatch.setattr(renderer, "render_page", lambda *a, **k: calls.append("render") or tmp_path / "x.png")
+    monkeypatch.setattr(renderer, "shutdown", lambda: None)
+
+    w = RenderWorker()
+    w.start()
+    try:
+        w.prefetch("f.pptx", 2)
+        qtbot.wait(500)
+        assert calls == []
     finally:
         w.stop()
         w.wait(3000)

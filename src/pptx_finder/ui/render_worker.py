@@ -135,7 +135,7 @@ class RenderWorker(QThread):
                 # —— 锁外执行实际渲染 ——
                 if kind == "warm":
                     try:
-                        renderer._get_app()  # 后台静默拉起 PowerPoint
+                        renderer.prewarm()
                     except Exception:  # noqa: BLE001
                         pass
                     with self._cv:
@@ -150,6 +150,7 @@ class RenderWorker(QThread):
                             long_edge=long_edge,
                             hi_priority=True,
                             priority=priority,
+                            use_snapshot=True,
                         )
                     except Exception:  # noqa: BLE001
                         png = None
@@ -162,14 +163,15 @@ class RenderWorker(QThread):
                     path, page_no, key, long_edge, priority = data
                     ok = False
                     try:
-                        ok = bool(renderer.render_page(
-                            path,
-                            page_no,
-                            cache_key=key,
-                            long_edge=long_edge,
-                            hi_priority=False,
-                            priority=priority,
-                        ))
+                        if renderer.background_powerpoint_allowed():
+                            ok = bool(renderer.render_page(
+                                path,
+                                page_no,
+                                cache_key=key,
+                                long_edge=long_edge,
+                                hi_priority=False,
+                                priority=priority,
+                            ))
                     except Exception:  # noqa: BLE001
                         pass
                     finally:

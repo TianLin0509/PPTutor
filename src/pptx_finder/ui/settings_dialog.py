@@ -525,10 +525,7 @@ def _probe_powerpoint() -> str:
         return f"PowerPoint COM 不可用：{type(exc).__name__}: {exc}"
     finally:
         if app is not None:
-            try:
-                app.Quit()
-            except Exception:  # noqa: BLE001
-                pass
+            app = None
         if initialized and pythoncom is not None:
             try:
                 pythoncom.CoUninitialize()

@@ -51,6 +51,10 @@ class _FakeApp:
 
     def __init__(self):
         self.Presentations = _FakeApp._Presentations()
+        self.quit_calls = 0
+
+    def Quit(self):
+        self.quit_calls += 1
 
 
 class _BrokenSlide:
@@ -176,3 +180,58 @@ def test_failed_render_is_short_circuited_by_ttl(tmp_path, monkeypatch):
     assert renderer.render_page(str(src), 1, cache_key="broken", long_edge=480) is None
     assert opens == 1
     renderer._failed_until.clear()
+
+
+def test_shutdown_closes_owned_presentation_but_never_quits_powerpoint(monkeypatch):
+    app = _FakeApp()
+    pres = _FakePres()
+    closed = []
+    pres.Close = lambda: closed.append(True)
+
+    monkeypatch.setattr(renderer, "_ipc_enabled", lambda: False)
+    renderer._state.app = app
+    renderer._state.pres = pres
+    renderer._state.pres_path = "C:/tmp/rendered.pptx"
+    renderer._state.pres_key = "k"
+
+    renderer.shutdown()
+
+    assert closed == [True]
+    assert app.quit_calls == 0
+    assert getattr(renderer._state, "app", None) is None
+
+
+def test_render_page_snapshot_opens_temp_copy_not_live_file(tmp_path, monkeypatch):
+    renderer.shutdown()
+    renderer._failed_until.clear()
+    monkeypatch.setattr(renderer, "cache_dir", lambda: tmp_path)
+    src = tmp_path / "live-editing.pptx"
+    src.write_bytes(b"dummy")
+    opened: list[str] = []
+
+    class RecordingApp:
+        class PresentationsImpl:
+            def Open(self, path, ReadOnly=1, WithWindow=0):
+                opened.append(path)
+                return _FakePres()
+
+        def __init__(self):
+            self.Presentations = RecordingApp.PresentationsImpl()
+
+    monkeypatch.setattr(renderer, "_get_app", lambda: RecordingApp())
+
+    out = renderer.render_page(
+        str(src),
+        1,
+        cache_key="snapshot-test",
+        long_edge=480,
+        use_snapshot=True,
+    )
+
+    assert out == tmp_path / "snapshot-test_1_480.png"
+    assert opened
+    assert opened[0] != str(src)
+    assert str(tmp_path / "render_snapshots") in opened[0]
+    assert (tmp_path / "render_snapshots" / "snapshot-test.pptx").exists()
+    renderer.shutdown()
+    assert not (tmp_path / "render_snapshots" / "snapshot-test.pptx").exists()

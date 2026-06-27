@@ -178,6 +178,7 @@ class RendererProcessClient:
         long_edge: int,
         hi_priority: bool,
         priority: int | None,
+        use_snapshot: bool = False,
     ) -> Path | None:
         try:
             resp = self.request({
@@ -188,6 +189,7 @@ class RendererProcessClient:
                 "long_edge": int(long_edge),
                 "hi_priority": bool(hi_priority),
                 "priority": priority,
+                "use_snapshot": bool(use_snapshot),
             })
         except Exception:
             return None
@@ -198,6 +200,13 @@ class RendererProcessClient:
         with self._lock:
             try:
                 self._request_locked({"op": "close_current"})
+            except Exception:
+                pass
+
+    def prewarm(self) -> None:
+        with self._lock:
+            try:
+                self._request_locked({"op": "prewarm"})
             except Exception:
                 pass
 
@@ -237,6 +246,7 @@ def render_page(
     long_edge: int,
     hi_priority: bool,
     priority: int | None,
+    use_snapshot: bool = False,
 ) -> Path | None:
     return _client.render_page(
         path,
@@ -245,11 +255,16 @@ def render_page(
         long_edge=long_edge,
         hi_priority=hi_priority,
         priority=priority,
+        use_snapshot=use_snapshot,
     )
 
 
 def close_current_presentation() -> None:
     _client.close_current_presentation()
+
+
+def prewarm() -> None:
+    _client.prewarm()
 
 
 def shutdown() -> None:

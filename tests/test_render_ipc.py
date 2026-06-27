@@ -12,13 +12,22 @@ from pptx_finder import render_client, render_service, renderer
 def test_render_service_render_request_returns_path(monkeypatch, tmp_path):
     out = tmp_path / "page.png"
 
-    def fake_render(path, page_no, cache_key=None, long_edge=2560, hi_priority=False, priority=None):
+    def fake_render(
+        path,
+        page_no,
+        cache_key=None,
+        long_edge=2560,
+        hi_priority=False,
+        priority=None,
+        use_snapshot=False,
+    ):
         assert path == "deck.pptx"
         assert page_no == 2
         assert cache_key == "k"
         assert long_edge == 720
         assert hi_priority is True
         assert priority == 0
+        assert use_snapshot is True
         return out
 
     monkeypatch.setattr(renderer, "render_page", fake_render)
@@ -32,6 +41,7 @@ def test_render_service_render_request_returns_path(monkeypatch, tmp_path):
         "long_edge": 720,
         "hi_priority": True,
         "priority": 0,
+        "use_snapshot": True,
     })
 
     assert resp == {"id": 7, "ok": True, "path": str(out)}
@@ -57,14 +67,14 @@ def test_renderer_wrapper_uses_direct_path_when_ipc_disabled(monkeypatch, tmp_pa
     monkeypatch.setenv("PPTUTOR_RENDERER_IPC", "0")
     called = []
 
-    def fake_direct(path, page_no, cache_key=None, long_edge=2560, hi_priority=False, priority=None):
-        called.append((Path(path).name, page_no, long_edge, hi_priority, priority))
+    def fake_direct(path, page_no, cache_key=None, long_edge=2560, hi_priority=False, priority=None, use_snapshot=False):
+        called.append((Path(path).name, page_no, long_edge, hi_priority, priority, use_snapshot))
         return tmp_path / "direct.png"
 
     monkeypatch.setattr(renderer, "_render_page_direct", fake_direct)
 
     assert renderer.render_page("deck.pptx", 3, long_edge=480, priority=5) == tmp_path / "direct.png"
-    assert called == [("deck.pptx", 3, 480, False, 5)]
+    assert called == [("deck.pptx", 3, 480, False, 5, False)]
 
 
 def test_render_service_waits_for_idle_parent_without_timeout(monkeypatch):

@@ -641,6 +641,37 @@ def test_settings_powerpoint_task_registered_for_parent_shutdown(qtbot, monkeypa
     assert task not in parent._bg_tasks
 
 
+def test_probe_powerpoint_never_quits_powerpoint(monkeypatch):
+    import sys
+    import types
+
+    from pptx_finder.ui import settings_dialog as settings_dialog_mod
+
+    class FakeApp:
+        Version = "16"
+
+        def __init__(self):
+            self.quit_calls = 0
+
+        def Quit(self):
+            self.quit_calls += 1
+
+    app = FakeApp()
+    pythoncom = types.SimpleNamespace(CoInitialize=lambda: None, CoUninitialize=lambda: None)
+    client = types.SimpleNamespace(DispatchEx=lambda _name: app)
+    win32com = types.SimpleNamespace(client=client)
+
+    monkeypatch.setattr(settings_dialog_mod.os, "name", "nt", raising=False)
+    monkeypatch.setitem(sys.modules, "pythoncom", pythoncom)
+    monkeypatch.setitem(sys.modules, "win32com", win32com)
+    monkeypatch.setitem(sys.modules, "win32com.client", client)
+
+    result = settings_dialog_mod._probe_powerpoint()
+
+    assert "PowerPoint COM 可用" in result
+    assert app.quit_calls == 0
+
+
 def test_settings_late_diagnostics_ignored_after_close(qtbot, mgr, monkeypatch):
     class FakeTimer:
         @staticmethod

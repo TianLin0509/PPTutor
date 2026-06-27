@@ -1,6 +1,7 @@
 """预览渲染：PowerPoint COM 导出指定页为 PNG，带磁盘缓存。
 
-隔离：用 DispatchEx 启动独立 PowerPoint 实例，不干扰用户已打开的 PowerPoint。
+隔离：打包版用 renderer 子进程；主动预览用临时快照，避免直接打开用户正在
+     编辑的原文件。DispatchEx 不是强沙箱，因此后台 COM 渲染需经安全门。
 线程：COM 为单线程套间，调用线程需 CoInitialize（本模块惰性处理）。
      UI 侧应在一个专用渲染线程里串行调用，避免并发与界面卡顿。
 失败策略：任何异常都返回 None，由 UI 显示「无法预览，可直接打开」兜底。
@@ -10,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import shutil
 import sys
 import threading
 import time
@@ -32,6 +34,68 @@ _hi_waiting = 0      # 排队中的高优先(预览)请求数
 _waiting_by_priority: dict[int, int] = {}
 _FAILED_TTL_SEC = 90.0
 _failed_until: dict[tuple[str, int, str, int], float] = {}
+_FALSE = {"0", "false", "no", "off"}
+_TRUE = {"1", "true", "yes", "on"}
+_POWERPOINT_ACTIVE_TTL_SEC = 2.0
+_powerpoint_active_cache_at = 0.0
+_powerpoint_active_cache = False
+
+
+def _env_bool(name: str) -> bool | None:
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    val = raw.strip().lower()
+    if val in _TRUE:
+        return True
+    if val in _FALSE:
+        return False
+    return None
+
+
+def _powerpoint_active() -> bool:
+    """Best-effort check for an already running user PowerPoint session."""
+    global _powerpoint_active_cache_at, _powerpoint_active_cache
+    if os.name != "nt":
+        return False
+    now = time.monotonic()
+    if now - _powerpoint_active_cache_at < _POWERPOINT_ACTIVE_TTL_SEC:
+        return _powerpoint_active_cache
+
+    active = False
+    pythoncom = None
+    initialized = False
+    try:
+        import pythoncom as _pythoncom  # type: ignore
+        import win32com.client  # type: ignore
+
+        pythoncom = _pythoncom
+        pythoncom.CoInitialize()
+        initialized = True
+        app = win32com.client.GetActiveObject("PowerPoint.Application")
+        try:
+            active = int(app.Presentations.Count) > 0
+        except Exception:  # noqa: BLE001
+            active = True
+    except Exception:  # noqa: BLE001
+        active = False
+    finally:
+        if initialized and pythoncom is not None:
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:  # noqa: BLE001
+                pass
+    _powerpoint_active_cache_at = now
+    _powerpoint_active_cache = active
+    return active
+
+
+def background_powerpoint_allowed() -> bool:
+    """Return whether non-user-triggered PowerPoint rendering may run."""
+    flag = _env_bool("PPTUTOR_BACKGROUND_POWERPOINT_RENDER")
+    if flag is not None:
+        return flag
+    return not _powerpoint_active()
 
 
 @contextlib.contextmanager
@@ -80,6 +144,67 @@ def _get_app():
     return app
 
 
+def _cleanup_snapshot() -> None:
+    snapshot = getattr(_state, "snapshot_path", None)
+    _state.snapshot_path = None
+    _state.snapshot_src = None
+    _state.snapshot_key = None
+    if snapshot:
+        try:
+            os.remove(snapshot)
+        except OSError:
+            pass
+
+
+def _snapshot_for_render(path: str, cache_key: str) -> str | None:
+    """Copy the source file once per render key so COM never opens the live file."""
+    snapshot = getattr(_state, "snapshot_path", None)
+    if (
+        snapshot
+        and getattr(_state, "snapshot_src", None) == path
+        and getattr(_state, "snapshot_key", None) == cache_key
+        and os.path.exists(snapshot)
+    ):
+        return snapshot
+
+    _cleanup_snapshot()
+    try:
+        snap_dir = cache_dir() / "render_snapshots"
+        snap_dir.mkdir(parents=True, exist_ok=True)
+        suffix = Path(path).suffix or ".pptx"
+        out = snap_dir / f"{cache_key}{suffix}"
+        tmp = out.with_suffix(out.suffix + ".tmp")
+        shutil.copy2(path, tmp)
+        os.replace(tmp, out)
+        _state.snapshot_path = str(out)
+        _state.snapshot_src = path
+        _state.snapshot_key = cache_key
+        return str(out)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("snapshot copy failed path=%s: %s", path, exc)
+        _cleanup_snapshot()
+        return None
+
+
+def prewarm() -> bool:
+    """Warm PowerPoint only when background COM work is safe."""
+    if not background_powerpoint_allowed():
+        return False
+    if _ipc_enabled():
+        try:
+            from . import render_client
+
+            render_client.prewarm()
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+    try:
+        _get_app()
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _open_pres(app, path: str, cache_key: str):
     """复用上次打开的 Presentation：同文件同内容直接返回，免重复 Open（翻页 / 多次预览
     同一稿，最耗时的就是 Open，大稿尤甚）；换文件或文件已变（cache_key 含 mtime+size）
@@ -88,7 +213,7 @@ def _open_pres(app, path: str, cache_key: str):
             and getattr(_state, "pres_path", None) == path
             and getattr(_state, "pres_key", None) == cache_key):
         return _state.pres
-    _close_pres()
+    _close_pres(clean_snapshot=False)
     pres = app.Presentations.Open(path, ReadOnly=1, WithWindow=0)
     _state.pres = pres
     _state.pres_path = path
@@ -102,7 +227,7 @@ def _open_pres(app, path: str, cache_key: str):
     return pres
 
 
-def _close_pres():
+def _close_pres(*, clean_snapshot: bool = True):
     pres = getattr(_state, "pres", None)
     if pres is not None:
         try:
@@ -112,6 +237,8 @@ def _close_pres():
     _state.pres = None
     _state.pres_path = None
     _state.pres_key = None
+    if clean_snapshot:
+        _cleanup_snapshot()
 
 
 def default_cache_key(path: str) -> str | None:
@@ -190,6 +317,7 @@ def _render_page_direct(
     long_edge: int = 2560,
     hi_priority: bool = False,
     priority: int | None = None,
+    use_snapshot: bool = False,
 ) -> Path | None:
     """导出 path 第 page_no 页（1-based）为高清 PNG，返回缓存路径；失败返回 None。
 
@@ -218,7 +346,12 @@ def _render_page_direct(
     with _com_slot(hi_priority, priority):  # COM 串行单槽（预览优先抢占缩略图）
         try:
             app = _get_app()
-            pres = _open_pres(app, path, cache_key)  # 复用已打开的同文件，免重复 Open
+            open_path = path
+            if use_snapshot:
+                open_path = _snapshot_for_render(path, cache_key)
+                if open_path is None:
+                    return None
+            pres = _open_pres(app, open_path, cache_key)  # 复用已打开的同文件，免重复 Open
             if page_no < 1 or page_no > int(pres.Slides.Count):
                 return None
             # 按 slide 实际宽高比算输出像素（宽高比随 pres 缓存，避免每页重取）
@@ -245,6 +378,7 @@ def render_page(
     long_edge: int = 2560,
     hi_priority: bool = False,
     priority: int | None = None,
+    use_snapshot: bool = False,
 ) -> Path | None:
     """Render a page, using a child process in packaged GUI builds."""
     if not _ipc_enabled():
@@ -255,6 +389,7 @@ def render_page(
             long_edge=long_edge,
             hi_priority=hi_priority,
             priority=priority,
+            use_snapshot=use_snapshot,
         )
 
     path = os.path.abspath(path)
@@ -283,6 +418,7 @@ def render_page(
             long_edge=long_edge,
             hi_priority=hi_priority,
             priority=priority,
+            use_snapshot=use_snapshot,
         )
     except Exception as e:  # noqa: BLE001
         log.warning("renderer ipc failed path=%s page=%s: %s", path, page_no, e)
@@ -302,10 +438,11 @@ def shutdown() -> None:
     app = getattr(_state, "app", None)
     if app is None:
         return
-    try:
-        app.Quit()
-    except Exception as e:  # noqa: BLE001
-        log.debug("app.Quit failed: %s", e)
+    if _env_bool("PPTUTOR_QUIT_POWERPOINT_ON_SHUTDOWN") is True:
+        try:
+            app.Quit()
+        except Exception as e:  # noqa: BLE001
+            log.debug("app.Quit failed: %s", e)
     _state.app = None
     try:
         import pythoncom
