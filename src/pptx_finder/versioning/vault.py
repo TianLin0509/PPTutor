@@ -109,12 +109,64 @@ def manifest_diff(doc_id: str, old_version_id: str | None, new_version_id: str) 
     }
 
 
-def file_hash(path: str) -> str:
+def _raw_file_hash(path: str) -> str:
     h = xxhash.xxh64()
     with open(ext_path(path), "rb") as f:
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _package_content_hash_from_parts(parts: dict[str, str]) -> str:
+    h = xxhash.xxh64()
+    for name in sorted(parts):
+        h.update(name.encode("utf-8"))
+        h.update(b"\0")
+        h.update(str(parts[name]).encode("ascii", errors="ignore"))
+        h.update(b"\0")
+    return f"pkg:{h.hexdigest()}"
+
+
+def manifest_content_hash(doc_id: str, version_id: str | None) -> str:
+    """Canonical content hash for a stored version manifest.
+
+    The hash ignores ZIP metadata/compression and only depends on package part
+    names plus part bytes, so rebuilding/exporting a version still matches the
+    original logical PPTX content.
+    """
+    if not version_id:
+        return ""
+    mf = manifest_for(doc_id, version_id)
+    parts = dict(mf.get("parts") or {})
+    if parts:
+        return _package_content_hash_from_parts(parts)
+    full = version_file(doc_id, version_id)
+    if full.exists():
+        return file_hash(str(full))
+    return ""
+
+
+def file_hash(path: str) -> str:
+    """Canonical PPTX content hash.
+
+    ZIP containers can differ after export/rebuild even when every OpenXML part
+    is identical. Hash the sorted package part map instead of raw bytes so copy
+    branch detection survives harmless repackaging.
+    """
+    try:
+        with zipfile.ZipFile(ext_path(path)) as zf:
+            parts: dict[str, str] = {}
+            for info in zf.infolist():
+                if info.is_dir():
+                    continue
+                part_hash = xxhash.xxh64()
+                with zf.open(info) as f:
+                    for chunk in iter(lambda: f.read(1 << 20), b""):
+                        part_hash.update(chunk)
+                parts[info.filename] = part_hash.hexdigest()
+            return _package_content_hash_from_parts(parts)
+    except (OSError, zipfile.BadZipFile):
+        return f"file:{_raw_file_hash(path)}"
 
 
 def _file_hash(path: str) -> str:
@@ -203,7 +255,11 @@ def snapshot(
     chash = content_hash or _file_hash(path)
     did = doc_id or doc_id_for(path)
     latest = base_version if base_version is not None else store.latest_version(conn, did)
-    if latest is not None and latest["content_hash"] == chash:
+    latest_doc_id = (latest["doc_id"] if latest is not None and "doc_id" in latest.keys() else did)
+    if latest is not None and (
+        latest["content_hash"] == chash
+        or manifest_content_hash(latest_doc_id, latest["version_id"]) == chash
+    ):
         store.upsert_doc(conn, did, path, datetime.datetime.now().timestamp())
         conn.commit()
         return None

@@ -211,7 +211,7 @@ class VersionManager:
             return doc_id, self._effective_latest_version_on_conn(self._conn, doc_id), None
 
         content_hash = vault.file_hash(path)
-        candidates = store.find_versions_by_content_hash(self._conn, content_hash)
+        candidates = self._find_versions_by_content_hash(content_hash)
         now = _now()
 
         for version in candidates:
@@ -247,6 +247,20 @@ class VersionManager:
 
         doc_id = vault.doc_id_for(path)
         return doc_id, store.latest_version(self._conn, doc_id), content_hash
+
+    def _find_versions_by_content_hash(self, content_hash: str):
+        candidates = list(store.find_versions_by_content_hash(self._conn, content_hash))
+        if candidates or not str(content_hash or "").startswith("pkg:"):
+            return candidates
+        rows = self._conn.execute("SELECT * FROM versions ORDER BY ts DESC").fetchall()
+        matched = []
+        for row in rows:
+            try:
+                if vault.manifest_content_hash(row["doc_id"], row["version_id"]) == content_hash:
+                    matched.append(row)
+            except Exception:  # noqa: BLE001
+                continue
+        return matched
 
     def _doc_id_for_path_on_conn(self, conn, path: str) -> str:
         doc = store.get_doc_by_path(conn, path)

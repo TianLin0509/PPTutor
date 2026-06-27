@@ -23,3 +23,20 @@ def test_handler_skips_system_and_cache():
     assert h._timers, "用户目录的 .pptx 应进入防抖"
     for t in h._timers.values():
         t.cancel()  # 清理，避免定时器残留触发
+
+
+def test_handler_allows_explicit_root_inside_skipped_tree():
+    h = _Handler(
+        lambda p: None,
+        roots=["C:\\Users\\me\\AppData\\Local\\Temp\\pptdoctor-e2e"],
+    )
+    h._trigger("C:\\Users\\me\\AppData\\Local\\Temp\\pptdoctor-e2e\\deck.pptx")
+    assert h._timers, "显式监听的 AppData 子目录不应被全盘降噪规则误跳过"
+    for t in h._timers.values():
+        t.cancel()
+
+
+def test_handler_still_skips_appdata_when_watching_drive_root():
+    h = _Handler(lambda p: None, roots=["C:\\"])
+    h._trigger("C:\\Users\\me\\AppData\\Local\\Temp\\deck.pptx")
+    assert not h._timers, "默认全盘监听仍应跳过 AppData 降噪"

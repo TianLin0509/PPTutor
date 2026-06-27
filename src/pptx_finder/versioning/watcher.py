@@ -20,12 +20,35 @@ def default_watch_paths() -> list[str]:
     return fixed_drives()
 
 
+def _norm_path(path: str) -> str:
+    return os.path.normcase(os.path.abspath(path))
+
+
+def _under(path: str, root: str) -> bool:
+    path = _norm_path(path)
+    root = _norm_path(root)
+    try:
+        return os.path.commonpath([path, root]) == root
+    except ValueError:
+        return False
+
+
 class _Handler(FileSystemEventHandler):
-    def __init__(self, on_saved, on_moved=None):
+    def __init__(self, on_saved, on_moved=None, roots: list[str] | None = None):
         self._on_saved = on_saved
         self._on_moved = on_moved
+        self._explicit_skip_roots = [
+            _norm_path(r) for r in (roots or [])
+            if any(seg in _norm_path(r).lower() for seg in _SKIP_SEGS)
+        ]
         self._timers: dict[str, threading.Timer] = {}
         self._lock = threading.Lock()
+
+    def _skip_path(self, path: str) -> bool:
+        low = _norm_path(path).lower()
+        if not any(seg in low for seg in _SKIP_SEGS):
+            return False
+        return not any(_under(path, root) for root in self._explicit_skip_roots)
 
     def _trigger(self, path: str) -> None:
         low = path.lower()
@@ -33,7 +56,7 @@ class _Handler(FileSystemEventHandler):
             return
         if os.path.basename(path).startswith("~$"):
             return
-        if any(seg in low for seg in _SKIP_SEGS):
+        if self._skip_path(path):
             return
         with self._lock:
             old = self._timers.get(path)
@@ -72,7 +95,7 @@ class _Handler(FileSystemEventHandler):
 class VaultWatcher:
     def __init__(self, roots: list[str], on_saved, on_moved=None):
         self._obs = Observer()
-        handler = _Handler(on_saved, on_moved)
+        handler = _Handler(on_saved, on_moved, roots)
         for r in roots:
             if os.path.isdir(r):
                 self._obs.schedule(handler, r, recursive=True)

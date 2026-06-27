@@ -147,6 +147,27 @@ def test_copy_from_old_parent_version_branches_from_matching_history_version(tmp
     assert [v["version_id"] for v in mgr.list_versions(str(child))] == [old_version_id]
 
 
+def test_copy_from_legacy_hash_version_uses_manifest_hash_fallback(tmp_path):
+    parent = tmp_path / "parent.pptx"
+    child = tmp_path / "child-from-legacy-hash.pptx"
+    exported = tmp_path / "exported.pptx"
+    fx.make_pptx(parent, [{"body": "legacy hash branch"}])
+    mgr = _mgr()
+    mgr.snapshot_now(str(parent))
+    version_id = mgr.list_versions(str(parent))[0]["version_id"]
+    mgr._conn.execute("UPDATE versions SET content_hash=? WHERE version_id=?", ("legacy-raw-hash", version_id))
+    mgr._conn.commit()
+
+    assert mgr.export(str(parent), version_id, str(exported))
+    shutil.copy2(exported, child)
+    assert mgr.snapshot_now(str(child)) is None
+
+    child_doc_id = vault.doc_id_for(str(child))
+    branch = store.get_branch(mgr._conn, child_doc_id)
+    assert branch["branched_from_version_id"] == version_id
+    assert [v["version_id"] for v in mgr.list_versions(str(child))] == [version_id]
+
+
 def test_restore_inherited_parent_version_targets_child_file(tmp_path):
     parent = tmp_path / "parent.pptx"
     child = tmp_path / "child-copy.pptx"
