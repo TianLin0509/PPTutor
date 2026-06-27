@@ -11,6 +11,11 @@ wheels/
 
 # Claude Code worktrees / 会话产物（嵌套 git worktree，勿入库、勿被工具递归扫描）
 .claude/
+.codex/
+
+# 版本化命名的构建/分发产物（build/ dist/ 规则盖不住带后缀名）
+build-*/
+dist-*/
 
 # 打包自检临时产物（测试集 PPTX + 报告 + 构建日志）
 .selftest/
