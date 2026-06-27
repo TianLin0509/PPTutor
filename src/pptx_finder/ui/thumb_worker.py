@@ -1,7 +1,8 @@
-"""缩略图渲染线程：FIFO 渲染所有请求（不像预览只渲最新），小尺寸 + 磁盘缓存。
+"""缩略图加载线程：FIFO 处理所有请求（不像预览只保留最新）。
 
-与预览的 RenderWorker 经 renderer._lock 串行（不并发 COM）；各自独立 PowerPoint 实例。
-切换搜索时主窗调 clear() 丢弃旧请求，避免为已离开视图的结果白渲。
+左侧结果缩略图不启动 PowerPoint COM：只使用已有渲染缓存、PPTX 内置
+thumbnail、Windows Shell 缩略图缓存。切换搜索时主窗调 clear() 丢弃旧请求，
+避免为已离开视图的结果白加载。
 """
 from __future__ import annotations
 
@@ -11,7 +12,7 @@ import threading
 
 from PySide6.QtCore import QThread, Signal
 
-from .. import renderer
+from .. import renderer, thumbnailer
 
 _STOP = object()
 
@@ -110,16 +111,12 @@ class ThumbWorker(QThread):
                 cache_hit = False
                 try:
                     try:
-                        png = renderer.find_cached_render(path, page_no, min_long_edge=self._long_edge)
-                        if png is None:
-                            png = renderer.render_page(
-                                path,
-                                page_no,
-                                long_edge=self._long_edge,
-                                hi_priority=False,
-                                priority=priority,
-                            )
-                        else:
+                        png = thumbnailer.find_non_com_thumbnail(
+                            path,
+                            page_no,
+                            long_edge=self._long_edge,
+                        )
+                        if png is not None:
                             cache_hit = True
                     except Exception:  # noqa: BLE001
                         png = None

@@ -8,7 +8,7 @@ from PySide6.QtGui import QPixmap
 
 from test_ui import StubRender, _index
 
-from pptx_finder import renderer
+from pptx_finder import renderer, thumbnailer
 from pptx_finder.models import FileResult, SearchHit
 from pptx_finder.ui import theme
 from pptx_finder.ui.main_window import MainWindow, ResultItem
@@ -142,14 +142,14 @@ def test_thumb_worker_coalesces_inflight_duplicate_requests(qtbot, monkeypatch, 
     release = threading.Event()
     lock = threading.Lock()
 
-    def fake_render(path, page_no, cache_key=None, long_edge=480, hi_priority=False, priority=None):
+    def fake_thumb(path, page_no, long_edge=480):
         with lock:
             calls.append((path, page_no, long_edge))
         started.set()
         release.wait(1)
         return tmp_path / f"{page_no}.png"
 
-    monkeypatch.setattr(renderer, "render_page", fake_render)
+    monkeypatch.setattr(thumbnailer, "find_non_com_thumbnail", fake_thumb)
     monkeypatch.setattr(renderer, "shutdown", lambda: None)
 
     tw = ThumbWorker()
@@ -199,16 +199,37 @@ def test_thumb_worker_reuses_cached_large_preview_before_com(qtbot, monkeypatch,
         tw.wait(3000)
 
 
-def test_thumb_worker_render_error_emits_failure_and_worker_survives(qtbot, monkeypatch, tmp_path):
+def test_thumb_worker_skips_powerpoint_when_background_render_is_blocked(qtbot, monkeypatch, tmp_path):
+    calls: list[str] = []
+
+    monkeypatch.setattr(renderer, "find_cached_render", lambda *a, **k: None)
+    monkeypatch.setattr(renderer, "background_powerpoint_allowed", lambda: False, raising=False)
+    monkeypatch.setattr(renderer, "render_page", lambda *a, **k: calls.append("render") or tmp_path / "x.png")
+    monkeypatch.setattr(renderer, "shutdown", lambda: None)
+
+    tw = ThumbWorker()
+    tw.start()
+    try:
+        with qtbot.waitSignal(tw.thumb_rendered, timeout=1000) as rendered:
+            tw.request("a.pptx", 1, priority=5)
+
+        assert rendered.args == ["a.pptx", 1, ""]
+        assert calls == []
+    finally:
+        tw.stop()
+        tw.wait(3000)
+
+
+def test_thumb_worker_thumbnail_error_emits_failure_and_worker_survives(qtbot, monkeypatch, tmp_path):
     calls: list[tuple[str, int]] = []
 
-    def fake_render(path, page_no, cache_key=None, long_edge=480, hi_priority=False, priority=None):
+    def fake_thumb(path, page_no, long_edge=480):
         calls.append((path, page_no))
         if path == "bad.pptx":
             raise RuntimeError("thumbnail render failed")
         return tmp_path / f"{page_no}.png"
 
-    monkeypatch.setattr(renderer, "render_page", fake_render)
+    monkeypatch.setattr(thumbnailer, "find_non_com_thumbnail", fake_thumb)
     monkeypatch.setattr(renderer, "shutdown", lambda: None)
 
     tw = ThumbWorker()
