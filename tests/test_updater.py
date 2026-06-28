@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from pptx_finder import updater
+from pptx_finder import __version__
 
 
 # ---------- 清单 diff（纯函数单测） ----------
@@ -54,6 +55,21 @@ def test_build_manifest_excludes_self_and_uses_posix(tmp_path):
     (tmp_path / "manifest.json").write_text("{}", encoding="utf-8")  # 应被排除
     m = updater.build_manifest(tmp_path, "0.9.0")
     assert set(m["files"]) == {"a.txt", "sub/b.txt"}  # 正斜杠 + 不含 manifest.json 自身
+
+
+def test_local_manifest_self_heals_when_missing(tmp_path, monkeypatch):
+    """已发出的绿色包若漏带 manifest，应能按当前安装目录补生成。"""
+    (tmp_path / "PPT Doctor.exe").write_bytes(b"exe")
+    (tmp_path / "_internal").mkdir()
+    (tmp_path / "_internal" / "lib.dll").write_bytes(b"dll")
+    monkeypatch.setattr(updater, "install_dir", lambda: tmp_path)
+
+    m = updater.local_manifest()
+
+    assert m is not None
+    assert m["version"] == __version__
+    assert set(m["files"]) == {"PPT Doctor.exe", "_internal/lib.dll"}
+    assert json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))["version"] == __version__
 
 
 # ---------- 本地 HTTP 真实下载 ----------

@@ -200,7 +200,7 @@ def test_index_progress_three_states(qtbot, tmp_path):
     # 索引态：百分比
     win._on_index_progress(50, 200, "x.pptx")
     assert win.pct_label.text() == "25%"
-    assert "正在索引" in win.status_label.text()
+    assert "正在建库" in win.status_label.text()
     # 就绪态
     win._on_index_done({"indexed": 1, "deleted": 0})
     qtbot.waitUntil(lambda: "索引就绪" in win.status_label.text(), timeout=2000)
@@ -230,7 +230,7 @@ def test_index_progress_ui_updates_are_throttled(qtbot, monkeypatch, tmp_path):
 
     win._on_index_progress(1, 100, "a.pptx")
     assert win.pct_label.text() == "1%"
-    assert "a.pptx" in win.status_label.text()
+    assert "1/100" in win.status_label.text()
 
     now[0] = 100.02
     win._on_index_progress(2, 100, "b.pptx")
@@ -238,13 +238,13 @@ def test_index_progress_ui_updates_are_throttled(qtbot, monkeypatch, tmp_path):
     assert win._index_last_done == 2
     assert win._index_last_current == "b.pptx"
     assert win.pct_label.text() == "1%"
-    assert "a.pptx" in win.status_label.text()
+    assert "1/100" in win.status_label.text()
 
     now[0] = 100.13
     win._on_index_progress(3, 100, "c.pptx")
 
     assert win.pct_label.text() == "3%"
-    assert "c.pptx" in win.status_label.text()
+    assert "3/100" in win.status_label.text()
 
 
 def test_index_signals_ignored_after_closing(qtbot, monkeypatch, tmp_path):

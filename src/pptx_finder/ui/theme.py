@@ -18,7 +18,8 @@ def _rgb(hx: str):
 
 
 def _mk(bg, blobs, acc, acc2, ink, light=False):
-    ar, ag, ab = _rgb(acc); A = f"{ar},{ag},{ab}"
+    ar, ag, ab = _rgb(acc)
+    A = f"{ar},{ag},{ab}"
     if light:
         d = dict(panel="rgba(255,255,255,0.82)", panel2="rgba(255,255,255,0.66)", field="rgba(255,255,255,0.72)",
                  hover="rgba(0,0,0,0.05)", sel=f"rgba({A},0.16)", selblur="rgba(0,0,0,0.06)",
@@ -273,6 +274,7 @@ QProgressBar#indexBar { background: $bd2; border: none; border-radius: 4px; max-
 QProgressBar#indexBar::chunk { background: $acc; border-radius: 4px; }
 QLabel#pctLabel { color: $acc; font-size: 12px; font-weight: 700; padding: 0 4px; background: transparent; }
 QLabel#statusDot { color: $grn; font-size: 13px; padding: 0 2px 0 4px; background: transparent; }
+QFrame#typeRail { background: transparent; }
 
 /* 仪表盘首屏（零搜索默认视图） */
 QWidget#dashView { background: transparent; }

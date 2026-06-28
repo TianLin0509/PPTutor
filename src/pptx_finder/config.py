@@ -91,7 +91,7 @@ SUPPORTED_EXTS = CONTENT_EXTS + (PPT_EXT,)
 MAX_PARSE_SIZE = 200 * 1024 * 1024  # 200MB
 
 # 全局唤起热键（默认值；用户可在设置里改，覆盖值存 ui.json 的 "hotkey" 键）
-GLOBAL_HOTKEY = "Ctrl+Alt+P"
+GLOBAL_HOTKEY = "Alt+F"
 
 
 # ---------- UI 偏好（ui.json：主题 / 热键 等，读-改-写保留其它键） ----------

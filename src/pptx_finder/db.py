@@ -58,6 +58,13 @@ CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
 """
 
 
+def sqlite_safe_text(text: str | None) -> str:
+    """Return text SQLite can UTF-8 encode, dropping invalid UTF-16 surrogates."""
+    if not text:
+        return ""
+    return "".join(ch for ch in str(text) if not 0xD800 <= ord(ch) <= 0xDFFF)
+
+
 def connect(db_path: str | Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path), check_same_thread=False)
     conn.row_factory = sqlite3.Row
@@ -163,6 +170,8 @@ def upsert_file(
     error: str,
     indexed_at: float,
 ) -> int:
+    name = sqlite_safe_text(name)
+    error = sqlite_safe_text(error)
     name_norm = normalize(name)
     cur = conn.execute(
         """
@@ -184,6 +193,7 @@ def upsert_file(
 
 
 def _update_filename_index(conn: sqlite3.Connection, file_id: int, name: str) -> None:
+    name = sqlite_safe_text(name)
     conn.execute("UPDATE files SET name_norm=? WHERE id=?", (normalize(name), file_id))
     conn.execute("DELETE FROM file_names_fts WHERE file_id=?", (file_id,))
     conn.execute(
@@ -197,6 +207,8 @@ def replace_pages(conn: sqlite3.Connection, file_id: int, pages: list[tuple[int,
     conn.execute("DELETE FROM pages_fts WHERE file_id=?", (file_id,))
     conn.execute("DELETE FROM pages_raw WHERE file_id=?", (file_id,))
     for page_no, raw, tok in pages:
+        raw = sqlite_safe_text(raw)
+        tok = sqlite_safe_text(tok)
         conn.execute(
             "INSERT INTO pages_fts(content,file_id,page_no) VALUES(?,?,?)",
             (tok, file_id, page_no),
@@ -229,7 +241,33 @@ def delete_file(conn: sqlite3.Connection, path: str) -> None:
 def stats(conn: sqlite3.Connection) -> dict:
     fc = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
     pc = conn.execute("SELECT COUNT(*) FROM pages_raw").fetchone()[0]
-    return {"file_count": fc, "page_count": pc}
+    status_counts = {
+        (r["status"] or ""): int(r["count"])
+        for r in conn.execute(
+            "SELECT status, COUNT(*) AS count FROM files GROUP BY status"
+        ).fetchall()
+    }
+    return {
+        "file_count": fc,
+        "page_count": pc,
+        "status_counts": status_counts,
+        "pending_count": status_counts.get("pending", 0),
+        "error_count": status_counts.get("error", 0),
+        "scanned_count": status_counts.get("scanned", 0),
+    }
+
+
+def type_counts(conn: sqlite3.Connection) -> dict[str, tuple[int, int]]:
+    """每个扩展名的 (已建内容, 已发现总数)。已建 = status 非 'pending'
+    （pending = 已登记文件名、内容还没建）。供底部状态栏「分类型索引进度」x/y 用。"""
+    out: dict[str, tuple[int, int]] = {}
+    for r in conn.execute(
+        "SELECT lower(ext) AS e, "
+        "SUM(CASE WHEN status='pending' THEN 0 ELSE 1 END) AS built, "
+        "COUNT(*) AS total FROM files GROUP BY lower(ext)"
+    ).fetchall():
+        out[r["e"] or ""] = (int(r["built"] or 0), int(r["total"] or 0))
+    return out
 
 
 def maintain(conn: sqlite3.Connection) -> dict:

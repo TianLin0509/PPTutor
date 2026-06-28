@@ -1,7 +1,7 @@
 """应用入口：托盘常驻 + 全局热键唤起 + 主窗口。
 
 形态：QSystemTrayIcon 常驻；关闭主窗 = 最小化到托盘；托盘菜单「退出」才真正退出。
-全局热键：Ctrl+Alt+P（可在 config 改）。注册失败不致命，仅记录。
+全局热键：Alt+F（可在 config 改）。注册失败不致命，仅记录。
 """
 from __future__ import annotations
 

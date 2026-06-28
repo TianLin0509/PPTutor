@@ -1025,7 +1025,9 @@ def test_refresh_status_reads_stats_in_background(qtbot, monkeypatch, tmp_path):
 
     assert calls == ["stats"]
     assert "索引就绪：7 个文件 · 11 页" in win.status_label.text()
-    assert "更新 2，移除 1" in win.status_label.text()
+    # 设计 F：就绪态显示类型分布（PPT…），不再显示「更新 N，移除 M」黑话
+    assert "PPT" in win.status_label.text()
+    assert "更新" not in win.status_label.text()
 
 
 def test_refresh_status_reuses_inflight_background_task(qtbot, monkeypatch, tmp_path):

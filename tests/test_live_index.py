@@ -237,6 +237,73 @@ def test_startup_existing_index_check_updates_status_without_scan(qtbot, monkeyp
     assert "pages=9" in lines
 
 
+def test_startup_existing_index_with_pending_resumes_scan(qtbot, monkeypatch, tmp_path):
+    tasks = _install_fake_background_task(monkeypatch)
+    starts = []
+
+    monkeypatch.setattr(
+        main_window_mod.db,
+        "stats",
+        lambda _conn: {
+            "file_count": 4,
+            "page_count": 9,
+            "pending_count": 2,
+            "status_counts": {"ok": 2, "pending": 2},
+        },
+    )
+    monkeypatch.setattr(main_window_mod, "LiveIndexer", _FakeLiveIndexer)
+    monkeypatch.setattr(
+        MainWindow,
+        "_start_indexing",
+        lambda self, roots, workers: starts.append((roots, workers)) or True,
+    )
+
+    conn = _index(tmp_path)
+    win = MainWindow(
+        conn=conn,
+        render_worker=StubRender(),
+        thumb_worker=StubThumb(),
+        do_index=True,
+        roots=["C:/docs"],
+        workers=2,
+    )
+    qtbot.addWidget(win)
+    startup_task = next(t for t in tasks if t.label == "startup-index-check")
+
+    _finish_fake_task(startup_task)
+
+    assert starts == [(["C:/docs"], 2)]
+    lines = "\n".join(win.diagnostic_lines())
+    assert "decision=resume_pending" in lines
+    assert "pending=2" in lines
+
+
+def test_index_progress_updates_type_rail(qtbot, tmp_path):
+    """建库中底部分类型迷你条（设计 D）：每类显示 已建/发现 x/y，建完打 ✓，无此类显 —。"""
+    conn = db.connect(tmp_path / "i.db")
+    db.init_db(conn)
+
+    def _f(name, ext, status):
+        db.upsert_file(conn, path=str(tmp_path / name), name=name, ext=ext, size=1, mtime=1.0,
+                       content_hash="h", page_count=1, status=status, error="", indexed_at=1.0)
+
+    _f("a.pptx", ".pptx", "ok")       # 已建
+    _f("b.pptx", ".pptx", "ok")       # 已建
+    _f("c.docx", ".docx", "pending")  # 已登记文件名、内容待补建
+    conn.commit()
+
+    win = MainWindow(conn=conn, render_worker=StubRender(), thumb_worker=StubThumb(), do_index=False)
+    qtbot.addWidget(win)
+
+    win._on_index_progress(2, 3, r"C:\docs\c.docx")
+
+    assert not win.type_rail.isHidden()
+    assert win._type_bars["PPT"]._cap.text() == "PPT 2/2 ✓"   # 2 个 pptx 都已建
+    assert win._type_bars["Word"]._cap.text() == "Word 0/1"   # 1 个 docx 待补建
+    assert win._type_bars["Excel"]._cap.text() == "Excel —"   # 没有 Excel
+    win._close_type_conn()
+
+
 def test_live_indexer_async_off_main_thread(qtbot, tmp_path):
     """LiveIndexer：submit 入队 → 后台线程索引 → indexed 信号 → 文件可搜。
 

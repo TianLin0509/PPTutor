@@ -240,7 +240,13 @@ def install_dir() -> Path:
 def local_manifest() -> dict | None:
     p = install_dir() / MANIFEST_NAME
     if not p.exists():
-        return None
+        try:
+            from . import __version__
+            manifest = build_manifest(install_dir(), __version__, f"PPT Doctor v{__version__}")
+            p.write_text(json.dumps(manifest, ensure_ascii=False, indent=0), encoding="utf-8")
+            return manifest
+        except Exception:  # noqa: BLE001
+            return None
     try:
         return json.loads(p.read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001

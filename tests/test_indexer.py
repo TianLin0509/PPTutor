@@ -4,6 +4,7 @@ from __future__ import annotations
 import fixtures_gen as fx
 
 from pptx_finder import db, indexer
+from pptx_finder.models import ParsedDeck, SlidePage
 from pptx_finder.text_tokenize import tokenize
 
 
@@ -166,3 +167,30 @@ def test_index_one_records_exact_content_hash(tmp_path):
     assert res["status"] == "ok"
     assert res["content_hash"].startswith("sha256:")
     assert len(res["content_hash"]) == len("sha256:") + 64
+
+
+def test_index_single_sanitizes_surrogate_text_before_sqlite(tmp_path, monkeypatch):
+    """PDF 等解析器可能吐出孤立 surrogate；写 SQLite 前必须清洗。"""
+    p = tmp_path / "bad-unicode.pdf"
+    p.write_bytes(b"%PDF fake enough for hash")
+
+    def fake_parse(_path: str) -> ParsedDeck:
+        return ParsedDeck(
+            path=str(p),
+            page_count=1,
+            pages=[SlidePage(page_no=1, body="Alpha \ud835 Keyword")],
+        )
+
+    monkeypatch.setattr(indexer, "parse_document", fake_parse)
+    conn = db.connect(tmp_path / "i.db")
+    db.init_db(conn)
+
+    assert indexer.index_single(conn, str(p)) is True
+
+    row = db.get_file_by_path(conn, str(p))
+    assert row is not None
+    assert row["status"] == "ok"
+    raw = db.get_page_text(conn, row["id"], 1)
+    assert "Keyword" in raw
+    assert not any(0xD800 <= ord(ch) <= 0xDFFF for ch in raw)
+    assert _fts_files(conn, "Keyword")

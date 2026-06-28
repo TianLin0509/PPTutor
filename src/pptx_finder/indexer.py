@@ -27,7 +27,17 @@ from pathlib import Path
 from typing import Any
 
 from . import db
-from .config import CONTENT_EXTS, MAX_PARSE_SIZE, PPT_EXT, PPTX_EXT, ext_path
+from .config import (
+    CONTENT_EXTS,
+    DOCX_EXT,
+    MAX_PARSE_SIZE,
+    PDF_EXT,
+    PPT_EXT,
+    PPTX_EXT,
+    TXT_EXT,
+    XLSX_EXT,
+    ext_path,
+)
 from .document_parser import parse_document
 from .text_tokenize import tokenize
 
@@ -36,6 +46,7 @@ log = logging.getLogger(__name__)
 ProgressCb = Callable[[int, int, str], None]
 COMMIT_EVERY = 50
 SCAN_COMMIT_EVERY = 200  # 扫描期每登记这么多就提交一次，让文件名尽快可搜
+DEFERRED_CONTENT_EXTS = (DOCX_EXT, XLSX_EXT, TXT_EXT, PDF_EXT)
 
 
 def _stat_hash(size: int, mtime: float) -> str:
@@ -79,7 +90,9 @@ def _index_one(path: str) -> dict[str, Any]:
     res["page_count"] = deck.page_count
     if deck.status == "ok":
         res["pages"] = [
-            (pg.page_no, pg.raw_text, tokenize(pg.raw_text)) for pg in deck.pages
+            (pg.page_no, raw, tokenize(raw))
+            for pg in deck.pages
+            if (raw := db.sqlite_safe_text(pg.raw_text)).strip()
         ]
     return res
 
@@ -151,7 +164,9 @@ def update_index(
     total = 0  # 需解析的 .pptx 数（随扫描增长）
     done = 0
     scan_done = False  # 扫描是否结束（total 是否已是最终值）→ 决定进度报忙碌态还是真实百分比
-    deferred: list[Path] = []  # 非 pptx 文档：PPT 全部处理完后再后台补建（PPT 优先）
+    # 非 pptx 文档：先按类型排队，PPT 全部处理完后再按稳定顺序整类补建。
+    deferred_by_ext: dict[str, list[Path]] = {ext: [] for ext in DEFERRED_CONTENT_EXTS}
+    deferred_other: list[Path] = []
 
     def stopped() -> bool:
         return stop_event is not None and stop_event.is_set()
@@ -216,7 +231,10 @@ def update_index(
                 if ext in CONTENT_EXTS:
                     if not inline:
                         _register_pending(conn, p, st)
-                    deferred.append(p)
+                    if ext in deferred_by_ext:
+                        deferred_by_ext[ext].append(p)
+                    else:
+                        deferred_other.append(p)
                 continue
             # .pptx —— 最高优先，立即处理（逻辑不变）
             total += 1
@@ -229,7 +247,7 @@ def update_index(
                     summary["errors"] += 1
                 done += 1
                 if progress_cb:
-                    progress_cb(done, total, sp)
+                    progress_cb(done, -1, f"已发现 {len(seen)} 个 · 已索引 {done} 个")
                 if done % COMMIT_EVERY == 0:
                     conn.commit()
             else:
@@ -243,6 +261,13 @@ def update_index(
                         write_done(f)
         conn.commit()
         scan_done = True  # 扫描结束：total 已是最终值，收尾解析的进度走真实百分比
+        deferred = [
+            p
+            for ext in DEFERRED_CONTENT_EXTS
+            for p in deferred_by_ext.get(ext, [])
+        ]
+        deferred.extend(deferred_other)
+        total += len(deferred)
 
         # ---- 删除磁盘上已消失的文件 ----
         for path in list(existing.keys()):
@@ -267,7 +292,6 @@ def update_index(
             if stopped():
                 break
             sp = str(p)
-            total += 1
             if inline:
                 try:
                     _write_result(conn, _index_one(sp))
@@ -277,7 +301,10 @@ def update_index(
                     summary["errors"] += 1
                 done += 1
                 if progress_cb:
-                    progress_cb(done, total, sp)
+                    if scan_done:
+                        progress_cb(done, total, sp)
+                    else:
+                        progress_cb(done, -1, f"已发现 {len(seen)} 个 · 已索引 {done} 个")
                 if done % COMMIT_EVERY == 0:
                     conn.commit()
             else:

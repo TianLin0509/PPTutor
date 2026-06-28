@@ -30,8 +30,9 @@ except Exception:  # noqa: BLE001
 
 from .. import actions, db, history, renderer as renderer_mod, search as search_mod, updater, __version__
 from ..config import (
-    db_path as cfg_db_path, get_hotkey, get_theme, is_first_run,
-    mark_welcomed, set_theme as cfg_set_theme, update_base_url,
+    DOCX_EXT, PDF_EXT, PPTX_EXT, TXT_EXT, XLSX_EXT, db_path as cfg_db_path,
+    get_hotkey, get_theme, is_first_run, mark_welcomed,
+    set_theme as cfg_set_theme, update_base_url,
 )
 from ..models import FileResult
 from ..query_explain import explain_query, mode_label, suggestion_keys
@@ -200,6 +201,58 @@ def _file_mime_for_path(path: str) -> QMimeData:
         mime.setUrls([QUrl.fromLocalFile(clean)])
         mime.setText(clean)
     return mime
+
+
+# 底部状态栏「分类型索引进度」（设计 D）：每类一条迷你条 + x/y 计数。
+# 颜色取各 Office 类型品牌色，一眼区分；浅/深主题下都可读。
+_TYPE_BUCKETS: tuple[tuple[str, tuple[str, ...], str], ...] = (
+    ("PPT", (PPTX_EXT, ".ppt"), "#D35230"),
+    ("Word", (DOCX_EXT,), "#2B6CB0"),
+    ("Excel", (XLSX_EXT,), "#2E9E4F"),
+    ("txt", (TXT_EXT,), "#8A929C"),
+    ("PDF", (PDF_EXT,), "#E04A3F"),
+)
+
+
+class _TypeBar(QWidget):
+    """单类型迷你进度：上行「标签 x/y(✓)」+ 下行细进度条（填到 x/y 比例）。"""
+
+    def __init__(self, label: str, color: str, parent=None) -> None:
+        super().__init__(parent)
+        self._label = label
+        self._color = color
+        self.setFixedWidth(88)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(2)
+        self._cap = QLabel(f"{label} —")
+        self._cap.setObjectName("typeBarCap")
+        self._cap.setStyleSheet(f"font-size:10px;font-weight:700;color:{color};")
+        lay.addWidget(self._cap)
+        self._bar = QProgressBar()
+        self._bar.setObjectName("typeBar")
+        self._bar.setTextVisible(False)
+        self._bar.setFixedHeight(5)
+        self._bar.setRange(0, 1)
+        self._bar.setValue(0)
+        self._bar.setStyleSheet(
+            "QProgressBar{background:rgba(140,140,140,0.22);border:0;border-radius:3px;}"
+            f"QProgressBar::chunk{{background:{color};border-radius:3px;}}"
+        )
+        lay.addWidget(self._bar)
+
+    def update_counts(self, built: int, total: int) -> None:
+        if total <= 0:
+            self._cap.setText(f"{self._label} —")
+            self._bar.setRange(0, 1)
+            self._bar.setValue(0)
+            self.setToolTip(f"{self._label}：未发现此类文件")
+            return
+        tick = " ✓" if built >= total else ""
+        self._cap.setText(f"{self._label} {built:,}/{total:,}{tick}")
+        self._bar.setRange(0, total)
+        self._bar.setValue(min(built, total))
+        self.setToolTip(f"{self._label}：已建 {built:,} / 发现 {total:,}")
 
 
 class ResultItem(QWidget):
@@ -497,6 +550,7 @@ class MainWindow(QMainWindow):
         self._startup_index_check_last_ms = 0.0
         self._startup_index_check_last_files = 0
         self._startup_index_check_last_pages = 0
+        self._startup_index_check_last_pending = 0
         self._startup_index_check_decision = "pending"
         self._startup_index_check_error = ""
         self._index_rebuild_reason = ""
@@ -693,6 +747,7 @@ class MainWindow(QMainWindow):
             f"last_ms={self._startup_index_check_last_ms:.0f} "
             f"files={self._startup_index_check_last_files} "
             f"pages={self._startup_index_check_last_pages} "
+            f"pending={self._startup_index_check_last_pending} "
             f"rebuild={self._index_rebuild_reason or '-'} "
             f"error={self._startup_index_check_error or '-'}"
         )
@@ -887,6 +942,10 @@ class MainWindow(QMainWindow):
         self.pct_label = QLabel("")
         self.pct_label.setObjectName("pctLabel")
         self.status.addWidget(self.pct_label)
+        self.type_rail = self._build_type_rail()  # 分类型索引进度迷你条（设计 D）
+        self.status.addWidget(self.type_rail)
+        self._type_conn = None          # 分类型计数用的独立只读连接（懒开，避免主线程抢写锁）
+        self._type_rail_last_at = 0.0   # 分类型条刷新节流时间戳
         self.status_dot = QLabel("●")
         self.status_dot.setObjectName("statusDot")
         self.status_dot.hide()
@@ -897,14 +956,11 @@ class MainWindow(QMainWindow):
         self.version_shield.setObjectName("verShield")
         self.version_shield.hide()  # 鏈夌増鏈悗鎵嶆樉绀?
         self.status.addPermanentWidget(self.version_shield)
-        kb = QLabel('<span id="kbd"> ↑↓ </span> 选择　<span id="kbd"> ↵</span> 打开　<span id="kbd"> Esc </span> 收起')
-        kb.setTextFormat(Qt.RichText)
         self.hotkey_label = QLabel(f"全局热键 {get_hotkey()}")
         self.hotkey_label.setObjectName("hotkeyLabel")
         self.hotkey_label.setCursor(Qt.PointingHandCursor)
         self.hotkey_label.setToolTip("点击修改全局唤起热键")
         self.hotkey_label.installEventFilter(self)  # 点击 → 打开设置（#2 热键可改）
-        self.status.addPermanentWidget(kb)
         self.status.addPermanentWidget(self.hotkey_label)
 
         # 瓒ｅ懗缁熻銆屾垜鐨勮兌鐗囨姤鍛娿€嶅叆鍙ｏ紙闈炰镜鍏ユ敞鍏ワ紝閫昏緫鍏ㄥ湪 stats_entry锛?
@@ -914,6 +970,62 @@ class MainWindow(QMainWindow):
         self._init_toast()
         self._init_spinner()
         self._install_shortcuts()
+
+    # —— 分类型索引进度迷你条（设计 D）——
+    def _build_type_rail(self) -> QFrame:
+        rail = QFrame()
+        rail.setObjectName("typeRail")
+        rail.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+        lay = QHBoxLayout(rail)
+        lay.setContentsMargins(2, 0, 4, 0)
+        lay.setSpacing(10)
+        self._type_bars: dict[str, _TypeBar] = {}
+        for label, _exts, color in _TYPE_BUCKETS:
+            bar = _TypeBar(label, color)
+            lay.addWidget(bar)
+            self._type_bars[label] = bar
+        rail.hide()
+        return rail
+
+    def _read_type_counts(self) -> dict[str, tuple[int, int]] | None:
+        """取分类型 (已建, 总数)。文件库走独立只读连接（不抢索引器的写锁）；
+        内存库（测试）无并发写者，直接读主连接。失败返 None，状态栏退化即可。"""
+        try:
+            conn_path = _sqlite_file_path(self._conn)
+            if conn_path:
+                if self._type_conn is None:
+                    self._type_conn = db.connect(conn_path)
+                conn = self._type_conn
+            else:
+                conn = self._conn
+            return db.type_counts(conn)
+        except Exception as e:  # noqa: BLE001
+            _log.debug("type_counts failed: %s", e)
+            return None
+
+    def _update_type_rail(self, *, force: bool = False) -> None:
+        """按 _TYPE_BUCKETS 分桶刷新各类型迷你条；节流约 0.6s（避免高频建库 tick 反复查库）。"""
+        now = time.monotonic()
+        if not force and (now - self._type_rail_last_at) < 0.6:
+            self.type_rail.show()
+            return
+        self._type_rail_last_at = now
+        per_ext = self._read_type_counts()
+        if per_ext is None:
+            return
+        for label, exts, _color in _TYPE_BUCKETS:
+            built = sum(per_ext.get(e.lower(), (0, 0))[0] for e in exts)
+            total = sum(per_ext.get(e.lower(), (0, 0))[1] for e in exts)
+            self._type_bars[label].update_counts(built, total)
+        self.type_rail.show()
+
+    def _close_type_conn(self) -> None:
+        if getattr(self, "_type_conn", None) is not None:
+            try:
+                self._type_conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._type_conn = None
 
     def _install_shortcuts(self) -> None:
         """键盘补全（#4）：命中页跳转 + 聚焦搜索框。
@@ -3941,13 +4053,23 @@ class MainWindow(QMainWindow):
             page_count = int(stats.get("page_count", 0))
         except (TypeError, ValueError):
             page_count = 0
+        status_counts = stats.get("status_counts") if isinstance(stats.get("status_counts"), dict) else {}
+        try:
+            pending_count = int(stats.get("pending_count", status_counts.get("pending", 0)))
+        except (TypeError, ValueError):
+            pending_count = 0
         self._index_rebuild_reason = str(stats.get("index_rebuild_reason") or "")
         self._startup_index_check_last_files = file_count
         self._startup_index_check_last_pages = page_count
+        self._startup_index_check_last_pending = pending_count
         if not isinstance(payload, dict):
             self._startup_index_check_error = "stats_unavailable"
         if file_count <= 0:
             self._startup_index_check_decision = "start_scan_rebuild" if self._index_rebuild_reason else "start_scan"
+            self._start_indexing(roots, workers)
+            return
+        if pending_count > 0:
+            self._startup_index_check_decision = "resume_pending"
             self._start_indexing(roots, workers)
             return
         self._startup_index_check_decision = "use_existing"
@@ -4031,8 +4153,9 @@ class MainWindow(QMainWindow):
         self._index_progress_last_ui_at = 0.0
         self._index_progress_last_phase = None
         self._index_status_cache = None
-        self.index_bar.setRange(0, 0)
-        self.index_bar.show()
+        self.index_bar.hide()  # 聚合大进度条由分类型迷你条取代（设计 D）
+        self._type_rail_last_at = 0.0
+        self._update_type_rail(force=True)
         self.status_dot.hide()
         if self._index_rebuild_reason:
             self.status_label.setText("正在升级索引：需要重新整理一次，期间可边扫边搜")
@@ -4060,7 +4183,8 @@ class MainWindow(QMainWindow):
         self._index_progress_last_ui_at = now
         self._index_progress_last_phase = phase
         self.status_dot.hide()
-        self.index_bar.show()
+        self.index_bar.hide()  # 分类型迷你条取代聚合大进度条（设计 D）
+        self._update_type_rail(force=(done >= total > 0))
         if getattr(self, "_welcome", None) is not None and done > 0:
             self._welcome.update_progress(done)
         preserve_search_status = self._search_pending_req is not None
@@ -4075,7 +4199,7 @@ class MainWindow(QMainWindow):
             self.index_bar.setValue(done)
             self.pct_label.setText(f"{int(done / max(1, total) * 100)}%")
             if not preserve_search_status:
-                self.status_label.setText(f"正在索引内容　{done}/{total}　·　{os.path.basename(cur)}")
+                self.status_label.setText(f"正在建库　{done}/{total}")
 
     def _on_index_done(self, summary: dict) -> None:
         if self._closing:
@@ -4091,6 +4215,8 @@ class MainWindow(QMainWindow):
                 pass
             self._index_rebuild_reason = ""
         self.index_bar.hide()
+        self.type_rail.hide()
+        self._close_type_conn()
         self.pct_label.setText("")
         celebrate = not getattr(self, "_index_celebrated", False)
         if celebrate:
@@ -4104,11 +4230,13 @@ class MainWindow(QMainWindow):
             try:
                 stats = dict(db.stats(own))
                 stats["index_rebuild_reason"] = db.meta_value(own, db.META_INDEX_REBUILD_REASON)
+                stats["type_counts"] = db.type_counts(own)
                 return stats
             finally:
                 own.close()
         stats = dict(db.stats(self._conn))
         stats["index_rebuild_reason"] = db.meta_value(self._conn, db.META_INDEX_REBUILD_REASON)
+        stats["type_counts"] = db.type_counts(self._conn)
         return stats
 
     def _refresh_status(self, summary: dict | None = None, *, celebrate: bool = False) -> None:
@@ -4177,12 +4305,17 @@ class MainWindow(QMainWindow):
         self._index_status_cache_at = time.monotonic()
         if self._search_pending_req is not None:
             return
-        extra = ""
-        if summary and "deleted" in summary:
-            extra = f"\uff08\u66f4\u65b0 {summary.get('indexed', 0)}\uff0c\u79fb\u9664 {summary.get('deleted', 0)}\uff09"
+        # \u5c31\u7eea\u6001\uff08\u8bbe\u8ba1 F\uff09\uff1a\u300c\u7d22\u5f15\u5c31\u7eea\uff1aN \u4e2a\u6587\u4ef6 \u00b7 M \u9875\u300d+ \u5404\u7c7b\u578b\u5206\u5e03\uff0c\u66ff\u6389\u65e7\u7684\u300c\u5f85\u8865\u5efa/\u66f4\u65b0/\u79fb\u9664\u300d\u9ed1\u8bdd
+        per_ext = stats.get("type_counts") or {}
+        parts = []
+        for label, exts, _color in _TYPE_BUCKETS:
+            total = sum(per_ext.get(e.lower(), (0, 0))[1] for e in exts)
+            if total > 0:
+                parts.append(f"{label} {total:,}")
+        dist = (" \u00b7 " + " \u00b7 ".join(parts)) if parts else ""
         self.status_dot.show()
         self.status_label.setText(
-            f"\u7d22\u5f15\u5c31\u7eea\uff1a{stats.get('file_count', 0)} \u4e2a\u6587\u4ef6 \u00b7 {stats.get('page_count', 0)} \u9875{extra}"
+            f"\u7d22\u5f15\u5c31\u7eea\uff1a{stats.get('file_count', 0)} \u4e2a\u6587\u4ef6 \u00b7 {stats.get('page_count', 0)} \u9875{dist}"
         )
 
     def _apply_status_error(self, token: int, error: Exception) -> None:
@@ -4216,6 +4349,7 @@ class MainWindow(QMainWindow):
     def _shutdown(self) -> None:
         self._closing = True
         self._render_gen += 1
+        self._close_type_conn()  # 关分类型计数用的只读连接
         if hasattr(self, "_visible_thumb_timer"):
             self._visible_thumb_timer.stop()
         if self._search_worker is not None:
