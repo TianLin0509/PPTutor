@@ -60,7 +60,7 @@ def test_search_worker_interrupts_stale_running_query(monkeypatch, qtbot, tmp_pa
     slow_started = threading.Event()
     seen = []
 
-    def fake_search(conn_arg, query):
+    def fake_search(conn_arg, query, exts=None):
         if query == "slow":
             slow_started.set()
             assert conn_arg.interrupted.wait(2), "slow search should be interrupted"
@@ -90,7 +90,7 @@ def test_search_worker_does_not_emit_interrupted_stale_query(monkeypatch, qtbot,
     slow_started = threading.Event()
     seen = []
 
-    def fake_search(conn_arg, query):
+    def fake_search(conn_arg, query, exts=None):
         if query == "slow":
             slow_started.set()
             assert conn_arg.interrupted.wait(2), "slow search should be interrupted"
@@ -120,7 +120,7 @@ def test_search_worker_does_not_emit_stale_success_when_newer_query_pending(monk
     slow_started = threading.Event()
     seen = []
 
-    def fake_search(conn_arg, query):
+    def fake_search(conn_arg, query, exts=None):
         if query == "slow":
             slow_started.set()
             assert conn_arg.interrupted.wait(2), "slow search should be interrupted"
@@ -151,7 +151,7 @@ def test_search_worker_cancel_interrupts_running_query_without_emitting(monkeypa
     slow_started = threading.Event()
     seen = []
 
-    def fake_search(conn_arg, query):
+    def fake_search(conn_arg, query, exts=None):
         if query == "slow":
             slow_started.set()
             assert conn_arg.interrupted.wait(2), "slow search should be interrupted"
@@ -182,7 +182,7 @@ def test_search_worker_records_diagnostics_for_interrupts(monkeypatch, qtbot, tm
     conn = InterruptibleConn()
     slow_started = threading.Event()
 
-    def fake_search(conn_arg, query):
+    def fake_search(conn_arg, query, exts=None):
         if query == "slow":
             slow_started.set()
             assert conn_arg.interrupted.wait(2), "slow search should be interrupted"
@@ -233,7 +233,7 @@ def test_search_worker_diagnostics_show_active_search_without_query_text(monkeyp
     active_started = threading.Event()
     release = threading.Event()
 
-    def slow_search(_conn, _query):
+    def slow_search(_conn, _query, exts=None):
         active_started.set()
         release.wait(2)
         return []
@@ -261,7 +261,7 @@ def test_search_worker_failure_logs_redact_query_text(monkeypatch, qtbot, tmp_pa
     db.init_db(conn)
     sensitive = "客户并购预算-绝密"
 
-    def fake_search(_conn, _query):
+    def fake_search(_conn, _query, exts=None):
         raise RuntimeError("boom")
 
     monkeypatch.setattr(search_worker_mod.search_mod, "search", fake_search)
@@ -284,7 +284,7 @@ def test_search_worker_diagnostic_error_redacts_query_text(monkeypatch, qtbot, t
     db.init_db(conn)
     sensitive = "客户并购预算-绝密"
 
-    def fake_search(_conn, query):
+    def fake_search(_conn, query, exts=None):
         raise RuntimeError(f"bad query: {query}")
 
     monkeypatch.setattr(search_worker_mod.search_mod, "search", fake_search)

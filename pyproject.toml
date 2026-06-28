@@ -1,6 +1,6 @@
 [project]
 name = "pptx-finder"
-version = "0.9.4"
+version = "1.0.0"
 description = "本地 PPTX 内容搜索与预览助手（搜内容定位页 / 版本归组 / 托盘常驻）"
 readme = "README.md"
 authors = [
@@ -11,6 +11,7 @@ dependencies = [
     "jieba>=0.42.1",
     "lxml>=6.1.1",
     "opencc>=1.3.1",
+    "pypdf>=6.14.2",
     "pyside6>=6.11.1",
     "pywin32>=312",
     "watchdog>=6.0.0",

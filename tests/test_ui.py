@@ -79,7 +79,7 @@ class PendingSearchWorker:
         self.requests: list[tuple[int, str, str]] = []
         self.cancels = 0
 
-    def request(self, req_id: int, query: str, mode_key: str):
+    def request(self, req_id: int, query: str, mode_key: str, exts=None):
         self.requests.append((req_id, query, mode_key))
 
     def cancel(self):
@@ -98,9 +98,9 @@ class ObservingSearchWorker(PendingSearchWorker):
         self._observer = observer
         self.observed: list[tuple[int, int, int]] = []
 
-    def request(self, req_id: int, query: str, mode_key: str):
+    def request(self, req_id: int, query: str, mode_key: str, exts=None):
         self.observed.append(self._observer())
-        super().request(req_id, query, mode_key)
+        super().request(req_id, query, mode_key, exts)
 
 
 def _index(tmp_path):

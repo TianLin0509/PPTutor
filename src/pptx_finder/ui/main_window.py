@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import datetime
 import html
-import json
 import logging
 import os
 
@@ -31,7 +30,7 @@ except Exception:  # noqa: BLE001
 
 from .. import actions, db, history, renderer as renderer_mod, search as search_mod, updater, __version__
 from ..config import (
-    data_dir, db_path as cfg_db_path, get_hotkey, get_theme, is_first_run,
+    db_path as cfg_db_path, get_hotkey, get_theme, is_first_run,
     mark_welcomed, set_theme as cfg_set_theme, update_base_url,
 )
 from ..models import FileResult
@@ -43,13 +42,12 @@ from .live_indexer import LiveIndexer
 from .path_helpers import ensure_pptx_suffix
 from .render_worker import RenderWorker
 from .result_utils import (
-    empty_suggestions as _empty_suggestions,
     facet_counts,
     facet_filter,
     group_by_time,
-    mode_key_from_text as _mode_key_from_text,
     sort_results as _sort_results,
-    time_bucket as _time_bucket,
+    empty_suggestions as _empty_suggestions,  # noqa: F401  供测试从本模块 re-export
+    time_bucket as _time_bucket,  # noqa: F401  供测试从本模块 re-export
 )
 from .search_worker import SearchWorker
 from .thumb_worker import ThumbWorker
@@ -754,6 +752,21 @@ class MainWindow(QMainWindow):
         self.search_box.setCompleter(self._completer)
         self._completer.popup().setObjectName("historyPopup")
         bar.addWidget(self.search_box, 1)
+        self.type_filter = QComboBox()
+        self.type_filter.setObjectName("typeFilter")
+        self.type_filter.setToolTip("选择要搜索的文件类型（默认 PPT）")
+        for _label, _exts in (
+            ("PPT", (".pptx", ".ppt")),
+            ("Word", (".docx",)),
+            ("Excel", (".xlsx",)),
+            ("txt", (".txt",)),
+            ("PDF", (".pdf",)),
+            ("全部", None),
+        ):
+            self.type_filter.addItem(_label, _exts)
+        self.type_filter.setCurrentIndex(0)  # 默认 PPT，保住产品焦点
+        self.type_filter.currentIndexChanged.connect(lambda _=0: self._do_search())
+        bar.addWidget(self.type_filter)
         self.mode = QComboBox()
         self.mode.addItems(["全部", "仅文件名", "仅内容"])
         self.mode.setMinimumHeight(42)
@@ -1043,9 +1056,9 @@ class MainWindow(QMainWindow):
         tb = QWidget()
         tb.setObjectName("glassTitle")
         tb.setFixedHeight(self._title_h)
-        l = QHBoxLayout(tb)
-        l.setContentsMargins(16, 0, 6, 0)
-        l.setSpacing(9)
+        lay = QHBoxLayout(tb)
+        lay.setContentsMargins(16, 0, 6, 0)
+        lay.setSpacing(9)
         dot = QLabel("◆")
         dot.setObjectName("gtDot")
         name = QLabel("PPT Doctor")
@@ -1058,12 +1071,12 @@ class MainWindow(QMainWindow):
         self.update_chip.setObjectName("updateChip")
         self.update_chip.setCursor(Qt.PointingHandCursor)
         self.update_chip.hide()
-        l.addWidget(dot)
-        l.addWidget(name)
-        l.addWidget(ver)
-        l.addWidget(self.gt_theme)
-        l.addWidget(self.update_chip)
-        l.addStretch(1)
+        lay.addWidget(dot)
+        lay.addWidget(name)
+        lay.addWidget(ver)
+        lay.addWidget(self.gt_theme)
+        lay.addWidget(self.update_chip)
+        lay.addStretch(1)
         for txt, slot, oid, tip in (("—", self.showMinimized, "winMin", "最小化"),
                                     ("□", self._win_toggle_max, "winMax", "最大化 / 还原"),
                                     ("×", self.close, "winClose", "关闭")):
@@ -1073,7 +1086,7 @@ class MainWindow(QMainWindow):
             btn.setCursor(Qt.PointingHandCursor)
             btn.setToolTip(tip)
             btn.clicked.connect(slot)
-            l.addWidget(btn)
+            lay.addWidget(btn)
         return tb
 
     def _win_toggle_max(self) -> None:
@@ -1298,6 +1311,11 @@ class MainWindow(QMainWindow):
         self.search_box.clear()
         self._do_search()
 
+    def _search_exts(self) -> tuple[str, ...] | None:
+        """当前文件类型过滤的扩展名元组；"全部" 返回 None（不过滤）。"""
+        tf = getattr(self, "type_filter", None)
+        return tf.currentData() if tf is not None else None
+
     def _do_search(self) -> None:
         if self._closing:
             return
@@ -1319,10 +1337,11 @@ class MainWindow(QMainWindow):
         self._show_list()  # 鏈夋悳绱㈣瘝 鈫?鏄剧ず缁撴灉鍒楄〃鍖猴紙闅愯棌浠〃鐩橀灞忥級
         if self._search_worker is not None:
             self._show_search_pending(query)
-            self._search_worker.request(self._search_seq, query, self._mode_key())
+            self._search_worker.request(self._search_seq, query, self._mode_key(), self._search_exts())
             return
         started = time.perf_counter()
-        results = SearchWorker._apply_mode(search_mod.search(self._conn, query), self._mode_key())
+        results = SearchWorker._apply_mode(
+            search_mod.search(self._conn, query, exts=self._search_exts()), self._mode_key())
         self._finish_search(query, results, (time.perf_counter() - started) * 1000)
 
     def _show_search_pending(self, query: str) -> None:

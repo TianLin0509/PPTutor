@@ -16,7 +16,8 @@ log = logging.getLogger(__name__)
 # 启动发现版本不符就清空内容、走全量重建——否则「原文里有、却怎么都搜不到」。
 # 也兼作"强制重建"开关：v0.7.0 首启重扫会冻结 UI，多数人的库停在残缺态（部分文件 +
 # 已盖 v2 标记 → 不会自动重扫）；2→3 让修复版（重扫已不冻结）自动重建这些残缺库。
-INDEX_VERSION = "5"
+# 5→6：内容搜索从只 pptx 扩到 docx/xlsx/txt/pdf，旧库需重建以纳入这些文档类型。
+INDEX_VERSION = "6"
 META_INDEX_REBUILD_REASON = "last_index_rebuild_reason"
 
 SCHEMA = """

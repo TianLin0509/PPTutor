@@ -78,7 +78,14 @@ EXCLUDE_DIR_NAMES: set[str] = {
 # 支持的扩展名
 PPTX_EXT = ".pptx"
 PPT_EXT = ".ppt"
-SUPPORTED_EXTS = (PPTX_EXT, PPT_EXT)
+DOCX_EXT = ".docx"
+XLSX_EXT = ".xlsx"
+TXT_EXT = ".txt"
+PDF_EXT = ".pdf"
+# 能解析「内容」的类型（pptx 优先，其余后台补建）。.ppt 旧二进制仅文件名登记、不在此列。
+CONTENT_EXTS = (PPTX_EXT, DOCX_EXT, XLSX_EXT, TXT_EXT, PDF_EXT)
+# 扫描枚举的全部类型 = 可解析内容的 + 仅文件名的 .ppt
+SUPPORTED_EXTS = CONTENT_EXTS + (PPT_EXT,)
 
 # 超过此大小跳过解析（仍可文件名命中）
 MAX_PARSE_SIZE = 200 * 1024 * 1024  # 200MB

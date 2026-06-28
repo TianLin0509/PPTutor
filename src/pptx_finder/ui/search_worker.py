@@ -27,7 +27,7 @@ class SearchWorker(QThread):
         self._db_path = db_path
         self._conn_injected = conn
         self._cv = threading.Condition()
-        self._pending: tuple[int, str, str] | None = None
+        self._pending: tuple[int, str, str, tuple[str, ...] | None] | None = None
         self._stop = False
         self._active_conn = None
         self._cancel_active = False
@@ -45,9 +45,10 @@ class SearchWorker(QThread):
             "samples": [],
         }
 
-    def request(self, req_id: int, query: str, mode_key: str) -> None:
+    def request(self, req_id: int, query: str, mode_key: str,
+                exts: tuple[str, ...] | None = None) -> None:
         with self._cv:
-            self._pending = (req_id, query, mode_key)
+            self._pending = (req_id, query, mode_key, exts)
             self._cancel_active = False
             with self._diag_lock:
                 self._diag["pending_query_chars"] = len(query)
@@ -160,7 +161,7 @@ class SearchWorker(QThread):
                         self._cv.wait()
                     if self._stop:
                         return
-                    req_id, query, mode_key = self._pending
+                    req_id, query, mode_key, exts = self._pending
                     self._pending = None
                     self._cancel_active = False
                     self._active_conn = conn  # 在同一把锁内提前置位，消除「取消落在赋值之前」的窗口
@@ -172,7 +173,7 @@ class SearchWorker(QThread):
                 error = None
                 results = []
                 try:
-                    results = self._apply_mode(search_mod.search(conn, query), mode_key)
+                    results = self._apply_mode(search_mod.search(conn, query, exts=exts), mode_key)
                 except Exception as exc:  # noqa: BLE001
                     error = f"{type(exc).__name__}: {exc}"
                     if "interrupted" in str(exc).lower():

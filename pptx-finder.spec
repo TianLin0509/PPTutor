@@ -8,6 +8,10 @@ hiddenimports = []
 # 否则 frozen 下 OpenCC("t2s") 找不到词典 → 繁简归一化静默失效（搜「软件」漏掉「軟件」）。
 tmp_ret = collect_all('opencc')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+# pypdf（v1.0.0 PDF 内容搜索）：parse_pdf 内惰性 import pypdf，且 pypdf 用 importlib.metadata
+# 读自身版本——必须带上 dist-info 元数据 + 全子模块，否则 frozen 下搜 PDF 静默失效/报错。
+tmp_ret = collect_all('pypdf')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 
 a = Analysis(

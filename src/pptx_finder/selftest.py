@@ -26,15 +26,23 @@ CASES = [
     ("繁体→简体(软件)", "软件", "08_traditional.pptx", True),
     ("大小写(gpt→GPT)", "gpt", "09_case.pptx", True),
     ("数字型号(910)", "910", "10_number.pptx", True),
+    # —— 多文档内容搜索（v1.0.0）：证明 docx/xlsx/txt/pdf 解析在 frozen 下带齐；
+    #    pdf 用 ASCII 探针，若 pypdf 没被打进 exe，这条必败 → all_pass=False → 退出码 1。
+    ("docx内容(文档专属词)", "文档专属词", "11_docx.docx", True),
+    ("xlsx内容(表格专属词)", "表格专属词", "12_xlsx.xlsx", True),
+    ("txt内容(文本专属词)", "文本专属词", "13_txt.txt", True),
+    ("pdf内容ASCII(pypdf抽取)", "PdfSampleKeyword", "14_pdf.pdf", True),
 ]
 
 
 def _run(pptx_dir: str) -> dict:
     from . import db, indexer, search
+    from .config import CONTENT_EXTS
     from .text_tokenize import normalize
 
     src = Path(pptx_dir)
-    files = sorted(src.glob("*.pptx"))
+    # v1.0.0：自检集含 pptx + docx/xlsx/txt/pdf，全部喂给索引，验证多文档解析在 frozen 下可用
+    files = sorted(p for p in src.iterdir() if p.is_file() and p.suffix.lower() in CONTENT_EXTS)
     td = tempfile.mkdtemp(prefix="pptxfinder_selftest_")
     try:
         conn = db.connect(Path(td) / "selftest.db")
@@ -55,6 +63,13 @@ def _run(pptx_dir: str) -> dict:
                     "expect": expect, "got": got, "pass": got == expect,
                 })
             stats = db.stats(conn)
+            # 每类型索引明细（诊断 pypdf/docx/xlsx 是否真被打包：pdf 这行 files≥1 才算 pypdf 生效）
+            by_ext = {
+                (r[0] or ""): {"files": r[1], "pages": r[2]}
+                for r in conn.execute(
+                    "SELECT lower(ext), COUNT(*), COALESCE(SUM(page_count),0) FROM files GROUP BY lower(ext)"
+                )
+            }
         finally:
             conn.close()  # WAL 模式必须先关连接，否则 Windows 下 db 文件被锁、临时目录删不掉
     finally:
@@ -65,6 +80,7 @@ def _run(pptx_dir: str) -> dict:
         "opencc_ok": opencc_ok,
         "indexed_files": stats["file_count"],
         "indexed_pages": stats["page_count"],
+        "by_ext": by_ext,
         "passed": passed,
         "total": len(cases),
         "all_pass": passed == len(cases) and opencc_ok,

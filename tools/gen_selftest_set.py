@@ -1,7 +1,8 @@
-"""生成打包自检用的 PPTX 测试集（10 个文件，名字 + 内容与 selftest.CASES 一一对应）。
+"""生成打包自检用的测试集（10 pptx + 4 非 pptx，名字 + 内容与 selftest.CASES 一一对应）。
 
 用法：uv run python tools/gen_selftest_set.py <out_dir>
-内容覆盖：跨词子串 / run 截断 / 长词 / 多词同页 / 多词跨页 / 精度 / 全角 / 繁简 / 大小写 / 数字。
+内容覆盖：跨词子串 / run 截断 / 长词 / 多词同页 / 多词跨页 / 精度 / 全角 / 繁简 / 大小写 / 数字
+        + docx / xlsx / txt / pdf 多文档内容搜索（v1.0.0，证明 frozen 下 pypdf 等解析器带齐）。
 """
 from __future__ import annotations
 
@@ -10,6 +11,10 @@ from pathlib import Path
 
 from pptx import Presentation
 from pptx.util import Inches
+
+# 复用测试夹具生成器造最小 docx/xlsx/pdf（pdf 的 xref 偏移由它精确计算）
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
+import fixtures_gen as fx  # noqa: E402
 
 
 def _single(path: Path, bodies: list[str]) -> None:
@@ -49,7 +54,12 @@ def main(out_dir: str) -> None:
     _single(out / "08_traditional.pptx", ["軟件開發流程"])     # 繁体
     _single(out / "09_case.pptx", ["基于GPT的方案设计"])
     _single(out / "10_number.pptx", ["昇腾910处理器规格"])
-    print(f"OK: 10 files -> {out}")
+    # —— v1.0.0 多文档内容搜索探针（与 selftest.CASES 11~14 对应）——
+    fx.make_docx(out / "11_docx.docx", ["文档专属词 抓手落地闭环"])
+    fx.make_xlsx(out / "12_xlsx.xlsx", [["表格专属词 营收同比增长"]])
+    (out / "13_txt.txt").write_text("文本专属词 现金流充裕", encoding="utf-8")
+    fx.make_pdf(out / "14_pdf.pdf", ["PdfSampleKeyword revenue alpha"])  # 纯 ASCII，pypdf 抽取
+    print(f"OK: 14 files (10 pptx + docx/xlsx/txt/pdf) -> {out}")
 
 
 if __name__ == "__main__":

@@ -206,7 +206,8 @@ def _recall(conn, words: list[str]) -> dict[int, list[tuple[int, float]]]:
 
 
 def search(conn: sqlite3.Connection, query: str, scope: str | None = None,
-           limit: int = 200) -> list[FileResult]:
+           limit: int = 200, exts: tuple[str, ...] | None = None) -> list[FileResult]:
+    ext_filter = {e.lower() for e in exts} if exts else None  # 文件类型过滤；None=全部类型
     terms, phrases = parse_query(query)
     if not terms and not phrases:
         return []
@@ -262,6 +263,8 @@ def search(conn: sqlite3.Connection, query: str, scope: str | None = None,
         if row is None:
             continue
         if scope and not row["path"].lower().startswith(scope.lower()):
+            continue
+        if ext_filter is not None and (row["ext"] or "").lower() not in ext_filter:
             continue
         pages = sorted(content.get(fid, []), key=lambda x: x[1])  # rank 升序=更相关
         best_rank = pages[0][1] if pages else None

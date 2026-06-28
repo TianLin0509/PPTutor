@@ -27,8 +27,8 @@ from pathlib import Path
 from typing import Any
 
 from . import db
-from .config import MAX_PARSE_SIZE, PPT_EXT, ext_path
-from .parser import parse_pptx
+from .config import CONTENT_EXTS, MAX_PARSE_SIZE, PPT_EXT, PPTX_EXT, ext_path
+from .document_parser import parse_document
 from .text_tokenize import tokenize
 
 log = logging.getLogger(__name__)
@@ -73,7 +73,7 @@ def _index_one(path: str) -> dict[str, Any]:
     if st.st_size > MAX_PARSE_SIZE:
         res["status"] = "too_large"
         return res
-    deck = parse_pptx(path)
+    deck = parse_document(path)
     res["status"] = deck.status
     res["error"] = deck.error
     res["page_count"] = deck.page_count
@@ -151,6 +151,7 @@ def update_index(
     total = 0  # 需解析的 .pptx 数（随扫描增长）
     done = 0
     scan_done = False  # 扫描是否结束（total 是否已是最终值）→ 决定进度报忙碌态还是真实百分比
+    deferred: list[Path] = []  # 非 pptx 文档：PPT 全部处理完后再后台补建（PPT 优先）
 
     def stopped() -> bool:
         return stop_event is not None and stop_event.is_set()
@@ -200,7 +201,8 @@ def update_index(
             )
             if unchanged:
                 continue
-            if p.suffix.lower() == PPT_EXT:
+            ext = p.suffix.lower()
+            if ext == PPT_EXT:
                 try:
                     _write_filename_only(conn, p)
                     summary["skipped_ppt"] += 1
@@ -208,7 +210,15 @@ def update_index(
                     log.warning("ppt register failed %s: %s", p, e)
                     summary["errors"] += 1
                 continue
-            # .pptx
+            if ext != PPTX_EXT:
+                # 非 pptx 文档（docx/xlsx/txt/pdf）：先登记文件名（可搜），
+                # 内容解析推迟到 pptx 全部完成后再补建（PPT 优先）。
+                if ext in CONTENT_EXTS:
+                    if not inline:
+                        _register_pending(conn, p, st)
+                    deferred.append(p)
+                continue
+            # .pptx —— 最高优先，立即处理（逻辑不变）
             total += 1
             if inline:
                 try:
@@ -244,7 +254,40 @@ def update_index(
         if summary["deleted"]:
             conn.commit()
 
-        # ---- 阶段 2 收尾：收割剩余解析 ----
+        # ---- 阶段 2 收尾：收割剩余 pptx 解析（PPT 优先：先把 pptx 全部完成）----
+        if not inline and futs:
+            for fut in as_completed(list(futs)):
+                if stopped():
+                    break
+                write_done(fut)
+        conn.commit()
+
+        # ---- 阶段 3：PPT 全部就绪后，再后台补建其它文档类型（docx/xlsx/txt/pdf）----
+        for p in deferred:
+            if stopped():
+                break
+            sp = str(p)
+            total += 1
+            if inline:
+                try:
+                    _write_result(conn, _index_one(sp))
+                    summary["indexed"] += 1
+                except Exception as e:  # noqa: BLE001
+                    log.warning("index failed %s: %s", p, e)
+                    summary["errors"] += 1
+                done += 1
+                if progress_cb:
+                    progress_cb(done, total, sp)
+                if done % COMMIT_EVERY == 0:
+                    conn.commit()
+            else:
+                futs[ex.submit(_index_one, sp)] = p
+                for f in [f for f in list(futs) if f.done()]:
+                    write_done(f)
+                if len(futs) >= max_workers * 4:
+                    fin, _ = wait(list(futs), return_when=FIRST_COMPLETED)
+                    for f in fin:
+                        write_done(f)
         if not inline and futs:
             for fut in as_completed(list(futs)):
                 if stopped():
@@ -274,7 +317,7 @@ def index_single(conn: sqlite3.Connection, path: str) -> bool:
         ext = p.suffix.lower()
         if ext == PPT_EXT:
             _write_filename_only(conn, p)
-        elif ext == ".pptx":
+        elif ext in CONTENT_EXTS:
             _write_result(conn, _index_one(str(p)))
         else:
             return False
