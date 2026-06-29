@@ -19,8 +19,8 @@ import time
 from collections.abc import Callable, Iterable
 from concurrent.futures import (
     FIRST_COMPLETED,
+    ProcessPoolExecutor,
     ThreadPoolExecutor,
-    as_completed,
     wait,
 )
 from pathlib import Path
@@ -31,11 +31,10 @@ from .config import (
     CONTENT_EXTS,
     DOCX_EXT,
     MAX_PARSE_SIZE,
+    MAX_PDF_PARSE_SIZE,
     PDF_EXT,
     PPT_EXT,
     PPTX_EXT,
-    TXT_EXT,
-    XLSX_EXT,
     ext_path,
 )
 from .document_parser import parse_document
@@ -46,7 +45,8 @@ log = logging.getLogger(__name__)
 ProgressCb = Callable[[int, int, str], None]
 COMMIT_EVERY = 50
 SCAN_COMMIT_EVERY = 200  # 扫描期每登记这么多就提交一次，让文件名尽快可搜
-DEFERRED_CONTENT_EXTS = (DOCX_EXT, XLSX_EXT, TXT_EXT, PDF_EXT)
+PARSE_TIMEOUT_S = 60.0   # 单文件解析超时：超过判定卡住 → 跳过不阻塞整批（子进程隔离的关键保护）
+DEFERRED_CONTENT_EXTS = (DOCX_EXT, PDF_EXT)  # 砍掉 xlsx/txt；PPT 优先建完后补建这些
 
 
 def _stat_hash(size: int, mtime: float) -> str:
@@ -69,21 +69,26 @@ def _index_one(path: str) -> dict[str, Any]:
     顺手计算完整文件 sha256，供搜索结果折叠完全相同副本。
     """
     st = os.stat(ext_path(path))
+    ext = os.path.splitext(path)[1].lower()
     res: dict[str, Any] = {
         "path": path,
         "name": os.path.basename(path),
-        "ext": os.path.splitext(path)[1].lower(),
+        "ext": ext,
         "size": st.st_size,
         "mtime": st.st_mtime,
-        "content_hash": _file_sha256(ext_path(path)),
+        "content_hash": f"size:{st.st_size}",
         "status": "ok",
         "error": "",
         "page_count": 0,
         "pages": [],
     }
-    if st.st_size > MAX_PARSE_SIZE:
+    # 先判尺寸再算 hash：超限直接跳过、连 sha256 都不读（省 IO，防大文件拖慢/卡死）。
+    # PDF 更严（pypdf 对大/坏 PDF 易慢易卡）。too_large 仍登记文件名、可按名搜。
+    cap = MAX_PDF_PARSE_SIZE if ext == PDF_EXT else MAX_PARSE_SIZE
+    if st.st_size > cap:
         res["status"] = "too_large"
         return res
+    res["content_hash"] = _file_sha256(ext_path(path))
     deck = parse_document(path)
     res["status"] = deck.status
     res["error"] = deck.error
@@ -135,6 +140,58 @@ def _write_filename_only(conn: sqlite3.Connection, path: Path) -> None:
     db.replace_pages(conn, fid, [])
 
 
+def _mark_skipped(conn: sqlite3.Connection, path: Path, status: str, error: str) -> None:
+    """把卡住/超时的文件标记为已跳过（用真实 size/mtime，下次扫描视为未变→不再反复重试）。"""
+    try:
+        st = path.stat()
+        size, mtime = st.st_size, st.st_mtime
+    except OSError:
+        size, mtime = 0, 0.0
+    fid = db.upsert_file(
+        conn,
+        path=str(path), name=path.name, ext=path.suffix.lower(), size=size,
+        mtime=mtime, content_hash=f"size:{size}", page_count=0,
+        status=status, error=error, indexed_at=time.time(),
+    )
+    db.replace_pages(conn, fid, [])
+
+
+def _ping() -> bool:
+    return True
+
+
+def _make_executor(max_workers: int):
+    """优先 ProcessPoolExecutor：多核真并行（提速）+ GIL/崩溃隔离（单个坏/慢文件冻不住主程序）。
+    打包/受限环境子进程起不来则回退 ThreadPoolExecutor（功能不变、退化为单核+GIL）。"""
+    try:
+        import multiprocessing as mp
+        ctx = mp.get_context("spawn")
+        ex = ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx)
+        ex.submit(_ping).result(timeout=60)  # 预热并确认子进程真能 spawn（frozen 下可能失败）
+        log.info("索引解析用 ProcessPool（%d 进程，多核并行 + 隔离）", max_workers)
+        return ex
+    except Exception as e:  # noqa: BLE001 子进程起不来不致命，回退线程
+        log.warning("ProcessPool 不可用，回退 ThreadPool：%s", e)
+        return ThreadPoolExecutor(max_workers=max_workers)
+
+
+def _shutdown_executor(ex) -> None:
+    """关执行器：不等待被超时放弃的卡死任务（否则在此重新卡住），并强制终止 ProcessPool
+    残留 worker 进程（防卡死任务占核空转）。ThreadPool 无法杀线程，随主进程退出回收。"""
+    try:
+        ex.shutdown(wait=False, cancel_futures=True)
+    except Exception:  # noqa: BLE001
+        pass
+    procs = getattr(ex, "_processes", None)  # ProcessPoolExecutor 私有：{pid: Process}
+    if procs:
+        for pr in list(procs.values()):
+            try:
+                if pr.is_alive():
+                    pr.terminate()
+            except Exception:  # noqa: BLE001
+                pass
+
+
 def update_index(
     conn: sqlite3.Connection,
     roots: list[str],
@@ -159,8 +216,13 @@ def update_index(
     max_workers = workers or min(os.cpu_count() or 4, 8)
     if not inline:
         tokenize("预热")  # 主线程先触发 OpenCC 繁简词典加载，避免多线程首次并发竞态
-    ex = None if inline else ThreadPoolExecutor(max_workers=max_workers)
+    ex = None if inline else _make_executor(max_workers)
+    summary["executor"] = (
+        "inline" if ex is None
+        else ("process" if isinstance(ex, ProcessPoolExecutor) else "thread")
+    )
     futs: dict[Any, Path] = {}
+    started: dict[Any, float] = {}  # future → 投递时刻，用于单文件超时判定
     total = 0  # 需解析的 .pptx 数（随扫描增长）
     done = 0
     scan_done = False  # 扫描是否结束（total 是否已是最终值）→ 决定进度报忙碌态还是真实百分比
@@ -171,15 +233,8 @@ def update_index(
     def stopped() -> bool:
         return stop_event is not None and stop_event.is_set()
 
-    def write_done(fut) -> None:
+    def _emit(p) -> None:
         nonlocal done
-        p = futs.pop(fut)
-        try:
-            _write_result(conn, fut.result())
-            summary["indexed"] += 1
-        except Exception as e:  # noqa: BLE001 单文件失败不中断批量
-            log.warning("index failed %s: %s", p, e)
-            summary["errors"] += 1
         done += 1
         if progress_cb:
             if scan_done:
@@ -190,6 +245,57 @@ def update_index(
                 progress_cb(done, -1, f"已发现 {len(seen)} 个 · 已索引 {done} 个")
         if done % COMMIT_EVERY == 0:
             conn.commit()
+
+    def write_done(fut) -> None:
+        p = futs.pop(fut)
+        started.pop(fut, None)
+        try:
+            _write_result(conn, fut.result())
+            summary["indexed"] += 1
+        except Exception as e:  # noqa: BLE001 单文件失败不中断批量
+            log.warning("index failed %s: %s", p, e)
+            summary["errors"] += 1
+        _emit(p)
+
+    def submit(p: Path) -> None:
+        f = ex.submit(_index_one, str(p))
+        futs[f] = p
+        started[f] = time.monotonic()
+
+    def reap_timeouts() -> None:
+        """放弃超时未完成的 future：标记 timeout、移出队列（子进程留到 shutdown 终止）。
+        这是「单个坏/卡死文件不冻住整批」的核心保护——配合 ProcessPool 的进程隔离。"""
+        now = time.monotonic()
+        for f in [f for f in list(futs)
+                  if not f.done() and now - started.get(f, now) > PARSE_TIMEOUT_S]:
+            p = futs.pop(f)
+            started.pop(f, None)
+            f.cancel()  # 排队中的能取消；运行中的取消无效，但我们不再等它
+            try:
+                _mark_skipped(conn, p, "timeout", "解析超时已跳过")
+            except Exception as e:  # noqa: BLE001
+                log.warning("mark timeout failed %s: %s", p, e)
+            summary["errors"] += 1
+            log.warning("parse timeout %.0fs, skipped: %s", PARSE_TIMEOUT_S, p)
+            _emit(p)
+
+    def harvest_ready() -> None:
+        """非阻塞：收割已完成 future + 清理超时。"""
+        for f in [f for f in list(futs) if f.done()]:
+            write_done(f)
+        reap_timeouts()
+
+    def backpressure() -> None:
+        """积压超过容量则阻塞收割直到降回容量内（1s 轮询 + 超时清理，绝不永久阻塞）。"""
+        while len(futs) >= max_workers * 4 and not stopped():
+            wait(list(futs), timeout=1.0, return_when=FIRST_COMPLETED)
+            harvest_ready()
+
+    def drain() -> None:
+        """收尾：收割到队列空（1s 轮询 + 超时清理，绝不卡在坏文件上）。"""
+        while futs and not stopped():
+            wait(list(futs), timeout=1.0, return_when=FIRST_COMPLETED)
+            harvest_ready()
 
     try:
         # ---- 阶段 1：流式扫描 + 即时登记文件名（并行路径同时投递解析）----
@@ -252,13 +358,9 @@ def update_index(
                     conn.commit()
             else:
                 _register_pending(conn, p, st)  # 先登记文件名（秒级可搜）
-                futs[ex.submit(_index_one, sp)] = p
-                for f in [f for f in list(futs) if f.done()]:  # 非阻塞收割
-                    write_done(f)
-                if len(futs) >= max_workers * 4:  # 背压：防积压内存膨胀
-                    fin, _ = wait(list(futs), return_when=FIRST_COMPLETED)
-                    for f in fin:
-                        write_done(f)
+                submit(p)
+                harvest_ready()   # 非阻塞收割已完成 + 清理超时
+                backpressure()    # 积压则阻塞收割到容量内（带超时保护）
         conn.commit()
         scan_done = True  # 扫描结束：total 已是最终值，收尾解析的进度走真实百分比
         deferred = [
@@ -280,11 +382,8 @@ def update_index(
             conn.commit()
 
         # ---- 阶段 2 收尾：收割剩余 pptx 解析（PPT 优先：先把 pptx 全部完成）----
-        if not inline and futs:
-            for fut in as_completed(list(futs)):
-                if stopped():
-                    break
-                write_done(fut)
+        if not inline:
+            drain()
         conn.commit()
 
         # ---- 阶段 3：PPT 全部就绪后，再后台补建其它文档类型（docx/xlsx/txt/pdf）----
@@ -308,22 +407,15 @@ def update_index(
                 if done % COMMIT_EVERY == 0:
                     conn.commit()
             else:
-                futs[ex.submit(_index_one, sp)] = p
-                for f in [f for f in list(futs) if f.done()]:
-                    write_done(f)
-                if len(futs) >= max_workers * 4:
-                    fin, _ = wait(list(futs), return_when=FIRST_COMPLETED)
-                    for f in fin:
-                        write_done(f)
-        if not inline and futs:
-            for fut in as_completed(list(futs)):
-                if stopped():
-                    break
-                write_done(fut)
+                submit(p)
+                harvest_ready()
+                backpressure()
+        if not inline:
+            drain()
         conn.commit()
     finally:
         if ex is not None:
-            ex.shutdown(wait=not stopped(), cancel_futures=stopped())
+            _shutdown_executor(ex)
 
     if progress_cb:
         progress_cb(total, total, "完成")  # 进度走满

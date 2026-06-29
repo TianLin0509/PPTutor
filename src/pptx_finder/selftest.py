@@ -29,8 +29,6 @@ CASES = [
     # —— 多文档内容搜索（v1.0.0）：证明 docx/xlsx/txt/pdf 解析在 frozen 下带齐；
     #    pdf 用 ASCII 探针，若 pypdf 没被打进 exe，这条必败 → all_pass=False → 退出码 1。
     ("docx内容(文档专属词)", "文档专属词", "11_docx.docx", True),
-    ("xlsx内容(表格专属词)", "表格专属词", "12_xlsx.xlsx", True),
-    ("txt内容(文本专属词)", "文本专属词", "13_txt.txt", True),
     ("pdf内容ASCII(pypdf抽取)", "PdfSampleKeyword", "14_pdf.pdf", True),
 ]
 
@@ -41,15 +39,15 @@ def _run(pptx_dir: str) -> dict:
     from .text_tokenize import normalize
 
     src = Path(pptx_dir)
-    # v1.0.0：自检集含 pptx + docx/xlsx/txt/pdf，全部喂给索引，验证多文档解析在 frozen 下可用
+    # 自检集含 pptx + docx/pdf，全部喂给索引，验证多文档解析 + ProcessPool 在 frozen 下可用
     files = sorted(p for p in src.iterdir() if p.is_file() and p.suffix.lower() in CONTENT_EXTS)
     td = tempfile.mkdtemp(prefix="pptxfinder_selftest_")
     try:
         conn = db.connect(Path(td) / "selftest.db")
         try:
             db.init_db(conn)
-            # scan_iter 直接喂文件列表，绕过目录排除规则，保证测试集一定被索引
-            indexer.update_index(conn, [str(src)], workers=1, scan_iter=iter(files))
+            # scan_iter 直接喂文件列表；用默认多 worker → 实测 ProcessPool 在 frozen 下能否 spawn
+            idx_summary = indexer.update_index(conn, [str(src)], scan_iter=iter(files))
 
             # OpenCC 繁简是否在 frozen 真实生效（词典打包成功的硬证据）
             opencc_ok = "软件" in normalize("軟件開發")
@@ -81,6 +79,7 @@ def _run(pptx_dir: str) -> dict:
         "indexed_files": stats["file_count"],
         "indexed_pages": stats["page_count"],
         "by_ext": by_ext,
+        "executor": idx_summary.get("executor"),  # process=ProcessPool 真生效 / thread=回退
         "passed": passed,
         "total": len(cases),
         "all_pass": passed == len(cases) and opencc_ok,

@@ -30,7 +30,7 @@ except Exception:  # noqa: BLE001
 
 from .. import actions, db, history, renderer as renderer_mod, search as search_mod, updater, __version__
 from ..config import (
-    DOCX_EXT, PDF_EXT, PPTX_EXT, TXT_EXT, XLSX_EXT, db_path as cfg_db_path,
+    DOCX_EXT, PDF_EXT, PPTX_EXT, db_path as cfg_db_path,
     get_hotkey, get_theme, is_first_run, mark_welcomed,
     set_theme as cfg_set_theme, update_base_url,
 )
@@ -208,8 +208,6 @@ def _file_mime_for_path(path: str) -> QMimeData:
 _TYPE_BUCKETS: tuple[tuple[str, tuple[str, ...], str], ...] = (
     ("PPT", (PPTX_EXT, ".ppt"), "#D35230"),
     ("Word", (DOCX_EXT,), "#2B6CB0"),
-    ("Excel", (XLSX_EXT,), "#2E9E4F"),
-    ("txt", (TXT_EXT,), "#8A929C"),
     ("PDF", (PDF_EXT,), "#E04A3F"),
 )
 
@@ -813,8 +811,6 @@ class MainWindow(QMainWindow):
         for _label, _exts in (
             ("PPT", (".pptx", ".ppt")),
             ("Word", (".docx",)),
-            ("Excel", (".xlsx",)),
-            ("txt", (".txt",)),
             ("PDF", (".pdf",)),
             ("全部", None),
         ):

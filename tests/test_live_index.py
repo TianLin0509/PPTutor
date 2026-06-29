@@ -300,7 +300,7 @@ def test_index_progress_updates_type_rail(qtbot, tmp_path):
     assert not win.type_rail.isHidden()
     assert win._type_bars["PPT"]._cap.text() == "PPT 2/2 ✓"   # 2 个 pptx 都已建
     assert win._type_bars["Word"]._cap.text() == "Word 0/1"   # 1 个 docx 待补建
-    assert win._type_bars["Excel"]._cap.text() == "Excel —"   # 没有 Excel
+    assert win._type_bars["PDF"]._cap.text() == "PDF —"       # 没有 PDF（xlsx/txt 已砍，桶=PPT/Word/PDF）
     win._close_type_conn()
 
 

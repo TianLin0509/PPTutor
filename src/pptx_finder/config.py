@@ -83,7 +83,9 @@ XLSX_EXT = ".xlsx"
 TXT_EXT = ".txt"
 PDF_EXT = ".pdf"
 # 能解析「内容」的类型（pptx 优先，其余后台补建）。.ppt 旧二进制仅文件名登记、不在此列。
-CONTENT_EXTS = (PPTX_EXT, DOCX_EXT, XLSX_EXT, TXT_EXT, PDF_EXT)
+# PPT Doctor 只面向 PowerPoint / Word / PDF（2026-06-29 砍掉 xlsx/txt：少扫少解析、更快更稳）。
+# XLSX_EXT/TXT_EXT 常量保留（document_parser 仍有解析器、夹具/测试引用），但不进扫描/索引集合。
+CONTENT_EXTS = (PPTX_EXT, DOCX_EXT, PDF_EXT)
 # 扫描枚举的全部类型 = 可解析内容的 + 仅文件名的 .ppt
 SUPPORTED_EXTS = CONTENT_EXTS + (PPT_EXT,)
 # 「PPT 分析」口径：胶片报告 / 仪表盘 / 库健康只统计 PowerPoint（pptx+ppt），
@@ -91,7 +93,10 @@ SUPPORTED_EXTS = CONTENT_EXTS + (PPT_EXT,)
 PPT_EXTS = (PPTX_EXT, PPT_EXT)
 
 # 超过此大小跳过解析（仍可文件名命中）
-MAX_PARSE_SIZE = 200 * 1024 * 1024  # 200MB
+# 超过此大小的文件只登记文件名、不解析内容（防巨文件拖慢/卡死建库；仍可按文件名搜）。
+# 2026-06-29 从 200MB 收紧到 60MB——文本搜索没必要硬啃上百 MB 的富媒体大稿。
+MAX_PARSE_SIZE = 60 * 1024 * 1024   # 60MB（通用）
+MAX_PDF_PARSE_SIZE = 30 * 1024 * 1024  # 30MB（PDF 更严：pypdf 对大/坏 PDF 易慢易卡）
 
 # 全局唤起热键（默认值；用户可在设置里改，覆盖值存 ui.json 的 "hotkey" 键）
 GLOBAL_HOTKEY = "Alt+F"
