@@ -111,6 +111,28 @@ def test_scan_health_counts_all_ailments(tmp_path):
     assert 0 <= rep.score < 100
 
 
+def test_scan_health_exts_filters_to_ppt(tmp_path):
+    """仪表盘库健康摘要按 PPT：scan_health(exts=PPT_EXTS) 只体检 pptx/ppt + 重复也只在 PPT 内；默认仍全类型。"""
+    from pptx_finder.config import PPT_EXTS
+    conn = _conn(tmp_path)
+
+    def _f(name, ext, ch):
+        db.upsert_file(conn, path="/" + name, name=name, ext=ext, size=1000,
+                       mtime=_ts(2026, 6, 1), content_hash=ch, page_count=5,
+                       status="ok", error="", indexed_at=0)
+
+    _f("a.pptx", ".pptx", _H1)
+    _f("b.pptx", ".pptx", _H1)   # PPT 内重复一组
+    _f("c.docx", ".docx", _H2)
+    _f("d.docx", ".docx", _H2)   # docx 重复（非 PPT，应被排除）
+    conn.commit()
+
+    assert health.scan_health(conn).deck_count == 4              # 默认全类型
+    rep = health.scan_health(conn, exts=PPT_EXTS)
+    assert rep.deck_count == 2                                   # 只算 PPT
+    assert rep.duplicate_groups_count == 1                       # 重复检测只在 PPT 内
+
+
 # ---------- ② 回收编排（monkeypatch 底层，绝不真删） ----------
 
 def test_recycle_paths_sends_to_bin(tmp_path, monkeypatch):

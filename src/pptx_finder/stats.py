@@ -11,6 +11,8 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
 
+from .config import PPT_EXTS
+
 
 @dataclass
 class FileStat:
@@ -227,9 +229,11 @@ class Report:
 
 
 def fetch_file_stats(conn: sqlite3.Connection) -> list[FileStat]:
-    """从 SQLite 取每份 pptx 的统计字段：join 版本组 + 聚合页文本字数。"""
+    """从 SQLite 取每份 PPT(pptx/ppt) 的统计字段：join 版本组 + 聚合页文本字数。
+    刻意只统计 PPT——「胶片报告」是 PPT 习惯分析，不混入多文档搜索引入的 docx/xlsx/txt/pdf。"""
+    ph = ",".join("?" * len(PPT_EXTS))
     rows = conn.execute(
-        """
+        f"""
         SELECT f.name, f.mtime, f.size, f.page_count, f.status,
                m.group_id,
                COALESCE(c.chars, 0) AS char_count
@@ -239,7 +243,9 @@ def fetch_file_stats(conn: sqlite3.Connection) -> list[FileStat]:
             SELECT file_id, SUM(LENGTH(raw_text)) AS chars
             FROM pages_raw GROUP BY file_id
         ) c ON c.file_id = f.id
-        """
+        WHERE lower(f.ext) IN ({ph})
+        """,
+        tuple(e.lower() for e in PPT_EXTS),
     ).fetchall()
     return [
         FileStat(

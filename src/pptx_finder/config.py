@@ -86,6 +86,9 @@ PDF_EXT = ".pdf"
 CONTENT_EXTS = (PPTX_EXT, DOCX_EXT, XLSX_EXT, TXT_EXT, PDF_EXT)
 # 扫描枚举的全部类型 = 可解析内容的 + 仅文件名的 .ppt
 SUPPORTED_EXTS = CONTENT_EXTS + (PPT_EXT,)
+# 「PPT 分析」口径：胶片报告 / 仪表盘 / 库健康只统计 PowerPoint（pptx+ppt），
+# 不混入多文档搜索引入的 docx/xlsx/txt/pdf。底部状态栏索引进度仍按全类型。
+PPT_EXTS = (PPTX_EXT, PPT_EXT)
 
 # 超过此大小跳过解析（仍可文件名命中）
 MAX_PARSE_SIZE = 200 * 1024 * 1024  # 200MB

@@ -238,13 +238,21 @@ def delete_file(conn: sqlite3.Connection, path: str) -> None:
     conn.execute("DELETE FROM files WHERE id=?", (fid,))
 
 
-def stats(conn: sqlite3.Connection) -> dict:
-    fc = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
-    pc = conn.execute("SELECT COUNT(*) FROM pages_raw").fetchone()[0]
+def stats(conn: sqlite3.Connection, exts: tuple[str, ...] | None = None) -> dict:
+    """库统计。exts 给定则只统计这些扩展名（如 config.PPT_EXTS）——胶片报告/仪表盘按 PPT 用；
+    默认 None = 全类型（底部状态栏 / 搜索覆盖）。"""
+    ex = tuple(e.lower() for e in exts) if exts else ()
+    fw = (" WHERE lower(ext) IN (%s)" % ",".join("?" * len(ex))) if ex else ""
+    fc = conn.execute(f"SELECT COUNT(*) FROM files{fw}", ex).fetchone()[0]
+    pc_sql = (
+        "SELECT COUNT(*) FROM pages_raw" if not ex
+        else f"SELECT COUNT(*) FROM pages_raw WHERE file_id IN (SELECT id FROM files{fw})"
+    )
+    pc = conn.execute(pc_sql, ex).fetchone()[0]
     status_counts = {
         (r["status"] or ""): int(r["count"])
         for r in conn.execute(
-            "SELECT status, COUNT(*) AS count FROM files GROUP BY status"
+            f"SELECT status, COUNT(*) AS count FROM files{fw} GROUP BY status", ex
         ).fetchall()
     }
     return {
@@ -297,11 +305,14 @@ def maintain(conn: sqlite3.Connection) -> dict:
     return result
 
 
-def recent_files(conn: sqlite3.Connection, limit: int = 20) -> list:
-    """最近修改的文件（空查询默认视图）。返回无命中片段的 FileResult，按 mtime 降序。"""
+def recent_files(conn: sqlite3.Connection, limit: int = 20, exts: tuple[str, ...] | None = None) -> list:
+    """最近修改的文件（空查询默认视图 / 仪表盘最近活跃）。返回无命中片段的 FileResult，按 mtime 降序。
+    exts 给定则只取这些扩展名（仪表盘按 PPT 用）；默认 None = 全类型。"""
     from .models import FileResult
+    ex = tuple(e.lower() for e in exts) if exts else ()
+    fw = (" WHERE lower(ext) IN (%s)" % ",".join("?" * len(ex))) if ex else ""
     rows = conn.execute(
-        "SELECT * FROM files ORDER BY mtime DESC LIMIT ?", (limit,)
+        f"SELECT * FROM files{fw} ORDER BY mtime DESC LIMIT ?", (*ex, limit)
     ).fetchall()
     return [
         FileResult(

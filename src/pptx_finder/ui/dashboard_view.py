@@ -24,6 +24,7 @@ except Exception:  # noqa: BLE001
     def _qt_is_valid(_obj) -> bool:
         return True
 
+from ..config import PPT_EXTS
 from ..health import human_bytes
 from .bg_task import BackgroundTask
 
@@ -60,7 +61,7 @@ def _scan_health_summary(conn) -> dict | None:
         return None
     from .. import health as _health
     try:
-        r = _health.scan_health(conn)
+        r = _health.scan_health(conn, exts=PPT_EXTS)  # 仪表盘库健康只算 PPT
         return {
             "score": r.score,
             "deck_count": r.deck_count,
@@ -529,13 +530,15 @@ class DashboardView(QWidget):
         if conn is not None:
             from .. import db
             try:
-                s = db.stats(conn)
+                s = db.stats(conn, exts=PPT_EXTS)  # 仪表盘 KPI 只算 PPT
                 file_count, page_count = s["file_count"], s["page_count"]
             except Exception:  # noqa: BLE001
                 _log.warning("db.stats failed in dashboard", exc_info=True)
             try:
                 rows = conn.execute(
-                    "SELECT path, name, mtime FROM files ORDER BY mtime DESC LIMIT 400"
+                    "SELECT path, name, mtime FROM files WHERE lower(ext) IN (%s) "
+                    "ORDER BY mtime DESC LIMIT 400" % ",".join("?" * len(PPT_EXTS)),
+                    tuple(e.lower() for e in PPT_EXTS),
                 ).fetchall()
             except Exception:  # noqa: BLE001
                 _log.warning("db files query failed in dashboard", exc_info=True)
@@ -577,7 +580,7 @@ class DashboardView(QWidget):
         if conn is not None:
             from .. import db
             try:
-                for fr in db.recent_files(conn, limit=5):
+                for fr in db.recent_files(conn, limit=5, exts=PPT_EXTS):
                     recents.append((fr.name, _rel_time(fr.mtime),
                                     f"{fr.page_count}页" if fr.page_count else ""))
             except Exception:  # noqa: BLE001
@@ -591,9 +594,9 @@ class DashboardView(QWidget):
         return {
             "health": health_summary,
             "kpi_vals": [
-                (f"{file_count:,}", "已索引文档", "全文可搜"),
+                (f"{file_count:,}", "PPT 文档", "全文可搜"),
                 (f"{guarded:,}" if guarded else "—", "版本快照", "PPT 版 git"),
-                (f"{page_count:,}", "已索引页", "命中即定位"),
+                (f"{page_count:,}", "PPT 页", "命中即定位"),
                 (f"{recent_week:,}", "本周改动", "近 7 日活跃"),
             ],
             "folders": top_folders,
@@ -621,13 +624,15 @@ class DashboardView(QWidget):
         if conn is not None:
             from .. import db
             try:
-                s = db.stats(conn)
+                s = db.stats(conn, exts=PPT_EXTS)  # 仪表盘 KPI 只算 PPT
                 file_count, page_count = s["file_count"], s["page_count"]
             except Exception:  # noqa: BLE001
                 _log.warning("db.stats failed in dashboard", exc_info=True)
             try:
                 rows = conn.execute(
-                    "SELECT path, name, mtime FROM files ORDER BY mtime DESC LIMIT 400"
+                    "SELECT path, name, mtime FROM files WHERE lower(ext) IN (%s) "
+                    "ORDER BY mtime DESC LIMIT 400" % ",".join("?" * len(PPT_EXTS)),
+                    tuple(e.lower() for e in PPT_EXTS),
                 ).fetchall()
             except Exception:  # noqa: BLE001
                 _log.warning("db files query failed in dashboard", exc_info=True)
@@ -667,9 +672,9 @@ class DashboardView(QWidget):
 
         # KPI 数值
         self._kpi_vals = [
-            (f"{file_count:,}", "已索引文档", "全文可搜"),
+            (f"{file_count:,}", "PPT 文档", "全文可搜"),
             (f"{guarded:,}" if guarded else "—", "版本快照", "PPT 版 git"),
-            (f"{page_count:,}", "已索引页", "命中即定位"),
+            (f"{page_count:,}", "PPT 页", "命中即定位"),
             (f"{recent_week:,}", "本周改动", "近 7 日活跃"),
         ]
         self._folders = top_folders
@@ -685,7 +690,7 @@ class DashboardView(QWidget):
         if conn is not None:
             from .. import db
             try:
-                for fr in db.recent_files(conn, limit=5):
+                for fr in db.recent_files(conn, limit=5, exts=PPT_EXTS):
                     recents.append((fr.name, _rel_time(fr.mtime),
                                     f"{fr.page_count}页" if fr.page_count else ""))
             except Exception:  # noqa: BLE001

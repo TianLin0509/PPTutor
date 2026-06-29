@@ -221,6 +221,49 @@ def test_fetch_file_stats_null_group_and_no_pages(tmp_path):
     assert f.char_count == 0
 
 
+def _put_ext(conn, name, ext, status="ok"):
+    return db.upsert_file(conn, path="/" + name, name=name, ext=ext, size=100,
+                          mtime=_ts(2026, 6, 1, 10), content_hash="h" + name,
+                          page_count=3, status=status, error="", indexed_at=0)
+
+
+def test_fetch_file_stats_excludes_non_ppt(tmp_path):
+    """胶片报告只统计 PPT(pptx/ppt)，不混入多文档搜索引入的 docx/xlsx/txt/pdf。"""
+    conn = db.connect(tmp_path / "i.db")
+    db.init_db(conn)
+    _put_ext(conn, "a.pptx", ".pptx")
+    _put_ext(conn, "b.ppt", ".ppt", status="filename_only")
+    _put_ext(conn, "c.docx", ".docx")
+    _put_ext(conn, "d.xlsx", ".xlsx")
+    _put_ext(conn, "e.txt", ".txt")
+    _put_ext(conn, "f.pdf", ".pdf")
+    conn.commit()
+
+    names = sorted(f.name for f in stats.fetch_file_stats(conn))
+    assert names == ["a.pptx", "b.ppt"]                         # 只含 PPT
+    assert stats.build_report(conn, year=None).deck_count == 2  # 报告口径同样只算 PPT
+
+
+def test_db_stats_and_recent_exts_filter(tmp_path):
+    """仪表盘数据源：db.stats / recent_files 传 PPT_EXTS 只算 PPT，默认仍全类型。"""
+    from pptx_finder.config import PPT_EXTS
+    conn = db.connect(tmp_path / "i.db")
+    db.init_db(conn)
+    pid = _put_ext(conn, "a.pptx", ".pptx")
+    db.replace_pages(conn, pid, [(1, "页", "t")])
+    _put_ext(conn, "c.docx", ".docx")
+    _put_ext(conn, "d.xlsx", ".xlsx")
+    conn.commit()
+
+    assert db.stats(conn)["file_count"] == 3                    # 默认全类型
+    assert db.stats(conn, exts=PPT_EXTS)["file_count"] == 1     # 只 PPT
+    assert db.stats(conn, exts=PPT_EXTS)["page_count"] == 1     # 页数也只算 PPT 的页
+    all_recent = [r.name for r in db.recent_files(conn)]
+    ppt_recent = [r.name for r in db.recent_files(conn, exts=PPT_EXTS)]
+    assert set(all_recent) == {"a.pptx", "c.docx", "d.xlsx"}
+    assert ppt_recent == ["a.pptx"]
+
+
 def _put(conn, name, mtime, **kw):
     return db.upsert_file(conn, path="/" + name, name=name, ext=".pptx",
                           size=kw.get("size", 1000), mtime=mtime, content_hash="h",

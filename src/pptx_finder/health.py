@@ -68,11 +68,14 @@ def _pick_keep(items: list[sqlite3.Row]):
     return max(items, key=key)
 
 
-def find_duplicate_groups(conn: sqlite3.Connection) -> list[DuplicateGroup]:
-    """全库按 content_hash 找完全相同的多份副本，按可回收空间降序。"""
+def find_duplicate_groups(conn: sqlite3.Connection, exts: tuple[str, ...] | None = None) -> list[DuplicateGroup]:
+    """按 content_hash 找完全相同的多份副本，按可回收空间降序。
+    exts 给定则只在这些扩展名内找（仪表盘库健康按 PPT）；默认 None = 全类型（库体检中心）。"""
+    ex = tuple(e.lower() for e in exts) if exts else ()
+    ef = (" AND lower(ext) IN (%s)" % ",".join("?" * len(ex))) if ex else ""
     rows = conn.execute(
         "SELECT path, name, size, mtime, content_hash FROM files "
-        "WHERE content_hash LIKE 'sha256:%'"
+        "WHERE content_hash LIKE 'sha256:%'" + ef, ex
     ).fetchall()
     by_hash: dict[str, dict[str, sqlite3.Row]] = defaultdict(dict)
     for r in rows:
@@ -132,15 +135,19 @@ def _health_score(deck_count: int, redundant: int, zombie_n: int,
     return max(0, round(100 - penalty))
 
 
-def scan_health(conn: sqlite3.Connection, *, now: float | None = None) -> HealthReport:
-    """一次扫库出体检报告。now 可注入（确定性单测）。"""
+def scan_health(conn: sqlite3.Connection, *, now: float | None = None,
+                exts: tuple[str, ...] | None = None) -> HealthReport:
+    """一次扫库出体检报告。now 可注入（确定性单测）。
+    exts 给定则只体检这些扩展名（仪表盘库健康摘要按 PPT）；默认 None = 全类型（库体检中心）。"""
     now = time.time() if now is None else now
+    ex = tuple(e.lower() for e in exts) if exts else ()
+    ef = (" WHERE lower(ext) IN (%s)" % ",".join("?" * len(ex))) if ex else ""
     rows = conn.execute(
-        "SELECT name, path, size, mtime, page_count, status, content_hash FROM files"
+        "SELECT name, path, size, mtime, page_count, status, content_hash FROM files" + ef, ex
     ).fetchall()
     deck_count = len(rows)
 
-    dup_groups = find_duplicate_groups(conn)
+    dup_groups = find_duplicate_groups(conn, exts=exts)
     dup_reclaim = sum(g.reclaimable for g in dup_groups)
     dup_redundant = sum(g.redundant for g in dup_groups)
 
