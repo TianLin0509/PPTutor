@@ -173,7 +173,13 @@ def _first_verified_page(conn, fid: int, clause: str, nw: str) -> int | None:
     return None
 
 
-def _recall(conn, words: list[str]) -> dict[int, list[tuple[int, float]]]:
+def _recall(
+    conn,
+    words: list[str],
+    *,
+    scope: str | None = None,
+    exts: tuple[str, ...] | None = None,
+) -> dict[int, list[tuple[int, float]]]:
     """字级 FTS5 召回 + 原文验证 → {file_id: [(page, rank)]}。
 
     同页（所有词都在一页）优先：用 FTS5 一次性 AND，**只返回全含的页**——天然被最稀有
@@ -190,10 +196,24 @@ def _recall(conn, words: list[str]) -> dict[int, list[tuple[int, float]]]:
 
     # 同页：一次 FTS5 AND，只命中所有词都在的页（选择性查询结果集很小，LIMIT 仅兜底）
     m_and = " AND ".join(clauses)
+    # 类型/目录筛选必须在 LIMIT 前进入 SQL。旧实现先从全库截 3000 条、再在 Python
+    # 里筛选，某一类型或目录被更高相关候选挤到第 3001 名后会稳定漏召回。
+    predicates = ["pages_fts MATCH ?"]
+    params: list[object] = [m_and]
+    if scope:
+        predicates.append("instr(lower(f.path), lower(?)) = 1")
+        params.append(scope)
+    ext_values = tuple(e.lower() for e in (exts or ()) if e)
+    if ext_values:
+        predicates.append(f"lower(f.ext) IN ({','.join('?' * len(ext_values))})")
+        params.extend(ext_values)
+    sql = (
+        "SELECT pages_fts.file_id, pages_fts.page_no, bm25(pages_fts) AS rank "
+        "FROM pages_fts JOIN files AS f ON f.id=pages_fts.file_id "
+        f"WHERE {' AND '.join(predicates)} ORDER BY rank LIMIT 3000"
+    )
     try:
-        for r in conn.execute(
-            "SELECT file_id, page_no, bm25(pages_fts) AS rank FROM pages_fts "
-            "WHERE pages_fts MATCH ? ORDER BY rank LIMIT 3000", (m_and,)):
+        for r in conn.execute(sql, tuple(params)):
             fid, pg = r["file_id"], r["page_no"]
             if all(_raw_contains(conn, fid, pg, nw) for nw in nws):
                 content.setdefault(fid, []).append((pg, r["rank"]))
@@ -220,7 +240,7 @@ def search(conn: sqlite3.Connection, query: str, scope: str | None = None,
             break
 
     # 字级召回 + 原文验证（精度） + 多词（同页优先，无则放宽同文件）
-    content = _recall(conn, terms + phrases)
+    content = _recall(conn, terms + phrases, scope=scope, exts=exts)
 
     # 文件名命中：索引期维护 name_norm + file_names_fts。查询先走 FTS 收窄候选，再用
     # name_norm 字面子串做最终验证，避免每次搜索都把 files 全表拉到 Python 逐行 normalize。

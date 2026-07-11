@@ -124,7 +124,7 @@ def _diff_summary(version, previous, text_diff: dict, package_diff: dict) -> lis
 
 
 class VersionManager:
-    def __init__(self, conn=None, on_snapshot=None):
+    def __init__(self, conn=None, on_snapshot=None, on_content_saved=None):
         self._db_path = vault.db_path() if conn is None else None
         self._conn = conn or store.connect(self._db_path)
         store.init_db(self._conn)
@@ -136,6 +136,7 @@ class VersionManager:
         self._lock = threading.RLock()
         self._watcher = None
         self._on_snapshot = on_snapshot
+        self._on_content_saved = on_content_saved
         self._reconcile_stop = threading.Event()
         self._reconcile_thread: threading.Thread | None = None
         self._reconcile_interval_sec = max(
@@ -160,6 +161,14 @@ class VersionManager:
         self._reconcile_last_new_checked = 0
         self._reconcile_last_ms = 0.0
         self._reconcile_last_error = ""
+        self._vault_maintenance_thread: threading.Thread | None = None
+        self._vault_maintenance_enabled = (
+            self._db_path is not None
+            and os.environ.get("PPTUTOR_VAULT_MAINTENANCE", "1").strip().lower()
+            not in _FALSE_ENV
+        )
+        self._vault_maintenance_result: dict = {}
+        self._vault_maintenance_error = ""
 
     # ---------- Snapshot identity ----------
     def snapshot_now(self, path: str, notify: bool = True) -> str | None:
@@ -424,6 +433,18 @@ class VersionManager:
     def list_docs(self):
         return store.list_docs(self._read_conn)
 
+    def summary_stats(self) -> dict[str, int]:
+        """Thread-safe KPI snapshot for dashboards and status surfaces."""
+        if self._db_path is None:
+            with self._lock:
+                return store.summary_stats(self._conn)
+        conn = store.connect(self._db_path)
+        try:
+            conn.isolation_level = None
+            return store.summary_stats(conn)
+        finally:
+            conn.close()
+
     def list_docs_details(self) -> list[dict]:
         if self._db_path is None:
             with self._lock:
@@ -672,12 +693,26 @@ class VersionManager:
         vers = store.list_versions(self._conn, doc_id)
         if len(vers) <= KEEP_PER_DOC:
             return
+        branch_bases = {
+            str(row["branched_from_version_id"])
+            for row in self._conn.execute(
+                "SELECT branched_from_version_id FROM doc_branches"
+            ).fetchall()
+            if row["branched_from_version_id"]
+        }
         for v in vers[KEEP_PER_DOC:]:
+            # A copied document may inherit history through this exact parent
+            # version. It is a live recovery root, not quota garbage.
+            if str(v["version_id"]) in branch_bases:
+                continue
+            thumb_path = str(v["thumb_path"] or "")
             store.delete_version(self._conn, v["version_id"])
-            try:
-                vault.version_file(doc_id, v["version_id"]).unlink(missing_ok=True)
-            except OSError:
-                pass
+            vault.delete_version_artifacts(doc_id, v["version_id"])
+            if thumb_path:
+                try:
+                    Path(thumb_path).unlink(missing_ok=True)
+                except OSError:
+                    pass
         self._conn.commit()
 
     # ---------- Watcher lifecycle ----------
@@ -685,11 +720,45 @@ class VersionManager:
         self.scan_deleted()
         self._start_watcher()
         self._start_reconcile_loop()
+        self._start_vault_maintenance()
+
+    def _start_vault_maintenance(self) -> None:
+        if not self._vault_maintenance_enabled:
+            return
+        thread = self._vault_maintenance_thread
+        if thread is not None and thread.is_alive():
+            return
+        self._vault_maintenance_thread = threading.Thread(
+            target=self.run_vault_maintenance,
+            name="PPTDoctorVaultMaintenance",
+            daemon=True,
+        )
+        self._vault_maintenance_thread.start()
+
+    def run_vault_maintenance(self) -> dict:
+        """Migrate cross-document duplicates, then safely collect unreachable data."""
+        try:
+            migration = vault.migrate_legacy_objects()
+            with self._lock:
+                garbage = vault.collect_garbage(self._conn, dry_run=False)
+            result = {"migration": migration, "garbage": garbage}
+            self._vault_maintenance_result = result
+            self._vault_maintenance_error = ""
+            return result
+        except Exception as exc:  # noqa: BLE001
+            self._vault_maintenance_error = f"{type(exc).__name__}: {exc}"
+            logging.getLogger(__name__).warning("vault maintenance failed", exc_info=True)
+            return {"migration": {}, "garbage": {"aborted": True}}
 
     def _start_watcher(self) -> None:
         self._stop_watcher()
         from .watcher import VaultWatcher, default_watch_paths
-        self._watcher = VaultWatcher(default_watch_paths(), self.snapshot_now, self.move_path)
+        self._watcher = VaultWatcher(
+            default_watch_paths(),
+            self.snapshot_now,
+            self.move_path,
+            self._on_content_saved,
+        )
         self._watcher.start()
 
     def _start_reconcile_loop(self) -> None:
@@ -705,6 +774,9 @@ class VersionManager:
         self._reconcile_thread.start()
 
     def _reconcile_loop(self) -> None:
+        # 启动即补一次离线期间漏拍；旧实现先睡 5 分钟，首屏看似受保护但
+        # 刚开机的保存记录仍处于盲区。
+        self.reconcile_known_docs()
         while not self._reconcile_stop.wait(self._reconcile_interval_sec):
             self.reconcile_known_docs()
 
@@ -726,6 +798,12 @@ class VersionManager:
 
     def diagnostic_lines(self) -> list[str]:
         alive = self._reconcile_thread is not None and self._reconcile_thread.is_alive()
+        maintenance_alive = (
+            self._vault_maintenance_thread is not None
+            and self._vault_maintenance_thread.is_alive()
+        )
+        migration = self._vault_maintenance_result.get("migration") or {}
+        garbage = self._vault_maintenance_result.get("garbage") or {}
         return [
             "version_reconcile: "
             f"enabled={self._reconcile_interval_sec > 0} "
@@ -737,5 +815,13 @@ class VersionManager:
             f"last_checked={self._reconcile_last_checked} "
             f"last_new_checked={self._reconcile_last_new_checked} "
             f"last_ms={self._reconcile_last_ms:.0f} "
-            f"error={self._reconcile_last_error or '-'}"
+            f"error={self._reconcile_last_error or '-'}",
+            "vault_maintenance: "
+            f"enabled={self._vault_maintenance_enabled} alive={maintenance_alive} "
+            f"migrated={int(migration.get('migrated', 0) or 0)} "
+            f"duplicates={int(migration.get('duplicates', 0) or 0)} "
+            f"migration_errors={int(migration.get('errors', 0) or 0)} "
+            f"gc_aborted={bool(garbage.get('aborted', False))} "
+            f"gc_objects={int(garbage.get('objects_removed', 0) or 0)} "
+            f"error={self._vault_maintenance_error or '-'}",
         ]

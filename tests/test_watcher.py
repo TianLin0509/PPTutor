@@ -40,3 +40,61 @@ def test_handler_still_skips_appdata_when_watching_drive_root():
     h = _Handler(lambda p: None, roots=["C:\\"])
     h._trigger("C:\\Users\\me\\AppData\\Local\\Temp\\deck.pptx")
     assert not h._timers, "默认全盘监听仍应跳过 AppData 降噪"
+
+
+def test_handler_routes_word_pdf_to_content_index_without_version_snapshot(monkeypatch):
+    snapshots = []
+    content_changes = []
+    monkeypatch.setattr("pptx_finder.versioning.watcher.os.path.exists", lambda _p: True)
+    h = _Handler(
+        snapshots.append,
+        on_content_saved=content_changes.append,
+    )
+
+    h._fire("C:\\docs\\report.docx")
+    h._fire("C:\\docs\\paper.pdf")
+    h._fire("C:\\docs\\deck.pptx")
+
+    assert snapshots == ["C:\\docs\\deck.pptx"]
+    assert content_changes == ["C:\\docs\\report.docx", "C:\\docs\\paper.pdf"]
+
+
+def test_handler_debounces_word_and_pdf_content_changes():
+    h = _Handler(lambda _p: None, on_content_saved=lambda _p: None)
+    h._trigger("C:\\docs\\report.docx")
+    h._trigger("C:\\docs\\paper.pdf")
+    assert len(h._timers) == 2
+    for timer in h._timers.values():
+        timer.cancel()
+
+
+def test_handler_retries_transient_missing_pptx_with_a_hard_limit(monkeypatch):
+    """PowerPoint 原子保存的短暂缺口不能直接吞掉，同时重试必须有上限。"""
+    callbacks = []
+    scheduled = []
+
+    class FakeTimer:
+        def __init__(self, delay, callback, args=()):
+            self.delay = delay
+            self.callback = callback
+            self.args = args
+            scheduled.append(self)
+
+        def start(self):
+            return None
+
+        def cancel(self):
+            return None
+
+    monkeypatch.setattr("pptx_finder.versioning.watcher.threading.Timer", FakeTimer)
+    monkeypatch.setattr("pptx_finder.versioning.watcher.os.path.exists", lambda _p: False)
+    h = _Handler(callbacks.append)
+
+    h._fire("C:\\docs\\atomic-save.pptx")
+    while scheduled:
+        timer = scheduled.pop(0)
+        timer.callback(*timer.args)
+
+    assert callbacks == []
+    assert len(h._retry_delays) == 3
+    assert not h._timers

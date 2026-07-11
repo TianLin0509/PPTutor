@@ -137,6 +137,27 @@ def test_db_maintain_optimizes_fts_without_error(tmp_path):
     assert result["checkpointed"] is True
 
 
+def test_db_maintain_vacuums_when_free_space_crosses_threshold(tmp_path):
+    conn = db.connect(tmp_path / "bloated.db")
+    db.init_db(conn)
+    conn.execute("CREATE TABLE payload(value BLOB)")
+    blob = b"x" * 8192
+    conn.executemany("INSERT INTO payload(value) VALUES(?)", [(blob,)] * 256)
+    conn.commit()
+    conn.execute("DELETE FROM payload")
+    conn.commit()
+    before = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
+    assert before > 0
+
+    result = db.maintain(conn, min_free_bytes=0, min_free_ratio=0.0)
+
+    after = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
+    assert result["error"] == ""
+    assert result["vacuumed"] is True
+    assert result["free_pages_before"] == before
+    assert after < before
+
+
 def test_two_stage_filename_searchable_before_content(tmp_path):
     """两阶段渐进：文件名先可搜，内容解析后才可搜。"""
     from pptx_finder import search as sm

@@ -47,6 +47,11 @@ COMMIT_EVERY = 50
 SCAN_COMMIT_EVERY = 200  # 扫描期每登记这么多就提交一次，让文件名尽快可搜
 PARSE_TIMEOUT_S = 60.0   # 单文件解析超时：超过判定卡住 → 跳过不阻塞整批（子进程隔离的关键保护）
 DEFERRED_CONTENT_EXTS = (DOCX_EXT, PDF_EXT)  # 砍掉 xlsx/txt；PPT 优先建完后补建这些
+MAX_UNCHANGED_PARSE_FAILURES = 3
+ERROR_RETRY_DELAYS_S = (24 * 60 * 60, 7 * 24 * 60 * 60)
+
+# Windows 云盘占位文件：文件名/元数据可见，但内容需召回后才能读。
+_CLOUD_PLACEHOLDER_ATTRS = 0x1000 | 0x40000 | 0x400000  # OFFLINE | RECALL_ON_OPEN | RECALL_ON_DATA_ACCESS
 
 
 def _stat_hash(size: int, mtime: float) -> str:
@@ -60,6 +65,15 @@ def _file_sha256(path: str) -> str:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return "sha256:" + h.hexdigest()
+
+
+def _is_cloud_placeholder(path: str | Path, st: os.stat_result | None = None) -> bool:
+    """Return whether a Windows file is an unhydrated cloud placeholder."""
+    try:
+        st = st or os.stat(ext_path(str(path)))
+    except OSError:
+        return False
+    return bool(int(getattr(st, "st_file_attributes", 0) or 0) & _CLOUD_PLACEHOLDER_ATTRS)
 
 
 def _index_one(path: str) -> dict[str, Any]:
@@ -105,19 +119,26 @@ def _index_one(path: str) -> dict[str, Any]:
 def _register_pending(conn: sqlite3.Connection, path: Path, st: os.stat_result) -> None:
     """阶段 1：仅登记文件名（status=pending，不解析内容），文件名立即可搜。
 
-    增量重解析时覆盖旧记录并清空旧页（旧内容先消失，解析完再补新内容）。
+    增量重解析采用 stale-while-revalidate：旧页继续可搜，解析成功后再原子替换。
     """
-    fid = db.upsert_file(
-        conn,
-        path=str(path), name=path.name, ext=path.suffix.lower(), size=st.st_size,
-        mtime=st.st_mtime, content_hash=_stat_hash(st.st_size, st.st_mtime),
-        page_count=0, status="pending", error="", indexed_at=time.time(),
+    _mark_skipped(
+        conn, path, "pending", "", size=st.st_size, mtime=st.st_mtime,
     )
-    db.replace_pages(conn, fid, [])
 
 
 def _write_result(conn: sqlite3.Connection, res: dict[str, Any]) -> None:
-    """阶段 2：写入解析结果（覆盖阶段 1 的 pending 占位 / 旧内容）。"""
+    """阶段 2：成功才替换旧内容；失败保留最后一次可搜索结果。"""
+    if res["status"] != "ok":
+        _mark_skipped(
+            conn,
+            Path(res["path"]),
+            str(res["status"]),
+            str(res.get("error") or ""),
+            size=int(res.get("size") or 0),
+            mtime=float(res.get("mtime") or 0.0),
+            retryable=res["status"] == "error",
+        )
+        return
     fid = db.upsert_file(
         conn,
         path=res["path"], name=res["name"], ext=res["ext"], size=res["size"],
@@ -140,20 +161,71 @@ def _write_filename_only(conn: sqlite3.Connection, path: Path) -> None:
     db.replace_pages(conn, fid, [])
 
 
-def _mark_skipped(conn: sqlite3.Connection, path: Path, status: str, error: str) -> None:
-    """把卡住/超时的文件标记为已跳过（用真实 size/mtime，下次扫描视为未变→不再反复重试）。"""
-    try:
-        st = path.stat()
-        size, mtime = st.st_size, st.st_mtime
-    except OSError:
-        size, mtime = 0, 0.0
-    fid = db.upsert_file(
+def _mark_skipped(
+    conn: sqlite3.Connection,
+    path: Path,
+    status: str,
+    error: str,
+    *,
+    size: int | None = None,
+    mtime: float | None = None,
+    retryable: bool = False,
+) -> None:
+    """Persist a non-success state without destroying last-known-good pages.
+
+    Parser errors get a bounded retry schedule. After three failures with the
+    same file stat, only a real size/mtime change can reopen the circuit.
+    """
+    if size is None or mtime is None:
+        try:
+            st = path.stat()
+            size, mtime = st.st_size, st.st_mtime
+        except OSError:
+            size, mtime = 0, 0.0
+    now = time.time()
+    previous = db.get_file_by_path(conn, str(path))
+    previous_failures = int(previous["parse_failures"] or 0) if previous else 0
+    previous_retry_after = float(previous["retry_after"] or 0) if previous else 0.0
+    if retryable:
+        failures = previous_failures + 1
+        if failures <= len(ERROR_RETRY_DELAYS_S):
+            retry_after = now + ERROR_RETRY_DELAYS_S[failures - 1]
+        else:
+            retry_after = 0.0
+    elif status == "pending":
+        failures = previous_failures
+        retry_after = previous_retry_after
+    else:
+        failures = 0
+        retry_after = 0.0
+    content_hash = (
+        str(previous["content_hash"] or "")
+        if previous
+        else _stat_hash(int(size), float(mtime))
+    )
+    page_count = int(previous["page_count"] or 0) if previous else 0
+    db.upsert_file(
         conn,
         path=str(path), name=path.name, ext=path.suffix.lower(), size=size,
-        mtime=mtime, content_hash=f"size:{size}", page_count=0,
-        status=status, error=error, indexed_at=time.time(),
+        mtime=mtime, content_hash=content_hash, page_count=page_count,
+        status=status, error=error, indexed_at=now,
+        parse_failures=failures, retry_after=retry_after,
     )
-    db.replace_pages(conn, fid, [])
+
+
+def _mark_index_failure(conn: sqlite3.Connection, path: Path, exc: Exception) -> str:
+    """Resolve a worker failure to a stable non-pending state."""
+    if not path.exists():
+        db.delete_file(conn, str(path))
+        return "missing"
+    status = "cloud_placeholder" if _is_cloud_placeholder(path) else "error"
+    message = (
+        "云文件尚未下载，内容可用后将自动重试"
+        if status == "cloud_placeholder"
+        else f"{type(exc).__name__}: {exc}"
+    )
+    _mark_skipped(conn, path, status, message, retryable=status == "error")
+    return status
 
 
 def _ping() -> bool:
@@ -209,7 +281,13 @@ def update_index(
 
     existing = db.all_indexed(conn)
     seen: set[str] = set()
-    summary = {"indexed": 0, "errors": 0, "skipped_ppt": 0, "deleted": 0}
+    summary = {
+        "indexed": 0,
+        "errors": 0,
+        "skipped_ppt": 0,
+        "skipped_cloud": 0,
+        "deleted": 0,
+    }
     source = scan_iter if scan_iter is not None else iter_ppt_files(roots)
 
     inline = workers == 1
@@ -254,6 +332,7 @@ def update_index(
             summary["indexed"] += 1
         except Exception as e:  # noqa: BLE001 单文件失败不中断批量
             log.warning("index failed %s: %s", p, e)
+            _mark_index_failure(conn, p, e)
             summary["errors"] += 1
         _emit(p)
 
@@ -313,13 +392,39 @@ def update_index(
                 st = p.stat()
             except OSError:
                 continue
-            # (size, mtime) 快筛；status=pending 视为「上次没解析完」需重做
-            unchanged = (
+            if _is_cloud_placeholder(p, st):
+                unchanged_placeholder = (
+                    row is not None
+                    and int(st.st_size) == int(row["size"])
+                    and abs(st.st_mtime - row["mtime"]) <= 1e-6
+                    and row["status"] == "cloud_placeholder"
+                )
+                if not unchanged_placeholder:
+                    _mark_skipped(
+                        conn,
+                        p,
+                        "cloud_placeholder",
+                        "云文件尚未下载，内容可用后将自动重试",
+                    )
+                summary["skipped_cloud"] += 1
+                continue
+            # (size, mtime) 快筛。永久解析错误用熔断式退避：同一份字节最多
+            # 自动尝试三次；文件 stat 真变化时始终立即重试。
+            same_stat = (
                 row is not None
                 and int(st.st_size) == int(row["size"])
                 and abs(st.st_mtime - row["mtime"]) <= 1e-6
-                and row["status"] != "pending"
             )
+            unchanged = same_stat
+            if same_stat and row["status"] in ("pending", "cloud_placeholder"):
+                unchanged = False
+            elif same_stat and row["status"] == "error":
+                failures = int(row["parse_failures"] or 0)
+                retry_after = float(row["retry_after"] or 0)
+                unchanged = not (
+                    failures < MAX_UNCHANGED_PARSE_FAILURES
+                    and time.time() >= retry_after
+                )
             if unchanged:
                 continue
             ext = p.suffix.lower()
@@ -350,6 +455,7 @@ def update_index(
                     summary["indexed"] += 1
                 except Exception as e:  # noqa: BLE001
                     log.warning("index failed %s: %s", p, e)
+                    _mark_index_failure(conn, p, e)
                     summary["errors"] += 1
                 done += 1
                 if progress_cb:
@@ -397,6 +503,7 @@ def update_index(
                     summary["indexed"] += 1
                 except Exception as e:  # noqa: BLE001
                     log.warning("index failed %s: %s", p, e)
+                    _mark_index_failure(conn, p, e)
                     summary["errors"] += 1
                 done += 1
                 if progress_cb:
@@ -419,6 +526,9 @@ def update_index(
 
     if progress_cb:
         progress_cb(total, total, "完成")  # 进度走满
+    if scan_iter is None and not stopped():
+        db.set_meta(conn, db.META_LAST_COMPLETED_SCAN_AT, str(time.time()))
+        conn.commit()
     summary["scanned"] = len(seen)
     return summary
 
@@ -426,13 +536,27 @@ def update_index(
 def index_single(conn: sqlite3.Connection, path: str) -> bool:
     """实时增量：索引单个文件（watcher 捕获到新建/改存时调用）。
 
-    只 upsert 这一个文件、绝不删除其他记录（区别于 update_index 的全量删除逻辑）。
-    供「谁变管谁」的实时索引用——新建/改完一个 PPT 立刻可搜，无需重扫全盘。
+    只变更这一个路径：存在则 upsert，已消失则删掉该路径的陈旧索引；绝不影响
+    其他记录。供实时 watcher 使用——新建、改存、移动、删除都无需全盘重扫。
     """
     p = Path(path)
     try:
         if not p.exists():
-            return False
+            if db.get_file_by_path(conn, str(p)) is None:
+                return False
+            db.delete_file(conn, str(p))
+            conn.commit()
+            return True
+        st = p.stat()
+        if _is_cloud_placeholder(p, st):
+            _mark_skipped(
+                conn,
+                p,
+                "cloud_placeholder",
+                "云文件尚未下载，内容可用后将自动重试",
+            )
+            conn.commit()
+            return True
         ext = p.suffix.lower()
         if ext == PPT_EXT:
             _write_filename_only(conn, p)
@@ -444,4 +568,9 @@ def index_single(conn: sqlite3.Connection, path: str) -> bool:
         return True
     except Exception as e:  # noqa: BLE001
         log.warning("index_single failed %s: %s", path, e)
+        try:
+            _mark_index_failure(conn, p, e)
+            conn.commit()
+        except Exception:  # noqa: BLE001
+            log.debug("failed to persist live index error %s", path, exc_info=True)
         return False

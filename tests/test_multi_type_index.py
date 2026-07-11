@@ -1,6 +1,7 @@
 """多类型内容索引：update_index / index_single 认 pptx+docx+pdf（2026-06-29 砍掉 xlsx/txt）。"""
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import fixtures_gen as fx
@@ -49,6 +50,18 @@ def test_index_single_handles_docx(tmp_path):
     assert row["ext"] == ".docx"
     assert row["status"] == "ok"
     assert row["page_count"] >= 1
+
+
+def test_index_single_removes_stale_row_when_watched_file_disappears(tmp_path):
+    conn = db.connect(tmp_path / "i.db")
+    db.init_db(conn)
+    docx = tmp_path / "moved.docx"
+    fx.make_docx(docx, ["旧路径不应残留"])
+    assert indexer.index_single(conn, str(docx)) is True
+    docx.unlink()
+
+    assert indexer.index_single(conn, str(docx)) is True
+    assert db.get_file_by_path(conn, str(docx)) is None
 
 
 def test_index_single_rejects_dropped_types(tmp_path):
@@ -166,6 +179,98 @@ def test_update_index_progress_uses_final_total_for_deferred_docs(tmp_path, monk
         (2, 3, ".docx"),
         (3, 3, ".pdf"),
     ]
+
+
+def test_cloud_placeholder_is_recorded_without_parse_or_pending_loop(tmp_path, monkeypatch):
+    p = tmp_path / "cloud.docx"
+    p.write_bytes(b"cloud placeholder")
+    monkeypatch.setattr(indexer, "_is_cloud_placeholder", lambda _path, _st=None: True)
+    monkeypatch.setattr(
+        indexer,
+        "_index_one",
+        lambda _path: (_ for _ in ()).throw(AssertionError("placeholder must not be opened")),
+    )
+    conn = db.connect(tmp_path / "i.db")
+    db.init_db(conn)
+
+    summary = indexer.update_index(conn, [], scan_iter=iter([p]), workers=1)
+
+    row = db.get_file_by_path(conn, str(p))
+    assert row["status"] == "cloud_placeholder"
+    assert db.stats(conn)["pending_count"] == 0
+    assert summary["skipped_cloud"] == 1
+
+
+def test_hydrated_cloud_placeholder_retries_even_when_stat_is_unchanged(tmp_path, monkeypatch):
+    p = tmp_path / "cloud.docx"
+    p.write_bytes(b"same stat after hydration")
+    conn = db.connect(tmp_path / "i.db")
+    db.init_db(conn)
+    placeholder = {"value": True}
+    calls = []
+    monkeypatch.setattr(
+        indexer,
+        "_is_cloud_placeholder",
+        lambda _path, _st=None: placeholder["value"],
+    )
+
+    indexer.update_index(conn, [], scan_iter=iter([p]), workers=1)
+    placeholder["value"] = False
+
+    def fake_index(path: str):
+        calls.append(path)
+        st = p.stat()
+        return {
+            "path": str(p), "name": p.name, "ext": ".docx",
+            "size": st.st_size, "mtime": st.st_mtime, "content_hash": "hydrated",
+            "status": "ok", "error": "", "page_count": 1,
+            "pages": [(1, "hydrated", "hydrated")],
+        }
+
+    monkeypatch.setattr(indexer, "_index_one", fake_index)
+    indexer.update_index(conn, [], scan_iter=iter([p]), workers=1)
+
+    assert calls == [str(p)]
+    assert db.get_file_by_path(conn, str(p))["status"] == "ok"
+
+
+def test_worker_parse_failure_does_not_leave_pending_forever(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
+    p = tmp_path / "broken.pptx"
+    p.write_bytes(b"broken")
+    monkeypatch.setattr(indexer, "_make_executor", lambda _n: ThreadPoolExecutor(max_workers=1))
+    monkeypatch.setattr(
+        indexer,
+        "_index_one",
+        lambda _path: (_ for _ in ()).throw(OSError(22, "not hydrated")),
+    )
+    conn = db.connect(tmp_path / "i.db")
+    db.init_db(conn)
+
+    summary = indexer.update_index(conn, [], scan_iter=iter([p]), workers=2)
+
+    row = db.get_file_by_path(conn, str(p))
+    assert summary["errors"] == 1
+    assert row["status"] == "error"
+    assert db.stats(conn)["pending_count"] == 0
+
+    # 重试退避只拦同一份坏字节；文件发生真实变化时立即自愈。
+    p.write_bytes(b"changed after hydration")
+    future = p.stat().st_mtime + 2
+    os.utime(p, (future, future))
+    st = p.stat()
+    monkeypatch.setattr(
+        indexer,
+        "_index_one",
+        lambda _path: {
+            "path": str(p), "name": p.name, "ext": ".pptx",
+            "size": st.st_size, "mtime": st.st_mtime, "content_hash": "retry-ok",
+            "status": "ok", "error": "", "page_count": 0, "pages": [],
+        },
+    )
+    indexer.update_index(conn, [], scan_iter=iter([p]), workers=1)
+    assert db.get_file_by_path(conn, str(p))["status"] == "ok"
 
 
 def test_type_counts_built_vs_total_by_ext(tmp_path):

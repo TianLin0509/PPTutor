@@ -30,7 +30,7 @@ except Exception:  # noqa: BLE001
 
 from .. import actions, db, history, renderer as renderer_mod, search as search_mod, updater, __version__
 from ..config import (
-    DOCX_EXT, PDF_EXT, PPTX_EXT, db_path as cfg_db_path,
+    DOCX_EXT, PDF_EXT, PPTX_EXT, PPT_EXTS, db_path as cfg_db_path,
     get_hotkey, get_theme, is_first_run, mark_welcomed,
     set_theme as cfg_set_theme, update_base_url,
 )
@@ -325,6 +325,15 @@ class ResultItem(QWidget):
             ext = QLabel(".ppt")
             ext.setStyleSheet(f"font-size:10px;color:{tok['ink4']};border:1px solid {tok['bd2']};border-radius:5px;padding:1px 6px;background:transparent;")
             row.addWidget(ext, 0)
+        if r.hits and r.status not in ("ok", "filename_only"):
+            stale = QLabel("上次索引")
+            stale.setObjectName("staleIndexBadge")
+            stale.setToolTip("当前文件尚未成功重建索引；命中来自最后一次成功解析的内容")
+            stale.setStyleSheet(
+                "font-size:10px;font-weight:700;color:#D97706;"
+                f"border:1px solid {tok['bd2']};border-radius:5px;padding:1px 6px;background:transparent;"
+            )
+            row.addWidget(stale, 0)
         if vcount > 0 and on_toggle_group is not None:
             exp = QToolButton()
             exp.setObjectName("verExpand")
@@ -471,6 +480,7 @@ class MainWindow(QMainWindow):
     _VERSION_SHIELD_REFRESH_MS = 250
     _INDEX_PROGRESS_UI_MS = 100
     _INDEX_STATUS_CACHE_MS = 1000
+    _OFFLINE_RESCAN_INTERVAL_SEC = 24 * 60 * 60
     _BG_LIGHT_SHUTDOWN_WAIT_MS = 250
     _BG_LIGHT_SHUTDOWN_TOTAL_WAIT_MS = 1000
     _SEARCH_SHUTDOWN_WAIT_MS = 500
@@ -1276,10 +1286,16 @@ class MainWindow(QMainWindow):
 
     def _set_ops_enabled(self, on: bool) -> None:
         on = on and self._active_heavy_op is None and self._search_pending_req is None
-        for w in (self.goto_btn, self.open_btn, self.folder_btn, self.clip_btn,
+        for w in (self.open_btn, self.folder_btn, self.clip_btn,
                   self.copy_path_btn, self.copy_text_btn, self.detail_btn,
                   self.prev_btn, self.next_btn):
             w.setEnabled(on)
+        can_goto = on and self._cur is not None and (self._cur.ext or "").lower() in PPT_EXTS
+        self.goto_btn.setEnabled(can_goto)
+        self.goto_btn.setToolTip(
+            "用 PowerPoint 打开并跳到当前页"
+            if can_goto else "Word/PDF 暂不支持自动跳转；可使用“打开文件”"
+        )
         for b in getattr(self, "_thumb_btns", []):
             b.setEnabled(on)
         panel = getattr(self, "detail_panel", None)
@@ -2467,6 +2483,8 @@ class MainWindow(QMainWindow):
         return self._PRIORITY_TOP_THUMB_BASE + max(0, min(int(idx), self._THUMB_FIRST - 1))
 
     def _request_thumb_worker(self, path: str, page: int, *, priority: int) -> None:
+        if os.path.splitext(path)[1].lower() not in PPT_EXTS:
+            return
         key = (path, page)
         old_priority = self._thumb_requested_priority.get(key)
         if old_priority is not None:
@@ -3146,10 +3164,11 @@ class MainWindow(QMainWindow):
         if not self._cur or not self._cur.hits:
             return
         hits = self._cur.hits
+        unit = "段" if (self._cur.ext or "").lower() == DOCX_EXT else "页"
         for i, h in enumerate(hits[:self._HIT_NAV_MAX]):
             b = QToolButton()
             b.setObjectName("thumb")
-            b.setText(f"\u7b2c{h.page_no}\u9875")
+            b.setText(f"第{h.page_no}{unit}")
             b.setCheckable(True)
             b.setChecked(i == self._hit_idx)
             b.setEnabled(self._active_heavy_op is None and self._search_pending_req is None)
@@ -3243,6 +3262,19 @@ class MainWindow(QMainWindow):
         self._cur_pixmap = None
         self._preview_provisional = False
 
+    def _show_non_powerpoint_preview(self, ext: str) -> None:
+        kind = "Word" if ext == DOCX_EXT else "PDF"
+        unit = "段落" if ext == DOCX_EXT else "页面"
+        self.image_label.setPixmap(QPixmap())
+        self.image_label.setText(
+            f'<div style="font-size:30px">📄</div>'
+            f'<div style="color:#888;font-size:13px;margin-top:12px">'
+            f'{kind} 内容已全文索引，可定位命中{unit}<br>'
+            f'暂不支持页图预览；点“打开文件”查看原文</div>'
+        )
+        self._cur_pixmap = None
+        self._preview_provisional = False
+
     def _show_cached_preview_placeholder(self, path: str, page: int) -> bool:
         """Show any cached image immediately while the sharp preview renders."""
         thumb = self._thumb_cache.get((path, page))
@@ -3281,6 +3313,23 @@ class MainWindow(QMainWindow):
         hits = self._cur.hits or []
         total = self._cur.page_count or 0
         n = len(hits)
+        ext = (self._cur.ext or os.path.splitext(self._cur.path)[1]).lower()
+        if ext not in PPT_EXTS:
+            self._invalidate_preview_request(clear_deferred=False)
+            ordn = next((i for i, h in enumerate(hits) if h.page_no == page), None)
+            hit_tag = f" · 命中 {ordn + 1}/{n}" if ordn is not None else ""
+            unit = "段" if ext == DOCX_EXT else "页"
+            self.page_label.setText(
+                f"第 {page} / {total} {unit}{hit_tag}"
+                if total else f"第 {page} {unit}{hit_tag}"
+            )
+            nav_enabled = self._active_heavy_op is None and self._search_pending_req is None
+            self.prev_btn.setEnabled(nav_enabled and n > 0 and self._hit_idx > 0)
+            self.next_btn.setEnabled(nav_enabled and n > 0 and self._hit_idx < n - 1)
+            self.goto_btn.setEnabled(False)
+            self.goto_btn.setToolTip("Word/PDF 暂不支持自动跳转；可使用“打开文件”")
+            self._show_non_powerpoint_preview(ext)
+            return
         # 命中页判定与序号已并入下方 ordn 计算（不再单独维护 hit_pages 集合）
         # 椤电爜锛氱 X / 鍏?N 椤碉紙婊氳疆鍙湪鍘熷椤靛簭闂磋嚜鐢辩炕锛涘懡涓〉鍔犳爣璁帮級
         ordn = next((i for i, h in enumerate(hits) if h.page_no == page), None)
@@ -3681,6 +3730,11 @@ class MainWindow(QMainWindow):
         if q:
             history.add_history(q)
             self._refresh_history_model()
+        if (self._cur.ext or os.path.splitext(self._cur.path)[1]).lower() not in PPT_EXTS:
+            kind = "Word" if (self._cur.ext or "").lower() == DOCX_EXT else "PDF"
+            self._open_file_path(self._cur.path)
+            self._toast(f"{kind} 暂不支持自动跳转，已按普通方式打开")
+            return
         self._open_at_page_bg(self._cur.path, self._view_page)
 
     def _activate_result_item(self, item: QListWidgetItem | None) -> None:
@@ -3833,6 +3887,8 @@ class MainWindow(QMainWindow):
 
     def _load_version_shield_count(self, version_mgr) -> int:
         try:
+            if hasattr(version_mgr, "summary_stats"):
+                return int((version_mgr.summary_stats() or {}).get("protected_docs", 0) or 0)
             if hasattr(version_mgr, "list_docs_details"):
                 return len(version_mgr.list_docs_details())
             return len(version_mgr.list_docs())
@@ -3953,6 +4009,10 @@ class MainWindow(QMainWindow):
         self._pending_version_intro = True
         self._maybe_show_version_intro()
 
+    def on_content_changed(self, path: str) -> None:
+        """Word/PDF 保存事件：只实时并入全文索引，不创建 PPT 版本快照。"""
+        self._index_file_live(path)
+
     def _maybe_show_version_intro(self) -> None:
         """棣栨鐣欑増 + 涓荤獥宸查湶鑴告椂锛屽脊涓€娆¤仛鍏夌伅鍛婄煡銆岀増鏈繚鎶ゃ€嶏紝涔嬪悗姘镐箙闈欓粯銆?"""
         if not getattr(self, "_pending_version_intro", False):
@@ -4055,6 +4115,10 @@ class MainWindow(QMainWindow):
         except (TypeError, ValueError):
             pending_count = 0
         self._index_rebuild_reason = str(stats.get("index_rebuild_reason") or "")
+        try:
+            last_completed_scan_at = float(stats.get("last_completed_scan_at", 0) or 0)
+        except (TypeError, ValueError):
+            last_completed_scan_at = 0.0
         self._startup_index_check_last_files = file_count
         self._startup_index_check_last_pages = page_count
         self._startup_index_check_last_pending = pending_count
@@ -4066,6 +4130,11 @@ class MainWindow(QMainWindow):
             return
         if pending_count > 0:
             self._startup_index_check_decision = "resume_pending"
+            self._start_indexing(roots, workers)
+            return
+        if time.time() - last_completed_scan_at >= self._OFFLINE_RESCAN_INTERVAL_SEC:
+            self._startup_index_check_decision = "reconcile_offline"
+            self._apply_status_stats(None, stats)  # 旧索引先立即可用，对账在后台进行
             self._start_indexing(roots, workers)
             return
         self._startup_index_check_decision = "use_existing"
@@ -4226,12 +4295,14 @@ class MainWindow(QMainWindow):
             try:
                 stats = dict(db.stats(own))
                 stats["index_rebuild_reason"] = db.meta_value(own, db.META_INDEX_REBUILD_REASON)
+                stats["last_completed_scan_at"] = db.meta_value(own, db.META_LAST_COMPLETED_SCAN_AT, "0")
                 stats["type_counts"] = db.type_counts(own)
                 return stats
             finally:
                 own.close()
         stats = dict(db.stats(self._conn))
         stats["index_rebuild_reason"] = db.meta_value(self._conn, db.META_INDEX_REBUILD_REASON)
+        stats["last_completed_scan_at"] = db.meta_value(self._conn, db.META_LAST_COMPLETED_SCAN_AT, "0")
         stats["type_counts"] = db.type_counts(self._conn)
         return stats
 

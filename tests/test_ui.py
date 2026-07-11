@@ -3,16 +3,44 @@ from __future__ import annotations
 
 import time
 
+import pytest
 from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtGui import QColor, QPixmap
-from PySide6.QtWidgets import QPushButton
+from PySide6.QtWidgets import QLabel, QPushButton
 
 import fixtures_gen as fx
 
-from pptx_finder import db, indexer
+from pptx_finder import actions, db, indexer
 from pptx_finder.models import FileResult, SearchHit
 import pptx_finder.ui.main_window as main_window_mod
 from pptx_finder.ui.main_window import MainWindow
+
+
+def test_stale_search_hit_is_visibly_labeled(qtbot):
+    result = FileResult(
+        file_id=1,
+        path="C:/docs/report.pdf",
+        name="report.pdf",
+        ext=".pdf",
+        mtime=1.0,
+        size=10,
+        page_count=1,
+        status="error",
+        score=1.0,
+        name_hit=False,
+        hits=[SearchHit(1, "上次成功内容")],
+    )
+    card = main_window_mod.ResultItem(
+        result,
+        main_window_mod.theme.tok("cloud"),
+        "",
+    )
+    qtbot.addWidget(card)
+
+    badge = card.findChild(QLabel, "staleIndexBadge")
+    assert badge is not None
+    assert badge.text() == "上次索引"
+    assert "最后一次成功解析" in badge.toolTip()
 
 
 def _index_multi(tmp_path, files: dict[str, list[str]]):
@@ -414,6 +442,45 @@ def test_preview_request_uses_adaptive_first_paint_resolution(qtbot, tmp_path):
     assert render.calls
     assert MainWindow._PREVIEW_MIN_EDGE <= render.calls[-1][3] <= MainWindow._PREVIEW_MAX_EDGE
     assert render.calls[-1][3] < 2560
+
+
+@pytest.mark.parametrize(
+    ("ext", "kind"),
+    [(".docx", "Word"), (".pdf", "PDF")],
+)
+def test_non_powerpoint_result_never_enters_com_preview_or_goto(qtbot, monkeypatch, tmp_path, ext, kind):
+    conn = _index(tmp_path)
+    render = StubRender()
+    win = MainWindow(conn=conn, render_worker=render, do_index=False)
+    qtbot.addWidget(win)
+    result = _fake_results(1)[0]
+    result.ext = ext
+    result.path = f"C:/document{ext}"
+    result.name = f"document{ext}"
+    win._cur = result
+    win._view_page = 1
+    win._set_ops_enabled(True)
+    opened = []
+    monkeypatch.setattr(win, "_open_file_path", opened.append)
+
+    win._request_preview()
+    win._act_goto()
+
+    assert render.calls == []
+    assert kind in win.image_label.text()
+    assert "不支持页图预览" in win.image_label.text()
+    assert win.goto_btn.isEnabled() is False
+    assert opened == [result.path]
+
+
+def test_actions_open_at_page_defensively_bypasses_powerpoint_for_docx(monkeypatch, tmp_path):
+    path = tmp_path / "report.docx"
+    path.write_bytes(b"doc")
+    opened = []
+    monkeypatch.setattr(actions, "open_file", lambda value: opened.append(value) or True)
+
+    assert actions.open_at_page(str(path), 7) == (True, False)
+    assert opened == [str(path)]
 
 
 def test_preview_uses_disk_cache_as_provisional_first_paint(qtbot, tmp_path, monkeypatch):

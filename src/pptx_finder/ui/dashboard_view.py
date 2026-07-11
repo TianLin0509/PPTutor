@@ -13,7 +13,7 @@ import logging
 import os
 import time
 
-from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
+from PySide6.QtCore import QRectF, Qt, QTimer
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
     QFrame, QGridLayout, QHBoxLayout, QLabel, QVBoxLayout, QWidget,
@@ -85,6 +85,43 @@ def _conn_path(conn) -> str | None:
         return path or None
     except Exception:  # noqa: BLE001
         return None
+
+
+def _version_summary(version_mgr) -> dict[str, int | bool]:
+    if version_mgr is None:
+        return {
+            "available": False,
+            "protected_docs": 0,
+            "total_versions": 0,
+            "rollback_docs": 0,
+        }
+    try:
+        if hasattr(version_mgr, "summary_stats"):
+            raw = version_mgr.summary_stats() or {}
+            return {
+                "available": True,
+                "protected_docs": int(raw.get("protected_docs", 0) or 0),
+                "total_versions": int(raw.get("total_versions", 0) or 0),
+                "rollback_docs": int(raw.get("rollback_docs", 0) or 0),
+            }
+        docs = (
+            version_mgr.list_docs_details()
+            if hasattr(version_mgr, "list_docs_details")
+            else version_mgr.list_docs()
+        )
+        return {
+            "available": True,
+            "protected_docs": len(docs),
+            "total_versions": 0,
+            "rollback_docs": 0,
+        }
+    except Exception:  # noqa: BLE001
+        return {
+            "available": False,
+            "protected_docs": 0,
+            "total_versions": 0,
+            "rollback_docs": 0,
+        }
 
 
 class _Donut(QWidget):
@@ -307,16 +344,16 @@ class DashboardView(QWidget):
     def _card(self, title: str) -> tuple[QFrame, QVBoxLayout]:
         w = QFrame()
         w.setObjectName("dashCard")
-        l = QVBoxLayout(w)
-        l.setContentsMargins(18, 15, 18, 16)
-        l.setSpacing(9)
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(18, 15, 18, 16)
+        layout.setSpacing(9)
         t = QLabel(title)
         t.setObjectName("dashCardT")
-        l.addWidget(t)
-        return w, l
+        layout.addWidget(t)
+        return w, layout
 
     def _topic_card(self) -> QFrame:
-        w, l = self._card("主题分布")
+        w, layout = self._card("主题分布")
         row = QHBoxLayout()
         self._donut = _Donut(self)
         row.addWidget(self._donut, 1)
@@ -337,30 +374,30 @@ class DashboardView(QWidget):
             self._leg_box.addLayout(r)
             self._leg_rows.append((dot, nm, pc))
         row.addLayout(self._leg_box, 1)
-        l.addLayout(row, 1)
+        layout.addLayout(row, 1)
         return w
 
     def _recent_card(self) -> QFrame:
-        w, l = self._card("最近活跃")
+        w, layout = self._card("最近活跃")
         self._rec_box = QVBoxLayout()
         self._rec_box.setSpacing(7)
-        l.addLayout(self._rec_box)
-        l.addStretch(1)
+        layout.addLayout(self._rec_box)
+        layout.addStretch(1)
         return w
 
     def _folder_card(self) -> QFrame:
-        w, l = self._card("库构成 · 按文件夹")
+        w, layout = self._card("库构成 · 按文件夹")
         self._hbars = _HBars(self)
-        l.addWidget(self._hbars, 1)
+        layout.addWidget(self._hbars, 1)
         return w
 
     def _week_card(self) -> QFrame:
-        w, l = self._card("本周活跃 · 改动趋势")
+        w, layout = self._card("本周活跃 · 改动趋势")
         self._spark = _Spark(self)
-        l.addWidget(self._spark, 1)
+        layout.addWidget(self._spark, 1)
         self._week_shield = QLabel("")
         self._week_shield.setObjectName("dashSub")
-        l.addWidget(self._week_shield)
+        layout.addWidget(self._week_shield)
         return w
 
     def _build_health_banner(self) -> QFrame:
@@ -544,15 +581,11 @@ class DashboardView(QWidget):
                 _log.warning("db files query failed in dashboard", exc_info=True)
                 rows = []
 
-        guarded = 0
-        if version_mgr is not None:
-            try:
-                if hasattr(version_mgr, "list_docs_details"):
-                    guarded = len(version_mgr.list_docs_details())
-                else:
-                    guarded = len(version_mgr.list_docs())
-            except Exception:  # noqa: BLE001
-                guarded = 0
+        version_summary = _version_summary(version_mgr)
+        protected = int(version_summary["protected_docs"])
+        total_versions = int(version_summary["total_versions"])
+        rollback_docs = int(version_summary["rollback_docs"])
+        version_available = bool(version_summary["available"])
 
         folder_counts: dict[str, int] = {}
         week = [0] * 7
@@ -595,7 +628,8 @@ class DashboardView(QWidget):
             "health": health_summary,
             "kpi_vals": [
                 (f"{file_count:,}", "PPT 文档", "全文可搜"),
-                (f"{guarded:,}" if guarded else "—", "版本快照", "PPT 版 git"),
+                (f"{rollback_docs:,}" if version_available else "—", "可回退 PPT",
+                 f"已留版 {protected:,} · 共 {total_versions:,} 版" if version_available else "版本数据未加载"),
                 (f"{page_count:,}", "PPT 页", "命中即定位"),
                 (f"{recent_week:,}", "本周改动", "近 7 日活跃"),
             ],
@@ -603,7 +637,7 @@ class DashboardView(QWidget):
             "topics": top_folders,
             "week": week if any(week) else [0] * 7,
             "week_shield_text": (
-                f"🛡 版本保护 {guarded} 份 · 改存即自动留版" if guarded
+                f"🛡 已留版 {protected} 份 · {rollback_docs} 份可回退" if version_available
                 else "🛡 改存即自动留版，随时回到旧版本"),
             "recent": recents,
         }
@@ -638,14 +672,13 @@ class DashboardView(QWidget):
                 _log.warning("db files query failed in dashboard", exc_info=True)
                 rows = []
 
-        # 守护文档数（版本快照）：version_mgr 可 None（测试 / 未注入）
-        guarded = 0
+        # 版本 KPI 三数分开：留版文档 / 快照总数 / 真正可回退文档。
         vm = getattr(self._win, "_version_mgr", None)
-        if vm is not None:
-            try:
-                guarded = len(vm.list_docs())
-            except Exception:  # noqa: BLE001
-                guarded = 0
+        version_summary = _version_summary(vm)
+        protected = int(version_summary["protected_docs"])
+        total_versions = int(version_summary["total_versions"])
+        rollback_docs = int(version_summary["rollback_docs"])
+        version_available = bool(version_summary["available"])
 
         # 文件夹构成（top 5，其余并入"其他"）
         folder_counts: dict[str, int] = {}
@@ -673,7 +706,8 @@ class DashboardView(QWidget):
         # KPI 数值
         self._kpi_vals = [
             (f"{file_count:,}", "PPT 文档", "全文可搜"),
-            (f"{guarded:,}" if guarded else "—", "版本快照", "PPT 版 git"),
+            (f"{rollback_docs:,}" if version_available else "—", "可回退 PPT",
+             f"已留版 {protected:,} · 共 {total_versions:,} 版" if version_available else "版本数据未加载"),
             (f"{page_count:,}", "PPT 页", "命中即定位"),
             (f"{recent_week:,}", "本周改动", "近 7 日活跃"),
         ]
@@ -682,7 +716,7 @@ class DashboardView(QWidget):
         self._topics = top_folders
         self._week = week if any(week) else [0] * 7
         self._week_shield_text = (
-            f"🛡 版本保护 {guarded} 份 · 改存即自动留版" if guarded
+            f"🛡 已留版 {protected} 份 · {rollback_docs} 份可回退" if version_available
             else "🛡 改存即自动留版，随时回到旧版本")
 
         # 最近活跃列表（取真实最近文件名 + 相对时间）

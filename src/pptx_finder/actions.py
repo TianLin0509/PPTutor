@@ -5,6 +5,8 @@ import logging
 import os
 import subprocess
 
+from .config import PPT_EXTS
+
 log = logging.getLogger(__name__)
 
 
@@ -41,6 +43,8 @@ def open_at_page(path: str, page_no: int) -> tuple[bool, bool]:
     返回 (是否已打开, 是否成功跳页)；COM 不可用时回退普通打开。"""
     if not os.path.exists(path):
         return (False, False)
+    if os.path.splitext(path)[1].lower() not in PPT_EXTS:
+        return (open_file(path), False)
     try:
         import pythoncom
         import win32com.client

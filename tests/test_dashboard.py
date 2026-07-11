@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pptx_finder.ui.dashboard_view as dashboard_mod
+from pptx_finder import db
 from pptx_finder.ui.dashboard_view import DashboardView
 
 
@@ -58,6 +59,31 @@ def test_dashboard_init_defers_expensive_recompute(qtbot, monkeypatch):
     qtbot.addWidget(dash)
 
     assert calls == []
+
+
+def test_dashboard_labels_real_rollback_count_not_managed_doc_count(qtbot, tmp_path):
+    class VersionManager:
+        def summary_stats(self):
+            return {
+                "protected_docs": 3865,
+                "total_versions": 4079,
+                "rollback_docs": 99,
+            }
+
+    conn = db.connect(tmp_path / "index.db")
+    db.init_db(conn)
+    dash = DashboardView(FakeWindow())
+    qtbot.addWidget(dash)
+
+    payload = dash._build_payload(fallback_conn=conn, version_mgr=VersionManager())
+
+    assert payload["kpi_vals"][1] == (
+        "99",
+        "可回退 PPT",
+        "已留版 3,865 · 共 4,079 版",
+    )
+    assert "3865 份" in payload["week_shield_text"]
+    assert "99 份可回退" in payload["week_shield_text"]
 
 
 def test_dashboard_scheduled_refresh_coalesces(qtbot, monkeypatch):

@@ -114,6 +114,25 @@ def test_save_creates_version_and_skips_unchanged(tmp_path):
     assert len(mgr.list_versions(str(p))) == 2
 
 
+def test_summary_stats_separates_protected_versions_and_rollback_docs(tmp_path):
+    p1 = tmp_path / "one-version.pptx"
+    p2 = tmp_path / "rollback-ready.pptx"
+    fx.make_pptx(p1, [{"body": "only v1"}])
+    fx.make_pptx(p2, [{"body": "v1"}])
+    mgr = _mgr()
+    assert mgr.snapshot_now(str(p1))
+    assert mgr.snapshot_now(str(p2))
+    fx.make_pptx(p2, [{"body": "v2 changed"}])
+    assert mgr.snapshot_now(str(p2))
+
+    stats = mgr.summary_stats()
+
+    assert stats["protected_docs"] == 2
+    assert stats["total_versions"] == 3
+    assert stats["rollback_docs"] == 1
+    assert stats["single_version_docs"] == 1
+
+
 def test_restore_old_keeps_current(tmp_path):
     p = tmp_path / "a.pptx"
     fx.make_pptx(p, [{"body": "原始 OLDX"}])

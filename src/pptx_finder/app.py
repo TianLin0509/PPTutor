@@ -242,10 +242,14 @@ def main() -> int:
     # 留版事件经 VersionBridge 跨线程信号送回 UI 主线程（更新盾牌 / 首次告知）
     bridge = VersionBridge()
     app._version_bridge = bridge  # 防 GC
-    version_mgr = VersionManager(on_snapshot=bridge.emit_snapshot)
+    version_mgr = VersionManager(
+        on_snapshot=bridge.emit_snapshot,
+        on_content_saved=bridge.emit_content_changed,
+    )
     app._version_manager = version_mgr  # 防 GC
     win._version_mgr = version_mgr  # 详情面板版本时间线数据源
     bridge.snapshotted.connect(win.on_version_snapshot)
+    bridge.content_changed.connect(win.on_content_changed)
     win.refresh_version_shield()  # 启动即显示已守护文件数
     threading.Thread(target=version_mgr.start, daemon=True).start()
 

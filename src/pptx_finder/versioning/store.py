@@ -120,6 +120,33 @@ def list_docs(conn):
     return conn.execute("SELECT * FROM managed_docs ORDER BY updated_at DESC").fetchall()
 
 
+def summary_stats(conn) -> dict[str, int]:
+    """Return non-overloaded vault KPIs.
+
+    ``protected_docs`` counts documents that actually own at least one stored
+    version; ``rollback_docs`` requires two or more versions. This deliberately
+    avoids presenting the managed-document row count as a snapshot count.
+    """
+    row = conn.execute(
+        """SELECT
+             (SELECT COUNT(*) FROM managed_docs) AS managed_docs,
+             (SELECT COUNT(*) FROM managed_docs WHERE status='active') AS active_docs,
+             (SELECT COUNT(*) FROM managed_docs WHERE status='deleted') AS deleted_docs,
+             (SELECT COUNT(*) FROM versions) AS total_versions,
+             (SELECT COUNT(*) FROM (
+                SELECT doc_id FROM versions GROUP BY doc_id HAVING COUNT(*) >= 1
+              )) AS protected_docs,
+             (SELECT COUNT(*) FROM (
+                SELECT doc_id FROM versions GROUP BY doc_id HAVING COUNT(*) >= 2
+              )) AS rollback_docs,
+             (SELECT COUNT(*) FROM (
+                SELECT doc_id FROM versions GROUP BY doc_id HAVING COUNT(*) = 1
+              )) AS single_version_docs
+        """
+    ).fetchone()
+    return {key: int(row[key] or 0) for key in row.keys()}
+
+
 def set_status(conn, doc_id: str, status: str) -> None:
     conn.execute("UPDATE managed_docs SET status=? WHERE doc_id=?", (status, doc_id))
     conn.commit()

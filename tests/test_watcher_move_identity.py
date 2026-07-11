@@ -12,11 +12,17 @@ class _MoveEvent:
 def test_handler_reports_move_source_and_still_debounces_destination():
     moved = []
     saved = []
-    handler = _Handler(saved.append, lambda src, dest: moved.append((src, dest)))
+    content_changes = []
+    handler = _Handler(
+        saved.append,
+        lambda src, dest: moved.append((src, dest)),
+        on_content_saved=content_changes.append,
+    )
 
     handler.on_moved(_MoveEvent())
 
     assert moved == [(_MoveEvent.src_path, _MoveEvent.dest_path)]
+    assert content_changes == [_MoveEvent.src_path]
     assert _MoveEvent.dest_path in handler._timers
     for timer in handler._timers.values():
         timer.cancel()

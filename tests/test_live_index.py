@@ -1,7 +1,8 @@
-"""实时索引：watcher 留版事件 → 单文件并入搜索（无需重扫）+ 启动跳过全盘扫。"""
+"""实时索引：保存事件单文件并入 + 启动按新鲜度做后台增量对账。"""
 from __future__ import annotations
 
 import threading
+import time
 
 import fixtures_gen as fx
 from test_ui import StubRender, StubThumb, _finish_fake_task, _index, _install_fake_background_task
@@ -108,6 +109,19 @@ def test_live_index_via_snapshot(qtbot, tmp_path):
     assert any("实时测试LT" in r.name for r in res)      # 实时进索引后可搜
 
 
+def test_live_index_via_word_pdf_content_change(qtbot, tmp_path):
+    conn = _index(tmp_path)
+    win = MainWindow(conn=conn, render_worker=StubRender(), do_index=False)
+    qtbot.addWidget(win)
+    docx = tmp_path / "实时文档.docx"
+    fx.make_docx(docx, ["Word 实时变化唯一词"])
+
+    win.on_content_changed(str(docx))
+
+    res = search.search(win._conn, "实时变化唯一词")
+    assert [r.path for r in res] == [str(docx)]
+
+
 def test_startup_skips_scan_when_indexed(qtbot, tmp_path):
     """已有索引时 _index_is_empty False（启动不再全盘扫）。"""
     win = MainWindow(conn=_index(tmp_path), render_worker=StubRender(), do_index=False)
@@ -207,7 +221,11 @@ def test_startup_existing_index_check_updates_status_without_scan(qtbot, monkeyp
     monkeypatch.setattr(
         main_window_mod.db,
         "stats",
-        lambda _conn: {"file_count": 4, "page_count": 9},
+        lambda _conn: {
+            "file_count": 4,
+            "page_count": 9,
+            "last_completed_scan_at": time.time(),
+        },
     )
     monkeypatch.setattr(main_window_mod, "LiveIndexer", _FakeLiveIndexer)
     monkeypatch.setattr(
@@ -235,6 +253,48 @@ def test_startup_existing_index_check_updates_status_without_scan(qtbot, monkeyp
     assert "decision=use_existing" in lines
     assert "files=4" in lines
     assert "pages=9" in lines
+
+
+def test_startup_stale_index_reconciles_offline_changes_in_background(qtbot, monkeypatch, tmp_path):
+    tasks = _install_fake_background_task(monkeypatch)
+    starts = []
+    monkeypatch.setattr(
+        main_window_mod.db,
+        "stats",
+        lambda _conn: {
+            "file_count": 4,
+            "page_count": 9,
+            "last_completed_scan_at": time.time() - MainWindow._OFFLINE_RESCAN_INTERVAL_SEC - 1,
+        },
+    )
+    monkeypatch.setattr(main_window_mod, "LiveIndexer", _FakeLiveIndexer)
+    monkeypatch.setattr(
+        MainWindow,
+        "_start_indexing",
+        lambda self, roots, workers: starts.append((roots, workers)) or True,
+    )
+    conn = _index(tmp_path)
+    db.set_meta(
+        conn,
+        db.META_LAST_COMPLETED_SCAN_AT,
+        str(time.time() - MainWindow._OFFLINE_RESCAN_INTERVAL_SEC - 1),
+    )
+    conn.commit()
+    win = MainWindow(
+        conn=conn,
+        render_worker=StubRender(),
+        thumb_worker=StubThumb(),
+        do_index=True,
+        roots=["C:/docs"],
+        workers=2,
+    )
+    qtbot.addWidget(win)
+
+    startup_task = next(t for t in tasks if t.label == "startup-index-check")
+    _finish_fake_task(startup_task)
+
+    assert starts == [(["C:/docs"], 2)]
+    assert "decision=reconcile_offline" in "\n".join(win.diagnostic_lines())
 
 
 def test_startup_existing_index_with_pending_resumes_scan(qtbot, monkeypatch, tmp_path):

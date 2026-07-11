@@ -12,6 +12,9 @@ from .text_tokenize import normalize, tokenize
 
 log = logging.getLogger(__name__)
 
+DEFAULT_VACUUM_MIN_FREE_BYTES = 256 * 1024 * 1024
+DEFAULT_VACUUM_MIN_FREE_RATIO = 0.25
+
 # 索引格式版本：分词器/切词规则改版即与旧库不兼容（如词级 jieba → 字级），
 # 启动发现版本不符就清空内容、走全量重建——否则「原文里有、却怎么都搜不到」。
 # 也兼作"强制重建"开关：v0.7.0 首启重扫会冻结 UI，多数人的库停在残缺态（部分文件 +
@@ -19,6 +22,7 @@ log = logging.getLogger(__name__)
 # 5→6：内容搜索从只 pptx 扩到 docx/xlsx/txt/pdf，旧库需重建以纳入这些文档类型。
 INDEX_VERSION = "6"
 META_INDEX_REBUILD_REASON = "last_index_rebuild_reason"
+META_LAST_COMPLETED_SCAN_AT = "last_completed_scan_at"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS files(
@@ -33,6 +37,8 @@ CREATE TABLE IF NOT EXISTS files(
   page_count INTEGER DEFAULT 0,
   status TEXT DEFAULT 'ok',
   error TEXT DEFAULT '',
+  parse_failures INTEGER DEFAULT 0,
+  retry_after REAL DEFAULT 0,
   indexed_at REAL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_files_name ON files(name);
@@ -77,6 +83,7 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
     _ensure_filename_index(conn)
+    _ensure_parse_retry_columns(conn)
     _migrate_index_version(conn)
     conn.commit()
 
@@ -102,6 +109,15 @@ def _ensure_filename_index(conn: sqlite3.Connection) -> None:
         conn.execute("DELETE FROM file_names_fts")
         for r in conn.execute("SELECT id, name FROM files").fetchall():
             _update_filename_index(conn, r["id"], r["name"])
+
+
+def _ensure_parse_retry_columns(conn: sqlite3.Connection) -> None:
+    """Add retry state in place; this metadata does not require a content rebuild."""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(files)").fetchall()}
+    if "parse_failures" not in cols:
+        conn.execute("ALTER TABLE files ADD COLUMN parse_failures INTEGER DEFAULT 0")
+    if "retry_after" not in cols:
+        conn.execute("ALTER TABLE files ADD COLUMN retry_after REAL DEFAULT 0")
 
 
 def _migrate_index_version(conn: sqlite3.Connection) -> None:
@@ -169,23 +185,34 @@ def upsert_file(
     status: str,
     error: str,
     indexed_at: float,
+    parse_failures: int = 0,
+    retry_after: float = 0.0,
 ) -> int:
     name = sqlite_safe_text(name)
     error = sqlite_safe_text(error)
     name_norm = normalize(name)
     cur = conn.execute(
         """
-        INSERT INTO files(path,name,name_norm,ext,size,mtime,content_hash,page_count,status,error,indexed_at)
-        VALUES(:path,:name,:name_norm,:ext,:size,:mtime,:content_hash,:page_count,:status,:error,:indexed_at)
+        INSERT INTO files(
+          path,name,name_norm,ext,size,mtime,content_hash,page_count,status,error,
+          parse_failures,retry_after,indexed_at
+        )
+        VALUES(
+          :path,:name,:name_norm,:ext,:size,:mtime,:content_hash,:page_count,:status,:error,
+          :parse_failures,:retry_after,:indexed_at
+        )
         ON CONFLICT(path) DO UPDATE SET
           name=excluded.name, name_norm=excluded.name_norm, ext=excluded.ext, size=excluded.size, mtime=excluded.mtime,
           content_hash=excluded.content_hash, page_count=excluded.page_count,
-          status=excluded.status, error=excluded.error, indexed_at=excluded.indexed_at
+          status=excluded.status, error=excluded.error,
+          parse_failures=excluded.parse_failures, retry_after=excluded.retry_after,
+          indexed_at=excluded.indexed_at
         RETURNING id
         """,
         dict(path=path, name=name, name_norm=name_norm, ext=ext, size=size, mtime=mtime,
              content_hash=content_hash, page_count=page_count, status=status,
-             error=error, indexed_at=indexed_at),
+             error=error, parse_failures=max(0, int(parse_failures)),
+             retry_after=max(0.0, float(retry_after)), indexed_at=indexed_at),
     )
     file_id = cur.fetchone()[0]
     _update_filename_index(conn, file_id, name)
@@ -278,14 +305,32 @@ def type_counts(conn: sqlite3.Connection) -> dict[str, tuple[int, int]]:
     return out
 
 
-def maintain(conn: sqlite3.Connection) -> dict:
-    """Run cheap SQLite maintenance after indexing.
+def maintain(
+    conn: sqlite3.Connection,
+    *,
+    min_free_bytes: int = DEFAULT_VACUUM_MIN_FREE_BYTES,
+    min_free_ratio: float = DEFAULT_VACUUM_MIN_FREE_RATIO,
+) -> dict:
+    """Run bounded SQLite maintenance after indexing.
 
     FTS optimize merges segment b-trees and keeps long-running local indexes from
-    slowly degrading. The WAL checkpoint is non-destructive and bounded by the
-    busy timeout on the connection.
+    slowly degrading. A full VACUUM only runs when *both* the absolute and ratio
+    thresholds are crossed, so routine incremental scans stay cheap while a
+    one-off format contraction can actually return large freelists to disk.
     """
-    result = {"fts_optimized": 0, "checkpointed": False, "error": ""}
+    result = {
+        "fts_optimized": 0,
+        "checkpointed": False,
+        "vacuumed": False,
+        "page_size": 0,
+        "page_count_before": 0,
+        "free_pages_before": 0,
+        "free_bytes_before": 0,
+        "free_ratio_before": 0.0,
+        "page_count_after": 0,
+        "free_pages_after": 0,
+        "error": "",
+    }
     try:
         for table in ("file_names_fts", "pages_fts"):
             try:
@@ -294,12 +339,48 @@ def maintain(conn: sqlite3.Connection) -> dict:
             except sqlite3.DatabaseError as exc:
                 log.debug("fts optimize skipped for %s: %s", table, exc)
         conn.commit()
+
+        page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+        page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
+        free_pages = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
+        free_bytes = page_size * free_pages
+        free_ratio = (free_pages / page_count) if page_count else 0.0
+        result.update({
+            "page_size": page_size,
+            "page_count_before": page_count,
+            "free_pages_before": free_pages,
+            "free_bytes_before": free_bytes,
+            "free_ratio_before": free_ratio,
+        })
+
+        should_vacuum = (
+            free_pages > 0
+            and free_bytes >= max(0, int(min_free_bytes))
+            and free_ratio >= max(0.0, float(min_free_ratio))
+        )
+        if should_vacuum:
+            try:
+                conn.execute("VACUUM")
+                result["vacuumed"] = True
+                log.info(
+                    "sqlite vacuum reclaimed candidate space: %.1f MiB (%.1f%% freelist)",
+                    free_bytes / (1024 * 1024),
+                    free_ratio * 100,
+                )
+            except sqlite3.DatabaseError as exc:
+                result["error"] = f"{type(exc).__name__}: {exc}"
+                log.warning("sqlite vacuum skipped: %s", exc)
+
         try:
-            conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            result["checkpointed"] = True
+            checkpoint_mode = "TRUNCATE" if result["vacuumed"] else "PASSIVE"
+            row = conn.execute(f"PRAGMA wal_checkpoint({checkpoint_mode})").fetchone()
+            result["checkpointed"] = row is None or int(row[0]) == 0
         except sqlite3.DatabaseError as exc:
             log.debug("wal checkpoint skipped: %s", exc)
         conn.commit()
+
+        result["page_count_after"] = int(conn.execute("PRAGMA page_count").fetchone()[0])
+        result["free_pages_after"] = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
     except Exception as exc:  # noqa: BLE001
         result["error"] = f"{type(exc).__name__}: {exc}"
     return result

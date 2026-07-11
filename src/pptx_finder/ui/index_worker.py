@@ -68,7 +68,9 @@ class IndexWorker(QThread):
             except Exception as e:  # noqa: BLE001
                 log.warning("compute_groups failed: %s", e)
             try:
-                db.maintain(conn)
+                maintenance = db.maintain(conn)
+                if maintenance.get("error"):
+                    log.warning("db maintenance incomplete: %s", maintenance["error"])
             except Exception as e:  # noqa: BLE001
                 log.warning("db maintenance failed: %s", e)
         finally:

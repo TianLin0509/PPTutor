@@ -1,6 +1,6 @@
 """版本库：快照 / 列版本 / 重组恢复 / 导出。
 
-按页（part）去重存储：pptx 是 zip，逐 part 内容寻址存进 objects/，重复的只存一份；
+按页（part）去重存储：pptx 是 zip，逐 part 内容寻址存进全局对象池，跨文档重复也只存一份；
 每版只记一份 manifest（name→hash 列表）。改几个字只新增变化的 part，大幅省空间。
 重组后做保真自检；万一失败，该版回退为完整拷贝（mode=full），保证一定能恢复。
 """
@@ -9,6 +9,7 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import re
 import shutil
 import tempfile
 import zipfile
@@ -20,6 +21,10 @@ from ..config import data_dir, ext_path
 from ..parser import parse_pptx
 from ..text_tokenize import tokenize
 from . import store
+
+_OBJECT_HASH_RE = re.compile(r"^[0-9a-f]{16}$")
+_GLOBAL_OBJECTS_DIRNAME = "_objects"
+_VERIFIED_OBJECT_PATHS: set[str] = set()
 
 
 def vault_dir() -> Path:
@@ -45,7 +50,82 @@ def _doc_dir(doc_id: str) -> Path:
 
 
 def _objects_dir(doc_id: str) -> Path:
+    """Legacy per-document object directory (kept for read compatibility)."""
     return _doc_dir(doc_id) / "objects"
+
+
+def _global_objects_dir() -> Path:
+    """Shared content-addressed pool used by all documents."""
+    p = vault_dir() / _GLOBAL_OBJECTS_DIRNAME
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _hash_path(path: Path) -> str:
+    h = xxhash.xxh64()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _object_path(doc_id: str, object_hash: str) -> Path:
+    """Resolve new global objects first, then the legacy per-document pool."""
+    shared = _global_objects_dir() / object_hash
+    if shared.exists():
+        return shared
+    return vault_dir() / doc_id / "objects" / object_hash
+
+
+def _object_is_valid(path: Path, object_hash: str) -> bool:
+    key = str(path)
+    if not path.exists():
+        _VERIFIED_OBJECT_PATHS.discard(key)
+        return False
+    if key in _VERIFIED_OBJECT_PATHS:
+        return True
+    if _hash_path(path) != object_hash:
+        return False
+    _VERIFIED_OBJECT_PATHS.add(key)
+    return True
+
+
+def _install_object_bytes(data: bytes, object_hash: str) -> Path:
+    """Crash-safe idempotent write into the shared object pool."""
+    objd = _global_objects_dir()
+    dest = objd / object_hash
+    if _object_is_valid(dest, object_hash):
+        return dest
+    fd, tmp = tempfile.mkstemp(prefix=".object-", dir=objd)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, dest)
+        _VERIFIED_OBJECT_PATHS.add(str(dest))
+        return dest
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _install_object_file(src: Path, object_hash: str) -> tuple[Path, bool]:
+    """Install a verified legacy object; return (destination, already_existed)."""
+    dest = _global_objects_dir() / object_hash
+    if _object_is_valid(dest, object_hash):
+        return dest, True
+    try:
+        os.link(src, dest)
+    except FileExistsError:
+        if not _object_is_valid(dest, object_hash):
+            _install_object_bytes(src.read_bytes(), object_hash)
+        return dest, True
+    except OSError:
+        _install_object_bytes(src.read_bytes(), object_hash)
+    return dest, False
 
 
 def _manifest_path(doc_id: str, version_id: str) -> Path:
@@ -178,15 +258,14 @@ def _new_vid() -> str:
 
 
 def _write_zip(dest: str, doc_id: str, names: list[str], parts: dict[str, str]) -> None:
-    objd = _objects_dir(doc_id)
     with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as z:
         for name in names:
-            z.writestr(name, (objd / parts[name]).read_bytes())
+            z.writestr(name, _object_path(doc_id, parts[name]).read_bytes())
 
 
 def _dedup_store(doc_id: str, path: str) -> tuple[list[str], dict[str, str]]:
-    """解压 pptx，逐 part 内容寻址去重存进 objects/，返回 (顺序, name->hash)。"""
-    objd = _objects_dir(doc_id)
+    """解压 pptx，逐 part 内容寻址写入全局对象池。"""
+    _doc_dir(doc_id)  # 保持每文档 manifest / full 目录结构与旧版本兼容
     names: list[str] = []
     parts: dict[str, str] = {}
     with zipfile.ZipFile(ext_path(path)) as zf:
@@ -196,12 +275,177 @@ def _dedup_store(doc_id: str, path: str) -> tuple[list[str], dict[str, str]]:
             name = info.filename
             data = zf.read(name)
             h = xxhash.xxh64(data).hexdigest()
-            obj = objd / h
-            if not obj.exists():
-                obj.write_bytes(data)
+            _install_object_bytes(data, h)
             names.append(name)
             parts[name] = h
     return names, parts
+
+
+def migrate_legacy_objects() -> dict[str, int]:
+    """Move per-document objects into the shared pool, safely and resumably.
+
+    Each source is hash-verified before installation and removed only after the
+    global copy verifies. Re-running after a crash is therefore idempotent.
+    """
+    result = {
+        "scanned": 0,
+        "migrated": 0,
+        "duplicates": 0,
+        "bytes_reclaimed": 0,
+        "errors": 0,
+    }
+    root = vault_dir()
+    for doc_dir in list(root.iterdir()):
+        if not doc_dir.is_dir() or doc_dir.name == _GLOBAL_OBJECTS_DIRNAME:
+            continue
+        legacy = doc_dir / "objects"
+        if not legacy.is_dir():
+            continue
+        for src in list(legacy.iterdir()):
+            if not src.is_file() or not _OBJECT_HASH_RE.fullmatch(src.name):
+                continue
+            result["scanned"] += 1
+            try:
+                size = src.stat().st_size
+                if _hash_path(src) != src.name:
+                    result["errors"] += 1
+                    continue
+                dest, existed = _install_object_file(src, src.name)
+                if not _object_is_valid(dest, src.name):
+                    result["errors"] += 1
+                    continue
+                if existed:
+                    result["duplicates"] += 1
+                    result["bytes_reclaimed"] += size
+                else:
+                    result["migrated"] += 1
+                src.unlink()
+            except OSError:
+                result["errors"] += 1
+    return result
+
+
+def delete_version_artifacts(doc_id: str, version_id: str) -> None:
+    """Remove non-shared files owned exclusively by a version DB row."""
+    for path in (_manifest_path(doc_id, version_id), version_file(doc_id, version_id)):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def collect_garbage(conn, *, dry_run: bool = True) -> dict[str, int | bool]:
+    """Delete only artifacts proven unreachable from every live DB version.
+
+    Safety gate: one missing/invalid live manifest or referenced object aborts
+    the entire mutation pass. An inconsistent vault is reported, never cleaned.
+    """
+    result: dict[str, int | bool] = {
+        "aborted": False,
+        "errors": 0,
+        "manifests_removed": 0,
+        "full_files_removed": 0,
+        "objects_removed": 0,
+        "bytes_reclaimed": 0,
+    }
+    rows = conn.execute("SELECT version_id, doc_id FROM versions").fetchall()
+    live_manifests = {
+        (str(row["doc_id"]), str(row["version_id"])) for row in rows
+    }
+    referenced: set[str] = set()
+
+    missing_branch_bases = conn.execute(
+        """SELECT COUNT(*)
+           FROM doc_branches AS b
+           LEFT JOIN versions AS v ON v.version_id=b.branched_from_version_id
+           WHERE v.version_id IS NULL"""
+    ).fetchone()[0]
+    if missing_branch_bases:
+        result["errors"] = int(result["errors"]) + int(missing_branch_bases)
+
+    # First pass is read-only and validates the complete recovery graph.
+    for row in rows:
+        doc_id = str(row["doc_id"])
+        version_id = str(row["version_id"])
+        mf = vault_dir() / doc_id / "versions" / f"{version_id}.json"
+        try:
+            manifest = json.loads(mf.read_text(encoding="utf-8"))
+            mode = manifest.get("mode")
+            if mode == "dedup":
+                parts = manifest.get("parts")
+                names = manifest.get("names")
+                if not isinstance(parts, dict) or not isinstance(names, list):
+                    raise ValueError("dedup manifest has no parts map")
+                if any(str(name) not in parts for name in names):
+                    raise ValueError("manifest order references a missing part")
+                for object_hash in parts.values():
+                    object_hash = str(object_hash)
+                    if not _OBJECT_HASH_RE.fullmatch(object_hash):
+                        raise ValueError("invalid object hash")
+                    referenced.add(object_hash)
+                    if not _object_path(doc_id, object_hash).is_file():
+                        raise FileNotFoundError(object_hash)
+            elif mode == "full":
+                full = vault_dir() / doc_id / "versions" / f"{version_id}.pptx"
+                if not full.is_file():
+                    raise FileNotFoundError(full)
+            else:
+                raise ValueError("invalid manifest mode")
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            result["errors"] = int(result["errors"]) + 1
+
+    if result["errors"]:
+        result["aborted"] = True
+        return result
+
+    root = vault_dir()
+    orphan_manifests: list[Path] = []
+    orphan_full: list[Path] = []
+    legacy_objects: list[Path] = []
+    for doc_dir in list(root.iterdir()):
+        if not doc_dir.is_dir() or doc_dir.name == _GLOBAL_OBJECTS_DIRNAME:
+            continue
+        versions_dir = doc_dir / "versions"
+        if versions_dir.is_dir():
+            orphan_manifests.extend(
+                p for p in versions_dir.glob("*.json")
+                if (doc_dir.name, p.stem) not in live_manifests
+            )
+            orphan_full.extend(
+                p for p in versions_dir.glob("*.pptx")
+                if (doc_dir.name, p.stem) not in live_manifests
+            )
+        legacy = doc_dir / "objects"
+        if legacy.is_dir():
+            legacy_objects.extend(
+                p for p in legacy.iterdir()
+                if p.is_file() and p.name not in referenced
+            )
+    shared_objects = [
+        p for p in _global_objects_dir().iterdir()
+        if p.is_file() and p.name not in referenced
+    ]
+
+    def remove(paths: list[Path], counter: str) -> None:
+        for path in paths:
+            try:
+                size = path.stat().st_size
+            except OSError:
+                size = 0
+            if not dry_run:
+                try:
+                    path.unlink()
+                    _VERIFIED_OBJECT_PATHS.discard(str(path))
+                except OSError:
+                    result["errors"] = int(result["errors"]) + 1
+                    continue
+            result[counter] = int(result[counter]) + 1
+            result["bytes_reclaimed"] = int(result["bytes_reclaimed"]) + size
+
+    remove(orphan_manifests, "manifests_removed")
+    remove(orphan_full, "full_files_removed")
+    remove(shared_objects + legacy_objects, "objects_removed")
+    return result
 
 
 def _verify(doc_id: str, names: list[str], parts: dict[str, str]) -> bool:
@@ -304,21 +548,46 @@ def snapshot(
 
 
 def rebuild_to(doc_id: str, version_id: str, dest: str) -> bool:
-    """把某版本重组/恢复到 dest（dedup 重组 zip / full 直接拷贝）。"""
+    """把某版本原子重组/恢复到 dest。
+
+    始终先在目标同目录生成并验证临时文件，最后用 ``os.replace`` 一次切换。
+    任一对象缺失、manifest 损坏或校验失败时，现有目标文件保持逐字节不变。
+    """
     dest = os.path.abspath(dest)
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     mf = _manifest_path(doc_id, version_id)
     if not mf.exists():
         return False
-    m = json.loads(mf.read_text(encoding="utf-8"))
-    if m.get("mode") == "full":
-        src = version_file(doc_id, version_id)
-        if not src.exists():
-            return False
-        shutil.copy2(src, ext_path(dest))
-        return True
+    fd, tmp = tempfile.mkstemp(
+        prefix=".pptdoctor-restore-",
+        suffix=".pptx",
+        dir=os.path.dirname(dest),
+    )
+    os.close(fd)
     try:
-        _write_zip(ext_path(dest), doc_id, m["names"], m["parts"])
+        m = json.loads(mf.read_text(encoding="utf-8"))
+        mode = m.get("mode")
+        if mode == "full":
+            src = version_file(doc_id, version_id)
+            if not src.exists():
+                return False
+            shutil.copy2(src, ext_path(tmp))
+        elif mode == "dedup":
+            _write_zip(ext_path(tmp), doc_id, m["names"], m["parts"])
+            if parse_pptx(tmp).status != "ok":
+                return False
+        else:
+            return False
+
+        expected = manifest_content_hash(doc_id, version_id)
+        if not expected or file_hash(tmp) != expected:
+            return False
+        os.replace(ext_path(tmp), ext_path(dest))
         return True
     except Exception:  # noqa: BLE001
         return False
+    finally:
+        try:
+            os.unlink(ext_path(tmp))
+        except OSError:
+            pass

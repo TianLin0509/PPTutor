@@ -2,10 +2,16 @@
 from __future__ import annotations
 
 import fixtures_gen as fx
+import pytest
 
 from pptx_finder.parser import parse_pptx
 from pptx_finder.text_tokenize import build_fts_match
 from pptx_finder.versioning import store, vault
+
+
+@pytest.fixture(autouse=True)
+def _isolated_vault(monkeypatch, tmp_path):
+    monkeypatch.setenv("PPTX_FINDER_DATA_DIR", str(tmp_path / "appdata"))
 
 
 def _conn():
@@ -29,17 +35,35 @@ def test_snapshot_rebuild_roundtrip(tmp_path):
     assert [pg.raw_text for pg in d1.pages] == [pg.raw_text for pg in d0.pages]
 
 
+def test_rebuild_failure_keeps_existing_destination_byte_for_byte(tmp_path):
+    """缺对象/坏快照不能先截断用户当前文件，再返回失败。"""
+    p = tmp_path / "a.pptx"
+    fx.make_pptx(p, [{"body": "可恢复版本"}])
+    conn = _conn()
+    vid = vault.snapshot(conn, str(p))
+    did = vault.doc_id_for(str(p))
+    manifest = vault.manifest_for(did, vid)
+    missing_hash = next(iter(manifest["parts"].values()))
+    (vault._global_objects_dir() / missing_hash).unlink()
+
+    dest = tmp_path / "current.pptx"
+    original = b"CURRENT USER FILE MUST SURVIVE"
+    dest.write_bytes(original)
+
+    assert vault.rebuild_to(did, vid, str(dest)) is False
+    assert dest.read_bytes() == original
+
+
 def test_dedup_reuses_unchanged_parts(tmp_path):
     """两版只差一页，objects 大量复用——不是翻倍存。"""
     p = tmp_path / "a.pptx"
     fx.make_pptx(p, [{"body": "页1 固定"}, {"body": "页2 固定"}, {"body": "页3 原始"}])
     conn = _conn()
     vault.snapshot(conn, str(p))
-    did = vault.doc_id_for(str(p))
-    n1 = len(list(vault._objects_dir(did).glob("*")))
+    n1 = len(list(vault._global_objects_dir().glob("*")))
     fx.make_pptx(p, [{"body": "页1 固定"}, {"body": "页2 固定"}, {"body": "页3 改了几个字"}])
     vault.snapshot(conn, str(p))
-    n2 = len(list(vault._objects_dir(did).glob("*")))
+    n2 = len(list(vault._global_objects_dir().glob("*")))
     assert n2 > n1            # 确有新增（变化的 part）
     assert n2 < n1 * 2        # 但远非翻倍（未变 part 复用）
 
