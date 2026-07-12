@@ -9,17 +9,18 @@ import threading
 from pathlib import Path
 
 from .. import renderer
-from ..config import PPTX_EXT
+from ..config import PPTX_EXT, get_version_keep_per_doc
 from ..scanner import iter_ppt_files
 from ..text_tokenize import build_fts_match_exact
 from . import store, vault
 
 SESSION_GAP_SEC = 30 * 60
-KEEP_PER_DOC = 50
+KEEP_PER_DOC = 100
 _DIFF_SAMPLE_LIMIT = 6
 _DEFAULT_RECONCILE_INTERVAL_SEC = 300.0
-_DEFAULT_RECONCILE_BATCH_DOCS = 200
+_DEFAULT_RECONCILE_BATCH_DOCS = 500
 _DEFAULT_RECONCILE_BATCH_NEW_FILES = 120
+_DEFAULT_VAULT_HEAVY_MAINTENANCE_INTERVAL_SEC = 7 * 24 * 60 * 60
 _FALSE_ENV = {"0", "false", "no", "off"}
 
 
@@ -161,35 +162,77 @@ class VersionManager:
         self._reconcile_last_new_checked = 0
         self._reconcile_last_ms = 0.0
         self._reconcile_last_error = ""
+        self._reconcile_last_cursor = ""
+        self._snapshot_failures = 0
+        self._snapshot_last_error = ""
+        self._keep_per_doc = max(
+            0,
+            _env_int(
+                "PPTUTOR_VERSION_KEEP_PER_DOC",
+                get_version_keep_per_doc(KEEP_PER_DOC),
+            ),
+        )
         self._vault_maintenance_thread: threading.Thread | None = None
+        # Serialize filesystem-moving maintenance with fsck. This lock is
+        # deliberately separate from ``_lock`` so long read-only deep audits
+        # never block ordinary snapshot commits.
+        self._vault_maintenance_lock = threading.RLock()
         self._vault_maintenance_enabled = (
             self._db_path is not None
             and os.environ.get("PPTUTOR_VAULT_MAINTENANCE", "1").strip().lower()
             not in _FALSE_ENV
         )
+        self._vault_heavy_maintenance_interval_sec = max(
+            0.0,
+            _env_float(
+                "PPTUTOR_VAULT_HEAVY_MAINTENANCE_SEC",
+                _DEFAULT_VAULT_HEAVY_MAINTENANCE_INTERVAL_SEC,
+            ),
+        )
         self._vault_maintenance_result: dict = {}
         self._vault_maintenance_error = ""
 
     # ---------- Snapshot identity ----------
-    def snapshot_now(self, path: str, notify: bool = True) -> str | None:
+    def snapshot_now(
+        self,
+        path: str,
+        notify: bool = True,
+        *,
+        preserve_version_ids: set[str] | None = None,
+    ) -> str | None:
         if not _is_pptx(path):
             return None
         path = os.path.abspath(path)
         if not os.path.exists(path):
             return None
-        with self._lock:
-            doc_id, base_version, content_hash = self._snapshot_identity(path)
-            sid = self._session_id_for_doc(doc_id)
-            vid = vault.snapshot(
-                self._conn,
-                path,
-                sid,
-                doc_id=doc_id,
-                base_version=base_version,
-                content_hash=content_hash,
-            )
-            if vid:
-                self._enforce_quota(doc_id)
+        try:
+            with vault.stable_snapshot_source(path) as snapshot_source:
+                content_hash = vault.file_hash(snapshot_source)
+                with self._lock:
+                    doc_id, base_version, content_hash = self._snapshot_identity(
+                        path,
+                        content_hash=content_hash,
+                    )
+                    sid = self._session_id_for_doc(doc_id)
+                    vid = vault.snapshot(
+                        self._conn,
+                        path,
+                        sid,
+                        doc_id=doc_id,
+                        base_version=base_version,
+                        content_hash=content_hash,
+                        source_path=snapshot_source,
+                    )
+                    if vid:
+                        self._enforce_quota(
+                            doc_id,
+                            preserve_version_ids=preserve_version_ids,
+                        )
+            self._snapshot_last_error = ""
+        except vault.SnapshotSourceError as exc:
+            self._snapshot_failures += 1
+            self._snapshot_last_error = f"{type(exc).__name__}: {exc}"
+            raise
         if vid and notify and self._on_snapshot is not None:
             try:
                 self._on_snapshot(path, vid)
@@ -213,13 +256,17 @@ class VersionManager:
             self._conn.commit()
             return True
 
-    def _snapshot_identity(self, path: str):
+    def _snapshot_identity(self, path: str, content_hash: str | None = None):
         doc = store.get_doc_by_path(self._conn, path)
         if doc:
             doc_id = doc["doc_id"]
-            return doc_id, self._effective_latest_version_on_conn(self._conn, doc_id), None
+            return (
+                doc_id,
+                self._effective_latest_version_on_conn(self._conn, doc_id),
+                content_hash,
+            )
 
-        content_hash = vault.file_hash(path)
+        content_hash = content_hash or vault.file_hash(path)
         candidates = self._find_versions_by_content_hash(content_hash)
         now = _now()
 
@@ -264,6 +311,8 @@ class VersionManager:
         rows = self._conn.execute("SELECT * FROM versions ORDER BY ts DESC").fetchall()
         matched = []
         for row in rows:
+            if "health" in row.keys() and str(row["health"] or "ok") != "ok":
+                continue
             try:
                 if vault.manifest_content_hash(row["doc_id"], row["version_id"]) == content_hash:
                     matched.append(row)
@@ -330,15 +379,13 @@ class VersionManager:
         """
         max_docs = self._reconcile_batch_docs if limit is None else max(1, int(limit))
         with self._lock:
-            docs = list(store.list_docs(self._conn))[:max_docs]
-            known_paths = {
-                store.path_key(str(doc["path"] or ""))
-                for doc in docs
-                if str(doc["path"] or "")
-            }
+            cursor = store.get_meta(self._conn, "reconcile_cursor", "")
+            docs = list(store.list_active_docs_after(self._conn, cursor, max_docs))
+            known_paths = store.current_path_keys(self._conn)
         checked = 0
         new_checked = 0
         created = 0
+        cycle_error = ""
         start = datetime.datetime.now().timestamp()
         try:
             for doc in docs:
@@ -346,6 +393,13 @@ class VersionManager:
                 if not path or not _is_pptx(path):
                     continue
                 if not os.path.exists(path):
+                    with self._lock:
+                        store.set_status(
+                            self._conn,
+                            doc["doc_id"],
+                            "deleted",
+                            commit=False,
+                        )
                     continue
                 checked += 1
                 with self._lock:
@@ -356,27 +410,44 @@ class VersionManager:
                     continue
                 if latest is not None and mtime <= float(latest["ts"] or 0) + 0.5:
                     continue
-                if self.snapshot_now(path, notify=notify):
-                    created += 1
+                try:
+                    if self.snapshot_now(path, notify=notify):
+                        created += 1
+                except vault.SnapshotSourceError as exc:
+                    cycle_error = f"{type(exc).__name__}: {exc}"
+                    continue
             if scan_new_files and self._reconcile_batch_new_files > 0:
                 for path in self._iter_reconcile_new_file_candidates(docs, known_paths):
                     new_checked += 1
-                    if self.snapshot_now(path, notify=notify):
-                        created += 1
+                    try:
+                        if self.snapshot_now(path, notify=notify):
+                            created += 1
+                    except vault.SnapshotSourceError as exc:
+                        cycle_error = f"{type(exc).__name__}: {exc}"
                     if new_checked >= self._reconcile_batch_new_files:
                         break
             return created
         except Exception as exc:  # noqa: BLE001
-            self._reconcile_last_error = f"{type(exc).__name__}: {exc}"
+            cycle_error = f"{type(exc).__name__}: {exc}"
             logging.getLogger(__name__).warning("version reconcile failed", exc_info=True)
             return created
         finally:
+            if docs:
+                with self._lock:
+                    self._reconcile_last_cursor = str(docs[-1]["doc_id"])
+                    store.set_meta(
+                        self._conn,
+                        "reconcile_cursor",
+                        self._reconcile_last_cursor,
+                    )
+                    self._conn.commit()
             elapsed = (datetime.datetime.now().timestamp() - start) * 1000.0
             self._reconcile_cycles += 1
             self._reconcile_snapshots += created
             self._reconcile_last_checked = checked
             self._reconcile_last_new_checked = new_checked
             self._reconcile_last_ms = elapsed
+            self._reconcile_last_error = cycle_error
 
     def _reconcile_candidate_dirs(self, docs) -> list[str]:
         dirs: dict[str, None] = {}
@@ -507,6 +578,10 @@ class VersionManager:
                 "changed": r["changed"],
                 "thumb_path": r["thumb_path"],
                 "session_id": (r["session_id"] if "session_id" in r.keys() else ""),
+                "health": (r["health"] if "health" in r.keys() else "ok"),
+                "health_error": (
+                    r["health_error"] if "health_error" in r.keys() else ""
+                ),
                 "inherited": r["doc_id"] != doc_id,
             }
             for r in rows
@@ -599,16 +674,28 @@ class VersionManager:
     def restore_to(self, path: str, version_id: str, dest: str | None = None) -> bool:
         with self._lock:
             target = dest or path
-            if target == path and os.path.exists(path):
-                self.snapshot_now(path, notify=False)
             version = store.get_version(self._conn, version_id)
             if not version:
                 return False
+            if "health" in version.keys() and str(version["health"] or "ok") != "ok":
+                return False
+            if target == path and os.path.exists(path):
+                # Saving the current file before restore can itself cross the
+                # retention boundary. Keep the user's selected recovery point
+                # alive through that quota pass or the restore can delete its
+                # own source immediately before rebuilding it.
+                self.snapshot_now(
+                    path,
+                    notify=False,
+                    preserve_version_ids={version_id},
+                )
             return vault.rebuild_to(version["doc_id"], version_id, target)
 
     def export(self, path: str, version_id: str, dest: str) -> bool:
         with self._lock:
             version = store.get_version(self._conn, version_id)
+            if version and "health" in version.keys() and str(version["health"] or "ok") != "ok":
+                return False
             owner_doc_id = version["doc_id"] if version else self._doc_id_for_path_on_conn(self._conn, path)
         return vault.rebuild_to(owner_doc_id, version_id, dest)
 
@@ -640,11 +727,13 @@ class VersionManager:
             ).fetchone()[0])
             rows = conn.execute(
                 """
-                SELECT f.doc_id, f.version_id, f.page_no, d.path AS doc_path, v.ts AS ts
+                SELECT f.doc_id, f.version_id, f.page_no, d.path AS doc_path,
+                       v.ts AS ts, v.health AS health, v.health_error AS health_error
                 FROM version_pages_fts AS f
                 LEFT JOIN managed_docs AS d ON d.doc_id = f.doc_id
                 LEFT JOIN versions AS v ON v.version_id = f.version_id
                 WHERE version_pages_fts MATCH ?
+                ORDER BY v.ts DESC, f.rowid DESC
                 LIMIT ?
                 """,
                 (match, int(limit)),
@@ -661,6 +750,8 @@ class VersionManager:
                     "page_no": r["page_no"],
                     "doc_path": r["doc_path"],
                     "ts": r["ts"] or 0,
+                    "health": r["health"] or "ok",
+                    "health_error": r["health_error"] or "",
                 }
                 for r in rows
                 if r["doc_path"]
@@ -677,10 +768,27 @@ class VersionManager:
                     n += 1
             return n
 
+    def mark_deleted(self, path: str) -> bool:
+        """Mark a watched PPTX as deleted immediately after its delete event."""
+        with self._lock:
+            doc = store.get_doc_by_path(self._conn, os.path.abspath(path))
+            if not doc:
+                return False
+            store.set_status(self._conn, doc["doc_id"], "deleted")
+            return True
+
     def recover(self, doc_id: str, dest: str | None = None) -> bool:
         with self._lock:
             doc = store.get_doc(self._conn, doc_id)
-            latest = self._effective_latest_version_on_conn(self._conn, doc_id)
+            latest = next(
+                (
+                    version
+                    for version in self._effective_versions_on_conn(self._conn, doc_id)
+                    if "health" not in version.keys()
+                    or str(version["health"] or "ok") == "ok"
+                ),
+                None,
+            )
             if not doc or not latest:
                 return False
             ok = vault.rebuild_to(latest["doc_id"], latest["version_id"], dest or doc["path"])
@@ -689,9 +797,19 @@ class VersionManager:
             return ok
 
     # ---------- Quota ----------
-    def _enforce_quota(self, doc_id: str) -> None:
+    def set_retention_limit(self, limit: int) -> None:
+        with self._lock:
+            self._keep_per_doc = max(0, int(limit))
+
+    def _enforce_quota(
+        self,
+        doc_id: str,
+        *,
+        preserve_version_ids: set[str] | None = None,
+    ) -> None:
         vers = store.list_versions(self._conn, doc_id)
-        if len(vers) <= KEEP_PER_DOC:
+        keep_limit = self._keep_per_doc
+        if keep_limit <= 0 or len(vers) <= keep_limit:
             return
         branch_bases = {
             str(row["branched_from_version_id"])
@@ -700,10 +818,58 @@ class VersionManager:
             ).fetchall()
             if row["branched_from_version_id"]
         }
-        for v in vers[KEEP_PER_DOC:]:
+        quarantined = {
+            str(version["version_id"])
+            for version in vers
+            if "health" in version.keys()
+            and str(version["health"] or "ok") != "ok"
+        }
+        healthy_versions = [
+            version
+            for version in vers
+            if str(version["version_id"]) not in quarantined
+        ]
+        session_rows: dict[str, list] = {}
+        session_order: list[str] = []
+        for version in healthy_versions:
+            key = str(version["session_id"] or version["version_id"])
+            if key not in session_rows:
+                session_rows[key] = []
+                session_order.append(key)
+            session_rows[key].append(version)
+
+        # First preserve one milestone per editing session, then spend the
+        # remaining budget on dense detail from the five newest sessions.
+        # This prevents one save-heavy afternoon from erasing months of useful
+        # rollback history. Branch bases and quarantined snapshots stay outside
+        # the healthy quota: the former are recovery roots; the latter may be
+        # repairable after a storage issue and require explicit cleanup.
+        candidates: list = [session_rows[key][0] for key in session_order]
+        candidates.extend(
+            version
+            for key in session_order[:5]
+            for version in session_rows[key]
+        )
+        seen_candidates = {str(v["version_id"]) for v in candidates}
+        candidates.extend(
+            v
+            for v in healthy_versions
+            if str(v["version_id"]) not in seen_candidates
+        )
+        explicit_preserves = {
+            str(version_id) for version_id in (preserve_version_ids or ())
+        }
+        exempt_ids = set(branch_bases) | quarantined | explicit_preserves
+        keep_ids = set(exempt_ids)
+        for version in candidates:
+            if len(keep_ids - exempt_ids) >= keep_limit:
+                break
+            keep_ids.add(str(version["version_id"]))
+
+        for v in vers:
             # A copied document may inherit history through this exact parent
             # version. It is a live recovery root, not quota garbage.
-            if str(v["version_id"]) in branch_bases:
+            if str(v["version_id"]) in keep_ids:
                 continue
             thumb_path = str(v["thumb_path"] or "")
             store.delete_version(self._conn, v["version_id"])
@@ -736,12 +902,77 @@ class VersionManager:
         self._vault_maintenance_thread.start()
 
     def run_vault_maintenance(self) -> dict:
-        """Migrate cross-document duplicates, then safely collect unreachable data."""
+        with self._vault_maintenance_lock:
+            return self._run_vault_maintenance_serialized()
+
+    def _run_vault_maintenance_serialized(self) -> dict:
+        """Run cheap integrity checks every start and throttle heavy GC weekly."""
         try:
-            migration = vault.migrate_legacy_objects()
             with self._lock:
-                garbage = vault.collect_garbage(self._conn, dry_run=False)
-            result = {"migration": migration, "garbage": garbage}
+                last_success_raw = store.get_meta(
+                    self._conn,
+                    "vault_heavy_maintenance_last_success",
+                    "0",
+                )
+            try:
+                last_success = float(last_success_raw or 0)
+            except (TypeError, ValueError):
+                last_success = 0.0
+            now = _now()
+            heavy_due = (
+                self._vault_heavy_maintenance_interval_sec <= 0
+                or now - last_success >= self._vault_heavy_maintenance_interval_sec
+            )
+            migration = (
+                vault.migrate_legacy_objects()
+                if heavy_due
+                else {
+                    "skipped": True,
+                    "reason": "interval",
+                    "last_success": last_success,
+                }
+            )
+            with self._lock:
+                hash_backfill = vault.backfill_content_hashes(self._conn)
+
+            # The integrity walk is read-only and can take noticeable time on
+            # large vaults. Run it on a separate snapshot connection so normal
+            # save events are never blocked behind diagnostics.
+            audit = self.audit_repository(deep=False)
+
+            with self._lock:
+                if heavy_due:
+                    # GC performs its own structural safety gate under the
+                    # manager lock. Quarantined legacy full snapshots do not
+                    # make unrelated live objects unsafe to collect.
+                    garbage = vault.collect_garbage(self._conn, dry_run=False)
+                else:
+                    garbage = {
+                        "skipped": True,
+                        "reason": "interval",
+                        "last_success": last_success,
+                    }
+                heavy_ok = (
+                    heavy_due
+                    and int(migration.get("errors", 0) or 0) == 0
+                    and int(hash_backfill.get("errors", 0) or 0) == 0
+                    and not bool(garbage.get("aborted", False))
+                    and int(garbage.get("errors", 0) or 0) == 0
+                )
+                if heavy_ok:
+                    store.set_meta(
+                        self._conn,
+                        "vault_heavy_maintenance_last_success",
+                        str(now),
+                    )
+                    self._conn.commit()
+            result = {
+                "migration": migration,
+                "hash_backfill": hash_backfill,
+                "audit": audit,
+                "garbage": garbage,
+                "heavy_due": heavy_due,
+            }
             self._vault_maintenance_result = result
             self._vault_maintenance_error = ""
             return result
@@ -749,6 +980,62 @@ class VersionManager:
             self._vault_maintenance_error = f"{type(exc).__name__}: {exc}"
             logging.getLogger(__name__).warning("vault maintenance failed", exc_info=True)
             return {"migration": {}, "garbage": {"aborted": True}}
+
+    def _audit_repository_locked(self, *, deep: bool) -> dict:
+        result = vault.audit_repository(self._conn, deep=deep)
+        self._persist_audit_health_locked(result)
+        return result
+
+    def _persist_audit_health_locked(self, result: dict) -> None:
+        if result.get("deep", False):
+            self._conn.execute(
+                "UPDATE versions SET health='ok', health_error='' WHERE health<>'ok'"
+            )
+        else:
+            # A quick manifest check cannot disprove byte corruption found by
+            # a prior deep hash pass. Preserve those quarantines until another
+            # deep pass verifies the object pool.
+            self._conn.execute(
+                """UPDATE versions SET health='ok', health_error=''
+                   WHERE health<>'ok' AND health_error NOT LIKE 'deep:%'"""
+            )
+        for version_id, error in (result.get("invalid_versions") or {}).items():
+            store.set_version_health(
+                self._conn,
+                str(version_id),
+                "invalid",
+                str(error),
+            )
+        self._conn.commit()
+        quarantined = int(self._conn.execute(
+            "SELECT COUNT(*) FROM versions WHERE health<>'ok'"
+        ).fetchone()[0])
+        result["quarantined_versions"] = quarantined
+        result["ok"] = bool(result.get("ok", False)) and quarantined == 0
+
+    def audit_repository(self, *, deep: bool = False) -> dict:
+        with self._vault_maintenance_lock:
+            return self._audit_repository_serialized(deep=deep)
+
+    def _audit_repository_serialized(self, *, deep: bool = False) -> dict:
+        """Run a user-requested quick or deep vault integrity check."""
+        if self._db_path is None:
+            with self._lock:
+                result = self._audit_repository_locked(deep=deep)
+        else:
+            conn = store.connect(self._db_path)
+            try:
+                conn.isolation_level = None
+                result = vault.audit_repository(conn, deep=deep)
+            finally:
+                conn.close()
+            with self._lock:
+                self._persist_audit_health_locked(result)
+        with self._lock:
+            current = dict(self._vault_maintenance_result)
+            current["audit"] = result
+            self._vault_maintenance_result = current
+        return result
 
     def _start_watcher(self) -> None:
         self._stop_watcher()
@@ -758,6 +1045,7 @@ class VersionManager:
             self.snapshot_now,
             self.move_path,
             self._on_content_saved,
+            self.mark_deleted,
         )
         self._watcher.start()
 
@@ -803,6 +1091,8 @@ class VersionManager:
             and self._vault_maintenance_thread.is_alive()
         )
         migration = self._vault_maintenance_result.get("migration") or {}
+        hash_backfill = self._vault_maintenance_result.get("hash_backfill") or {}
+        audit = self._vault_maintenance_result.get("audit") or {}
         garbage = self._vault_maintenance_result.get("garbage") or {}
         return [
             "version_reconcile: "
@@ -815,13 +1105,30 @@ class VersionManager:
             f"last_checked={self._reconcile_last_checked} "
             f"last_new_checked={self._reconcile_last_new_checked} "
             f"last_ms={self._reconcile_last_ms:.0f} "
+            f"cursor={self._reconcile_last_cursor or '-'} "
             f"error={self._reconcile_last_error or '-'}",
+            "version_snapshots: "
+            f"failures={self._snapshot_failures} "
+            f"last_error={self._snapshot_last_error or '-'}",
+            f"version_retention: keep_per_doc={self._keep_per_doc or 'unlimited'}",
+            "vault_fsck: "
+            f"ok={bool(audit.get('ok', False))} "
+            f"deep={bool(audit.get('deep', False))} "
+            f"versions={int(audit.get('versions_checked', 0) or 0)} "
+            f"invalid={int(audit.get('quarantined_versions', audit.get('invalid_count', 0)) or 0)} "
+            f"missing={int(audit.get('missing_objects', 0) or 0)} "
+            f"hash_errors={int(audit.get('hash_errors', 0) or 0)}",
+            "vault_hashes: "
+            f"updated={int(hash_backfill.get('updated', 0) or 0)} "
+            f"errors={int(hash_backfill.get('errors', 0) or 0)}",
             "vault_maintenance: "
             f"enabled={self._vault_maintenance_enabled} alive={maintenance_alive} "
+            f"heavy_due={bool(self._vault_maintenance_result.get('heavy_due', False))} "
             f"migrated={int(migration.get('migrated', 0) or 0)} "
             f"duplicates={int(migration.get('duplicates', 0) or 0)} "
             f"migration_errors={int(migration.get('errors', 0) or 0)} "
             f"gc_aborted={bool(garbage.get('aborted', False))} "
+            f"gc_skipped={bool(garbage.get('skipped', False))} "
             f"gc_objects={int(garbage.get('objects_removed', 0) or 0)} "
             f"error={self._vault_maintenance_error or '-'}",
         ]

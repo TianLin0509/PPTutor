@@ -13,6 +13,7 @@ from PySide6.QtGui import QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QDialog,
     QHBoxLayout,
     QLabel,
@@ -23,6 +24,29 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+try:
+    from shiboken6 import isValid as _qt_is_valid
+except Exception:  # noqa: BLE001
+    def _qt_is_valid(_obj) -> bool:
+        return True
+
+from .. import db
+from ..config import (
+    APP_NAME,
+    EXCLUDE_DIR_NAMES,
+    cache_dir,
+    data_dir,
+    db_path,
+    get_autostart,
+    get_hotkey,
+    get_version_keep_per_doc,
+    set_autostart,
+    set_hotkey,
+    set_version_keep_per_doc,
+)
+from ..versioning import autostart
+from . import bg_task
+from .bg_task import BackgroundTask
 
 _MOD_NAMES = ("Ctrl", "Alt", "Shift", "Win")
 
@@ -56,6 +80,20 @@ def _diagnostic_summary_lines(lines: list[str]) -> list[str]:
             issues.append("最近一次渲染错误：" + line.split(":", 1)[1].strip())
         elif line.startswith("version_reconcile:") and "error=-" not in line:
             issues.append("版本兜底巡检异常：" + line)
+        elif (
+            line.startswith("version_snapshots:")
+            and _diag_number(line, "failures") > 0
+            and "last_error=-" not in line
+        ):
+            issues.append("版本快照近期有失败记录：" + line)
+        elif (
+            line.startswith("vault_fsck:")
+            and "versions=0" not in line
+            and "ok=True" not in line
+        ):
+            issues.append("版本库完整性检查未通过：" + line)
+        elif line.startswith("autostart:") and "preference=on actual=off" in line:
+            issues.append("开机自启目标无效，需要重新写入")
         elif "unavailable" in line:
             issues.append("诊断项不可用：" + line)
 
@@ -98,27 +136,6 @@ class HotkeyEdit(QLineEdit):
         parts.append(main)
         self._spec = "+".join(parts)
         self.setText(self._spec)
-try:
-    from shiboken6 import isValid as _qt_is_valid
-except Exception:  # noqa: BLE001
-    def _qt_is_valid(_obj) -> bool:
-        return True
-
-from .. import db
-from ..config import (
-    APP_NAME,
-    EXCLUDE_DIR_NAMES,
-    cache_dir,
-    data_dir,
-    db_path,
-    get_autostart,
-    get_hotkey,
-    set_autostart,
-    set_hotkey,
-)
-from ..versioning import autostart
-from . import bg_task
-from .bg_task import BackgroundTask
 
 
 class SettingsDialog(QDialog):
@@ -136,6 +153,7 @@ class SettingsDialog(QDialog):
         self._diag_inflight_token: int | None = None
         self._diag_extra_lines: list[str] = []
         self._powerpoint_inflight = False
+        self._vault_audit_inflight = False
         self._closing = False
         self.setObjectName("settingsWin")
         self.setWindowTitle("设置 · PPT Doctor")
@@ -197,6 +215,26 @@ class SettingsDialog(QDialog):
         self.auto.toggled.connect(self._toggle_auto)
         lay.addWidget(self.auto)
 
+        retention_row = QHBoxLayout()
+        retention_row.addWidget(QLabel("每份 PPT 最多保留版本："))
+        self.retention = QComboBox()
+        for label, value in (
+            ("50 版", 50),
+            ("100 版（推荐）", 100),
+            ("200 版", 200),
+            ("不限", 0),
+        ):
+            self.retention.addItem(label, value)
+        current_limit = get_version_keep_per_doc()
+        index = self.retention.findData(current_limit)
+        if index < 0:
+            self.retention.addItem(f"{current_limit} 版", current_limit)
+            index = self.retention.count() - 1
+        self.retention.setCurrentIndex(index)
+        self.retention.currentIndexChanged.connect(self._apply_retention)
+        retention_row.addWidget(self.retention, 1)
+        lay.addLayout(retention_row)
+
         # 全局唤起热键（#2 可改：解决状态栏「热键被占用」无修复路径）
         hk_title = QLabel("全局唤起热键")
         hk_title.setStyleSheet("font-weight:700;font-size:13px;margin-top:8px;")
@@ -253,6 +291,12 @@ class SettingsDialog(QDialog):
         self.rescan_btn.setEnabled(callable(self._on_rescan))
         self.rescan_btn.clicked.connect(self._request_rescan)
         head.addWidget(self.rescan_btn)
+        self.vault_audit_btn = QPushButton("深度检查版本库")
+        self.vault_audit_btn.setToolTip(
+            "逐一校验版本清单与对象内容哈希；大版本库可能需要约一分钟。"
+        )
+        self.vault_audit_btn.clicked.connect(self._check_vault_repository)
+        head.addWidget(self.vault_audit_btn)
         refresh = QPushButton("刷新")
         refresh.clicked.connect(self.schedule_diagnostics_refresh)
         head.addWidget(refresh)
@@ -302,6 +346,13 @@ class SettingsDialog(QDialog):
         set_autostart(on)
         autostart.set_enabled(on)
 
+    def _apply_retention(self, _index: int) -> None:
+        limit = int(self.retention.currentData() or 0)
+        set_version_keep_per_doc(limit)
+        fn = getattr(self._mgr, "set_retention_limit", None)
+        if callable(fn):
+            fn(limit)
+
     def schedule_diagnostics_refresh(self, *, delay_ms: int = 0) -> None:
         if not self._ui_alive():
             return
@@ -346,6 +397,7 @@ class SettingsDialog(QDialog):
             f"cache_dir: {cache_dir()}",
             f"global_hotkey: {get_hotkey()}",
             f"autostart: preference={'on' if get_autostart() else 'off'} actual={'on' if autostart.is_enabled() else 'off'}",
+            f"autostart_target: {autostart.link_target() or '(missing)'}",
             f"PPTX_FINDER_ROOTS: {os.environ.get('PPTX_FINDER_ROOTS', '') or '(auto fixed drives)'}",
             f"PPTX_FINDER_DATA_DIR: {os.environ.get('PPTX_FINDER_DATA_DIR', '') or '(default)'}",
             f"exclude_dirs: {len(EXCLUDE_DIR_NAMES)} rules",
@@ -466,6 +518,48 @@ class SettingsDialog(QDialog):
             self._diag_extra_lines.append("rescan: requested in background")
         self.schedule_diagnostics_refresh()
 
+    def _check_vault_repository(self) -> None:
+        if not self._ui_alive() or self._vault_audit_inflight:
+            return
+        fn = getattr(self._mgr, "audit_repository", None)
+        if not callable(fn):
+            self.diagnostic_text.appendPlainText("\nvault_fsck_manual: unavailable")
+            return
+        self._vault_audit_inflight = True
+        self.vault_audit_btn.setEnabled(False)
+        self.diagnostic_text.appendPlainText(
+            "\nvault_fsck_manual: running deep object verification..."
+        )
+        task = BackgroundTask(lambda: fn(deep=True), "vault-fsck-deep", None)
+        self._track_diag_task(task)
+        task.done.connect(self._on_vault_audit_done)
+        task.finished.connect(lambda task=task: self._finish_vault_audit(task))
+        task.start()
+
+    def _on_vault_audit_done(self, result: object) -> None:
+        if not self._ui_alive() or not isinstance(result, dict):
+            return
+        line = (
+            "vault_fsck_manual: "
+            f"ok={bool(result.get('ok', False))} "
+            f"versions={int(result.get('versions_checked', 0) or 0)} "
+            f"objects={int(result.get('objects_hashed', 0) or 0)} "
+            f"invalid={int(result.get('quarantined_versions', result.get('invalid_count', 0)) or 0)} "
+            f"missing={int(result.get('missing_objects', 0) or 0)} "
+            f"hash_errors={int(result.get('hash_errors', 0) or 0)}"
+        )
+        self._diag_extra_lines.append(line)
+        self.diagnostic_text.appendPlainText("\n" + line)
+
+    def _finish_vault_audit(self, task) -> None:
+        self._forget_diag_task(task)
+        self._vault_audit_inflight = False
+        try:
+            if _qt_is_valid(getattr(self, "vault_audit_btn", None)):
+                self.vault_audit_btn.setEnabled(True)
+        except RuntimeError:
+            pass
+
     def _check_powerpoint(self) -> None:
         if not self._ui_alive():
             return
@@ -500,6 +594,7 @@ class SettingsDialog(QDialog):
         self._diag_refresh_token += 1
         self._diag_inflight_token = None
         self._powerpoint_inflight = False
+        self._vault_audit_inflight = False
         super().closeEvent(event)
 
 

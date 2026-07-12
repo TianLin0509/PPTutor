@@ -12,6 +12,7 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QFileDialog,
+    QComboBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -76,6 +77,7 @@ class VersionWindow(QWidget):
         self._reload_docs_after_file_op = False
         self._pending_versions_after_file_op: tuple[int, str, object] | None = None
         self._closing = False
+        self._all_docs: list[dict] = []
         self.setObjectName("versionWin")
         self.setWindowTitle("版本管理 · PPT 版 git")
         self.resize(940, 580)
@@ -102,6 +104,18 @@ class VersionWindow(QWidget):
         ll = QVBoxLayout(left)
         ll.setContentsMargins(0, 0, 0, 0)
         ll.addWidget(QLabel("受管文档"))
+        doc_filter_row = QHBoxLayout()
+        self.doc_filter = QLineEdit()
+        self.doc_filter.setPlaceholderText("按文件名或路径筛选…")
+        self.doc_filter.textChanged.connect(self._apply_doc_filter)
+        doc_filter_row.addWidget(self.doc_filter, 1)
+        self.doc_scope = QComboBox()
+        self.doc_scope.addItem("全部", "all")
+        self.doc_scope.addItem("现存", "active")
+        self.doc_scope.addItem("已删除", "deleted")
+        self.doc_scope.currentIndexChanged.connect(self._apply_doc_filter)
+        doc_filter_row.addWidget(self.doc_scope)
+        ll.addLayout(doc_filter_row)
         self.doc_list = QListWidget()
         self.doc_list.currentItemChanged.connect(self._on_doc)
         ll.addWidget(self.doc_list, 1)
@@ -202,6 +216,8 @@ class VersionWindow(QWidget):
     def _set_navigation_enabled(self, enabled: bool) -> None:
         self.doc_list.setEnabled(enabled)
         self.ver_list.setEnabled(enabled)
+        self.doc_filter.setEnabled(enabled)
+        self.doc_scope.setEnabled(enabled)
         self.search.setEnabled(enabled)
         self.search_btn.setEnabled(enabled)
 
@@ -210,13 +226,19 @@ class VersionWindow(QWidget):
         ctx = self._sel_version_context()
         has_version = ctx is not None
         version_id = ctx[0] if ctx else ""
+        current_item = self.ver_list.currentItem()
+        current_data = current_item.data(Qt.UserRole) if current_item else None
+        healthy = not isinstance(current_data, dict) or str(
+            current_data.get("health") or "ok"
+        ) == "ok"
         recoverable = isinstance(self._cur_doc, tuple) and self._cur_doc[2] == "deleted"
-        self.btn_restore.setEnabled(on and has_version)
-        self.btn_export.setEnabled(on and has_version)
+        self.btn_restore.setEnabled(on and has_version and healthy)
+        self.btn_export.setEnabled(on and has_version and healthy)
         self.btn_recover.setEnabled(on and recoverable)
         self.btn_preview.setEnabled(
             on
             and has_version
+            and healthy
             and hasattr(self._mgr, "ensure_version_preview")
             and version_id not in self._version_preview_inflight
         )
@@ -256,6 +278,11 @@ class VersionWindow(QWidget):
         data = it.data(Qt.UserRole) if it is not None else None
         if not isinstance(data, dict) or not data.get("version_id"):
             self._clear_version_preview()
+            return
+        if str(data.get("health") or "ok") != "ok":
+            reason = str(data.get("health_error") or "完整性检查未通过")
+            self._clear_version_preview("恢复点已隔离")
+            self.version_preview.setToolTip(reason)
             return
         thumb_path = str(data.get("thumb_path") or "")
         if not self._set_version_preview_image(thumb_path):
@@ -374,20 +401,52 @@ class VersionWindow(QWidget):
         self._populate_docs(docs)
 
     def _populate_docs(self, docs: list[dict]) -> None:
+        self._all_docs = list(docs)
+        self._apply_doc_filter()
+
+    def _apply_doc_filter(self, *_args) -> None:
+        selected = None
+        current = self.doc_list.currentItem()
+        if current is not None:
+            data = current.data(Qt.UserRole)
+            if isinstance(data, tuple):
+                selected = data[0]
+        query = self.doc_filter.text().strip().casefold()
+        scope = str(self.doc_scope.currentData() or "all")
+        docs = [
+            doc
+            for doc in self._all_docs
+            if (scope == "all" or str(_vget(doc, "status", "active") or "active") == scope)
+            and (
+                not query
+                or query in str(_vget(doc, "path", "") or "").casefold()
+                or query in os.path.basename(
+                    str(_vget(doc, "path", "") or "")
+                ).casefold()
+            )
+        ]
         self.doc_list.clear()
         if not docs:
-            it = QListWidgetItem("暂无版本文档")
+            self._cur_doc = None
+            self.ver_list.clear()
+            self._clear_version_preview("没有匹配的版本文档")
+            it = QListWidgetItem("没有匹配的版本文档")
             it.setData(Qt.UserRole, None)
             self.doc_list.addItem(it)
             self.right_title.setText("还没有可恢复的版本历史")
+            self._update_file_ops_state()
             return
-        for d in docs:
+        selected_row = 0
+        for row, d in enumerate(docs):
             name = os.path.basename(d["path"])
             label = ("🗑 " + name + "（已删·可找回）") if d["status"] == "deleted" else name
             it = QListWidgetItem(label)
+            it.setToolTip(str(d["path"]))
             it.setData(Qt.UserRole, (d["doc_id"], d["path"], d["status"]))
             self.doc_list.addItem(it)
-        self.doc_list.setCurrentRow(0)
+            if selected and d["doc_id"] == selected:
+                selected_row = row
+        self.doc_list.setCurrentRow(selected_row)
 
     def _on_doc(self, cur, prev=None) -> None:
         if not self._ui_alive():
@@ -515,11 +574,16 @@ class VersionWindow(QWidget):
 
     def _make_version_item(self, v, doc_id: str, header: str = "") -> QListWidgetItem:
         changed = str(_vget(v, "changed", "") or "").strip()
+        health = str(_vget(v, "health", "ok") or "ok")
         body = f"{_fmt_ts(_vget(v, 'ts', 0))}　·　{_vget(v, 'page_count', 0)} 页"
         if changed:
             body = f"{body}\n  ✎ {changed}"
+        if health != "ok":
+            body = f"{body}\n  ⚠ 无效恢复点（已隔离）"
         label = f"{header}\n{body}" if header else body
         it = QListWidgetItem(label)
+        if health != "ok":
+            it.setToolTip(str(_vget(v, "health_error", "") or "完整性检查未通过"))
         doc_path = None
         if isinstance(self._cur_doc, tuple) and self._cur_doc[0] == doc_id:
             doc_path = self._cur_doc[1]
@@ -528,6 +592,8 @@ class VersionWindow(QWidget):
             "doc_path": doc_path,
             "changed": changed,
             "thumb_path": _vget(v, "thumb_path", ""),
+            "health": health,
+            "health_error": _vget(v, "health_error", ""),
         })
         return it
 
@@ -805,10 +871,18 @@ class VersionWindow(QWidget):
         for row in rows:
             ts = _fmt_ts(float(row.get("ts") or 0))
             name = row.get("name") or os.path.basename(str(row.get("doc_path") or "")) or str(row.get("doc_id") or "")
-            it = QListWidgetItem(f"{name}　·　{ts}　·　第 {row.get('page_no', '')} 页")
+            health = str(row.get("health") or "ok")
+            label = f"{name}　·　{ts}　·　第 {row.get('page_no', '')} 页"
+            if health != "ok":
+                label += "　⚠ 已隔离"
+            it = QListWidgetItem(label)
+            if health != "ok":
+                it.setToolTip(str(row.get("health_error") or "完整性检查未通过"))
             it.setData(Qt.UserRole, {
                 "version_id": row.get("version_id"),
                 "doc_path": row.get("doc_path"),
+                "health": health,
+                "health_error": row.get("health_error") or "",
             })
             self.ver_list.addItem(it)
         self.ver_list.setCurrentRow(0)

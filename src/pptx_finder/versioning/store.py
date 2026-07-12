@@ -13,7 +13,8 @@ CREATE TABLE IF NOT EXISTS managed_docs(
 CREATE TABLE IF NOT EXISTS versions(
   version_id TEXT PRIMARY KEY, doc_id TEXT NOT NULL, ts REAL DEFAULT 0,
   session_id TEXT DEFAULT '', page_count INTEGER DEFAULT 0, size INTEGER DEFAULT 0,
-  changed TEXT DEFAULT '', thumb_path TEXT DEFAULT '', content_hash TEXT DEFAULT ''
+  changed TEXT DEFAULT '', thumb_path TEXT DEFAULT '', content_hash TEXT DEFAULT '',
+  health TEXT DEFAULT 'ok', health_error TEXT DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_versions_doc ON versions(doc_id, ts);
 CREATE INDEX IF NOT EXISTS idx_versions_hash ON versions(content_hash, ts);
@@ -31,6 +32,9 @@ CREATE TABLE IF NOT EXISTS doc_branches(
   branched_from_version_id TEXT NOT NULL, branched_at REAL DEFAULT 0,
   reason TEXT DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS vault_meta(
+  key TEXT PRIMARY KEY, value TEXT DEFAULT ''
+);
 """
 
 
@@ -47,6 +51,8 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
     _ensure_column(conn, "versions", "changed", "TEXT DEFAULT ''")
     _ensure_column(conn, "versions", "thumb_path", "TEXT DEFAULT ''")
+    _ensure_column(conn, "versions", "health", "TEXT DEFAULT 'ok'")
+    _ensure_column(conn, "versions", "health_error", "TEXT DEFAULT ''")
     # Backfill path aliases for existing vaults created before doc_paths existed.
     for row in conn.execute("SELECT doc_id, path, created_at, updated_at FROM managed_docs").fetchall():
         ts = row["updated_at"] or row["created_at"] or 0
@@ -120,36 +126,103 @@ def list_docs(conn):
     return conn.execute("SELECT * FROM managed_docs ORDER BY updated_at DESC").fetchall()
 
 
+def list_active_docs_after(conn, cursor: str, limit: int):
+    """Return a deterministic round-robin batch ordered by doc_id."""
+    limit = max(1, int(limit))
+    rows = list(conn.execute(
+        """SELECT * FROM managed_docs
+           WHERE status='active' AND doc_id>?
+           ORDER BY doc_id LIMIT ?""",
+        (str(cursor or ""), limit),
+    ).fetchall())
+    if len(rows) < limit:
+        rows.extend(conn.execute(
+            """SELECT * FROM managed_docs
+               WHERE status='active' AND doc_id<=?
+               ORDER BY doc_id LIMIT ?""",
+            (str(cursor or ""), limit - len(rows)),
+        ).fetchall())
+    return rows
+
+
+def current_path_keys(conn) -> set[str]:
+    """Return current aliases that belong to actively managed documents.
+
+    Deleted-document aliases must stay eligible for offline recreation scans;
+    otherwise a file rebuilt at the same path while the app was closed is
+    mistaken for an already-covered active file forever.
+    """
+    return {
+        str(row["path_key"])
+        for row in conn.execute(
+            """SELECT p.path_key
+               FROM doc_paths AS p
+               JOIN managed_docs AS d ON d.doc_id=p.doc_id
+               WHERE p.status='current' AND d.status='active'"""
+        ).fetchall()
+    }
+
+
+def get_meta(conn, key: str, default: str = "") -> str:
+    row = conn.execute("SELECT value FROM vault_meta WHERE key=?", (key,)).fetchone()
+    return str(row["value"] if row else default)
+
+
+def set_meta(conn, key: str, value: str) -> None:
+    conn.execute(
+        """INSERT INTO vault_meta(key,value) VALUES(?,?)
+           ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+        (key, str(value)),
+    )
+
+
 def summary_stats(conn) -> dict[str, int]:
     """Return non-overloaded vault KPIs.
 
-    ``protected_docs`` counts documents that actually own at least one stored
-    version; ``rollback_docs`` requires two or more versions. This deliberately
-    avoids presenting the managed-document row count as a snapshot count.
+    ``protected_docs`` counts documents with at least one healthy recovery
+    point; ``rollback_docs`` requires two or more healthy points. Physical and
+    quarantined version counts remain separate so a broken point never inflates
+    the user-facing recovery promise.
     """
     row = conn.execute(
-        """SELECT
+        """WITH own AS (
+             SELECT doc_id, COUNT(*) AS n
+             FROM versions
+             WHERE COALESCE(health,'ok')='ok'
+             GROUP BY doc_id
+           ), inherited AS (
+             SELECT b.doc_id, COUNT(v.version_id) AS n
+             FROM doc_branches AS b
+             JOIN versions AS base ON base.version_id=b.branched_from_version_id
+             JOIN versions AS v ON v.doc_id=b.parent_doc_id
+               AND (v.ts<base.ts OR (v.ts=base.ts AND v.version_id<=base.version_id))
+               AND COALESCE(v.health,'ok')='ok'
+             GROUP BY b.doc_id
+           ), effective AS (
+             SELECT d.doc_id, COALESCE(o.n,0)+COALESCE(i.n,0) AS n
+             FROM managed_docs AS d
+             LEFT JOIN own AS o ON o.doc_id=d.doc_id
+             LEFT JOIN inherited AS i ON i.doc_id=d.doc_id
+           )
+           SELECT
              (SELECT COUNT(*) FROM managed_docs) AS managed_docs,
              (SELECT COUNT(*) FROM managed_docs WHERE status='active') AS active_docs,
              (SELECT COUNT(*) FROM managed_docs WHERE status='deleted') AS deleted_docs,
              (SELECT COUNT(*) FROM versions) AS total_versions,
-             (SELECT COUNT(*) FROM (
-                SELECT doc_id FROM versions GROUP BY doc_id HAVING COUNT(*) >= 1
-              )) AS protected_docs,
-             (SELECT COUNT(*) FROM (
-                SELECT doc_id FROM versions GROUP BY doc_id HAVING COUNT(*) >= 2
-              )) AS rollback_docs,
-             (SELECT COUNT(*) FROM (
-                SELECT doc_id FROM versions GROUP BY doc_id HAVING COUNT(*) = 1
-              )) AS single_version_docs
+             (SELECT COUNT(*) FROM versions WHERE COALESCE(health,'ok')='ok') AS healthy_versions,
+             (SELECT COUNT(*) FROM effective WHERE n>=1) AS protected_docs,
+             (SELECT COUNT(*) FROM effective WHERE n>=2) AS rollback_docs,
+             (SELECT COUNT(*) FROM effective WHERE n=1) AS single_version_docs,
+             (SELECT COUNT(*) FROM versions WHERE health<>'ok') AS unhealthy_versions
         """
     ).fetchone()
     return {key: int(row[key] or 0) for key in row.keys()}
 
 
-def set_status(conn, doc_id: str, status: str) -> None:
+def set_status(conn, doc_id: str, status: str, *, commit: bool = True) -> None:
     conn.execute("UPDATE managed_docs SET status=? WHERE doc_id=?", (status, doc_id))
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 def set_latest(conn, doc_id: str, version_id: str) -> None:
@@ -157,16 +230,53 @@ def set_latest(conn, doc_id: str, version_id: str) -> None:
 
 
 # ---- Versions ----
-def add_version(conn, version_id, doc_id, ts, session_id, page_count, size, content_hash, changed="") -> None:
+def add_version(
+    conn,
+    version_id,
+    doc_id,
+    ts,
+    session_id,
+    page_count,
+    size,
+    content_hash,
+    changed="",
+    health="ok",
+    health_error="",
+) -> None:
     conn.execute(
-        """INSERT INTO versions(version_id, doc_id, ts, session_id, page_count, size, content_hash, changed)
-           VALUES(?,?,?,?,?,?,?,?)""",
-        (version_id, doc_id, ts, session_id, page_count, size, content_hash, changed),
+        """INSERT INTO versions(
+             version_id, doc_id, ts, session_id, page_count, size,
+             content_hash, changed, health, health_error
+           ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+        (
+            version_id,
+            doc_id,
+            ts,
+            session_id,
+            page_count,
+            size,
+            content_hash,
+            changed,
+            health,
+            health_error,
+        ),
     )
 
 
 def set_version_thumb_path(conn, version_id: str, thumb_path: str) -> None:
     conn.execute("UPDATE versions SET thumb_path=? WHERE version_id=?", (thumb_path, version_id))
+
+
+def set_version_health(
+    conn,
+    version_id: str,
+    health: str,
+    error: str = "",
+) -> None:
+    conn.execute(
+        "UPDATE versions SET health=?, health_error=? WHERE version_id=?",
+        (str(health or "unknown"), str(error or ""), version_id),
+    )
 
 
 def list_versions(conn, doc_id: str):
@@ -216,7 +326,9 @@ def find_versions_by_content_hash(conn, content_hash: str):
     if not content_hash:
         return []
     return conn.execute(
-        "SELECT * FROM versions WHERE content_hash=? ORDER BY ts DESC",
+        """SELECT * FROM versions
+           WHERE content_hash=? AND COALESCE(health, 'ok')='ok'
+           ORDER BY ts DESC, version_id DESC""",
         (content_hash,),
     ).fetchall()
 

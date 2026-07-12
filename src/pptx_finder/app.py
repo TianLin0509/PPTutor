@@ -35,9 +35,16 @@ HOTKEY_ID = 1
 def _sync_autostart_preference() -> bool:
     desired = get_autostart()
     try:
-        if autostart.is_enabled() == desired:
-            return True
-        return autostart.set_enabled(desired)
+        # A versioned green-install folder moves on every release.  Merely
+        # checking whether the Startup shortcut exists leaves it pointing at
+        # a deleted old executable after upgrades.  Rewriting an enabled link
+        # is cheap and makes the configured target self-healing.
+        if desired:
+            return autostart.set_enabled(True)
+        # Remove the link by filename even when its target points at a stale
+        # versioned install directory. ``is_enabled`` intentionally reports
+        # target mismatches as false, which is not the same as "no link".
+        return autostart.set_enabled(False)
     except Exception:  # noqa: BLE001
         logging.getLogger(__name__).warning("failed to sync autostart preference", exc_info=True)
         return False

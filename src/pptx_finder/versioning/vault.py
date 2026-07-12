@@ -7,11 +7,13 @@
 from __future__ import annotations
 
 import datetime
+from contextlib import contextmanager
 import json
 import os
 import re
 import shutil
 import tempfile
+import time
 import zipfile
 from pathlib import Path
 
@@ -25,6 +27,19 @@ from . import store
 _OBJECT_HASH_RE = re.compile(r"^[0-9a-f]{16}$")
 _GLOBAL_OBJECTS_DIRNAME = "_objects"
 _VERIFIED_OBJECT_PATHS: set[str] = set()
+_STABLE_COPY_RETRY_DELAYS_SEC = (0.15, 0.4, 0.9)
+
+
+class SnapshotSourceError(OSError):
+    """The source could not be captured as one coherent point-in-time file."""
+
+
+class SnapshotSourceChangedError(SnapshotSourceError):
+    """The source changed while it was being copied."""
+
+
+class InvalidSnapshotError(SnapshotSourceError):
+    """The stable source is not a parseable PPTX recovery point."""
 
 
 def vault_dir() -> Path:
@@ -257,6 +272,59 @@ def _new_vid() -> str:
     return datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
 
 
+@contextmanager
+def stable_snapshot_source(path: str):
+    """Yield one immutable temporary copy of ``path``.
+
+    PowerPoint and sync clients can replace a package while a watcher callback
+    is already running.  Hashing the live path and then opening it again can
+    mix two saves.  We copy once, require source stat stability across that
+    copy, and make every later snapshot stage read only the temporary file.
+    """
+    source = os.path.abspath(path)
+    last_error: Exception | None = None
+    prepared = ""
+    for attempt, delay in enumerate((0.0, *_STABLE_COPY_RETRY_DELAYS_SEC)):
+        if delay:
+            time.sleep(delay)
+        fd, tmp = tempfile.mkstemp(prefix=".pptdoctor-snapshot-", suffix=".pptx")
+        os.close(fd)
+        try:
+            before = os.stat(ext_path(source))
+            shutil.copyfile(ext_path(source), ext_path(tmp))
+            with open(ext_path(tmp), "rb+") as copied:
+                os.fsync(copied.fileno())
+            after = os.stat(ext_path(source))
+            copied_stat = os.stat(ext_path(tmp))
+            stable = (
+                before.st_size == after.st_size == copied_stat.st_size
+                and before.st_mtime_ns == after.st_mtime_ns
+            )
+            if not stable:
+                raise SnapshotSourceChangedError(source)
+            prepared = tmp
+            break
+        except (OSError, SnapshotSourceChangedError) as exc:
+            last_error = exc
+            try:
+                os.unlink(ext_path(tmp))
+            except OSError:
+                pass
+            if attempt >= len(_STABLE_COPY_RETRY_DELAYS_SEC):
+                break
+    if not prepared:
+        if isinstance(last_error, SnapshotSourceChangedError):
+            raise last_error
+        raise SnapshotSourceError(source) from last_error
+    try:
+        yield prepared
+    finally:
+        try:
+            os.unlink(ext_path(prepared))
+        except OSError:
+            pass
+
+
 def _write_zip(dest: str, doc_id: str, names: list[str], parts: dict[str, str]) -> None:
     with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as z:
         for name in names:
@@ -325,6 +393,36 @@ def migrate_legacy_objects() -> dict[str, int]:
     return result
 
 
+def backfill_content_hashes(conn) -> dict[str, int]:
+    """Upgrade legacy raw ZIP hashes to canonical package hashes in place."""
+    result = {"checked": 0, "updated": 0, "errors": 0}
+    rows = conn.execute(
+        "SELECT version_id, doc_id, content_hash FROM versions"
+    ).fetchall()
+    for row in rows:
+        current = str(row["content_hash"] or "")
+        if current.startswith(("pkg:", "file:")):
+            continue
+        result["checked"] += 1
+        try:
+            canonical = manifest_content_hash(
+                str(row["doc_id"]),
+                str(row["version_id"]),
+            )
+            if not canonical:
+                result["errors"] += 1
+                continue
+            conn.execute(
+                "UPDATE versions SET content_hash=? WHERE version_id=?",
+                (canonical, row["version_id"]),
+            )
+            result["updated"] += 1
+        except (OSError, ValueError, TypeError):
+            result["errors"] += 1
+    conn.commit()
+    return result
+
+
 def delete_version_artifacts(doc_id: str, version_id: str) -> None:
     """Remove non-shared files owned exclusively by a version DB row."""
     for path in (_manifest_path(doc_id, version_id), version_file(doc_id, version_id)):
@@ -353,6 +451,12 @@ def collect_garbage(conn, *, dry_run: bool = True) -> dict[str, int | bool]:
         (str(row["doc_id"]), str(row["version_id"])) for row in rows
     }
     referenced: set[str] = set()
+    root = vault_dir()
+    shared_by_hash = {
+        path.name: path
+        for path in _global_objects_dir().iterdir()
+        if path.is_file() and _OBJECT_HASH_RE.fullmatch(path.name)
+    }
 
     missing_branch_bases = conn.execute(
         """SELECT COUNT(*)
@@ -383,7 +487,10 @@ def collect_garbage(conn, *, dry_run: bool = True) -> dict[str, int | bool]:
                     if not _OBJECT_HASH_RE.fullmatch(object_hash):
                         raise ValueError("invalid object hash")
                     referenced.add(object_hash)
-                    if not _object_path(doc_id, object_hash).is_file():
+                    if (
+                        object_hash not in shared_by_hash
+                        and not (root / doc_id / "objects" / object_hash).is_file()
+                    ):
                         raise FileNotFoundError(object_hash)
             elif mode == "full":
                 full = vault_dir() / doc_id / "versions" / f"{version_id}.pptx"
@@ -398,7 +505,6 @@ def collect_garbage(conn, *, dry_run: bool = True) -> dict[str, int | bool]:
         result["aborted"] = True
         return result
 
-    root = vault_dir()
     orphan_manifests: list[Path] = []
     orphan_full: list[Path] = []
     legacy_objects: list[Path] = []
@@ -422,8 +528,8 @@ def collect_garbage(conn, *, dry_run: bool = True) -> dict[str, int | bool]:
                 if p.is_file() and p.name not in referenced
             )
     shared_objects = [
-        p for p in _global_objects_dir().iterdir()
-        if p.is_file() and p.name not in referenced
+        path for object_hash, path in shared_by_hash.items()
+        if object_hash not in referenced
     ]
 
     def remove(paths: list[Path], counter: str) -> None:
@@ -448,13 +554,154 @@ def collect_garbage(conn, *, dry_run: bool = True) -> dict[str, int | bool]:
     return result
 
 
+def audit_repository(conn, *, deep: bool = False) -> dict:
+    """Validate the recovery graph without mutating repository files.
+
+    The quick pass validates every DB row, manifest and referenced artifact.
+    The deep pass additionally re-hashes every shared object, providing a
+    user-invokable equivalent of ``git fsck`` for the local PPT vault.
+    """
+    rows = conn.execute(
+        "SELECT version_id, doc_id, content_hash FROM versions ORDER BY version_id"
+    ).fetchall()
+    root = vault_dir()
+    shared = {
+        p.name: p
+        for p in _global_objects_dir().iterdir()
+        if p.is_file() and _OBJECT_HASH_RE.fullmatch(p.name)
+    }
+    object_paths = dict(shared)
+    referenced: set[str] = set()
+    object_versions: dict[str, set[str]] = {}
+    invalid: dict[str, str] = {}
+    missing_objects: set[str] = set()
+    full_versions = 0
+
+    for row in rows:
+        version_id = str(row["version_id"])
+        doc_id = str(row["doc_id"])
+        mf = vault_dir() / doc_id / "versions" / f"{version_id}.json"
+        try:
+            manifest = json.loads(mf.read_text(encoding="utf-8"))
+            mode = manifest.get("mode")
+            if mode == "dedup":
+                names = manifest.get("names")
+                parts = manifest.get("parts")
+                if not isinstance(names, list) or not isinstance(parts, dict):
+                    raise ValueError("invalid dedup manifest")
+                if not all(isinstance(name, str) for name in names):
+                    raise ValueError("manifest contains a non-string part name")
+                if len(names) != len(set(names)) or set(names) != set(parts):
+                    raise ValueError("manifest names/parts do not match")
+                for raw_hash in parts.values():
+                    if not _OBJECT_HASH_RE.fullmatch(str(raw_hash)):
+                        raise ValueError("invalid object hash")
+                stored_hash = str(row["content_hash"] or "")
+                manifest_hash = _package_content_hash_from_parts(parts)
+                if stored_hash.startswith(("pkg:", "file:")) and stored_hash != manifest_hash:
+                    raise ValueError("content hash mismatch between database and manifest")
+                version_missing: list[str] = []
+                for raw_hash in parts.values():
+                    object_hash = str(raw_hash)
+                    referenced.add(object_hash)
+                    object_versions.setdefault(object_hash, set()).add(version_id)
+                    if object_hash not in shared:
+                        legacy = root / doc_id / "objects" / object_hash
+                        if legacy.is_file():
+                            object_paths.setdefault(object_hash, legacy)
+                        else:
+                            missing_objects.add(object_hash)
+                            version_missing.append(object_hash)
+                if version_missing:
+                    raise FileNotFoundError(
+                        f"{len(version_missing)} referenced objects are missing"
+                    )
+            elif mode == "full":
+                full_versions += 1
+                full = vault_dir() / doc_id / "versions" / f"{version_id}.pptx"
+                if not full.is_file():
+                    raise FileNotFoundError("missing full snapshot")
+                deck = parse_pptx(str(full))
+                if deck.status != "ok":
+                    raise ValueError(
+                        f"full snapshot is not parseable: {deck.status} "
+                        f"({getattr(deck, 'error', '') or 'invalid PPTX'})"
+                    )
+                stored_hash = str(row["content_hash"] or "")
+                full_hash = file_hash(str(full))
+                if stored_hash.startswith(("pkg:", "file:")) and stored_hash != full_hash:
+                    raise ValueError("content hash mismatch between database and full snapshot")
+            else:
+                raise ValueError("unknown manifest mode")
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            invalid[version_id] = f"{type(exc).__name__}: {exc}"
+
+    hash_errors: list[str] = []
+    read_errors: list[str] = []
+    bytes_checked = 0
+    if deep:
+        for object_hash, path in object_paths.items():
+            try:
+                bytes_checked += path.stat().st_size
+                if _hash_path(path) != object_hash:
+                    hash_errors.append(object_hash)
+                    _VERIFIED_OBJECT_PATHS.discard(str(path))
+            except OSError:
+                read_errors.append(object_hash)
+                _VERIFIED_OBJECT_PATHS.discard(str(path))
+
+        # A corrupt shared object can invalidate many restore points.  Map the
+        # pool-level failure back to every version that references it so the
+        # UI can quarantine those exact recovery points until a later deep
+        # check proves the bytes healthy again.
+        for object_hash in hash_errors:
+            for version_id in object_versions.get(object_hash, ()):
+                invalid.setdefault(
+                    version_id,
+                    f"deep: object hash mismatch ({object_hash})",
+                )
+        for object_hash in read_errors:
+            for version_id in object_versions.get(object_hash, ()):
+                invalid.setdefault(
+                    version_id,
+                    f"deep: object read failed ({object_hash})",
+                )
+
+    unreferenced = set(shared) - referenced
+    ok = not (
+        invalid
+        or missing_objects
+        or hash_errors
+        or read_errors
+    )
+    return {
+        "ok": ok,
+        "deep": bool(deep),
+        "versions_checked": len(rows),
+        "full_versions": full_versions,
+        "invalid_versions": invalid,
+        "invalid_count": len(invalid),
+        "referenced_objects": len(referenced),
+        "missing_objects": len(missing_objects),
+        "shared_objects": len(shared),
+        "unreferenced_objects": len(unreferenced),
+        "objects_hashed": len(object_paths) if deep else 0,
+        "bytes_hashed": bytes_checked,
+        "hash_errors": len(hash_errors),
+        "read_errors": len(read_errors),
+    }
+
+
 def _verify(doc_id: str, names: list[str], parts: dict[str, str]) -> bool:
     """重组到临时文件并验证能正常解析（保真自检）。"""
     fd, tmp = tempfile.mkstemp(suffix=".pptx")
     os.close(fd)
     try:
         _write_zip(tmp, doc_id, names, parts)
-        return parse_pptx(tmp).status == "ok"
+        return (
+            parse_pptx(tmp).status == "ok"
+            and file_hash(tmp) == _package_content_hash_from_parts(parts)
+        )
     except Exception:  # noqa: BLE001
         return False
     finally:
@@ -491,14 +738,44 @@ def snapshot(
     doc_id: str | None = None,
     base_version=None,
     content_hash: str | None = None,
+    source_path: str | None = None,
 ) -> str | None:
     """对 path 当前内容拍快照（按页去重）；内容相对最新版未变则跳过（返回 None）。"""
     path = os.path.abspath(path)
-    if not os.path.exists(path):
-        return None
-    chash = content_hash or _file_hash(path)
+    if source_path is None:
+        if not os.path.exists(path):
+            return None
+        with stable_snapshot_source(path) as stable:
+            return snapshot(
+                conn,
+                path,
+                session_id,
+                doc_id=doc_id,
+                base_version=base_version,
+                content_hash=content_hash,
+                source_path=stable,
+            )
+
+    source_path = os.path.abspath(source_path)
+    if not os.path.exists(source_path):
+        raise SnapshotSourceError(source_path)
+    deck = parse_pptx(source_path)
+    if deck.status != "ok":
+        error = getattr(deck, "error", "") or "invalid PPTX"
+        raise InvalidSnapshotError(f"{path}: {deck.status} ({error})")
+
+    chash = content_hash or _file_hash(source_path)
     did = doc_id or doc_id_for(path)
     latest = base_version if base_version is not None else store.latest_version(conn, did)
+    if (
+        latest is not None
+        and "health" in latest.keys()
+        and str(latest["health"] or "ok") != "ok"
+    ):
+        # An identical live file is valuable repair material when the stored
+        # recovery point was quarantined. Never let hash dedupe suppress the
+        # creation of a fresh healthy baseline in that case.
+        latest = None
     latest_doc_id = (latest["doc_id"] if latest is not None and "doc_id" in latest.keys() else did)
     if latest is not None and (
         latest["content_hash"] == chash
@@ -514,27 +791,39 @@ def snapshot(
     names: list[str] = []
     parts: dict[str, str] = {}
     try:
-        names, parts = _dedup_store(did, path)
+        names, parts = _dedup_store(did, source_path)
         if not _verify(did, names, parts):
             mode = "full"
     except Exception:  # noqa: BLE001 解压失败 → 完整拷贝兜底
         mode = "full"
     if mode == "full":
-        shutil.copy2(ext_path(path), version_file(did, vid))
+        shutil.copy2(ext_path(source_path), version_file(did, vid))
         names, parts = [], {}
 
-    _manifest_path(did, vid).write_text(
-        json.dumps({"mode": mode, "names": names, "parts": parts}), encoding="utf-8"
+    manifest_path = _manifest_path(did, vid)
+    fd, manifest_tmp = tempfile.mkstemp(
+        prefix=".manifest-",
+        suffix=".json",
+        dir=manifest_path.parent,
     )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as manifest_file:
+            json.dump({"mode": mode, "names": names, "parts": parts}, manifest_file)
+            manifest_file.flush()
+            os.fsync(manifest_file.fileno())
+        os.replace(manifest_tmp, manifest_path)
+    finally:
+        try:
+            os.unlink(manifest_tmp)
+        except OSError:
+            pass
 
     # 解析逐页文本（供跨版本搜 + 页数）
-    deck = parse_pptx(path)
     pages = []
-    if deck.status == "ok":
-        pages = [(pg.page_no, tokenize(pg.raw_text)) for pg in deck.pages]
+    pages = [(pg.page_no, tokenize(pg.raw_text)) for pg in deck.pages]
     now = datetime.datetime.now().timestamp()
     try:
-        size = os.path.getsize(ext_path(path))
+        size = os.path.getsize(ext_path(source_path))
     except OSError:
         size = 0
     changed = (_change_summary(conn, latest["version_id"], pages, deck.page_count, latest["page_count"] or 0)
@@ -572,6 +861,8 @@ def rebuild_to(doc_id: str, version_id: str, dest: str) -> bool:
             if not src.exists():
                 return False
             shutil.copy2(src, ext_path(tmp))
+            if parse_pptx(tmp).status != "ok":
+                return False
         elif mode == "dedup":
             _write_zip(ext_path(tmp), doc_id, m["names"], m["parts"])
             if parse_pptx(tmp).status != "ok":

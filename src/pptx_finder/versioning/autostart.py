@@ -14,7 +14,33 @@ def _startup_lnk() -> Path:
 
 
 def is_enabled() -> bool:
-    return _startup_lnk().exists()
+    lnk = _startup_lnk()
+    if not lnk.exists():
+        return False
+    try:
+        import win32com.client
+
+        sh = win32com.client.Dispatch("WScript.Shell")
+        current = str(sh.CreateShortcut(str(lnk)).TargetPath or "")
+        return os.path.normcase(os.path.abspath(current)) == os.path.normcase(
+            os.path.abspath(_target())
+        )
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def link_target() -> str:
+    """Return the configured Startup target for diagnostics."""
+    lnk = _startup_lnk()
+    if not lnk.exists():
+        return ""
+    try:
+        import win32com.client
+
+        sh = win32com.client.Dispatch("WScript.Shell")
+        return str(sh.CreateShortcut(str(lnk)).TargetPath or "")
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def _target() -> str:

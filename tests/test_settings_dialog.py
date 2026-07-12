@@ -76,6 +76,96 @@ def test_autostart_toggle_persists_preference(qtbot, mgr, monkeypatch, tmp_path)
     assert calls == [False]
 
 
+def test_retention_setting_updates_config_and_running_manager(qtbot, monkeypatch):
+    calls = []
+
+    class FakeTimer:
+        @staticmethod
+        def singleShot(_delay_ms, _callback):
+            return None
+
+    class FakeMgr:
+        def set_retention_limit(self, limit):
+            calls.append(("manager", limit))
+
+    monkeypatch.setattr(settings_dialog_mod, "QTimer", FakeTimer, raising=False)
+    monkeypatch.setattr(settings_dialog_mod, "get_version_keep_per_doc", lambda: 100)
+    monkeypatch.setattr(
+        settings_dialog_mod,
+        "set_version_keep_per_doc",
+        lambda limit: calls.append(("config", limit)),
+    )
+    dlg = SettingsDialog(FakeMgr())
+    qtbot.addWidget(dlg)
+
+    dlg.retention.setCurrentIndex(dlg.retention.findData(200))
+
+    assert calls == [("config", 200), ("manager", 200)]
+
+
+def test_deep_vault_audit_runs_in_background_and_reports_result(qtbot, monkeypatch):
+    tasks = []
+    calls = []
+
+    class FakeTimer:
+        @staticmethod
+        def singleShot(_delay_ms, _callback):
+            return None
+
+    class FakeSignal:
+        def __init__(self):
+            self.callbacks = []
+
+        def connect(self, callback):
+            self.callbacks.append(callback)
+
+        def emit(self, value=None):
+            for callback in list(self.callbacks):
+                if value is None:
+                    callback()
+                else:
+                    callback(value)
+
+    class FakeTask:
+        def __init__(self, fn, label="", parent=None):
+            self.fn = fn
+            self.label = label
+            self.done = FakeSignal()
+            self.finished = FakeSignal()
+
+        def start(self):
+            tasks.append(self)
+
+    class FakeMgr:
+        def audit_repository(self, *, deep=False):
+            calls.append(deep)
+            return {
+                "ok": True,
+                "versions_checked": 9,
+                "objects_hashed": 17,
+                "invalid_count": 0,
+                "missing_objects": 0,
+                "hash_errors": 0,
+            }
+
+    monkeypatch.setattr(settings_dialog_mod, "QTimer", FakeTimer, raising=False)
+    monkeypatch.setattr(settings_dialog_mod, "BackgroundTask", FakeTask, raising=False)
+    dlg = SettingsDialog(FakeMgr())
+    qtbot.addWidget(dlg)
+
+    qtbot.mouseClick(dlg.vault_audit_btn, Qt.LeftButton)
+    assert tasks and tasks[-1].label == "vault-fsck-deep"
+    assert not dlg.vault_audit_btn.isEnabled()
+
+    result = tasks[-1].fn()
+    tasks[-1].done.emit(result)
+    tasks[-1].finished.emit()
+
+    assert calls == [True]
+    assert dlg.vault_audit_btn.isEnabled()
+    assert "ok=True versions=9 objects=17 invalid=0" in dlg.diagnostic_text.toPlainText()
+
+
 def test_health_rescan_button_invokes_callback(qtbot, mgr):
     calls = []
     dlg = SettingsDialog(mgr, on_rescan=lambda: calls.append("rescan"))

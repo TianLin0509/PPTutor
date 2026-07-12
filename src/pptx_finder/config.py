@@ -9,6 +9,7 @@ from pathlib import Path
 APP_NAME = "pptx-finder"
 DEFAULT_THEME = "cloud"
 DEFAULT_AUTOSTART = True
+DEFAULT_VERSION_KEEP_PER_DOC = 100
 
 
 def resource_path(*parts: str) -> Path:
@@ -147,6 +148,17 @@ def get_autostart(default: bool = DEFAULT_AUTOSTART) -> bool:
 
 def set_autostart(enabled: bool) -> None:
     update_ui_settings(autostart=bool(enabled))
+
+
+def get_version_keep_per_doc(default: int = DEFAULT_VERSION_KEEP_PER_DOC) -> int:
+    value = load_ui_settings().get("version_keep_per_doc")
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return max(0, int(default))
+
+
+def set_version_keep_per_doc(limit: int) -> None:
+    update_ui_settings(version_keep_per_doc=max(0, int(limit)))
 
 
 def get_hotkey() -> str:

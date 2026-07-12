@@ -5,6 +5,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 _tmp = tempfile.mkdtemp(prefix="pptxver_ui_")
@@ -32,6 +33,16 @@ def check(name: str, cond: bool) -> None:
     print(f"{'PASS' if cond else 'FAIL'} | {name}")
 
 
+def wait_until(app: QApplication, predicate, timeout: float = 2.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        app.processEvents()
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return bool(predicate())
+
+
 def main() -> int:
     work = Path(_tmp) / "work"
     work.mkdir(parents=True)
@@ -50,31 +61,59 @@ def main() -> int:
 
     w = VersionWindow(mgr)
     w.resize(940, 580)
-    check("版本窗口列出受管文档", w.doc_list.count() >= 1)
+    w.show()
+    check(
+        "版本窗口列出受管文档",
+        wait_until(app, lambda: w.doc_list.count() >= 1 and "算力方案" in w.doc_list.item(0).text()),
+    )
 
     w.doc_list.setCurrentRow(0)
-    check("选中文档后列出版本时间线(3 版)", w.ver_list.count() == 3)
+    check(
+        "选中文档后列出版本时间线(3 版)",
+        wait_until(app, lambda: w.ver_list.count() == 3),
+    )
+    w.doc_filter.setText("算力")
+    check("文件名筛选保留目标文档", w.doc_list.count() == 1)
+    check("现存/已删除范围选择可用", w.doc_scope.count() == 3)
 
     w.search.setText("量子计算")
     w._do_search()
-    check("跨版本搜在 UI 列出历史命中", w.ver_list.count() >= 1)
+    check(
+        "跨版本搜在 UI 列出历史命中",
+        wait_until(app, lambda: "命中" in w.right_title.text() and w.ver_list.count() >= 1),
+    )
+    w.search.clear()
+    w._populate_docs(mgr.list_docs_details())
+    check(
+        "截图前恢复完整版本时间线",
+        wait_until(app, lambda: w.ver_list.count() == 3),
+    )
 
-    w.show()
     loop = QEventLoop()
     QTimer.singleShot(400, loop.quit)
     loop.exec()
-    out = ROOT / "artifacts"
-    out.mkdir(exist_ok=True)
-    w.grab().save(str(out / "version_window.png"))
-    check("版本窗口截图成功", (out / "version_window.png").exists())
+    out = Path.home() / "artifacts"
+    out.mkdir(parents=True, exist_ok=True)
+    version_shot = out / "ppt-doctor-v105-version-window.png"
+    w.grab().save(str(version_shot))
+    check("版本窗口截图成功", version_shot.exists())
 
     dlg = SettingsDialog(mgr)
-    check("设置面板列出受管目录", dlg.root_list.count() >= 1)
-    dlg.grab().save(str(out / "settings_dialog.png"))
+    dlg.show()
+    check("设置面板默认保留 100 版", dlg.retention.currentData() == 100)
+    check("设置面板提供版本库深检", dlg.vault_audit_btn.text() == "深度检查版本库")
+    check(
+        "设置面板守护统计异步加载完成",
+        wait_until(app, lambda: "正在读取" not in dlg.stat.text()),
+    )
+    settings_shot = out / "ppt-doctor-v105-settings.png"
+    dlg.grab().save(str(settings_shot))
+    check("设置面板截图成功", settings_shot.exists())
 
     ok = sum(1 for _, c in results if c)
     print(f"\n=== UI E2E: {ok}/{len(results)} 通过 ===")
     app.quit()
+    mgr.stop()
     shutil.rmtree(_tmp, ignore_errors=True)
     return 0 if ok == len(results) else 1
 

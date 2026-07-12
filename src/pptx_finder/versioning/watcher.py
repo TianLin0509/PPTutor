@@ -45,10 +45,12 @@ class _Handler(FileSystemEventHandler):
         on_moved=None,
         roots: list[str] | None = None,
         on_content_saved=None,
+        on_removed=None,
     ):
         self._on_saved = on_saved
         self._on_moved = on_moved
         self._on_content_saved = on_content_saved
+        self._on_removed = on_removed
         self._explicit_skip_roots = [
             _norm_path(r) for r in (roots or [])
             if any(seg in _norm_path(r).lower() for seg in _SKIP_SEGS)
@@ -136,20 +138,34 @@ class _Handler(FileSystemEventHandler):
             self._trigger(e.dest_path)
 
     def on_deleted(self, e):  # noqa: N802
-        if e.is_directory or self._on_content_saved is None:
+        if e.is_directory:
             return
-        if os.path.splitext(e.src_path)[1].lower() not in CONTENT_EXTS:
+        ext = os.path.splitext(e.src_path)[1].lower()
+        if ext not in CONTENT_EXTS:
             return
-        try:
-            self._on_content_saved(e.src_path)
-        except Exception:  # noqa: BLE001
-            pass
+        if self._on_content_saved is not None:
+            try:
+                self._on_content_saved(e.src_path)
+            except Exception:  # noqa: BLE001
+                pass
+        if ext == PPTX_EXT and self._on_removed is not None:
+            try:
+                self._on_removed(e.src_path)
+            except Exception:  # noqa: BLE001
+                pass
 
 
 class VaultWatcher:
-    def __init__(self, roots: list[str], on_saved, on_moved=None, on_content_saved=None):
+    def __init__(
+        self,
+        roots: list[str],
+        on_saved,
+        on_moved=None,
+        on_content_saved=None,
+        on_removed=None,
+    ):
         self._obs = Observer()
-        handler = _Handler(on_saved, on_moved, roots, on_content_saved)
+        handler = _Handler(on_saved, on_moved, roots, on_content_saved, on_removed)
         for r in roots:
             if os.path.isdir(r):
                 self._obs.schedule(handler, r, recursive=True)

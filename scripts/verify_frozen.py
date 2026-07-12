@@ -6,6 +6,7 @@ DATA(vault) 隔离在临时目录，不碰生产。
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -30,6 +31,12 @@ import fixtures_gen as fx  # noqa: E402
 _data_tmp = Path(tempfile.mkdtemp(prefix="frozen_verify_"))
 DATA = _data_tmp / "appdata"
 DATA.mkdir(parents=True)
+# Frozen smoke tests must not rewrite the user's real Windows Startup link to
+# the temporary dist build before the release is installed.
+(DATA / "ui.json").write_text(
+    json.dumps({"autostart": False}),
+    encoding="utf-8",
+)
 # DECKS 必须在被全盘 watcher 监听的位置（Desktop），不能放 AppData/Temp（被排除）
 DECKS = Path(os.path.expanduser("~")) / "Desktop" / "_pptxverify_decks"
 DECKS.mkdir(parents=True, exist_ok=True)

@@ -251,6 +251,75 @@ def test_version_window_auto_selects_first_loaded_version_and_enables_actions(qt
     assert win.btn_export.isEnabled()
 
 
+def test_version_window_filters_documents_by_name_and_status(qtbot, monkeypatch):
+    class FakeSignal:
+        def connect(self, _callback):
+            return None
+
+    class FakeTask:
+        def __init__(self, *_args, **_kwargs):
+            self.done = FakeSignal()
+            self.finished = FakeSignal()
+
+        def start(self):
+            return None
+
+    monkeypatch.setattr(version_window_mod.QTimer, "singleShot", lambda *_args: None)
+    monkeypatch.setattr(version_window_mod, "BackgroundTask", FakeTask, raising=False)
+    win = VersionWindow(FakeVersionManager())
+    qtbot.addWidget(win)
+    win._populate_docs([
+        {"doc_id": "doc1", "path": "C:/work/deck-a.pptx", "status": "active"},
+        {"doc_id": "doc2", "path": "D:/archive/deck-b.pptx", "status": "deleted"},
+    ])
+
+    win.doc_filter.setText("archive")
+    assert win.doc_list.count() == 1
+    assert "deck-b.pptx" in win.doc_list.item(0).text()
+
+    win.doc_filter.clear()
+    win.doc_scope.setCurrentIndex(win.doc_scope.findData("active"))
+    assert win.doc_list.count() == 1
+    assert win.doc_list.item(0).data(Qt.UserRole)[0] == "doc1"
+
+    win._on_versions_loaded(win._versions_load_token, "doc1", [{
+        "version_id": "v1",
+        "ts": 1_700_000_000,
+        "page_count": 12,
+    }])
+    assert win.btn_restore.isEnabled()
+
+    win.doc_filter.setText("does-not-exist")
+    assert win._cur_doc is None
+    assert win.ver_list.count() == 0
+    assert not win.btn_restore.isEnabled()
+    assert not win.btn_export.isEnabled()
+
+
+def test_version_window_quarantines_unhealthy_restore_point(qtbot, monkeypatch):
+    monkeypatch.setattr(version_window_mod.QTimer, "singleShot", lambda *_args: None)
+    win = VersionWindow(FakeVersionManager())
+    qtbot.addWidget(win)
+    win._cur_doc = ("doc1", "C:/deck-a.pptx", "active")
+
+    win._on_versions_loaded(0, "doc1", [{
+        "version_id": "bad-v1",
+        "ts": 1_700_000_000,
+        "page_count": 12,
+        "health": "invalid",
+        "health_error": "bad zip",
+    }])
+
+    item = win.ver_list.item(0)
+    assert "无效恢复点" in item.text()
+    assert item.toolTip() == "bad zip"
+    assert win.version_preview.text() == "恢复点已隔离"
+    assert win.version_preview.toolTip() == "bad zip"
+    assert not win.btn_restore.isEnabled()
+    assert not win.btn_export.isEnabled()
+    assert not win.btn_preview.isEnabled()
+
+
 def test_version_window_version_row_shows_summary_and_cached_preview(qtbot, tmp_path, monkeypatch):
     monkeypatch.setattr(version_window_mod.QTimer, "singleShot", lambda *_args: None)
     image = tmp_path / "version.png"
@@ -359,6 +428,34 @@ def test_version_window_history_search_auto_selects_first_result_and_enables_act
     assert win.ver_list.currentRow() == 0
     assert win.btn_restore.isEnabled()
     assert win.btn_export.isEnabled()
+
+
+def test_version_window_history_search_quarantines_unhealthy_hit(qtbot, monkeypatch):
+    monkeypatch.setattr(version_window_mod.QTimer, "singleShot", lambda *_args: None)
+    win = VersionWindow(FakeVersionManager())
+    qtbot.addWidget(win)
+
+    win._on_history_search_done(
+        0,
+        "旧内容",
+        {
+            "total": 1,
+            "rows": [{
+                "doc_path": "C:/deck-a.pptx",
+                "ts": 1_700_000_000,
+                "page_no": 3,
+                "version_id": "bad-v1",
+                "health": "invalid",
+                "health_error": "deep: corrupt object",
+            }],
+        },
+    )
+
+    item = win.ver_list.item(0)
+    assert "已隔离" in item.text()
+    assert item.toolTip() == "deep: corrupt object"
+    assert not win.btn_restore.isEnabled()
+    assert not win.btn_export.isEnabled()
 
 
 def test_version_window_scheduled_doc_load_populates(qtbot):
