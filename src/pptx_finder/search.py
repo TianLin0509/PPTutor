@@ -23,8 +23,15 @@ MAX_HITS_PER_FILE = 10
 _EXT_RE = re.compile(r"\.(pptx?|potx?|ppsx?)$", re.IGNORECASE)
 _CAND_SPLIT_RE = re.compile(r"[^0-9A-Za-z\u4e00-\u9fff]+")
 _TEXT_CAND_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]{2,40}|[0-9A-Za-z]{3,40}|[\u4e00-\u9fff]{2,12}")
-_COMPACT_RE = re.compile(r"[^0-9a-z\u4e00-\u9fff]+")
-_MATCH_KIND_ORDER = {"filename_exact": 0, "content_exact": 1, "partial": 2}
+_COMPACT_RE = re.compile(r"[^0-9a-z\u4e00-\u9fff]+", re.IGNORECASE)
+_WS_RE = re.compile(r"\s+")
+_MATCH_KIND_ORDER = {
+    "filename_phrase": 0,
+    "content_phrase": 1,
+    "filename_exact": 2,
+    "content_exact": 3,
+    "partial": 4,
+}
 
 
 def _stem_name(name: str) -> str:
@@ -133,8 +140,89 @@ def _normalized_raw(raw: str) -> str:
     return normalize(raw)
 
 
-def _compact_normalized(text: str) -> str:
-    return _COMPACT_RE.sub("", normalize(text))
+@lru_cache(maxsize=512)
+def _normalized_raw_case_sensitive(raw: str) -> str:
+    """Case-preserving counterpart used only after case-insensitive FTS recall."""
+    return normalize(raw, case_sensitive=True)
+
+
+def _normalized_for_verify(text: str, *, case_sensitive: bool) -> str:
+    return (
+        _normalized_raw_case_sensitive(text)
+        if case_sensitive
+        else _normalized_raw(text)
+    )
+
+
+def _compact_normalized(text: str, *, case_sensitive: bool = False) -> str:
+    return _COMPACT_RE.sub("", normalize(text, case_sensitive=case_sensitive))
+
+
+def _contains_compact_exact(text_norm: str, query_exact: str) -> bool:
+    """Match the compact query through separators without ASCII prefix leaks."""
+    if not query_exact:
+        return False
+    separator = r"[^0-9A-Za-z\u4e00-\u9fff]*"
+    pattern = separator.join(re.escape(ch) for ch in query_exact)
+    if query_exact[0].isascii() and query_exact[0].isalnum():
+        pattern = r"(?<![0-9A-Za-z])" + pattern
+    if query_exact[-1].isascii() and query_exact[-1].isalnum():
+        pattern += r"(?![0-9A-Za-z])"
+    return re.search(pattern, text_norm) is not None
+
+
+def _full_query_phrase(
+    terms: list[str],
+    phrases: list[str],
+    *,
+    case_sensitive: bool,
+) -> str:
+    """Return the user's whole multi-word phrase for priority classification.
+
+    Unquoted ``AI SP`` remains an AND query for recall, but the contiguous phrase
+    receives a harder ranking tier. A single explicit quoted phrase gets the same
+    treatment. Mixed quoted/unquoted clauses keep their existing AND semantics.
+    """
+    value = ""
+    if not phrases and len(terms) >= 2:
+        value = " ".join(terms)
+    elif not terms and len(phrases) == 1:
+        value = phrases[0]
+    if not value:
+        return ""
+    return _WS_RE.sub(" ", normalize(value, case_sensitive=case_sensitive)).strip()
+
+
+def _contains_full_phrase(text_norm: str, phrase_norm: str) -> bool:
+    if not phrase_norm:
+        return False
+    text = _WS_RE.sub(" ", text_norm).strip()
+    start = 0
+    while True:
+        pos = text.find(phrase_norm, start)
+        if pos < 0:
+            return False
+        end = pos + len(phrase_norm)
+        # FTS treats contiguous ASCII letters/digits as one token. Mirror that
+        # boundary here so ``AI SP`` is not promoted by the prefix of ``AI SPARK``.
+        # Chinese remains substring-based, preserving the existing character recall.
+        left_ok = not (
+            phrase_norm[0].isascii()
+            and phrase_norm[0].isalnum()
+            and pos > 0
+            and text[pos - 1].isascii()
+            and text[pos - 1].isalnum()
+        )
+        right_ok = not (
+            phrase_norm[-1].isascii()
+            and phrase_norm[-1].isalnum()
+            and end < len(text)
+            and text[end].isascii()
+            and text[end].isalnum()
+        )
+        if left_ok and right_ok:
+            return True
+        start = pos + 1
 
 
 def _snippet_from_raw(
@@ -204,6 +292,7 @@ def _recall(
     *,
     scope: str | None = None,
     exts: tuple[str, ...] | None = None,
+    case_sensitive: bool = False,
 ) -> dict[int, list[tuple[int, float, str, str]]]:
     """字级 FTS5 召回 + 原文验证 → {file_id: [(page, rank)]}。
 
@@ -211,7 +300,10 @@ def _recall(
     的词收窄，无需 per-term 限额（根治「常见词召回截断漏掉同时含稀有词的文件」假阴性）。
     多词无同页命中时放宽到「同一文件不同页」，低相关排后。原文验证保精度（不相邻不误中）。
     """
-    pairs = [(char_match(w), normalize(w)) for w in words]
+    pairs = [
+        (char_match(w), normalize(w, case_sensitive=case_sensitive))
+        for w in words
+    ]
     pairs = [(c, nw) for c, nw in pairs if c]
     if not pairs:
         return {}
@@ -244,7 +336,7 @@ def _recall(
         for r in conn.execute(sql, tuple(params)):
             fid, pg = r["file_id"], r["page_no"]
             raw = r["raw_text"] or ""
-            raw_norm = _normalized_raw(raw)
+            raw_norm = _normalized_for_verify(raw, case_sensitive=case_sensitive)
             if all(nw in raw_norm for nw in nws):
                 content.setdefault(fid, []).append((pg, r["rank"], raw, raw_norm))
     except sqlite3.OperationalError as e:
@@ -258,26 +350,43 @@ def _recall(
 
 
 def search(conn: sqlite3.Connection, query: str, scope: str | None = None,
-           limit: int = 200, exts: tuple[str, ...] | None = None) -> list[FileResult]:
+           limit: int = 200, exts: tuple[str, ...] | None = None,
+           case_sensitive: bool = False) -> list[FileResult]:
     ext_filter = {e.lower() for e in exts} if exts else None  # 文件类型过滤；None=全部类型
     terms, phrases = parse_query(query)
     if not terms and not phrases:
         return []
-    needles = [normalize(x) for x in (phrases + terms) if x.strip()]
+    needles = [
+        normalize(x, case_sensitive=case_sensitive)
+        for x in (phrases + terms)
+        if x.strip()
+    ]
+    full_phrase = _full_query_phrase(
+        terms, phrases, case_sensitive=case_sensitive)
     # 文件名搜索意图：整个 query 去扩展名，用于「完全/前缀匹配」加权（如搜 b.pptx → b）
-    q_stem = normalize(query).strip()
+    q_stem = normalize(query, case_sensitive=case_sensitive).strip()
     for _e in (".pptx", ".ppt"):
-        if q_stem.endswith(_e):
+        if q_stem.casefold().endswith(_e):
             q_stem = q_stem[: -len(_e)]
             break
 
     # 字级召回 + 原文验证（精度）；多词必须在同一页共同出现。
-    content = _recall(conn, terms + phrases, scope=scope, exts=exts)
+    content = _recall(
+        conn,
+        terms + phrases,
+        scope=scope,
+        exts=exts,
+        case_sensitive=case_sensitive,
+    )
 
     # 文件名命中：索引期维护 name_norm + file_names_fts。查询先走 FTS 收窄候选，再用
     # name_norm 字面子串做最终验证，避免每次搜索都把 files 全表拉到 Python 逐行 normalize。
     name_hits: set[int] = set()
-    nterms = [normalize(t) for t in (terms + phrases) if t.strip()]
+    nterms = [
+        normalize(t, case_sensitive=case_sensitive)
+        for t in (terms + phrases)
+        if t.strip()
+    ]
     if nterms:
         clauses = [c for c in (char_match(t) for t in (terms + phrases)) if c]
         if clauses:
@@ -304,7 +413,11 @@ def search(conn: sqlite3.Connection, query: str, scope: str | None = None,
                 log.warning("filename fts match failed %r: %s", match, e)
                 name_rows = ()
             for r in name_rows:
-                nm = r["name_norm"] or normalize(r["name"])
+                nm = (
+                    normalize(r["name"], case_sensitive=True)
+                    if case_sensitive
+                    else (r["name_norm"] or normalize(r["name"]))
+                )
                 if all(t in nm for t in nterms):
                     name_hits.add(r["id"])
 
@@ -366,10 +479,25 @@ def search(conn: sqlite3.Connection, query: str, scope: str | None = None,
             return 1.0   # 前缀匹配
         return NAME_BONUS  # 普通包含（0.50）
 
-    query_exact = _compact_normalized(query)
+    query_exact = _compact_normalized(query, case_sensitive=case_sensitive)
     results: list[FileResult] = []
     for row, hits, name_hit, best_rank, pages in raw_items:
-        normalized_name = row["name_norm"] or normalize(row["name"])
+        normalized_name = (
+            normalize(row["name"], case_sensitive=True)
+            if case_sensitive
+            else (row["name_norm"] or normalize(row["name"]))
+        )
+        filename_phrase = bool(
+            name_hit
+            and _contains_full_phrase(_stem_name(normalized_name), full_phrase)
+        )
+        content_phrase = bool(
+            full_phrase
+            and any(
+                _contains_full_phrase(raw_norm, full_phrase)
+                for *_head, raw_norm in pages
+            )
+        )
         filename_exact = bool(
             name_hit
             and query_exact
@@ -377,10 +505,12 @@ def search(conn: sqlite3.Connection, query: str, scope: str | None = None,
         )
         content_exact = bool(
             query_exact
-            and any(query_exact in _COMPACT_RE.sub("", raw_norm) for *_head, raw_norm in pages)
+            and any(_contains_compact_exact(raw_norm, query_exact) for *_head, raw_norm in pages)
         )
         match_kind = (
-            "filename_exact" if filename_exact
+            "filename_phrase" if filename_phrase
+            else "content_phrase" if content_phrase
+            else "filename_exact" if filename_exact
             else "content_exact" if content_exact
             else "partial"
         )
@@ -397,9 +527,9 @@ def search(conn: sqlite3.Connection, query: str, scope: str | None = None,
             content_hash=row["content_hash"] or "", group_id=gmap.get(row["id"]),
         ))
 
-    # 相关度硬分层：文件名全字 > 内容全字 > 部分命中；层内才比较综合相关度和新旧。
+    # 相关度硬分层：完整短语（文件名 > 内容）> 分隔符压缩后的全字 > 拆词部分命中。
     results.sort(key=lambda r: (
-        _MATCH_KIND_ORDER.get(r.match_kind, 2),
+        _MATCH_KIND_ORDER.get(r.match_kind, _MATCH_KIND_ORDER["partial"]),
         -r.score,
         -r.mtime,
         r.name.casefold(),

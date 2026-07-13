@@ -21,7 +21,12 @@ def mode_label(mode_key: str) -> str:
     }.get(mode_key, "全部范围")
 
 
-def explain_query(query: str, mode_key: str = "all") -> QueryExplanation:
+def explain_query(
+    query: str,
+    mode_key: str = "all",
+    *,
+    case_sensitive: bool = False,
+) -> QueryExplanation:
     terms, phrases = parse_query(query)
     short_ascii = [
         t for t in terms
@@ -33,10 +38,13 @@ def explain_query(query: str, mode_key: str = "all") -> QueryExplanation:
         parts.append("同页包含：" + " + ".join(terms))
     if phrases:
         parts.append("精确短语：" + " / ".join(phrases))
+    if not phrases and len(terms) >= 2:
+        parts.append("完整短语优先：" + " ".join(terms))
     if short_ascii:
         parts.append("短英文/数字按完整词匹配：" + "、".join(short_ascii))
     if len(terms) + len(phrases) > 1:
         parts.append("多条件为 AND，优先命中同一页")
+    parts.append("区分大小写" if case_sensitive else "不区分大小写")
     return QueryExplanation(
         summary=" · ".join(parts),
         terms=terms,

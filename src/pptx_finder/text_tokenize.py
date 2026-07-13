@@ -36,13 +36,18 @@ _FANCY_QUOTES = str.maketrans({
 })
 
 
-def normalize(text: str) -> str:
-    """全半角(NFKC)+ 繁→简(OpenCC)+ 大小写(casefold)。保留标点供原文验证。"""
+def normalize(text: str, *, case_sensitive: bool = False) -> str:
+    """全半角(NFKC)+ 繁→简(OpenCC)，默认再做大小写折叠。
+
+    索引与 FTS 召回始终使用默认的不区分大小写模式；搜索结果的原文验证可传
+    ``case_sensitive=True`` 保留原始大小写，因此无需为大小写开关重建第二套索引。
+    标点会保留，供 search 做连续短语精确验证。
+    """
     if not text:
         return ""
     text = unicodedata.normalize("NFKC", text)
     text = _to_simplified(text)
-    return text.casefold()
+    return text if case_sensitive else text.casefold()
 
 
 _TRI_MIN = 3  # 英数 token 长度 ≥ 此值才补字符 trigram（供子串召回）

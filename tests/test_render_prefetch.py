@@ -55,6 +55,7 @@ def test_preview_and_prefetch_reuse_the_same_safe_snapshot(qtbot, monkeypatch, t
         hi_priority=False,
         priority=None,
         use_snapshot=False,
+        **_kwargs,
     ):
         with lock:
             calls.append((page_no, bool(hi_priority), bool(use_snapshot)))
@@ -285,19 +286,48 @@ def test_preview_render_error_emits_failure_and_worker_survives(qtbot, monkeypat
         w.wait(3000)
 
 
-def test_prefetch_skips_powerpoint_when_background_render_is_blocked(qtbot, monkeypatch, tmp_path):
-    calls: list[str] = []
+def test_prefetch_reuses_existing_session_when_background_start_is_blocked(qtbot, monkeypatch, tmp_path):
+    calls: list[dict] = []
 
     monkeypatch.setattr(renderer, "background_powerpoint_allowed", lambda: False, raising=False)
-    monkeypatch.setattr(renderer, "render_page", lambda *a, **k: calls.append("render") or tmp_path / "x.png")
+
+    def fake_render(*_args, **kwargs):
+        calls.append(dict(kwargs))
+        return tmp_path / "x.png"
+
+    monkeypatch.setattr(renderer, "render_page", fake_render)
     monkeypatch.setattr(renderer, "shutdown", lambda: None)
 
     w = RenderWorker()
     w.start()
     try:
         w.prefetch("f.pptx", 2)
-        qtbot.wait(500)
-        assert calls == []
+        qtbot.waitUntil(lambda: len(calls) == 1, timeout=1000)
+        assert calls[0]["existing_session_only"] is True
+    finally:
+        w.stop()
+        w.wait(3000)
+
+
+def test_primary_prefetch_starts_quickly_without_raising_concurrency(qtbot, monkeypatch, tmp_path):
+    started = threading.Event()
+    started_at: list[float] = []
+
+    def fake_render(*_args, **_kwargs):
+        started_at.append(time.perf_counter())
+        started.set()
+        return tmp_path / "x.png"
+
+    monkeypatch.setattr(renderer, "render_page", fake_render)
+    monkeypatch.setattr(renderer, "shutdown", lambda: None)
+    w = RenderWorker()
+    w.start()
+    try:
+        requested_at = time.perf_counter()
+        w.prefetch("f.pptx", 2)
+
+        assert started.wait(0.32), "primary neighbor should begin before a normal page-turn"
+        assert started_at[0] - requested_at < 0.30
     finally:
         w.stop()
         w.wait(3000)

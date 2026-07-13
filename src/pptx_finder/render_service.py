@@ -28,14 +28,19 @@ def handle_request(req: dict[str, Any]) -> dict[str, Any]:
         if op == "ping":
             return {"id": req_id, "ok": True, "pong": True}
         if op == "render":
+            render_kwargs = {
+                "cache_key": req.get("cache_key"),
+                "long_edge": int(req.get("long_edge") or 2560),
+                "hi_priority": bool(req.get("hi_priority")),
+                "priority": req.get("priority"),
+                "use_snapshot": bool(req.get("use_snapshot")),
+            }
+            if req.get("existing_session_only"):
+                render_kwargs["existing_session_only"] = True
             png = renderer.render_page(
                 str(req.get("path") or ""),
                 int(req.get("page_no") or 1),
-                cache_key=req.get("cache_key"),
-                long_edge=int(req.get("long_edge") or 2560),
-                hi_priority=bool(req.get("hi_priority")),
-                priority=req.get("priority"),
-                use_snapshot=bool(req.get("use_snapshot")),
+                **render_kwargs,
             )
             return {"id": req_id, "ok": True, "path": str(png) if png else ""}
         if op == "close_current":

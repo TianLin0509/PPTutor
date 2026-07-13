@@ -183,6 +183,7 @@ class RendererProcessClient:
         hi_priority: bool,
         priority: int | None,
         use_snapshot: bool = False,
+        existing_session_only: bool = False,
     ) -> Path | None:
         try:
             resp = self.request({
@@ -194,6 +195,7 @@ class RendererProcessClient:
                 "hi_priority": bool(hi_priority),
                 "priority": priority,
                 "use_snapshot": bool(use_snapshot),
+                "existing_session_only": bool(existing_session_only),
             })
         except Exception:
             return None
@@ -251,6 +253,7 @@ def render_page(
     hi_priority: bool,
     priority: int | None,
     use_snapshot: bool = False,
+    existing_session_only: bool = False,
 ) -> Path | None:
     return _client.render_page(
         path,
@@ -260,6 +263,7 @@ def render_page(
         hi_priority=hi_priority,
         priority=priority,
         use_snapshot=use_snapshot,
+        existing_session_only=existing_session_only,
     )
 
 

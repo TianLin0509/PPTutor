@@ -552,8 +552,36 @@ def test_neighbor_prefetch_is_low_priority_and_limited(qtbot, tmp_path):
 
     assert render.prefetches == [
         ("C:/deck.pptx", 4, win._PREFETCH_EDGE, win._PRIORITY_NEIGHBOR_PREFETCH),
+        ("C:/deck.pptx", 8, win._PREFETCH_EDGE, win._PRIORITY_NEIGHBOR_PREFETCH),
     ]
+    assert len(render.prefetches) == win._NEIGHBOR_PREFETCH_MAX == 2
     assert win._PRIORITY_NEIGHBOR_PREFETCH > win._PRIORITY_TOP_THUMB_BASE + win._THUMB_FIRST
+
+
+def test_completed_right_preview_is_reused_for_selected_result_thumbnail(qtbot, tmp_path):
+    image = tmp_path / "preview.png"
+    pm = QPixmap(160, 90)
+    pm.fill(Qt.green)
+    assert pm.save(str(image), "PNG")
+
+    conn = _index(tmp_path)
+    render = PendingRender()
+    win = MainWindow(conn=conn, render_worker=render, do_index=False)
+    qtbot.addWidget(win)
+    result = _fake_results(1)[0]
+    result.hits = [SearchHit(3, "hit")]
+    result.page_count = 5
+    card = main_window_mod.ResultItem(result, win._tok, "")
+    qtbot.addWidget(card)
+    win._cur = result
+    win._cur_item_widget = card
+    win._view_page = 3
+    win._req_id = 77
+
+    win._on_rendered(77, str(image))
+
+    assert (result.path, 3) in win._thumb_cache
+    assert card._thumb.pixmap() is not None and not card._thumb.pixmap().isNull()
 
 
 def test_facet_change_auto_preview_is_delayed(qtbot, monkeypatch, tmp_path):

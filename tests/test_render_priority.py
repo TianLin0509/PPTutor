@@ -237,3 +237,73 @@ def test_render_page_snapshot_opens_temp_copy_not_live_file(tmp_path, monkeypatc
     assert (tmp_path / "render_snapshots" / "snapshot-test.pptx").exists()
     renderer.shutdown()
     assert not (tmp_path / "render_snapshots" / "snapshot-test.pptx").exists()
+
+
+def test_existing_session_only_never_opens_powerpoint_without_owned_snapshot(tmp_path, monkeypatch):
+    renderer.shutdown()
+    renderer._failed_until.clear()
+    monkeypatch.setattr(renderer, "cache_dir", lambda: tmp_path)
+    src = tmp_path / "no-session.pptx"
+    src.write_bytes(b"dummy")
+    get_app_calls = []
+
+    def forbidden_get_app():
+        get_app_calls.append(True)
+        raise AssertionError("reuse-only prefetch must not start or attach to PowerPoint")
+
+    monkeypatch.setattr(renderer, "_get_app", forbidden_get_app)
+
+    out = renderer.render_page(
+        str(src),
+        2,
+        cache_key="no-session",
+        long_edge=960,
+        use_snapshot=True,
+        existing_session_only=True,
+    )
+
+    assert out is None
+    assert get_app_calls == []
+
+
+def test_existing_session_only_reuses_the_owned_snapshot_without_reopening(tmp_path, monkeypatch):
+    renderer.shutdown()
+    renderer._failed_until.clear()
+    monkeypatch.setattr(renderer, "cache_dir", lambda: tmp_path)
+    src = tmp_path / "reuse.pptx"
+    src.write_bytes(b"dummy")
+    app = _FakeApp()
+    opens = []
+    original_open = app.Presentations.Open
+
+    def recording_open(path, ReadOnly=1, WithWindow=0):
+        opens.append(path)
+        return original_open(path, ReadOnly=ReadOnly, WithWindow=WithWindow)
+
+    app.Presentations.Open = recording_open
+    monkeypatch.setattr(renderer, "_get_app", lambda: app)
+
+    first = renderer.render_page(
+        str(src),
+        1,
+        cache_key="reuse",
+        long_edge=960,
+        use_snapshot=True,
+    )
+    monkeypatch.setattr(
+        renderer,
+        "_get_app",
+        lambda: (_ for _ in ()).throw(AssertionError("must reuse existing app")),
+    )
+    second = renderer.render_page(
+        str(src),
+        2,
+        cache_key="reuse",
+        long_edge=960,
+        use_snapshot=True,
+        existing_session_only=True,
+    )
+
+    assert first is not None and second is not None
+    assert len(opens) == 1
+    renderer.shutdown()

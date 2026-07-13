@@ -437,8 +437,10 @@ class ResultItem(QWidget):
         row.addWidget(fn, 1)
 
         match_kind = getattr(r, "match_kind", "partial")
-        if match_kind in {"filename_exact", "content_exact"}:
-            exact = QLabel("文件名全字" if match_kind == "filename_exact" else "内容全字")
+        if match_kind in {
+            "filename_phrase", "content_phrase", "filename_exact", "content_exact"
+        }:
+            exact = QLabel("文件名全字" if match_kind.startswith("filename_") else "内容全字")
             exact.setObjectName("exactMatchBadge")
             exact.setStyleSheet(
                 f"font-size:10px;font-weight:700;color:{tok['grn']};"
@@ -721,6 +723,7 @@ class MainWindow(QMainWindow):
         self._index_progress_last_phase: str | None = None
         self._hit_idx = 0
         self._view_page = 1  # 褰撳墠棰勮椤碉紙鍘熷椤靛簭锛屾粴杞彲鑴辩鍛戒腑椤佃嚜鐢辩炕锛?
+        self._preview_direction = 1  # 最近一次翻页方向；邻页预取优先沿该方向
         self._req_id = 0
         self._cur_pixmap: QPixmap | None = None
         self._preview_provisional = False  # 褰撳墠棰勮鏄惁涓虹缉鐣ュ浘鍗犱綅锛堥珮娓呮湭鍒帮級
@@ -952,7 +955,9 @@ class MainWindow(QMainWindow):
         bar.addWidget(logo)
         self.search_box = QLineEdit()
         self.search_box.setObjectName("searchBox")
-        self.search_box.setPlaceholderText('输入你记得的文字 / 文件名…（多词空格=同时含，"引号"=精确短语）')
+        self.search_box.setPlaceholderText(
+            '输入你记得的文字 / 文件名…（多词完整短语优先；空格=同时含，"引号"=只搜短语）'
+        )
         self.search_box.setMinimumHeight(42)
         self.search_box.addAction(_icon_search(), QLineEdit.LeadingPosition)
         self._clear_act = self.search_box.addAction(_icon_clear(), QLineEdit.TrailingPosition)
@@ -1039,6 +1044,16 @@ class MainWindow(QMainWindow):
         self.sort_secondary.setToolTip("第二排序条件；例如先按文件名，再按最近修改")
         self.sort_secondary.currentIndexChanged.connect(self._on_sort_changed)
         hr.addWidget(self.sort_secondary, 0)
+        self.case_sensitive_btn = QPushButton("Aa 大小写")
+        self.case_sensitive_btn.setObjectName("chip")
+        self.case_sensitive_btn.setCheckable(True)
+        self.case_sensitive_btn.setChecked(False)
+        self.case_sensitive_btn.setAccessibleName("区分大小写")
+        self.case_sensitive_btn.setToolTip(
+            "区分英文大小写；默认关闭。开启后 AI 不再匹配 ai"
+        )
+        self.case_sensitive_btn.toggled.connect(self._on_case_sensitive_changed)
+        hr.addWidget(self.case_sensitive_btn, 0)
         self.list_head.hide()
         ll.addWidget(self.list_head)
         self.result_list = QListWidget()
@@ -1467,7 +1482,13 @@ class MainWindow(QMainWindow):
             set_detail_actions(on)
 
     def _set_result_refine_enabled(self, enabled: bool) -> None:
-        for w in (self.sort_combo, self.sort_secondary, self.facet_btn, self.facet_panel):
+        for w in (
+            self.sort_combo,
+            self.sort_secondary,
+            self.case_sensitive_btn,
+            self.facet_btn,
+            self.facet_panel,
+        ):
             w.setEnabled(enabled)
 
     def _clear_stale_result_context(self) -> None:
@@ -1598,7 +1619,11 @@ class MainWindow(QMainWindow):
             self.query_hint.hide()
             self.query_hint.setText("")
             return
-        self.query_hint.setText(explain_query(query, self._mode_key()).summary)
+        self.query_hint.setText(explain_query(
+            query,
+            self._mode_key(),
+            case_sensitive=self.case_sensitive_btn.isChecked(),
+        ).summary)
         self.query_hint.show()
 
     def _clear_search_now(self) -> None:
@@ -1635,12 +1660,36 @@ class MainWindow(QMainWindow):
         self._show_list()  # 鏈夋悳绱㈣瘝 鈫?鏄剧ず缁撴灉鍒楄〃鍖猴紙闅愯棌浠〃鐩橀灞忥級
         if self._search_worker is not None:
             self._show_search_pending(query)
-            self._search_worker.request(self._search_seq, query, self._mode_key(), self._search_exts())
+            request_args = (
+                self._search_seq,
+                query,
+                self._mode_key(),
+                self._search_exts(),
+            )
+            if self.case_sensitive_btn.isChecked():
+                self._search_worker.request(*request_args, case_sensitive=True)
+            else:
+                # Preserve the legacy request signature for injected workers.
+                self._search_worker.request(*request_args)
             return
         started = time.perf_counter()
         results = SearchWorker._apply_mode(
-            search_mod.search(self._conn, query, exts=self._search_exts()), self._mode_key())
+            search_mod.search(
+                self._conn,
+                query,
+                exts=self._search_exts(),
+                case_sensitive=self.case_sensitive_btn.isChecked(),
+            ),
+            self._mode_key(),
+        )
         self._finish_search(query, results, (time.perf_counter() - started) * 1000)
+
+    def _on_case_sensitive_changed(self, _checked: bool) -> None:
+        """大小写属于检索语义；切换后重跑当前词，而不是只重排旧结果。"""
+        query = self.search_box.text().strip()
+        self._update_query_hint(query)
+        if query:
+            self._do_search()
 
     def _show_search_pending(self, query: str) -> None:
         self._status_refresh_token += 1
@@ -2379,6 +2428,11 @@ class MainWindow(QMainWindow):
         self._history_hint_query = ""
         vm = self._version_mgr
         q = (query or "").strip()
+        # 历史版本 FTS 只保存归一化 token、没有保留大小写原文，无法可靠二次验证；
+        # 区分大小写时宁可不显示历史提示，也不混入语义不一致的假命中。
+        if self.case_sensitive_btn.isChecked():
+            self._history_hint_pending_query = ""
+            return
         if vm is None or len(q) < 2 or not hasattr(vm, "search_history_details"):
             self._history_hint_pending_query = ""
             return
@@ -2396,6 +2450,7 @@ class MainWindow(QMainWindow):
             or not q
             or q != self.search_box.text().strip()
             or self._search_pending_req is not None
+            or self.case_sensitive_btn.isChecked()
         ):
             return
         seq = self._search_seq
@@ -2474,7 +2529,7 @@ class MainWindow(QMainWindow):
     _PRIORITY_VISIBLE_THUMB = 5
     _PRIORITY_TOP_THUMB_BASE = 10
     _PRIORITY_NEIGHBOR_PREFETCH = 220
-    _NEIGHBOR_PREFETCH_MAX = 1
+    _NEIGHBOR_PREFETCH_MAX = 2
 
     def _render_results(self, results: list[FileResult]) -> None:
         self.result_list.setEnabled(True)
@@ -2898,6 +2953,7 @@ class MainWindow(QMainWindow):
             return
         self._cur = self._results[idx]
         self._hit_idx = 0
+        self._preview_direction = 1
         self._view_page = self._current_page()  # 鍒濆瀹氫綅棣栦釜鍛戒腑椤碉紙鏃犲懡涓?绗?椤碉級
         w = self.result_list.itemWidget(cur)
         if isinstance(w, ResultItem):
@@ -3414,6 +3470,7 @@ class MainWindow(QMainWindow):
             return
         if not self._cur:
             return
+        self._preview_direction = 1 if page_no >= self._view_page else -1
         self._view_page = page_no
         self._request_preview()
 
@@ -3456,9 +3513,11 @@ class MainWindow(QMainWindow):
     def _goto_hit(self, i: int) -> None:
         if self._preview_interaction_blocked():
             return
+        old_page = self._view_page
         self._hit_idx = i
         if self._cur and self._cur.hits:
             self._view_page = self._cur.hits[i].page_no
+            self._preview_direction = 1 if self._view_page >= old_page else -1
         self._request_preview()
 
     def _step_hit(self, delta: int) -> None:
@@ -3466,6 +3525,7 @@ class MainWindow(QMainWindow):
             return
         if not self._cur or not self._cur.hits:
             return
+        self._preview_direction = 1 if delta >= 0 else -1
         self._hit_idx = max(0, min(len(self._cur.hits) - 1, self._hit_idx + delta))
         self._view_page = self._cur.hits[self._hit_idx].page_no
         self._request_preview()
@@ -3680,6 +3740,7 @@ class MainWindow(QMainWindow):
         new = max(1, min(total, new))
         if new == self._view_page:
             return
+        self._preview_direction = 1 if new > self._view_page else -1
         self._view_page = new
         for i, h in enumerate(self._cur.hits or []):
             if h.page_no == new:
@@ -3724,6 +3785,15 @@ class MainWindow(QMainWindow):
         self._cur_pixmap = pm
         self._preview_provisional = False  # 楂樻竻宸插埌锛屼笉鍐嶆槸鍗犱綅
         self._preview_hinted = True  # 棣栨棰勮宸叉垚鍔燂紝涔嬪悗涓嶅啀鎻愩€屽敜璧?PowerPoint銆?
+        # The selected result card usually represents this same first hit page.
+        # Reuse the completed right-side render as a tiny in-memory card image:
+        # zero extra COM/CPU, and no misleading cover fallback for later hit pages.
+        if self._cur is not None and self._cur_item_widget is not None:
+            key = (self._cur.path, self._view_page)
+            if self._cur_item_widget.thumb_page == self._view_page:
+                thumb = pm.scaled(148, 110, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                self._remember_thumb(key, thumb)
+                self._cur_item_widget.set_thumbnail(thumb)
         self._update_pixmap()
         self._prefetch_neighbors()  # 鍚庡彴棰勬覆鏌撶浉閭?鍛戒腑椤碉紝缈昏繃鍘绘椂缂撳瓨鍛戒腑=鐬棿
 
@@ -3739,8 +3809,24 @@ class MainWindow(QMainWindow):
             return  # 娴嬭瘯娉ㄥ叆鐨?StubRender 鏃犳鏂规硶
         total = self._cur.page_count or 0
         cur = self._view_page
-        order: list[int] = [cur + 1, cur - 1]
-        order += [h.page_no for h in (self._cur.hits or []) if h.page_no != cur]
+        direction = 1 if self._preview_direction >= 0 else -1
+        # First cover ordinary wheel/page turning, then the next search-hit button.
+        # The opposite neighbor is only a final fallback. The hard two-page cap
+        # prevents a long result list from turning into background COM work.
+        directional_hits = [
+            h.page_no for h in (self._cur.hits or [])
+            if (h.page_no - cur) * direction > 0
+        ]
+        directional_hits.sort(reverse=direction < 0)
+        opposite_hits = [
+            h.page_no for h in (self._cur.hits or [])
+            if (h.page_no - cur) * direction < 0
+        ]
+        opposite_hits.sort(reverse=direction > 0)
+        order: list[int] = [cur + direction]
+        order += directional_hits
+        order += [cur - direction]
+        order += opposite_hits
         seen = {cur}
         queued = 0
         for p in order:

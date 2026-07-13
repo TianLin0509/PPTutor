@@ -70,7 +70,8 @@ class FileResult:
     score: float
     name_hit: bool
     hits: list[SearchHit] = field(default_factory=list)
-    # 相关度硬分层：文件名全字 > 内容全字 > 部分命中。旧调用方不传时按部分命中处理。
+    # 相关度硬分层：完整短语（文件名 > 内容）> 紧凑全字 > 部分命中。
+    # phrase 类用于未加引号的多词查询（如 AI SP），旧调用方不传时按部分命中处理。
     match_kind: str = "partial"
     # P1 版本归组
     group_id: int | None = None

@@ -47,6 +47,28 @@ def test_render_service_render_request_returns_path(monkeypatch, tmp_path):
     assert resp == {"id": 7, "ok": True, "path": str(out)}
 
 
+def test_render_service_propagates_existing_session_only(monkeypatch, tmp_path):
+    out = tmp_path / "prefetched.png"
+    seen = []
+
+    def fake_render(*_args, existing_session_only=False, **_kwargs):
+        seen.append(bool(existing_session_only))
+        return out
+
+    monkeypatch.setattr(renderer, "render_page", fake_render)
+
+    resp = render_service.handle_request({
+        "id": 8,
+        "op": "render",
+        "path": "deck.pptx",
+        "page_no": 3,
+        "existing_session_only": True,
+    })
+
+    assert resp == {"id": 8, "ok": True, "path": str(out)}
+    assert seen == [True]
+
+
 def test_renderer_ipc_disabled_in_source_by_default(monkeypatch):
     monkeypatch.delenv("PPTUTOR_RENDERER_CHILD", raising=False)
     monkeypatch.delenv("PPTUTOR_RENDERER_IPC", raising=False)

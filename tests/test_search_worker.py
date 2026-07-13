@@ -55,6 +55,27 @@ def test_search_worker_filters_modes(qtbot, tmp_path):
         worker.wait(3000)
 
 
+def test_search_worker_propagates_case_sensitive_flag(monkeypatch, qtbot, tmp_path):
+    conn = db.connect(tmp_path / "case-worker.db")
+    db.init_db(conn)
+    seen: list[bool] = []
+
+    def fake_search(_conn, _query, exts=None, case_sensitive=False):
+        seen.append(bool(case_sensitive))
+        return []
+
+    monkeypatch.setattr(search_worker_mod.search_mod, "search", fake_search)
+    worker = SearchWorker(conn=conn)
+    worker.start()
+    try:
+        with qtbot.waitSignal(worker.searched, timeout=3000):
+            worker.request(9, "AI SP", "all", case_sensitive=True)
+        assert seen == [True]
+    finally:
+        worker.stop()
+        worker.wait(3000)
+
+
 def test_search_worker_interrupts_stale_running_query(monkeypatch, qtbot, tmp_path):
     conn = InterruptibleConn()
     slow_started = threading.Event()

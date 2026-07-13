@@ -318,6 +318,7 @@ def _render_page_direct(
     hi_priority: bool = False,
     priority: int | None = None,
     use_snapshot: bool = False,
+    existing_session_only: bool = False,
 ) -> Path | None:
     """导出 path 第 page_no 页（1-based）为高清 PNG，返回缓存路径；失败返回 None。
 
@@ -345,13 +346,31 @@ def _render_page_direct(
 
     with _com_slot(hi_priority, priority):  # COM 串行单槽（预览优先抢占缩略图）
         try:
-            app = _get_app()
-            open_path = path
-            if use_snapshot:
-                open_path = _snapshot_for_render(path, cache_key)
-                if open_path is None:
+            if existing_session_only:
+                # Low-CPU prefetch may reuse the exact safe-snapshot session opened
+                # by a preceding user preview, but must never start/attach to
+                # PowerPoint or open another presentation in the background.
+                open_path = getattr(_state, "snapshot_path", None)
+                pres = getattr(_state, "pres", None)
+                if not (
+                    use_snapshot
+                    and pres is not None
+                    and open_path
+                    and os.path.exists(open_path)
+                    and getattr(_state, "snapshot_src", None) == path
+                    and getattr(_state, "snapshot_key", None) == cache_key
+                    and getattr(_state, "pres_path", None) == open_path
+                    and getattr(_state, "pres_key", None) == cache_key
+                ):
                     return None
-            pres = _open_pres(app, open_path, cache_key)  # 复用已打开的同文件，免重复 Open
+            else:
+                app = _get_app()
+                open_path = path
+                if use_snapshot:
+                    open_path = _snapshot_for_render(path, cache_key)
+                    if open_path is None:
+                        return None
+                pres = _open_pres(app, open_path, cache_key)  # 复用已打开的同文件，免重复 Open
             if page_no < 1 or page_no > int(pres.Slides.Count):
                 return None
             # 按 slide 实际宽高比算输出像素（宽高比随 pres 缓存，避免每页重取）
@@ -379,18 +398,20 @@ def render_page(
     hi_priority: bool = False,
     priority: int | None = None,
     use_snapshot: bool = False,
+    existing_session_only: bool = False,
 ) -> Path | None:
     """Render a page, using a child process in packaged GUI builds."""
     if not _ipc_enabled():
-        return _render_page_direct(
-            path,
-            page_no,
-            cache_key=cache_key,
-            long_edge=long_edge,
-            hi_priority=hi_priority,
-            priority=priority,
-            use_snapshot=use_snapshot,
-        )
+        direct_kwargs = {
+            "cache_key": cache_key,
+            "long_edge": long_edge,
+            "hi_priority": hi_priority,
+            "priority": priority,
+            "use_snapshot": use_snapshot,
+        }
+        if existing_session_only:
+            direct_kwargs["existing_session_only"] = True
+        return _render_page_direct(path, page_no, **direct_kwargs)
 
     path = os.path.abspath(path)
     if cache_key is None:
@@ -411,15 +432,16 @@ def render_page(
     try:
         from . import render_client
 
-        return render_client.render_page(
-            path,
-            page_no,
-            cache_key=cache_key,
-            long_edge=long_edge,
-            hi_priority=hi_priority,
-            priority=priority,
-            use_snapshot=use_snapshot,
-        )
+        client_kwargs = {
+            "cache_key": cache_key,
+            "long_edge": long_edge,
+            "hi_priority": hi_priority,
+            "priority": priority,
+            "use_snapshot": use_snapshot,
+        }
+        if existing_session_only:
+            client_kwargs["existing_session_only"] = True
+        return render_client.render_page(path, page_no, **client_kwargs)
     except Exception as e:  # noqa: BLE001
         log.warning("renderer ipc failed path=%s page=%s: %s", path, page_no, e)
         return None

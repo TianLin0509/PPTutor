@@ -19,7 +19,13 @@ def empty_suggestions(query: str, mode: str) -> list[str]:
     return suggestion_keys(query, mode_key_from_text(mode))
 
 
-_MATCH_KIND_ORDER = {"filename_exact": 0, "content_exact": 1, "partial": 2}
+_MATCH_KIND_ORDER = {
+    "filename_phrase": 0,
+    "content_phrase": 1,
+    "filename_exact": 2,
+    "content_exact": 3,
+    "partial": 4,
+}
 
 
 def _sort_key_for(r, keys: tuple[str, ...]) -> tuple:
@@ -31,7 +37,10 @@ def _sort_key_for(r, keys: tuple[str, ...]) -> tuple:
             out.append(str(r.name or "").casefold())
         else:  # relevance
             out.extend((
-                _MATCH_KIND_ORDER.get(getattr(r, "match_kind", "partial"), 2),
+                _MATCH_KIND_ORDER.get(
+                    getattr(r, "match_kind", "partial"),
+                    _MATCH_KIND_ORDER["partial"],
+                ),
                 -float(r.score or 0.0),
             ))
     return tuple(out)

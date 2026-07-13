@@ -17,7 +17,9 @@ from .. import renderer
 
 class RenderWorker(QThread):
     rendered = Signal(int, str)  # request_id, png_path（失败为空串）
-    _PREFETCH_IDLE_GRACE_SEC = 0.45
+    # 120ms absorbs rapid result-selection churn while still getting the next page
+    # ready before a normal human page-turn. Concurrency remains one COM export.
+    _PREFETCH_IDLE_GRACE_SEC = 0.12
     _PRIORITY_PREVIEW = 0
     _PRIORITY_PREFETCH = 220
 
@@ -159,20 +161,20 @@ class RenderWorker(QThread):
                         if not png:
                             self._preview_failed += 1
                     self.rendered.emit(req_id, str(png) if png else "")
-                else:  # prefetch：低优先填缓存，不发信号、被预览随时抢占
+                else:  # prefetch：只复用已打开的安全快照，不发信号、被预览随时抢占
                     path, page_no, key, long_edge, priority = data
                     ok = False
                     try:
-                        if renderer.background_powerpoint_allowed():
-                            ok = bool(renderer.render_page(
-                                path,
-                                page_no,
-                                cache_key=key,
-                                long_edge=long_edge,
-                                hi_priority=False,
-                                priority=priority,
-                                use_snapshot=True,
-                            ))
+                        ok = bool(renderer.render_page(
+                            path,
+                            page_no,
+                            cache_key=key,
+                            long_edge=long_edge,
+                            hi_priority=False,
+                            priority=priority,
+                            use_snapshot=True,
+                            existing_session_only=True,
+                        ))
                     except Exception:  # noqa: BLE001
                         pass
                     finally:
