@@ -6,6 +6,7 @@ import re
 import sqlite3
 from collections import defaultdict
 from difflib import SequenceMatcher
+from functools import lru_cache
 
 from . import cluster
 from .models import FileResult, SearchHit
@@ -22,6 +23,8 @@ MAX_HITS_PER_FILE = 10
 _EXT_RE = re.compile(r"\.(pptx?|potx?|ppsx?)$", re.IGNORECASE)
 _CAND_SPLIT_RE = re.compile(r"[^0-9A-Za-z\u4e00-\u9fff]+")
 _TEXT_CAND_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]{2,40}|[0-9A-Za-z]{3,40}|[\u4e00-\u9fff]{2,12}")
+_COMPACT_RE = re.compile(r"[^0-9a-z\u4e00-\u9fff]+")
+_MATCH_KIND_ORDER = {"filename_exact": 0, "content_exact": 1, "partial": 2}
 
 
 def _stem_name(name: str) -> str:
@@ -124,16 +127,28 @@ def suggest_queries(
     return suggestions
 
 
-def _snippet(conn: sqlite3.Connection, file_id: int, page_no: int,
-             needles: list[str], width: int = 34) -> str:
-    row = conn.execute(
-        "SELECT raw_text FROM pages_raw WHERE file_id=? AND page_no=?",
-        (file_id, page_no),
-    ).fetchone()
-    if not row or not row["raw_text"]:
+@lru_cache(maxsize=2048)
+def _normalized_raw(raw: str) -> str:
+    """Bounded hot-query cache; the raw string itself makes stale entries harmless."""
+    return normalize(raw)
+
+
+def _compact_normalized(text: str) -> str:
+    return _COMPACT_RE.sub("", normalize(text))
+
+
+def _snippet_from_raw(
+    raw: str,
+    needles: list[str],
+    width: int = 34,
+    *,
+    raw_norm: str | None = None,
+) -> str:
+    if not raw:
         return ""
-    raw = row["raw_text"].replace("\n", " ")
-    low = normalize(raw)  # normalize 保持长度 1:1，可用同索引切回原文
+    raw = raw.replace("\n", " ")
+    # 搜索召回阶段已经归一化过原文；复用它，避免为每条摘要再次跑 OpenCC。
+    low = raw_norm.replace("\n", " ") if raw_norm is not None else _normalized_raw(raw)
     pos, hit_len = -1, 0
     for n in needles:
         if not n:
@@ -152,12 +167,22 @@ def _snippet(conn: sqlite3.Connection, file_id: int, page_no: int,
     return ("…" if start > 0 else "") + seg + ("…" if end < len(raw) else "")
 
 
+def _snippet(conn: sqlite3.Connection, file_id: int, page_no: int,
+             needles: list[str], width: int = 34) -> str:
+    """Compatibility wrapper for callers/tests; search() uses the joined raw row."""
+    row = conn.execute(
+        "SELECT raw_text FROM pages_raw WHERE file_id=? AND page_no=?",
+        (file_id, page_no),
+    ).fetchone()
+    return _snippet_from_raw(row["raw_text"] if row and row["raw_text"] else "", needles, width)
+
+
 def _raw_contains(conn, fid: int, page: int, nw: str) -> bool:
     """原文验证：归一化后的页原文里有没有这个连续子串（尊重标点，保证精度）。"""
     row = conn.execute(
         "SELECT raw_text FROM pages_raw WHERE file_id=? AND page_no=?", (fid, page)
     ).fetchone()
-    return bool(row and row["raw_text"] and nw in normalize(row["raw_text"]))
+    return bool(row and row["raw_text"] and nw in _normalized_raw(row["raw_text"]))
 
 
 def _first_verified_page(conn, fid: int, clause: str, nw: str) -> int | None:
@@ -179,7 +204,7 @@ def _recall(
     *,
     scope: str | None = None,
     exts: tuple[str, ...] | None = None,
-) -> dict[int, list[tuple[int, float]]]:
+) -> dict[int, list[tuple[int, float, str, str]]]:
     """字级 FTS5 召回 + 原文验证 → {file_id: [(page, rank)]}。
 
     同页（所有词都在一页）优先：用 FTS5 一次性 AND，**只返回全含的页**——天然被最稀有
@@ -192,7 +217,8 @@ def _recall(
         return {}
     clauses = [c for c, _ in pairs]
     nws = [nw for _, nw in pairs]
-    content: dict[int, list[tuple[int, float]]] = {}
+    # file_id -> (page_no, bm25 rank, raw text, normalized raw text)
+    content: dict[int, list[tuple[int, float, str, str]]] = {}
 
     # 同页：一次 FTS5 AND，只命中所有词都在的页（选择性查询结果集很小，LIMIT 仅兜底）
     m_and = " AND ".join(clauses)
@@ -208,16 +234,22 @@ def _recall(
         predicates.append(f"lower(f.ext) IN ({','.join('?' * len(ext_values))})")
         params.extend(ext_values)
     sql = (
-        "SELECT pages_fts.file_id, pages_fts.page_no, bm25(pages_fts) AS rank "
+        "SELECT pages_fts.file_id, pages_fts.page_no, bm25(pages_fts) AS rank, "
+        "       pr.raw_text AS raw_text "
         "FROM pages_fts JOIN files AS f ON f.id=pages_fts.file_id "
+        "JOIN pages_raw AS pr ON pr.file_id=pages_fts.file_id AND pr.page_no=pages_fts.page_no "
         f"WHERE {' AND '.join(predicates)} ORDER BY rank LIMIT 3000"
     )
     try:
         for r in conn.execute(sql, tuple(params)):
             fid, pg = r["file_id"], r["page_no"]
-            if all(_raw_contains(conn, fid, pg, nw) for nw in nws):
-                content.setdefault(fid, []).append((pg, r["rank"]))
+            raw = r["raw_text"] or ""
+            raw_norm = _normalized_raw(raw)
+            if all(nw in raw_norm for nw in nws):
+                content.setdefault(fid, []).append((pg, r["rank"], raw, raw_norm))
     except sqlite3.OperationalError as e:
+        if "interrupted" in str(e).casefold():
+            raise
         log.warning("FTS match failed %r: %s", m_and, e)
 
     # 多词只认「同一页」：所有词必须出现在同一页（上面同页 AND 已实现）。不再做「跨页放宽」
@@ -239,7 +271,7 @@ def search(conn: sqlite3.Connection, query: str, scope: str | None = None,
             q_stem = q_stem[: -len(_e)]
             break
 
-    # 字级召回 + 原文验证（精度） + 多词（同页优先，无则放宽同文件）
+    # 字级召回 + 原文验证（精度）；多词必须在同一页共同出现。
     content = _recall(conn, terms + phrases, scope=scope, exts=exts)
 
     # 文件名命中：索引期维护 name_norm + file_names_fts。查询先走 FTS 收窄候选，再用
@@ -251,19 +283,30 @@ def search(conn: sqlite3.Connection, query: str, scope: str | None = None,
         if clauses:
             match = " AND ".join(clauses)
             try:
-                cands = [r["file_id"] for r in conn.execute(
-                    "SELECT file_id FROM file_names_fts WHERE file_names_fts MATCH ?",
-                    (match,),
-                )]
+                name_predicates = ["file_names_fts MATCH ?"]
+                name_params: list[object] = [match]
+                if scope:
+                    name_predicates.append("instr(lower(f.path), lower(?)) = 1")
+                    name_params.append(scope)
+                if ext_filter:
+                    name_predicates.append(
+                        f"lower(f.ext) IN ({','.join('?' * len(ext_filter))})")
+                    name_params.extend(sorted(ext_filter))
+                name_rows = conn.execute(
+                    "SELECT f.id, f.name, f.name_norm "
+                    "FROM file_names_fts JOIN files AS f ON f.id=file_names_fts.file_id "
+                    f"WHERE {' AND '.join(name_predicates)} LIMIT 3000",
+                    tuple(name_params),
+                )
             except sqlite3.OperationalError as e:
+                if "interrupted" in str(e).casefold():
+                    raise
                 log.warning("filename fts match failed %r: %s", match, e)
-                cands = []
-            if cands:
-                qmarks = ",".join("?" * len(cands))
-                for r in conn.execute(f"SELECT id, name, name_norm FROM files WHERE id IN ({qmarks})", tuple(cands)):
-                    nm = r["name_norm"] or normalize(r["name"])
-                    if all(t in nm for t in nterms):
-                        name_hits.add(r["id"])
+                name_rows = ()
+            for r in name_rows:
+                nm = r["name_norm"] or normalize(r["name"])
+                if all(t in nm for t in nterms):
+                    name_hits.add(r["id"])
 
     file_ids = set(content) | name_hits
     if not file_ids:
@@ -277,7 +320,7 @@ def search(conn: sqlite3.Connection, query: str, scope: str | None = None,
         rows[r["id"]] = r
 
     # 收集中间结果用于归一化
-    raw_items = []  # (row, hits, name_hit, best_rank)
+    raw_items = []  # (row, hits, name_hit, best_rank, recalled_pages)
     for fid in file_ids:
         row = rows.get(fid)
         if row is None:
@@ -289,17 +332,17 @@ def search(conn: sqlite3.Connection, query: str, scope: str | None = None,
         pages = sorted(content.get(fid, []), key=lambda x: x[1])  # rank 升序=更相关
         best_rank = pages[0][1] if pages else None
         hits = [
-            SearchHit(pno, _snippet(conn, fid, pno, needles))
-            for pno, _ in pages[:MAX_HITS_PER_FILE]
+            SearchHit(pno, _snippet_from_raw(raw, needles, raw_norm=raw_norm))
+            for pno, _rank, raw, raw_norm in pages[:MAX_HITS_PER_FILE]
         ]
-        raw_items.append((row, hits, fid in name_hits, best_rank))
+        raw_items.append((row, hits, fid in name_hits, best_rank, pages))
 
     if not raw_items:
         return []
 
-    ranks = [b for *_, b in raw_items if b is not None]
+    ranks = [item[3] for item in raw_items if item[3] is not None]
     rmin, rmax = (min(ranks), max(ranks)) if ranks else (0.0, 0.0)
-    mtimes = [row["mtime"] for row, *_ in raw_items]
+    mtimes = [item[0]["mtime"] for item in raw_items]
     mmin, mmax = min(mtimes), max(mtimes)
 
     def rel_norm(b: float | None) -> float:
@@ -314,35 +357,53 @@ def search(conn: sqlite3.Connection, query: str, scope: str | None = None,
             return 1.0
         return (m - mmin) / (mmax - mmin)
 
-    def name_bonus(name: str) -> float:
+    def name_bonus(name: str, name_norm: str | None = None) -> float:
         """文件名命中质量分级：完全匹配 > 前缀 > 普通包含（让搜 b.pptx 时 b.pptx 居首）。"""
-        nstem = normalize(name)
-        for _e in (".pptx", ".ppt"):
-            if nstem.endswith(_e):
-                nstem = nstem[: -len(_e)]
-                break
+        nstem = _stem_name(name_norm or normalize(name))
         if q_stem and nstem == q_stem:
             return 2.0   # 文件名完全匹配 → 绝对优先（盖过 内容0.6+时间0.25+包含0.5=1.35）
         if q_stem and nstem.startswith(q_stem):
             return 1.0   # 前缀匹配
         return NAME_BONUS  # 普通包含（0.50）
 
+    query_exact = _compact_normalized(query)
     results: list[FileResult] = []
-    for row, hits, name_hit, best_rank in raw_items:
+    for row, hits, name_hit, best_rank, pages in raw_items:
+        normalized_name = row["name_norm"] or normalize(row["name"])
+        filename_exact = bool(
+            name_hit
+            and query_exact
+            and _COMPACT_RE.sub("", _stem_name(normalized_name)) == query_exact
+        )
+        content_exact = bool(
+            query_exact
+            and any(query_exact in _COMPACT_RE.sub("", raw_norm) for *_head, raw_norm in pages)
+        )
+        match_kind = (
+            "filename_exact" if filename_exact
+            else "content_exact" if content_exact
+            else "partial"
+        )
         score = (
             W_REL * rel_norm(best_rank)
             + W_RECENCY * rec_norm(row["mtime"])
-            + (name_bonus(row["name"]) if name_hit else 0.0)
+            + (name_bonus(row["name"], normalized_name) if name_hit else 0.0)
         )
         results.append(FileResult(
             file_id=row["id"], path=row["path"], name=row["name"], ext=row["ext"],
             mtime=row["mtime"], size=row["size"], page_count=row["page_count"],
             status=row["status"], score=score, name_hit=name_hit, hits=hits,
+            match_kind=match_kind,
             content_hash=row["content_hash"] or "", group_id=gmap.get(row["id"]),
         ))
 
-    # 文件名命中硬优先：文件名命中的永远排在纯内容命中之前（name_hit 作主键），同类内按分排
-    results.sort(key=lambda r: (r.name_hit, r.score), reverse=True)
+    # 相关度硬分层：文件名全字 > 内容全字 > 部分命中；层内才比较综合相关度和新旧。
+    results.sort(key=lambda r: (
+        _MATCH_KIND_ORDER.get(r.match_kind, 2),
+        -r.score,
+        -r.mtime,
+        r.name.casefold(),
+    ))
 
     # 版本组内标记“最新版”：文件名含 终稿/定稿/final/最终 优先，否则修改时间最新
     members: dict[int, list[FileResult]] = defaultdict(list)

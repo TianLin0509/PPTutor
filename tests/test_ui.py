@@ -552,7 +552,6 @@ def test_neighbor_prefetch_is_low_priority_and_limited(qtbot, tmp_path):
 
     assert render.prefetches == [
         ("C:/deck.pptx", 4, win._PREFETCH_EDGE, win._PRIORITY_NEIGHBOR_PREFETCH),
-        ("C:/deck.pptx", 2, win._PREFETCH_EDGE, win._PRIORITY_NEIGHBOR_PREFETCH),
     ]
     assert win._PRIORITY_NEIGHBOR_PREFETCH > win._PRIORITY_TOP_THUMB_BASE + win._THUMB_FIRST
 
@@ -1045,6 +1044,9 @@ def test_live_refresh_waits_for_pending_search(qtbot, tmp_path):
     assert len(pending.requests) == 1
     assert win._live_refresh_after_search is True
 
+    # Production uses a multi-second quiet period.  Shorten only this test's
+    # timer while preserving the wait-until-the-current-search-finishes rule.
+    win._live_refresh.setInterval(20)
     win._on_search_done(first_req, "昇腾", [], 1.0, None)
 
     qtbot.waitUntil(lambda: len(pending.requests) == 2, timeout=1000)
@@ -1203,24 +1205,17 @@ def test_deferred_live_refresh_does_not_search_after_closing(qtbot, tmp_path):
     assert pending.requests == []
 
 
-def test_deferred_live_refresh_yields_before_rerun(qtbot, monkeypatch, tmp_path):
+def test_deferred_live_refresh_waits_for_idle_before_rerun(qtbot, tmp_path):
     conn = _index(tmp_path)
     win = MainWindow(conn=conn, render_worker=StubRender(), do_index=False)
     qtbot.addWidget(win)
-    scheduled: list[tuple[int, object]] = []
     win.search_box.setText("昇腾")
     win._live_refresh_after_search = True
 
-    monkeypatch.setattr(
-        main_window_mod.QTimer,
-        "singleShot",
-        lambda delay_ms, callback: scheduled.append((delay_ms, callback)),
-    )
-
     win._maybe_run_deferred_live_refresh("昇腾")
 
-    assert scheduled
-    assert scheduled[-1][0] >= 1
+    assert win._live_refresh.isActive()
+    assert win._live_refresh.interval() >= 1000
     assert win._live_refresh_after_search is False
 
 
@@ -1279,10 +1274,15 @@ def test_large_result_rendering_batches_first_frame_and_thumbnails(qtbot, tmp_pa
 
     assert win._RENDER_FIRST <= 16
     assert win._RENDER_CHUNK <= 16
-    assert win.result_list.count() == win._RENDER_FIRST
+    assert win.result_list.count() == win._RENDER_FIRST + 1
     assert len(thumb.requests) - initial_thumb_requests <= win._RENDER_FIRST
 
-    qtbot.waitUntil(lambda: win.result_list.count() == 80, timeout=5000)
+    # The list remains virtualized until the user asks for/scrolls to more.
+    qtbot.wait(250)
+    assert win.result_list.count() == win._RENDER_FIRST + 1
+    while win._render_plan_pos < len(win._render_plan):
+        win._load_more_results()
+    assert win.result_list.count() == 80
     assert len(thumb.requests) - initial_thumb_requests <= win._THUMB_FIRST
 
 
@@ -1449,7 +1449,10 @@ def test_large_index_async_search_streams_without_ui_slow_gap(qtbot, monkeypatch
         win._do_search()
 
         qtbot.waitUntil(lambda: len(win._results_raw) == 48, timeout=5000)
-        qtbot.waitUntil(lambda: win.result_list.count() == 48, timeout=5000)
+        qtbot.waitUntil(
+            lambda: win.result_list.count() == win._RENDER_FIRST + 1,
+            timeout=5000,
+        )
 
         lines = "\n".join(win.diagnostic_lines())
         assert "ui_loop:" in lines

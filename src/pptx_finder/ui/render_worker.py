@@ -1,9 +1,9 @@
 """后台渲染线程：串行调用 PowerPoint COM 渲染（COM 单线程套间）。
 
-优先级模型：预览（仅最新一个）> 预热 > 预取（相邻/命中页，填磁盘缓存）。
+优先级模型：预览（仅最新一个）> 手动预热 > 预取（相邻/命中页，填磁盘缓存）。
 - 预览随时抢占：新预览到来即作废所有待处理的预取（它们是旧页的邻居）。
 - 预取低优先、不发信号、复用已打开的同一文件（仅多导出几页），让用户翻过去时缓存命中=瞬间。
-- 预热：后台静默拉起 PowerPoint，首次预览免冷启动。
+- 预热仅保留为显式能力；主窗口启动时不再自动拉起 PowerPoint。
 """
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from .. import renderer
 
 class RenderWorker(QThread):
     rendered = Signal(int, str)  # request_id, png_path（失败为空串）
-    _PREFETCH_IDLE_GRACE_SEC = 0.18
+    _PREFETCH_IDLE_GRACE_SEC = 0.45
     _PRIORITY_PREVIEW = 0
     _PRIORITY_PREFETCH = 220
 
@@ -171,6 +171,7 @@ class RenderWorker(QThread):
                                 long_edge=long_edge,
                                 hi_priority=False,
                                 priority=priority,
+                                use_snapshot=True,
                             ))
                     except Exception:  # noqa: BLE001
                         pass

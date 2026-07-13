@@ -31,7 +31,7 @@ def should_use_ipc() -> bool:
 
 
 class RendererProcessClient:
-    def __init__(self, *, connect_timeout: float = 10.0, request_timeout: float = 75.0):
+    def __init__(self, *, connect_timeout: float = 10.0, request_timeout: float = 20.0):
         self.connect_timeout = float(connect_timeout)
         self.request_timeout = float(request_timeout)
         self._lock = threading.RLock()
@@ -165,6 +165,10 @@ class RendererProcessClient:
         with self._lock:
             try:
                 return self._request_locked(payload)
+            except (socket.timeout, TimeoutError):
+                # A full COM timeout already means the page is unhealthy/too slow. Repeating the
+                # same call would turn a 20s failure into 40s of spinner with no new information.
+                raise
             except Exception:
                 # One restart attempt covers renderer crashes during a request.
                 return self._request_locked(payload)

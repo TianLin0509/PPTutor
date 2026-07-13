@@ -33,7 +33,7 @@ def test_preview_then_prefetch(qtbot, monkeypatch, tmp_path):
             w.request(1, "f.pptx", 1)        # 预览 page1
         w.prefetch("f.pptx", 2)
         w.prefetch("f.pptx", 3)
-        qtbot.wait(600)                       # 等预取跑完（含低优先空闲等待）
+        qtbot.waitUntil(lambda: len(calls) >= 3, timeout=2500)  # 含交互空闲保护窗口
         with lock:
             got = list(calls)
         assert (1, True) in got               # 预览走高优先
@@ -43,7 +43,7 @@ def test_preview_then_prefetch(qtbot, monkeypatch, tmp_path):
         w.wait(3000)
 
 
-def test_preview_uses_snapshot_but_prefetch_does_not(qtbot, monkeypatch, tmp_path):
+def test_preview_and_prefetch_reuse_the_same_safe_snapshot(qtbot, monkeypatch, tmp_path):
     calls: list[tuple[int, bool, bool]] = []
     lock = threading.Lock()
 
@@ -70,11 +70,11 @@ def test_preview_uses_snapshot_but_prefetch_does_not(qtbot, monkeypatch, tmp_pat
         with qtbot.waitSignal(w.rendered, timeout=1000):
             w.request(1, "f.pptx", 1)
         w.prefetch("f.pptx", 2)
-        qtbot.wait(350)
+        qtbot.waitUntil(lambda: len(calls) >= 2, timeout=1500)
         with lock:
             got = list(calls)
         assert (1, True, True) in got
-        assert (2, False, False) in got
+        assert (2, False, True) in got
     finally:
         w.stop()
         w.wait(3000)

@@ -189,6 +189,8 @@ def test_shutdown_closes_owned_presentation_but_never_quits_powerpoint(monkeypat
     pres.Close = lambda: closed.append(True)
 
     monkeypatch.setattr(renderer, "_ipc_enabled", lambda: False)
+    # No environment override may weaken the user's open-PowerPoint safety boundary.
+    monkeypatch.setenv("PPTUTOR_QUIT_POWERPOINT_ON_SHUTDOWN", "1")
     renderer._state.app = app
     renderer._state.pres = pres
     renderer._state.pres_path = "C:/tmp/rendered.pptx"

@@ -438,11 +438,10 @@ def shutdown() -> None:
     app = getattr(_state, "app", None)
     if app is None:
         return
-    if _env_bool("PPTUTOR_QUIT_POWERPOINT_ON_SHUTDOWN") is True:
-        try:
-            app.Quit()
-        except Exception as e:  # noqa: BLE001
-            log.debug("app.Quit failed: %s", e)
+    # PowerPoint is effectively a single-instance COM server on some Office builds:
+    # even DispatchEx may hand us the user's existing Application.  There is therefore
+    # no reliable ownership proof that makes Application.Quit safe.  Releasing our COM
+    # reference is allowed; quitting the application is never allowed.
     _state.app = None
     try:
         import pythoncom

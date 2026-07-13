@@ -274,6 +274,7 @@ def test_version_window_filters_documents_by_name_and_status(qtbot, monkeypatch)
     ])
 
     win.doc_filter.setText("archive")
+    win._apply_doc_filter()
     assert win.doc_list.count() == 1
     assert "deck-b.pptx" in win.doc_list.item(0).text()
 
@@ -290,6 +291,7 @@ def test_version_window_filters_documents_by_name_and_status(qtbot, monkeypatch)
     assert win.btn_restore.isEnabled()
 
     win.doc_filter.setText("does-not-exist")
+    win._apply_doc_filter()
     assert win._cur_doc is None
     assert win.ver_list.count() == 0
     assert not win.btn_restore.isEnabled()

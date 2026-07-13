@@ -78,6 +78,8 @@ class VersionWindow(QWidget):
         self._pending_versions_after_file_op: tuple[int, str, object] | None = None
         self._closing = False
         self._all_docs: list[dict] = []
+        self._doc_filter_signature: tuple | None = None
+        self._doc_filter_token = 0
         self.setObjectName("versionWin")
         self.setWindowTitle("版本管理 · PPT 版 git")
         self.resize(940, 580)
@@ -107,7 +109,7 @@ class VersionWindow(QWidget):
         doc_filter_row = QHBoxLayout()
         self.doc_filter = QLineEdit()
         self.doc_filter.setPlaceholderText("按文件名或路径筛选…")
-        self.doc_filter.textChanged.connect(self._apply_doc_filter)
+        self.doc_filter.textChanged.connect(self._schedule_doc_filter)
         doc_filter_row.addWidget(self.doc_filter, 1)
         self.doc_scope = QComboBox()
         self.doc_scope.addItem("全部", "all")
@@ -117,6 +119,7 @@ class VersionWindow(QWidget):
         doc_filter_row.addWidget(self.doc_scope)
         ll.addLayout(doc_filter_row)
         self.doc_list = QListWidget()
+        self.doc_list.setUniformItemSizes(True)
         self.doc_list.currentItemChanged.connect(self._on_doc)
         ll.addWidget(self.doc_list, 1)
         split.addWidget(left)
@@ -129,6 +132,7 @@ class VersionWindow(QWidget):
         self.right_title.setStyleSheet("font-weight:700;")
         rl.addWidget(self.right_title)
         self.ver_list = QListWidget()
+        self.ver_list.setUniformItemSizes(True)
         self.ver_list.currentItemChanged.connect(lambda *_args: self._on_version_selection_changed())
         rl.addWidget(self.ver_list, 1)
         preview_row = QHBoxLayout()
@@ -402,6 +406,18 @@ class VersionWindow(QWidget):
 
     def _populate_docs(self, docs: list[dict]) -> None:
         self._all_docs = list(docs)
+        self._doc_filter_signature = None
+        self._apply_doc_filter()
+
+    def _schedule_doc_filter(self, *_args) -> None:
+        """Coalesce rapid typing without keeping another always-live timer."""
+        self._doc_filter_token += 1
+        token = self._doc_filter_token
+        QTimer.singleShot(180, lambda: self._apply_scheduled_doc_filter(token))
+
+    def _apply_scheduled_doc_filter(self, token: int) -> None:
+        if token != self._doc_filter_token or self._closing:
+            return
         self._apply_doc_filter()
 
     def _apply_doc_filter(self, *_args) -> None:
@@ -413,6 +429,10 @@ class VersionWindow(QWidget):
                 selected = data[0]
         query = self.doc_filter.text().strip().casefold()
         scope = str(self.doc_scope.currentData() or "all")
+        signature = (query, scope, len(self._all_docs), id(self._all_docs))
+        if signature == self._doc_filter_signature:
+            return
+        self._doc_filter_signature = signature
         docs = [
             doc
             for doc in self._all_docs

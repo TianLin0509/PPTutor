@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import zipfile
+import time
 from pathlib import Path
 
 from lxml import etree
@@ -26,7 +27,18 @@ def _rewrite_zip(path: Path, mutate) -> None:
     with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zout:
         for name, blob in data.items():
             zout.writestr(name, blob)
-    tmp.replace(path)
+    # Windows Defender / shell preview handlers can hold a newly rewritten PPTX
+    # for a few milliseconds.  This is test-fixture setup, so absorb only that
+    # short transient lock instead of making the product assertion flaky.
+    deadline = time.monotonic() + 1.0
+    while True:
+        try:
+            tmp.replace(path)
+            break
+        except PermissionError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.02)
 
 
 def _ensure_png_content_type(data: dict[str, bytes]) -> None:

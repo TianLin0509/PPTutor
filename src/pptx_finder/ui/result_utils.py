@@ -19,12 +19,45 @@ def empty_suggestions(query: str, mode: str) -> list[str]:
     return suggestion_keys(query, mode_key_from_text(mode))
 
 
-def sort_results(results: list, key: str) -> list:
-    if key == "recent":
-        return sorted(results, key=lambda r: r.mtime, reverse=True)
-    if key == "name":
-        return sorted(results, key=lambda r: r.name.lower())
-    return list(results)
+_MATCH_KIND_ORDER = {"filename_exact": 0, "content_exact": 1, "partial": 2}
+
+
+def _sort_key_for(r, keys: tuple[str, ...]) -> tuple:
+    out: list = []
+    for key in keys:
+        if key == "recent":
+            out.append(-float(r.mtime or 0.0))
+        elif key == "name":
+            out.append(str(r.name or "").casefold())
+        else:  # relevance
+            out.extend((
+                _MATCH_KIND_ORDER.get(getattr(r, "match_kind", "partial"), 2),
+                -float(r.score or 0.0),
+            ))
+    return tuple(out)
+
+
+def _regroup_relevance(ordered: list) -> list:
+    """Keep version-group members adjacent so the relevance view can fold them."""
+    grouped: dict[str, list] = {}
+    order: list[str] = []
+    for r in ordered:
+        gid = getattr(r, "group_id", None)
+        key = f"g:{gid}" if gid is not None else f"s:{getattr(r, 'file_id', id(r))}"
+        if key not in grouped:
+            grouped[key] = []
+            order.append(key)
+        grouped[key].append(r)
+    return [r for key in order for r in grouped[key]]
+
+
+def sort_results(results: list, key: str | tuple[str, ...] | list[str]) -> list:
+    keys = (key,) if isinstance(key, str) else tuple(key)
+    keys = tuple(dict.fromkeys(k for k in keys if k in {"relevance", "recent", "name"}))
+    if not keys:
+        keys = ("relevance",)
+    ordered = sorted(results, key=lambda r: _sort_key_for(r, keys))
+    return _regroup_relevance(ordered) if keys[0] == "relevance" else ordered
 
 
 def time_bucket(mtime: float, now_ts: float) -> str:

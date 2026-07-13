@@ -611,8 +611,9 @@ def _probe_powerpoint() -> str:
         pythoncom = _pythoncom
         pythoncom.CoInitialize()
         initialized = True
-        # DispatchEx creates an isolated automation instance. It must not attach
-        # to, close, or quit the user's existing PowerPoint window.
+        # Some PowerPoint builds still return the user's single COM server even
+        # for DispatchEx.  This probe is therefore strictly read-only and never
+        # closes a presentation or calls Application.Quit.
         app = win32com.client.DispatchEx("PowerPoint.Application")
         version = getattr(app, "Version", "")
         return f"PowerPoint COM 可用，版本 {version or '未知'}。"

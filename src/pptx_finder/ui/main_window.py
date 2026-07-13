@@ -59,6 +59,7 @@ from .dashboard_view import DashboardView
 from .update_ui import UpdateController
 
 _log = logging.getLogger(__name__)
+_THUMB_PLACEHOLDER_CACHE: dict[tuple[str, str, str], QPixmap] = {}
 
 
 def _make_icon(draw, color: str = "#8A8A8A", size: int = 18) -> QIcon:
@@ -183,6 +184,10 @@ def _elide_middle(s: str, maxlen: int = 72) -> str:
 
 def _thumb_placeholder(tok: dict) -> QPixmap:
     """缂╃暐鍥惧崰浣嶏細骞荤伅鐗囨牱瀛愶紙椤堕儴鑹叉潯 + 鍐呭绾匡級锛岀湡瀹炲浘娓叉煋濂藉悗鏇挎崲銆?"""
+    key = (str(tok["field"]), str(tok["bd2"]), str(tok["ink4"]))
+    cached = _THUMB_PLACEHOLDER_CACHE.get(key)
+    if cached is not None and not cached.isNull():
+        return cached
     pm = QPixmap(74, 55)
     pm.fill(QColor(tok["field"]))
     p = QPainter(pm)
@@ -191,6 +196,7 @@ def _thumb_placeholder(tok: dict) -> QPixmap:
     p.drawLine(9, 27, 52, 27)
     p.drawLine(9, 37, 40, 37)
     p.end()
+    _THUMB_PLACEHOLDER_CACHE[key] = pm
     return pm
 
 
@@ -306,6 +312,16 @@ class ResultItem(QWidget):
         fn.setStyleSheet(f"font-size:14px;font-weight:600;color:{_fn_color};background:transparent;")
         fn.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         row.addWidget(fn, 1)
+
+        match_kind = getattr(r, "match_kind", "partial")
+        if match_kind in {"filename_exact", "content_exact"}:
+            exact = QLabel("文件名全字" if match_kind == "filename_exact" else "内容全字")
+            exact.setObjectName("exactMatchBadge")
+            exact.setStyleSheet(
+                f"font-size:10px;font-weight:700;color:{tok['grn']};"
+                f"border:1px solid {tok['bd2']};border-radius:5px;padding:1px 6px;background:transparent;"
+            )
+            row.addWidget(exact, 0)
 
         if r.hits:
             for h in r.hits[:3]:
@@ -467,14 +483,15 @@ class ResultItem(QWidget):
 
 class MainWindow(QMainWindow):
     _SEARCH_SLOW_HINT_MS = 1000
-    _AUTO_PREVIEW_DELAY_MS = 120
-    _UI_LOOP_INTERVAL_MS = 250
+    _AUTO_PREVIEW_DELAY_MS = 420
+    _HISTORY_HINT_DELAY_MS = 900
+    _UI_LOOP_INTERVAL_MS = 1000
     _UI_LOOP_SLOW_GAP_MS = 250
     _RECENT_CACHE_MS = 1000
     _LIVE_FLUSH_BATCH = 64
     _LIVE_FLUSH_YIELD_MS = 1
     _DEFERRED_LIVE_SEARCH_YIELD_MS = 1
-    _LIVE_STATUS_REFRESH_MS = 250
+    _LIVE_STATUS_REFRESH_MS = 1500
     _DETAIL_UPDATE_DELAY_MS = 80
     _DETAIL_DOT_DELAY_MS = 80
     _VERSION_SHIELD_REFRESH_MS = 250
@@ -591,16 +608,17 @@ class MainWindow(QMainWindow):
         self._open_settings_cb = None                        # app.py 注入：状态栏热键标签点击 → 打开设置（#2）
         self._open_version_cb = None                         # app.py 注入：搜索结果 → 版本历史窗口（D6）
         self._history_hint_query = ""                        # 跨版本搜命中提示对应的 query（D3）
+        self._history_hint_pending_query = ""
+        self._render_plan: list = []
+        self._render_plan_pos = 0
+        self._render_plan_hlcss = ""
+        self._render_more_item: QListWidgetItem | None = None
 
         self._render = render_worker or RenderWorker(self)
         self._render.rendered.connect(self._on_rendered)
         self._owns_render = render_worker is None
         if self._owns_render:
             self._render.start()
-            # 鍚姩鍚?1.5s 鍚庡彴闈欓粯棰勭儹 PowerPoint COM锛堢敤鎴蜂笉鎰熺煡锛夛紝棣栨棰勮鍏嶅喎鍚姩 ~1.5s銆?
-            # 浠呯湡瀹炶繍琛屾€侊紙do_index锛夐鐑紱娴嬭瘯 do_index=False 涓嶆棤璋撴媺璧?PowerPoint銆?
-            if do_index:
-                QTimer.singleShot(1500, self._maybe_prewarm_render)
 
         self._thumb = thumb_worker or ThumbWorker(self)
         self._thumb.thumb_rendered.connect(self._on_thumb)
@@ -632,6 +650,10 @@ class MainWindow(QMainWindow):
         self._auto_preview_timer.timeout.connect(
             lambda: self._run_auto_preview(self._auto_preview_token, self._auto_preview_seq)
         )
+        self._history_hint_timer = QTimer(self)
+        self._history_hint_timer.setSingleShot(True)
+        self._history_hint_timer.setInterval(self._HISTORY_HINT_DELAY_MS)
+        self._history_hint_timer.timeout.connect(self._run_history_hint_search)
         self._detail_update_timer = QTimer(self)
         self._detail_update_timer.setSingleShot(True)
         self._detail_update_timer.setInterval(self._DETAIL_UPDATE_DELAY_MS)
@@ -652,7 +674,7 @@ class MainWindow(QMainWindow):
         # 鏈搷搴旓級銆傚悎骞舵垚涓€娆″欢杩熷埛鏂帮細椋庢毚 N 涓簨浠?鈫?鏈€澶?1 娆℃悳绱€?
         self._live_refresh = QTimer(self)
         self._live_refresh.setSingleShot(True)
-        self._live_refresh.setInterval(600)
+        self._live_refresh.setInterval(2500)
         self._live_refresh.timeout.connect(self._do_live_refresh)
         self._live_status_refresh = QTimer(self)
         self._live_status_refresh.setSingleShot(True)
@@ -876,9 +898,15 @@ class MainWindow(QMainWindow):
         self.sort_combo = QComboBox()
         self.sort_combo.setObjectName("sortCombo")
         self.sort_combo.addItems(["相关度", "最近修改", "文件名"])
-        self.sort_combo.setToolTip("结果排序方式")
+        self.sort_combo.setToolTip("第一排序条件")
         self.sort_combo.currentIndexChanged.connect(self._on_sort_changed)
         hr.addWidget(self.sort_combo, 0)
+        self.sort_secondary = QComboBox()
+        self.sort_secondary.setObjectName("sortSecondary")
+        self.sort_secondary.addItems(["不叠加", "最近修改", "文件名", "相关度"])
+        self.sort_secondary.setToolTip("第二排序条件；例如先按文件名，再按最近修改")
+        self.sort_secondary.currentIndexChanged.connect(self._on_sort_changed)
+        hr.addWidget(self.sort_secondary, 0)
         self.list_head.hide()
         ll.addWidget(self.list_head)
         self.result_list = QListWidget()
@@ -888,7 +916,10 @@ class MainWindow(QMainWindow):
         self.result_list.itemDoubleClicked.connect(self._on_activate)
         self.result_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.result_list.customContextMenuRequested.connect(self._context_menu)
-        self.result_list.verticalScrollBar().valueChanged.connect(self._schedule_visible_thumbs)
+        result_scroll = self.result_list.verticalScrollBar()
+        result_scroll.valueChanged.connect(self._schedule_visible_thumbs)
+        result_scroll.actionTriggered.connect(
+            lambda _action: QTimer.singleShot(0, self._load_more_if_near_bottom))
         ll.addWidget(self.result_list, 1)
         self._history_hint = QLabel("")
         self._history_hint.setObjectName("listHead")
@@ -1304,7 +1335,7 @@ class MainWindow(QMainWindow):
             set_detail_actions(on)
 
     def _set_result_refine_enabled(self, enabled: bool) -> None:
-        for w in (self.sort_combo, self.facet_btn, self.facet_panel):
+        for w in (self.sort_combo, self.sort_secondary, self.facet_btn, self.facet_panel):
             w.setEnabled(enabled)
 
     def _clear_stale_result_context(self) -> None:
@@ -1352,6 +1383,7 @@ class MainWindow(QMainWindow):
     # ---------- 涓婚 ----------
     def showEvent(self, e):  # noqa: N802
         super().showEvent(e)
+        self._start_ui_loop_monitor()
         self._apply_titlebar_theme()  # 绐楀彛鏄剧ず鍚庣郴缁熸爣棰樻爮鎵嶆帴鍙楁繁鑹插睘鎬?
         if not getattr(self, "_did_fade", False):
             self._did_fade = True
@@ -1364,6 +1396,12 @@ class MainWindow(QMainWindow):
                 self._fade.setEndValue(1.0)
                 self._fade.start()
         self._maybe_show_version_intro()  # 鏈夈€岄娆＄暀鐗堛€嶅緟鍛婄煡涓旂獥鍙ｅ凡闇茶劯鍒欒ˉ寮?
+
+    def hideEvent(self, e):  # noqa: N802
+        # 托盘常驻时不需要每秒唤醒 GUI 做卡顿采样；重新显示时 showEvent 会恢复。
+        self._ui_loop_timer.stop()
+        self._visible_thumb_timer.stop()
+        super().hideEvent(e)
 
     def _apply_titlebar_theme(self) -> None:
         """Windows 绯荤粺鏍囬鏍忔繁娴呰窡闅忛鏍硷紙娣辫壊椋庢牸鈫掓繁鑹叉爣棰樻爮锛屾秷闄ょ櫧鏉″壊瑁傦級銆?"""
@@ -1444,6 +1482,10 @@ class MainWindow(QMainWindow):
         if self._closing:
             return
         self._debounce.stop()
+        self._history_hint_timer.stop()
+        self._history_hint_pending_query = ""
+        if hasattr(self, "_history_hint"):
+            self._history_hint.hide()
         query = self.search_box.text().strip()
         self._search_seq += 1
         self._cancel_render_work_for_new_search()
@@ -1499,6 +1541,10 @@ class MainWindow(QMainWindow):
 
     def _cancel_render_work_for_new_search(self) -> None:
         self._render_gen += 1
+        self._remove_load_more_item()
+        self._render_plan = []
+        self._render_plan_pos = 0
+        self._render_plan_hlcss = ""
         if hasattr(self, "_visible_thumb_timer"):
             self._visible_thumb_timer.stop()
         self._invalidate_preview_request(clear_deferred=False)
@@ -1517,7 +1563,8 @@ class MainWindow(QMainWindow):
         self._live_refresh_after_search = False
         if self._closing or self.search_box.text().strip() != query:
             return
-        QTimer.singleShot(self._DEFERRED_LIVE_SEARCH_YIELD_MS, self._do_search)
+        # 文件风暴期间不要刚搜完就原样重搜；等 watcher 真正空闲后至多合并跑一次。
+        self._live_refresh.start()
 
     def _show_search_slow_hint(self, req_id: int, query: str) -> None:
         if self._closing or self._search_pending_req != req_id:
@@ -1554,17 +1601,23 @@ class MainWindow(QMainWindow):
             self._maybe_run_deferred_live_refresh(query)
             return
         self._finish_search(query, list(results or []), elapsed_ms)
-        self._refresh_status()
+        # 索引统计不是搜索收口的一部分；缓存缺失时才补一次后台读取。
+        if self._index_status_cache is None:
+            self._refresh_status()
         self._maybe_run_deferred_live_refresh(query)
 
     def _finish_search(self, query: str, results: list[FileResult], elapsed_ms: float | None = None) -> None:
         self._clear_search_pending()
         self._results_raw = results
         self._refresh_facets()
+        suffix = f" \u00b7 {elapsed_ms:.0f} ms" if elapsed_ms is not None else ""
+        if results:
+            self.result_count.setText(f"\u547d\u4e2d {len(results)} \u4e2a\u6587\u4ef6{suffix}")
+            self.status_label.setText(f"搜索完成：命中 {len(results)} 个文件{suffix}")
+        else:
+            self.status_label.setText(f"搜索完成：没有命中{suffix}")
         self._apply_sort_render()
         if results:
-            suffix = f" \u00b7 {elapsed_ms:.0f} ms" if elapsed_ms is not None else ""
-            self.result_count.setText(f"\u547d\u4e2d {len(results)} \u4e2a\u6587\u4ef6{suffix}")
             self.list_head.show()
             self._select_first(delayed_preview=True)
             self._animate_list_in()
@@ -2187,7 +2240,7 @@ class MainWindow(QMainWindow):
                 fn(path)
 
     def _kick_history_search(self, query: str) -> None:
-        """主搜完成后顺带跨版本搜历史；命中则在结果区下方显「历史版本另有 N 处」提示（D3）。"""
+        """用户停顿后再补搜历史，避免与主搜收口、排序和首屏预览争 CPU。"""
         if not hasattr(self, "_history_hint"):
             return
         self._history_hint.hide()
@@ -2195,6 +2248,23 @@ class MainWindow(QMainWindow):
         vm = self._version_mgr
         q = (query or "").strip()
         if vm is None or len(q) < 2 or not hasattr(vm, "search_history_details"):
+            self._history_hint_pending_query = ""
+            return
+        self._history_hint_pending_query = q
+        self._history_hint_timer.setInterval(self._HISTORY_HINT_DELAY_MS)
+        self._history_hint_timer.start()
+
+    def _run_history_hint_search(self) -> None:
+        q = self._history_hint_pending_query
+        self._history_hint_pending_query = ""
+        vm = self._version_mgr
+        if (
+            self._closing
+            or vm is None
+            or not q
+            or q != self.search_box.text().strip()
+            or self._search_pending_req is not None
+        ):
             return
         seq = self._search_seq
         task = BackgroundTask(lambda: vm.search_history_details(q, limit=200), "history-hint-search")
@@ -2232,11 +2302,20 @@ class MainWindow(QMainWindow):
         return {"相关度": "relevance", "最近修改": "recent", "文件名": "name"}.get(
             self.sort_combo.currentText(), "relevance")
 
+    def _sort_keys(self) -> tuple[str, ...]:
+        primary = self._sort_key()
+        secondary = {
+            "最近修改": "recent",
+            "文件名": "name",
+            "相关度": "relevance",
+        }.get(self.sort_secondary.currentText())
+        return tuple(dict.fromkeys(k for k in (primary, secondary) if k))
+
     def _apply_sort_render(self) -> None:
         base = self._results_raw
         if self._facet_filters:
             base = facet_filter(base, self._facet_filters, datetime.datetime.now().timestamp())
-        self._results = _sort_results(base, self._sort_key())
+        self._results = _sort_results(base, self._sort_keys())
         self._render_results(self._results)
 
     def _on_sort_changed(self) -> None:
@@ -2248,22 +2327,22 @@ class MainWindow(QMainWindow):
             if self._results:
                 self._select_first(delayed_preview=True)
 
-    # 棣栧睆鍚屾娓叉煋鏉℃暟锛氱粨鏋?鈮?姝ゆ暟鍒欏叏閮ㄥ悓姝ラ摵锛堝皬缁撴灉闆嗛浂寤惰繜锛孶I 娴嬭瘯涓嶅彈寮傛褰卞搷锛夛紱
-    # 瓒呭嚭閮ㄥ垎鐢ㄤ簨浠跺惊鐜垎鎵?娴佸紡"琛ュ叆鈥斺€旈涓粨鏋滄渶蹇嚭鐜帮紝鏁翠綋浠?< 3s銆?
-    _RENDER_FIRST = 16
-    _RENDER_CHUNK = 16
-    _THUMB_FIRST = 100
+    # 只同步创建首屏结果卡片；其余结果在滚到底部或点击“继续显示”时分批物化。
+    # 这样排序/筛选不再销毁并重建数百个 QWidget，缩略图任务也只覆盖真正看过的结果。
+    _RENDER_FIRST = 12
+    _RENDER_CHUNK = 12
+    _THUMB_FIRST = 24
     _THUMB_CACHE_MAX = 256
     _HIT_NAV_MAX = 12
     _RENDER_YIELD_MS = 1
-    _PREVIEW_MIN_EDGE = 1200
-    _PREVIEW_MAX_EDGE = 1600
+    _PREVIEW_MIN_EDGE = 960
+    _PREVIEW_MAX_EDGE = 1280
     _PREFETCH_EDGE = 960
     _PRIORITY_RIGHT_PREVIEW = 0
     _PRIORITY_VISIBLE_THUMB = 5
     _PRIORITY_TOP_THUMB_BASE = 10
     _PRIORITY_NEIGHBOR_PREFETCH = 220
-    _NEIGHBOR_PREFETCH_MAX = 2
+    _NEIGHBOR_PREFETCH_MAX = 1
 
     def _render_results(self, results: list[FileResult]) -> None:
         self.result_list.setEnabled(True)
@@ -2271,6 +2350,7 @@ class MainWindow(QMainWindow):
         if not self._showing_recent:
             self._recent_load_token += 1
         self._hide_empty_hint(invalidate_status=bool(results))
+        self._render_more_item = None
         self.result_list.clear()
         self._thumb.clear()        # 涓㈠純涓婁竴鎵规湭娓插畬鐨勭缉鐣ュ浘璇锋眰
         self._thumb_items.clear()
@@ -2283,10 +2363,65 @@ class MainWindow(QMainWindow):
         self._render_gen += 1      # 浣滃簾涓婁竴鎵逛粛鍦ㄦ祦鍏ョ殑鍒嗘壒娓叉煋
         hlcss = theme.highlight_css(self._theme)
         plan = self._build_render_plan(results)
-        n = self._flush_plan(plan, 0, self._RENDER_FIRST, hlcss)  # 棣栧睆绔嬪嵆閾?
+        self._render_plan = plan
+        self._render_plan_hlcss = hlcss
+        self._render_plan_pos = self._flush_plan(
+            plan, 0, self._RENDER_FIRST, hlcss)  # 只物化首屏，后续按滚动/点击加载
+        self._add_load_more_item()
         self._schedule_visible_thumbs()
-        if n < len(plan):
-            self._stream_plan_rest(plan, n, hlcss, self._render_gen)
+
+    def _remove_load_more_item(self) -> None:
+        item = self._render_more_item
+        self._render_more_item = None
+        if item is None:
+            return
+        row = self.result_list.row(item)
+        if row < 0:
+            return
+        widget = self.result_list.itemWidget(item)
+        self.result_list.takeItem(row)
+        if widget is not None:
+            widget.deleteLater()
+
+    def _add_load_more_item(self) -> None:
+        self._remove_load_more_item()
+        remaining = len(self._render_plan) - self._render_plan_pos
+        if remaining <= 0:
+            return
+        item = QListWidgetItem()
+        item.setData(Qt.UserRole, None)
+        item.setFlags(Qt.ItemIsEnabled)
+        button = QPushButton(f"继续显示 · 还剩 {remaining} 条")
+        button.setObjectName("loadMoreResults")
+        button.setToolTip("只在需要时创建更多结果卡片，避免后台无意义占用 CPU")
+        button.clicked.connect(self._load_more_results)
+        item.setSizeHint(button.sizeHint())
+        self.result_list.addItem(item)
+        self.result_list.setItemWidget(item, button)
+        self._render_more_item = item
+
+    def _load_more_results(self) -> None:
+        if self._closing or self._render_plan_pos >= len(self._render_plan):
+            return
+        gen = self._render_gen
+        self._remove_load_more_item()
+        if gen != self._render_gen:
+            return
+        self._render_plan_pos = self._flush_plan(
+            self._render_plan,
+            self._render_plan_pos,
+            self._render_plan_pos + self._RENDER_CHUNK,
+            self._render_plan_hlcss,
+        )
+        self._add_load_more_item()
+        self._schedule_visible_thumbs()
+
+    def _load_more_if_near_bottom(self) -> None:
+        if self._render_more_item is None or self._closing:
+            return
+        bar = self.result_list.verticalScrollBar()
+        if bar.maximum() <= 0 or bar.value() >= max(0, bar.maximum() - 2):
+            self._load_more_results()
 
     def _build_render_plan(self, results: list[FileResult]) -> list:
         """灞曞紑鎴愮嚎鎬ф覆鏌撹鍒掞細('h', 鏍囬)=鍒嗙粍澶?/ ('i', idx, r)=缁撴灉鏉＄洰銆?"""
@@ -3485,7 +3620,9 @@ class MainWindow(QMainWindow):
             self._prefetch_render(
                 self._cur.path,
                 p,
-                long_edge=self._PREFETCH_EDGE,
+                # 与右侧实际请求同一清晰度，避免先导出 960px、用户翻页后又导出
+                # 1280px 的重复 COM 工作；仍然只预取一页且先等待空闲窗口。
+                long_edge=max(self._PREFETCH_EDGE, self._preview_long_edge()),
                 priority=self._PRIORITY_NEIGHBOR_PREFETCH,
             )
             queued += 1
