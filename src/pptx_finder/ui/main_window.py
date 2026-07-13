@@ -9,6 +9,7 @@ import datetime
 import html
 import logging
 import os
+from collections import deque
 
 import sys
 import time
@@ -28,10 +29,10 @@ try:
 except Exception:  # noqa: BLE001
     _WIN = False
 
-from .. import actions, db, history, renderer as renderer_mod, search as search_mod, updater, __version__
+from .. import actions, db, history, indexer as indexer_mod, renderer as renderer_mod, search as search_mod, updater, __version__
 from ..config import (
-    DOCX_EXT, PDF_EXT, PPTX_EXT, PPT_EXTS, db_path as cfg_db_path,
-    get_hotkey, get_theme, is_first_run, mark_welcomed,
+    DOCX_EXT, PDF_EXT, PPTX_EXT, PPT_EXTS, SUPPORTED_EXTS, db_path as cfg_db_path,
+    ext_path, get_hotkey, get_theme, is_first_run, mark_welcomed,
     set_theme as cfg_set_theme, update_base_url,
 )
 from ..models import FileResult
@@ -101,6 +102,128 @@ def _sqlite_file_path(conn) -> str | None:
         return path or None
     except Exception:  # noqa: BLE001
         return None
+
+
+def _scan_known_index_changes(conn_path: str, *, limit: int = 200) -> dict:
+    """Cheap startup reconciliation that never walks the disks.
+
+    Only stat paths already present in the index. Changed and missing paths are
+    handed to ``LiveIndexer`` later, so this worker performs no parsing and
+    cannot monopolise a CPU core like the former 24-hour full-drive scan.
+    """
+    conn = db.connect(conn_path)
+    now = time.time()
+    candidates: list[str] = []
+    pending_paths: list[str] = []
+    try:
+        rows = conn.execute(
+            "SELECT path, size, mtime, status, parse_failures, retry_after FROM files"
+        ).fetchall()
+        known_paths = {os.path.normcase(str(row["path"])) for row in rows}
+        known_dirs = {os.path.dirname(str(row["path"])) for row in rows}
+        for row in rows:
+            path = str(row["path"])
+            changed = False
+            try:
+                stat = os.stat(ext_path(path))
+            except FileNotFoundError:
+                # A missing path is ambiguous at startup: the file may be on a
+                # detached/remapped drive. Live watcher deletes are definitive;
+                # startup reconciliation deliberately preserves the searchable
+                # row until the user runs a full rescan.
+                continue
+            except OSError:
+                # Offline/cloud drives can make stat fail transiently. Treating
+                # that as deletion would create a false-negative search result.
+                continue
+            else:
+                if row["status"] == "pending":
+                    pending_paths.append(path)
+                    continue
+                changed = (
+                    int(stat.st_size) != int(row["size"])
+                    or abs(float(stat.st_mtime) - float(row["mtime"])) > 1e-6
+                )
+                if not changed and row["status"] == "cloud_placeholder":
+                    # Hydration can flip only file attributes while preserving
+                    # logical size and mtime.
+                    changed = not indexer_mod._is_cloud_placeholder(path, stat)
+                elif not changed and row["status"] == "error":
+                    changed = (
+                        int(row["parse_failures"] or 0)
+                        < indexer_mod.MAX_UNCHANGED_PARSE_FAILURES
+                        and now >= float(row["retry_after"] or 0)
+                    )
+            if changed:
+                candidates.append(path)
+
+        # Discover offline-created siblings without recursing across disks.
+        # This covers normal "saved a new deck next to existing work" while
+        # keeping the daily check proportional to known folders.
+        folders_checked = 0
+        new_paths = 0
+        for directory in sorted(known_dirs, key=str.casefold):
+            if not directory:
+                continue
+            try:
+                entries = os.scandir(ext_path(directory))
+            except OSError:
+                continue
+            folders_checked += 1
+            with entries:
+                for entry in entries:
+                    try:
+                        is_file = entry.is_file(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    if not is_file or entry.name.startswith("~$"):
+                        continue
+                    if os.path.splitext(entry.name)[1].lower() not in SUPPORTED_EXTS:
+                        continue
+                    path = os.path.join(directory, entry.name)
+                    if os.path.normcase(path) in known_paths:
+                        continue
+                    candidates.append(path)
+                    known_paths.add(os.path.normcase(path))
+                    new_paths += 1
+
+        ordered = sorted(set(candidates), key=str.casefold)
+        cap = max(1, int(limit))
+        cursor = db.meta_value(conn, db.META_KNOWN_RECONCILE_CURSOR, "")
+        start = 0
+        if cursor and ordered:
+            if cursor in ordered:
+                start = (ordered.index(cursor) + 1) % len(ordered)
+            else:
+                cursor_key = cursor.casefold()
+                start = next(
+                    (i for i, path in enumerate(ordered) if path.casefold() > cursor_key),
+                    0,
+                )
+        rotated = ordered[start:] + ordered[:start]
+        selected = rotated[:cap]
+        remaining = max(0, len(ordered) - len(selected))
+        # Advance the freshness marker only after a clean pass. When changes
+        # are merely queued, keep it stale so a quick shutdown cannot lose
+        # those paths for the next 24 hours.
+        if not ordered and not pending_paths:
+            db.set_meta(conn, db.META_LAST_KNOWN_RECONCILE_AT, str(now))
+            db.delete_meta(conn, db.META_KNOWN_RECONCILE_CURSOR)
+        elif selected:
+            # Rotate capped batches across launches so a permanently failing
+            # early path cannot starve later changes.
+            db.set_meta(conn, db.META_KNOWN_RECONCILE_CURSOR, selected[-1])
+        conn.commit()
+        return {
+            "checked": len(rows),
+            "paths": selected,
+            "pending_paths": sorted(set(pending_paths), key=str.casefold),
+            "remaining": remaining,
+            "folders_checked": folders_checked,
+            "new_paths": new_paths,
+        }
+    finally:
+        conn.close()
 
 
 def _app_logo() -> QPixmap:
@@ -497,7 +620,7 @@ class MainWindow(QMainWindow):
     _VERSION_SHIELD_REFRESH_MS = 250
     _INDEX_PROGRESS_UI_MS = 100
     _INDEX_STATUS_CACHE_MS = 1000
-    _OFFLINE_RESCAN_INTERVAL_SEC = 24 * 60 * 60
+    _KNOWN_RECONCILE_INTERVAL_SEC = 24 * 60 * 60
     _BG_LIGHT_SHUTDOWN_WAIT_MS = 250
     _BG_LIGHT_SHUTDOWN_TOTAL_WAIT_MS = 1000
     _SEARCH_SHUTDOWN_WAIT_MS = 500
@@ -578,6 +701,11 @@ class MainWindow(QMainWindow):
         self._startup_index_check_last_pending = 0
         self._startup_index_check_decision = "pending"
         self._startup_index_check_error = ""
+        self._startup_known_checked = 0
+        self._startup_known_changed = 0
+        self._startup_known_remaining = 0
+        self._startup_pending_queue: deque[str] = deque()
+        self._startup_pending_timer: QTimer | None = None
         self._index_rebuild_reason = ""
         self._version_shield_token = 0
         self._version_shield_inflight_token: int | None = None
@@ -778,6 +906,10 @@ class MainWindow(QMainWindow):
             f"files={self._startup_index_check_last_files} "
             f"pages={self._startup_index_check_last_pages} "
             f"pending={self._startup_index_check_last_pending} "
+            f"known_checked={self._startup_known_checked} "
+            f"known_changed={self._startup_known_changed} "
+            f"known_remaining={self._startup_known_remaining} "
+            f"pending_resume_queued={len(self._startup_pending_queue)} "
             f"rebuild={self._index_rebuild_reason or '-'} "
             f"error={self._startup_index_check_error or '-'}"
         )
@@ -4224,6 +4356,68 @@ class MainWindow(QMainWindow):
             lambda task=task: self._bg_tasks.remove(task) if task in self._bg_tasks else None)
         task.start()
 
+    def _schedule_known_index_reconcile(self, token: int) -> None:
+        """Reconcile only paths already in the DB; never walk whole drives."""
+        conn_path = _sqlite_file_path(self._conn)
+        if not conn_path:
+            self._startup_index_check_error = "known_reconcile_no_db_path"
+            return
+        task = BackgroundTask(
+            lambda conn_path=conn_path: _scan_known_index_changes(conn_path),
+            "startup-known-file-reconcile",
+        )
+        self._bg_tasks.append(task)
+        task.done.connect(
+            lambda payload, token=token: self._on_known_index_reconciled(token, payload)
+        )
+        task.finished.connect(
+            lambda task=task: self._bg_tasks.remove(task) if task in self._bg_tasks else None
+        )
+        task.start()
+
+    def _on_known_index_reconciled(self, token: int, payload: object) -> None:
+        if self._closing or token != self._startup_index_token:
+            return
+        if not isinstance(payload, dict):
+            self._startup_index_check_error = "known_reconcile_failed"
+            return
+        paths = [p for p in payload.get("paths", []) if isinstance(p, str) and p]
+        pending_paths = [
+            p for p in payload.get("pending_paths", []) if isinstance(p, str) and p
+        ]
+        self._startup_known_checked = int(payload.get("checked", 0) or 0)
+        self._startup_known_changed = len(paths) + len(pending_paths)
+        self._startup_known_remaining = int(payload.get("remaining", 0) or 0)
+        for path in paths:
+            self._submit_live_index(path)
+        self._queue_pending_index_resume(pending_paths)
+
+    def _queue_pending_index_resume(self, paths: list[str]) -> None:
+        """Resume interrupted first-build work gradually in this session."""
+        queued = set(self._startup_pending_queue)
+        for path in paths:
+            if path not in queued:
+                self._startup_pending_queue.append(path)
+                queued.add(path)
+        if not self._startup_pending_queue or self._closing:
+            return
+        if self._startup_pending_timer is None:
+            self._startup_pending_timer = QTimer(self)
+            self._startup_pending_timer.setInterval(1500)
+            self._startup_pending_timer.timeout.connect(self._resume_one_pending_index)
+        self._resume_one_pending_index()
+        if self._startup_pending_queue and not self._startup_pending_timer.isActive():
+            self._startup_pending_timer.start()
+
+    def _resume_one_pending_index(self) -> None:
+        if self._closing or not self._startup_pending_queue:
+            if self._startup_pending_timer is not None:
+                self._startup_pending_timer.stop()
+            return
+        self._submit_live_index(self._startup_pending_queue.popleft())
+        if not self._startup_pending_queue and self._startup_pending_timer is not None:
+            self._startup_pending_timer.stop()
+
     def _on_startup_index_checked(
         self,
         token: int,
@@ -4256,6 +4450,11 @@ class MainWindow(QMainWindow):
             last_completed_scan_at = float(stats.get("last_completed_scan_at", 0) or 0)
         except (TypeError, ValueError):
             last_completed_scan_at = 0.0
+        try:
+            last_known_reconcile_at = float(stats.get("last_known_reconcile_at", 0) or 0)
+        except (TypeError, ValueError):
+            last_known_reconcile_at = 0.0
+        last_reconcile_at = max(last_completed_scan_at, last_known_reconcile_at)
         self._startup_index_check_last_files = file_count
         self._startup_index_check_last_pages = page_count
         self._startup_index_check_last_pending = pending_count
@@ -4266,13 +4465,14 @@ class MainWindow(QMainWindow):
             self._start_indexing(roots, workers)
             return
         if pending_count > 0:
-            self._startup_index_check_decision = "resume_pending"
-            self._start_indexing(roots, workers)
+            self._startup_index_check_decision = "reconcile_known"
+            self._apply_status_stats(None, stats)
+            self._schedule_known_index_reconcile(token)
             return
-        if time.time() - last_completed_scan_at >= self._OFFLINE_RESCAN_INTERVAL_SEC:
-            self._startup_index_check_decision = "reconcile_offline"
-            self._apply_status_stats(None, stats)  # 旧索引先立即可用，对账在后台进行
-            self._start_indexing(roots, workers)
+        if time.time() - last_reconcile_at >= self._KNOWN_RECONCILE_INTERVAL_SEC:
+            self._startup_index_check_decision = "reconcile_known"
+            self._apply_status_stats(None, stats)  # old index stays instantly searchable
+            self._schedule_known_index_reconcile(token)
             return
         self._startup_index_check_decision = "use_existing"
         self._apply_status_stats(None, stats)
@@ -4433,6 +4633,8 @@ class MainWindow(QMainWindow):
                 stats = dict(db.stats(own))
                 stats["index_rebuild_reason"] = db.meta_value(own, db.META_INDEX_REBUILD_REASON)
                 stats["last_completed_scan_at"] = db.meta_value(own, db.META_LAST_COMPLETED_SCAN_AT, "0")
+                stats["last_known_reconcile_at"] = db.meta_value(
+                    own, db.META_LAST_KNOWN_RECONCILE_AT, "0")
                 stats["type_counts"] = db.type_counts(own)
                 return stats
             finally:
@@ -4440,6 +4642,8 @@ class MainWindow(QMainWindow):
         stats = dict(db.stats(self._conn))
         stats["index_rebuild_reason"] = db.meta_value(self._conn, db.META_INDEX_REBUILD_REASON)
         stats["last_completed_scan_at"] = db.meta_value(self._conn, db.META_LAST_COMPLETED_SCAN_AT, "0")
+        stats["last_known_reconcile_at"] = db.meta_value(
+            self._conn, db.META_LAST_KNOWN_RECONCILE_AT, "0")
         stats["type_counts"] = db.type_counts(self._conn)
         return stats
 
