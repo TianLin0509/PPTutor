@@ -5,8 +5,10 @@
 """
 from __future__ import annotations
 
+import sys
 import threading
 import time
+import types
 
 from pptx_finder import renderer
 
@@ -203,6 +205,141 @@ def test_shutdown_closes_owned_presentation_but_never_quits_powerpoint(monkeypat
     assert getattr(renderer._state, "app", None) is None
 
 
+def test_shutdown_closes_every_renderer_owned_presentation_reference(monkeypatch):
+    app = _FakeApp()
+    first = _FakePres()
+    second = _FakePres()
+    user_document = _FakePres()
+    closed: list[str] = []
+    first.Close = lambda: closed.append("first")
+    second.Close = lambda: closed.append("second")
+    user_document.Close = lambda: closed.append("user")
+
+    monkeypatch.setattr(renderer, "_ipc_enabled", lambda: False)
+    renderer._state.app = app
+    renderer._state.pres = second
+    renderer._state.pres_path = "C:/cache/second.pptx"
+    renderer._state.pres_key = "second"
+    renderer._state.owned_presentations = [first, second]
+
+    renderer.shutdown()
+
+    assert sorted(closed) == ["first", "second"]
+    assert "user" not in closed
+    assert getattr(renderer._state, "owned_presentations", []) == []
+
+
+def test_shutdown_quits_only_proven_owned_empty_headless_powerpoint(monkeypatch):
+    class EmptyPresentations:
+        Count = 0
+
+    class OwnedHeadlessApp:
+        HWND = 123
+        Presentations = EmptyPresentations()
+
+        def __init__(self):
+            self.quit_calls = 0
+
+        def Quit(self):
+            self.quit_calls += 1
+
+    app = OwnedHeadlessApp()
+    monkeypatch.setattr(renderer, "_ipc_enabled", lambda: False)
+    monkeypatch.setattr(renderer, "_pid_for_app", lambda _app: 9001, raising=False)
+    monkeypatch.setattr(
+        renderer,
+        "_pid_has_visible_window",
+        lambda _pid: False,
+        raising=False,
+    )
+    renderer._state.app = app
+    renderer._state.app_owned_pid = 9001
+    renderer._state.pres = None
+    renderer._state.owned_presentations = []
+
+    renderer.shutdown()
+
+    assert app.quit_calls == 1
+
+
+def test_shutdown_never_quits_owned_pid_after_it_becomes_user_visible(monkeypatch):
+    class EmptyPresentations:
+        Count = 0
+
+    class VisibleApp:
+        HWND = 123
+        Presentations = EmptyPresentations()
+
+        def __init__(self):
+            self.quit_calls = 0
+
+        def Quit(self):
+            self.quit_calls += 1
+
+    app = VisibleApp()
+    monkeypatch.setattr(renderer, "_ipc_enabled", lambda: False)
+    monkeypatch.setattr(renderer, "_pid_for_app", lambda _app: 9002, raising=False)
+    monkeypatch.setattr(
+        renderer,
+        "_pid_has_visible_window",
+        lambda _pid: True,
+        raising=False,
+    )
+    renderer._state.app = app
+    renderer._state.app_owned_pid = 9002
+    renderer._state.pres = None
+    renderer._state.owned_presentations = []
+
+    renderer.shutdown()
+
+    assert app.quit_calls == 0
+
+
+def test_shutdown_never_quits_process_that_contains_any_user_document(monkeypatch):
+    class PresentationsWithUserDocument:
+        Count = 1
+
+    class AppWithUserDocument:
+        HWND = 123
+        Presentations = PresentationsWithUserDocument()
+
+        def __init__(self):
+            self.quit_calls = 0
+
+        def Quit(self):
+            self.quit_calls += 1
+
+    app = AppWithUserDocument()
+    monkeypatch.setattr(renderer, "_ipc_enabled", lambda: False)
+    monkeypatch.setattr(renderer, "_pid_for_app", lambda _app: 9003)
+    monkeypatch.setattr(renderer, "_pid_has_visible_window", lambda _pid: False)
+    renderer._state.app = app
+    renderer._state.app_owned_pid = 9003
+    renderer._state.pres = None
+    renderer._state.owned_presentations = []
+
+    renderer.shutdown()
+
+    assert app.quit_calls == 0
+
+
+def test_shutdown_never_uninitializes_a_com_apartment_it_did_not_initialize(monkeypatch):
+    app = _FakeApp()
+    calls: list[str] = []
+    pythoncom = types.SimpleNamespace(CoUninitialize=lambda: calls.append("uninit"))
+    monkeypatch.setitem(sys.modules, "pythoncom", pythoncom)
+    monkeypatch.setattr(renderer, "_ipc_enabled", lambda: False)
+    renderer._state.app = app
+    renderer._state.app_owned_pid = None
+    renderer._state.com_initialized_by_renderer = False
+    renderer._state.pres = None
+    renderer._state.owned_presentations = []
+
+    renderer.shutdown()
+
+    assert calls == []
+
+
 def test_render_page_snapshot_opens_temp_copy_not_live_file(tmp_path, monkeypatch):
     renderer.shutdown()
     renderer._failed_until.clear()
@@ -260,6 +397,35 @@ def test_existing_session_only_never_opens_powerpoint_without_owned_snapshot(tmp
         long_edge=960,
         use_snapshot=True,
         existing_session_only=True,
+    )
+
+    assert out is None
+    assert get_app_calls == []
+
+
+def test_user_preview_never_attaches_when_any_powerpoint_session_is_active(tmp_path, monkeypatch):
+    renderer.shutdown()
+    renderer._failed_until.clear()
+    monkeypatch.setattr(renderer, "cache_dir", lambda: tmp_path)
+    monkeypatch.setattr(renderer, "_ipc_enabled", lambda: False)
+    monkeypatch.setattr(renderer, "_powerpoint_active", lambda **_kwargs: True)
+    src = tmp_path / "user-session-active.pptx"
+    src.write_bytes(b"dummy")
+    get_app_calls = []
+
+    def forbidden_get_app():
+        get_app_calls.append(True)
+        raise AssertionError("preview must not reuse the user's PowerPoint process")
+
+    monkeypatch.setattr(renderer, "_get_app", forbidden_get_app)
+
+    out = renderer._render_page_direct(
+        str(src),
+        1,
+        cache_key="user-session-active",
+        long_edge=961,
+        hi_priority=True,
+        use_snapshot=True,
     )
 
     assert out is None

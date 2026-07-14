@@ -301,6 +301,113 @@ def test_startup_stale_index_reconciles_known_files_without_full_disk_scan(
     assert "decision=reconcile_known" in "\n".join(win.diagnostic_lines())
 
 
+def test_startup_old_scan_policy_schedules_low_priority_full_coverage(
+    qtbot, monkeypatch, tmp_path,
+):
+    conn = _index(tmp_path)
+    win = MainWindow(
+        conn=conn,
+        render_worker=StubRender(),
+        thumb_worker=StubThumb(),
+        do_index=False,
+    )
+    qtbot.addWidget(win)
+    scheduled = []
+    monkeypatch.setattr(
+        win,
+        "_schedule_full_coverage_scan",
+        lambda roots, reason: scheduled.append((roots, reason)),
+        raising=False,
+    )
+
+    win._on_startup_index_checked(
+        win._startup_index_token,
+        ["C:/docs"],
+        8,
+        {
+            "file_count": 4,
+            "page_count": 9,
+            "pending_count": 0,
+            "last_completed_scan_at": time.time(),
+            "last_known_reconcile_at": time.time(),
+            "scan_policy_version": "1",
+        },
+    )
+
+    assert scheduled == [(["C:/docs"], "scan_policy_upgrade")]
+    assert win._startup_index_check_decision == "schedule_full_coverage_upgrade"
+
+
+def test_startup_week_old_full_scan_schedules_single_worker_coverage(
+    qtbot, monkeypatch, tmp_path,
+):
+    from pptx_finder.scanner import SCAN_POLICY_VERSION
+
+    conn = _index(tmp_path)
+    win = MainWindow(
+        conn=conn,
+        render_worker=StubRender(),
+        thumb_worker=StubThumb(),
+        do_index=False,
+    )
+    qtbot.addWidget(win)
+    scheduled = []
+    monkeypatch.setattr(
+        win,
+        "_schedule_full_coverage_scan",
+        lambda roots, reason: scheduled.append((roots, reason)),
+        raising=False,
+    )
+
+    win._on_startup_index_checked(
+        win._startup_index_token,
+        None,
+        8,
+        {
+            "file_count": 4,
+            "page_count": 9,
+            "pending_count": 0,
+            "last_completed_scan_at": time.time() - win._FULL_COVERAGE_INTERVAL_SEC - 1,
+            "last_known_reconcile_at": time.time(),
+            "scan_policy_version": SCAN_POLICY_VERSION,
+        },
+    )
+
+    assert scheduled == [(None, "periodic_coverage")]
+    assert win._startup_index_check_decision == "schedule_full_coverage"
+
+
+def test_scheduled_coverage_defers_when_busy_then_uses_one_worker(qtbot, monkeypatch, tmp_path):
+    conn = _index(tmp_path)
+    win = MainWindow(
+        conn=conn,
+        render_worker=StubRender(),
+        thumb_worker=StubThumb(),
+        do_index=False,
+    )
+    qtbot.addWidget(win)
+    starts = []
+    monkeypatch.setattr(
+        win,
+        "_start_indexing",
+        lambda roots, workers: starts.append((roots, workers)) or True,
+    )
+    win._coverage_scan_roots = ["C:/"]
+    win._coverage_scan_reason = "periodic_coverage"
+    win._search_pending_req = 42
+
+    win._run_scheduled_coverage_scan()
+
+    assert starts == []
+    assert win._coverage_scan_timer.isActive()
+
+    win._coverage_scan_timer.stop()
+    win._search_pending_req = None
+    win._run_scheduled_coverage_scan()
+
+    assert starts == [(["C:/"], 1)]
+
+
 def test_startup_existing_index_with_pending_reconciles_known_files_only(
     qtbot, monkeypatch, tmp_path,
 ):
@@ -721,6 +828,41 @@ def test_index_worker_reports_search_ready_before_clustering(monkeypatch, qtbot,
     finally:
         release_cluster.set()
         worker.wait(1000)
+
+
+def test_no_change_coverage_skips_cluster_and_database_maintenance(monkeypatch, qtbot, tmp_path):
+    heavy_calls = []
+
+    monkeypatch.setattr(
+        indexer,
+        "update_index",
+        lambda *args, **kwargs: {
+            "indexed": 0,
+            "deleted": 0,
+            "skipped_ppt": 0,
+            "errors": 0,
+        },
+    )
+    monkeypatch.setattr(
+        "pptx_finder.cluster.compute_groups",
+        lambda _conn: heavy_calls.append("cluster") or {},
+    )
+    monkeypatch.setattr(
+        "pptx_finder.db.maintain",
+        lambda _conn: heavy_calls.append("maintain") or {"error": ""},
+    )
+
+    worker = IndexWorker(str(tmp_path / "i.db"), [str(tmp_path)], workers=1)
+    worker.start()
+    try:
+        with qtbot.waitSignal(worker.finished_index, timeout=3000):
+            pass
+        worker.wait(1000)
+    finally:
+        worker.stop()
+        worker.wait(1000)
+
+    assert heavy_calls == []
 
 
 def test_index_worker_throttles_progress_burst_before_ui(monkeypatch, qtbot, tmp_path):

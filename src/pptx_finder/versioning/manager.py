@@ -613,7 +613,11 @@ class VersionManager:
                     hi_priority=False,
                 )
             finally:
-                renderer.close_current_presentation()
+                # Historical previews run in one-shot BackgroundTask threads.
+                # Tear down the complete renderer client/apartment here; merely
+                # closing the presentation can leave a hidden PowerPoint server
+                # (and its random tempfile title) alive in the user's taskbar.
+                renderer.shutdown()
             if not png or not os.path.exists(png):
                 return None
             out = str(png)

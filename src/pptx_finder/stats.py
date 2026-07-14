@@ -154,6 +154,88 @@ def scale(files: list[FileStat]) -> ScaleStat:
 
 
 @dataclass
+class ActivityStat:
+    """按当前文件最后修改时间推导的创作足迹。"""
+
+    active_days: int
+    longest_streak_days: int
+    peak_month: str | None
+    peak_month_count: int
+    first_mtime: float
+    latest_mtime: float
+
+
+def activity(files: list[FileStat]) -> ActivityStat:
+    """活跃天数、连续活跃期与最忙月份；同一天多份胶片只算一个活跃日。"""
+    if not files:
+        return ActivityStat(0, 0, None, 0, 0.0, 0.0)
+
+    days = sorted({datetime.fromtimestamp(f.mtime).date() for f in files})
+    longest = current = 1
+    for previous, day in zip(days, days[1:]):
+        current = current + 1 if (day - previous).days == 1 else 1
+        longest = max(longest, current)
+
+    months: dict[str, int] = {}
+    for f in files:
+        key = datetime.fromtimestamp(f.mtime).strftime("%Y-%m")
+        months[key] = months.get(key, 0) + 1
+    peak_month, peak_count = max(months.items(), key=lambda item: (item[1], item[0]))
+    mtimes = [float(f.mtime) for f in files]
+    return ActivityStat(
+        active_days=len(days),
+        longest_streak_days=longest,
+        peak_month=peak_month,
+        peak_month_count=peak_count,
+        first_mtime=min(mtimes),
+        latest_mtime=max(mtimes),
+    )
+
+
+@dataclass
+class LibraryDNAStat:
+    """胶片形态、内容密度、同源复用与正文索引健康度。"""
+
+    avg_pages: float
+    avg_chars_per_page: float
+    brief_count: int
+    epic_count: int
+    family_count: int
+    family_deck_count: int
+    family_ratio: float
+    content_ready_count: int
+    content_ready_ratio: float
+
+
+def library_dna(files: list[FileStat]) -> LibraryDNAStat:
+    """复用现有 FileStat 一次线性计算，不触碰 PPT 文件或额外查询数据库。"""
+    total = len(files)
+    if not total:
+        return LibraryDNAStat(0.0, 0.0, 0, 0, 0, 0, 0.0, 0, 0.0)
+
+    total_pages = sum(max(0, int(f.page_count or 0)) for f in files)
+    total_chars = sum(max(0, int(f.char_count or 0)) for f in files)
+    groups: dict[int, int] = {}
+    for f in files:
+        if f.group_id is not None:
+            groups[f.group_id] = groups.get(f.group_id, 0) + 1
+    family_sizes = [count for count in groups.values() if count >= 2]
+    family_decks = sum(family_sizes)
+    content_ready = sum(1 for f in files if f.status == "ok")
+    return LibraryDNAStat(
+        avg_pages=total_pages / total,
+        avg_chars_per_page=total_chars / total_pages if total_pages else 0.0,
+        brief_count=sum(1 for f in files if 0 < int(f.page_count or 0) <= 5),
+        epic_count=sum(1 for f in files if int(f.page_count or 0) >= 50),
+        family_count=len(family_sizes),
+        family_deck_count=family_decks,
+        family_ratio=family_decks / total,
+        content_ready_count=content_ready,
+        content_ready_ratio=content_ready / total,
+    )
+
+
+@dataclass
 class PersonaStat:
     """⑥ 人格称号：主称号 + 副标签 + 作息×产出 矩阵定位。"""
 
@@ -225,27 +307,56 @@ class Report:
     heatmap: list[list[int]]
     drama: VersionDramaStat
     scale: ScaleStat
+    activity: ActivityStat
+    library_dna: LibraryDNAStat
     persona: PersonaStat
 
 
-def fetch_file_stats(conn: sqlite3.Connection) -> list[FileStat]:
+def fetch_file_stats(
+    conn: sqlite3.Connection,
+    *,
+    year: int | None = None,
+    since_ts: float | None = None,
+    until_ts: float | None = None,
+) -> list[FileStat]:
     """从 SQLite 取每份 PPT(pptx/ppt) 的统计字段：join 版本组 + 聚合页文本字数。
     刻意只统计 PPT——「胶片报告」是 PPT 习惯分析，不混入多文档搜索引入的 docx/xlsx/txt/pdf。"""
     ph = ",".join("?" * len(PPT_EXTS))
+    predicates = [f"lower(f.ext) IN ({ph})"]
+    params: list[object] = [e.lower() for e in PPT_EXTS]
+    if year is not None:
+        predicates.extend(["f.mtime >= ?", "f.mtime < ?"])
+        params.extend([
+            datetime(year, 1, 1).timestamp(),
+            datetime(year + 1, 1, 1).timestamp(),
+        ])
+    if since_ts is not None:
+        predicates.append("f.mtime >= ?")
+        params.append(float(since_ts))
+    if until_ts is not None:
+        predicates.append("f.mtime < ?")
+        params.append(float(until_ts))
     rows = conn.execute(
         f"""
+        WITH scoped_files AS (
+            SELECT f.id, f.name, f.mtime, f.size, f.page_count, f.status
+            FROM files f
+            WHERE {' AND '.join(predicates)}
+        ),
+        char_counts AS (
+            SELECT p.file_id, SUM(LENGTH(p.raw_text)) AS chars
+            FROM pages_raw p
+            JOIN scoped_files sf2 ON sf2.id = p.file_id
+            GROUP BY p.file_id
+        )
         SELECT f.name, f.mtime, f.size, f.page_count, f.status,
                m.group_id,
                COALESCE(c.chars, 0) AS char_count
-        FROM files f
+        FROM scoped_files f
         LEFT JOIN minhash m ON m.file_id = f.id
-        LEFT JOIN (
-            SELECT file_id, SUM(LENGTH(raw_text)) AS chars
-            FROM pages_raw GROUP BY file_id
-        ) c ON c.file_id = f.id
-        WHERE lower(f.ext) IN ({ph})
+        LEFT JOIN char_counts c ON c.file_id = f.id
         """,
-        tuple(e.lower() for e in PPT_EXTS),
+        tuple(params),
     ).fetchall()
     return [
         FileStat(
@@ -269,13 +380,12 @@ def build_report(
     year 给定则只统计该自然年修改的文件；since_ts / until_ts 用于本月、本周等滚动时间窗。
     until_ts 按半开区间处理，避免边界文件被相邻窗口重复统计。
     """
-    files = fetch_file_stats(conn)
-    if year is not None:
-        files = [f for f in files if datetime.fromtimestamp(f.mtime).year == year]
-    if since_ts is not None:
-        files = [f for f in files if f.mtime >= since_ts]
-    if until_ts is not None:
-        files = [f for f in files if f.mtime < until_ts]
+    files = fetch_file_stats(
+        conn,
+        year=year,
+        since_ts=since_ts,
+        until_ts=until_ts,
+    )
     night = night_owl(files)
     sc = scale(files)
     drama = version_drama(files)
@@ -286,5 +396,7 @@ def build_report(
         heatmap=heatmap(files),
         drama=drama,
         scale=sc,
+        activity=activity(files),
+        library_dna=library_dna(files),
         persona=persona(night, drama, sc),
     )

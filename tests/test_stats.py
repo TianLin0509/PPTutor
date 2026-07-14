@@ -151,6 +151,51 @@ def test_scale_totals():
     assert r.deck_count == 2
 
 
+# ---------- ⑥ 创作足迹 / 胶片 DNA ----------
+
+
+def test_activity_tracks_active_days_peak_month_and_streak():
+    files = [
+        _fs(mtime=_ts(2026, 5, 31, 10)),
+        _fs(mtime=_ts(2026, 6, 1, 10)),
+        _fs(mtime=_ts(2026, 6, 2, 10)),
+        _fs(mtime=_ts(2026, 6, 2, 18)),
+        _fs(mtime=_ts(2026, 6, 4, 10)),
+    ]
+
+    r = stats.activity(files)
+
+    assert r.active_days == 4
+    assert r.longest_streak_days == 3
+    assert r.peak_month == "2026-06"
+    assert r.peak_month_count == 4
+
+
+def test_library_dna_summarizes_shape_reuse_and_index_readiness():
+    files = [
+        _fs(page_count=5, char_count=500, group_id=7, status="ok"),
+        _fs(page_count=15, char_count=1500, group_id=7, status="ok"),
+        _fs(page_count=60, char_count=6000, group_id=9, status="error"),
+        _fs(page_count=20, char_count=2000, group_id=None, status="ok"),
+    ]
+
+    r = stats.library_dna(files)
+
+    assert r.avg_pages == 25.0
+    assert r.avg_chars_per_page == 100.0
+    assert r.brief_count == 1
+    assert r.epic_count == 1
+    assert r.family_count == 1
+    assert r.family_deck_count == 2
+    assert r.family_ratio == 0.5
+    assert r.content_ready_count == 3
+    assert r.content_ready_ratio == 0.75
+
+
+def test_library_dna_does_not_call_unparsed_zero_page_files_brief_decks():
+    assert stats.library_dna([_fs(page_count=0, status="error")]).brief_count == 0
+
+
 # ---------- ⑥ 人格称号 persona ----------
 
 def _night(ratio=0.0, w=0.0):
@@ -312,3 +357,18 @@ def test_build_report_filters_by_time_window(tmp_path):
 
     assert rep.deck_count == 2
     assert rep.scope_year is None
+
+
+def test_build_report_pushes_scope_into_fetch_query(monkeypatch, tmp_path):
+    conn = db.connect(tmp_path / "i.db")
+    db.init_db(conn)
+    calls = []
+
+    def fake_fetch(_conn, *, year=None, since_ts=None, until_ts=None):
+        calls.append((year, since_ts, until_ts))
+        return []
+
+    monkeypatch.setattr(stats, "fetch_file_stats", fake_fetch)
+    stats.build_report(conn, year=2026, since_ts=10.0, until_ts=20.0)
+
+    assert calls == [(2026, 10.0, 20.0)]

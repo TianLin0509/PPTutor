@@ -41,6 +41,10 @@ _powerpoint_active_cache_at = 0.0
 _powerpoint_active_cache = False
 
 
+class PowerPointSessionBusy(RuntimeError):
+    """A user/foreign PowerPoint COM server already exists; preview must stand down."""
+
+
 def _env_bool(name: str) -> bool | None:
     raw = os.environ.get(name)
     if raw is None:
@@ -53,13 +57,13 @@ def _env_bool(name: str) -> bool | None:
     return None
 
 
-def _powerpoint_active() -> bool:
+def _powerpoint_active(*, force: bool = False) -> bool:
     """Best-effort check for an already running user PowerPoint session."""
     global _powerpoint_active_cache_at, _powerpoint_active_cache
     if os.name != "nt":
         return False
     now = time.monotonic()
-    if now - _powerpoint_active_cache_at < _POWERPOINT_ACTIVE_TTL_SEC:
+    if not force and now - _powerpoint_active_cache_at < _POWERPOINT_ACTIVE_TTL_SEC:
         return _powerpoint_active_cache
 
     active = False
@@ -72,11 +76,11 @@ def _powerpoint_active() -> bool:
         pythoncom = _pythoncom
         pythoncom.CoInitialize()
         initialized = True
-        app = win32com.client.GetActiveObject("PowerPoint.Application")
-        try:
-            active = int(app.Presentations.Count) > 0
-        except Exception:  # noqa: BLE001
-            active = True
+        # The mere existence of a registered server is enough.  An empty or
+        # hidden instance can still be the user's start screen or an orphaned
+        # automation server; DispatchEx is not a reliable isolation boundary.
+        win32com.client.GetActiveObject("PowerPoint.Application")
+        active = True
     except Exception:  # noqa: BLE001
         active = False
     finally:
@@ -88,6 +92,87 @@ def _powerpoint_active() -> bool:
     _powerpoint_active_cache_at = now
     _powerpoint_active_cache = active
     return active
+
+
+def _invalidate_powerpoint_active_cache() -> None:
+    global _powerpoint_active_cache_at
+    _powerpoint_active_cache_at = 0.0
+
+
+def _powerpoint_process_ids() -> set[int] | None:
+    """Return running POWERPNT PIDs, or None when ownership cannot be audited."""
+    if os.name != "nt":
+        return set()
+    try:
+        import win32api  # type: ignore
+        import win32con  # type: ignore
+        import win32process  # type: ignore
+
+        pids = win32process.EnumProcesses()
+    except Exception:  # noqa: BLE001
+        return None
+    found: set[int] = set()
+    access = int(win32con.PROCESS_QUERY_INFORMATION) | int(win32con.PROCESS_VM_READ)
+    for raw_pid in pids:
+        pid = int(raw_pid or 0)
+        if pid <= 0:
+            continue
+        handle = None
+        try:
+            handle = win32api.OpenProcess(access, False, pid)
+            executable = str(win32process.GetModuleFileNameEx(handle, 0) or "")
+            if os.path.basename(executable).lower() == "powerpnt.exe":
+                found.add(pid)
+        except Exception:  # noqa: BLE001 access-denied/system processes are irrelevant
+            pass
+        finally:
+            if handle is not None:
+                try:
+                    handle.Close()
+                except Exception:  # noqa: BLE001
+                    pass
+    return found
+
+
+def _pid_for_app(app) -> int | None:
+    if os.name != "nt":
+        return None
+    try:
+        import win32process  # type: ignore
+
+        hwnd = int(app.HWND)
+        if hwnd <= 0:
+            return None
+        return int(win32process.GetWindowThreadProcessId(hwnd)[1])
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _pid_has_visible_window(pid: int) -> bool:
+    """Conservative visible-window check; errors mean 'visible' (never quit)."""
+    if os.name != "nt":
+        return True
+    try:
+        import win32gui  # type: ignore
+        import win32process  # type: ignore
+
+        visible = False
+
+        def _visit(hwnd, _extra):
+            nonlocal visible
+            if visible or not win32gui.IsWindowVisible(hwnd):
+                return
+            try:
+                window_pid = int(win32process.GetWindowThreadProcessId(hwnd)[1])
+            except Exception:  # noqa: BLE001
+                return
+            if window_pid == int(pid):
+                visible = True
+
+        win32gui.EnumWindows(_visit, None)
+        return visible
+    except Exception:  # noqa: BLE001
+        return True
 
 
 def background_powerpoint_allowed() -> bool:
@@ -135,13 +220,68 @@ def _get_app():
     app = getattr(_state, "app", None)
     if app is not None:
         return app
+    existing_pids = _powerpoint_process_ids()
+    if existing_pids is None:
+        raise PowerPointSessionBusy(
+            "cannot audit PowerPoint process ownership; preview renderer disabled"
+        )
+    if existing_pids or _powerpoint_active(force=True):
+        raise PowerPointSessionBusy(
+            "PowerPoint is already running; refusing to attach the preview renderer"
+        )
     import pythoncom
     import win32com.client
 
     pythoncom.CoInitialize()
-    app = win32com.client.DispatchEx("PowerPoint.Application")
+    _state.com_initialized_by_renderer = True
+    try:
+        app = win32com.client.DispatchEx("PowerPoint.Application")
+    except Exception:
+        try:
+            pythoncom.CoUninitialize()
+        except Exception:  # noqa: BLE001
+            pass
+        _state.com_initialized_by_renderer = False
+        raise
     _state.app = app
+    owned_pid = _pid_for_app(app)
+    if owned_pid is None or owned_pid in existing_pids:
+        _state.app_owned_pid = None
+        _release_local_app_reference()
+        raise PowerPointSessionBusy(
+            "could not prove exclusive ownership of the preview PowerPoint process"
+        )
+    _state.app_owned_pid = owned_pid
+    # Force every future first-session decision to observe current ROT state,
+    # not the cached pre-creation "no PowerPoint" result.
+    _invalidate_powerpoint_active_cache()
     return app
+
+
+def _release_local_app_reference() -> None:
+    """Release this COM apartment; quit only a proven-owned, empty, headless app."""
+    app = getattr(_state, "app", None)
+    owned_pid = getattr(_state, "app_owned_pid", None)
+    if app is not None and owned_pid is not None:
+        try:
+            same_process = _pid_for_app(app) == int(owned_pid)
+            empty = int(app.Presentations.Count) == 0
+            headless = not _pid_has_visible_window(int(owned_pid))
+            if same_process and empty and headless:
+                app.Quit()
+        except Exception as exc:  # noqa: BLE001 release below remains mandatory
+            log.debug("owned preview PowerPoint did not quit cleanly: %s", exc)
+    _state.app = None
+    _state.app_owned_pid = None
+    _invalidate_powerpoint_active_cache()
+    if bool(getattr(_state, "com_initialized_by_renderer", False)):
+        try:
+            import pythoncom
+
+            pythoncom.CoUninitialize()
+        except Exception:  # noqa: BLE001
+            pass
+    _state.com_initialized_by_renderer = False
 
 
 def _cleanup_snapshot() -> None:
@@ -216,6 +356,10 @@ def _open_pres(app, path: str, cache_key: str):
     _close_pres(clean_snapshot=False)
     pres = app.Presentations.Open(path, ReadOnly=1, WithWindow=0)
     _state.pres = pres
+    owned = list(getattr(_state, "owned_presentations", []))
+    if not any(item is pres for item in owned):
+        owned.append(pres)
+    _state.owned_presentations = owned
     _state.pres_path = path
     _state.pres_key = cache_key
     try:
@@ -229,11 +373,18 @@ def _open_pres(app, path: str, cache_key: str):
 
 def _close_pres(*, clean_snapshot: bool = True):
     pres = getattr(_state, "pres", None)
-    if pres is not None:
+    owned = list(getattr(_state, "owned_presentations", []))
+    if pres is not None and not any(item is pres for item in owned):
+        owned.append(pres)
+    # Close only presentations explicitly opened by this renderer.  Keeping all
+    # references (not just the latest) lets shutdown recover from a prior Close
+    # failure instead of leaking hash-named snapshot decks into the taskbar.
+    for item in owned:
         try:
-            pres.Close()
+            item.Close()
         except Exception:  # noqa: BLE001
             pass
+    _state.owned_presentations = []
     _state.pres = None
     _state.pres_path = None
     _state.pres_key = None
@@ -345,6 +496,13 @@ def _render_page_direct(
         return None
 
     with _com_slot(hi_priority, priority):  # COM 串行单槽（预览优先抢占缩略图）
+        if (
+            not existing_session_only
+            and getattr(_state, "app", None) is None
+            and _powerpoint_active(force=True)
+        ):
+            log.info("preview skipped because another PowerPoint session is active")
+            return None
         try:
             if existing_session_only:
                 # Low-CPU prefetch may reuse the exact safe-snapshot session opened
@@ -381,11 +539,16 @@ def _render_page_direct(
                 _failed_until.pop(fail_key, None)
                 return out
             return None
+        except PowerPointSessionBusy as e:
+            # This is an expected safety decision, not a broken-file failure;
+            # do not poison the page's 90-second retry cache.
+            log.info("preview skipped: %s", e)
+            return None
         except Exception as e:  # noqa: BLE001
             log.warning("render_page failed path=%s page=%s: %s", path, page_no, e)
             _failed_until[fail_key] = time.monotonic() + _FAILED_TTL_SEC
             _close_pres()       # 关掉可能损坏的 pres
-            _state.app = None   # 丢弃可能已损坏的 COM 实例，下次重建干净实例
+            _release_local_app_reference()  # 丢弃损坏的 COM apartment，下次重建
             return None
         # 不再每次 Close——保持打开供同文件翻页复用（shutdown 统一关）
 
@@ -459,18 +622,14 @@ def shutdown() -> None:
     _close_pres()  # 关掉保持打开的 Presentation
     app = getattr(_state, "app", None)
     if app is None:
+        _state.app_owned_pid = None
+        _invalidate_powerpoint_active_cache()
         return
-    # PowerPoint is effectively a single-instance COM server on some Office builds:
-    # even DispatchEx may hand us the user's existing Application.  There is therefore
-    # no reliable ownership proof that makes Application.Quit safe.  Releasing our COM
-    # reference is allowed; quitting the application is never allowed.
-    _state.app = None
-    try:
-        import pythoncom
-
-        pythoncom.CoUninitialize()
-    except Exception:  # noqa: BLE001
-        pass
+    # DispatchEx may still reuse a single-instance server, so Application.Quit is
+    # delegated to the strict PID + empty + headless proof in
+    # _release_local_app_reference.  Any user-visible or document-bearing session is
+    # reference-released only and is never closed.
+    _release_local_app_reference()
 
 
 def diagnostic_lines() -> list[str]:

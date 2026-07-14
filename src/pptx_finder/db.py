@@ -25,6 +25,7 @@ META_INDEX_REBUILD_REASON = "last_index_rebuild_reason"
 META_LAST_COMPLETED_SCAN_AT = "last_completed_scan_at"
 META_LAST_KNOWN_RECONCILE_AT = "last_known_reconcile_at"
 META_KNOWN_RECONCILE_CURSOR = "known_reconcile_cursor"
+META_SCAN_POLICY_VERSION = "scan_policy_version"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS files(

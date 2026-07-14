@@ -70,8 +70,8 @@ def mark_version_intro_done() -> None:
 # 扫描时排除的目录名（小写，按路径片段匹配）——减少无效 IO 与噪音
 EXCLUDE_DIR_NAMES: set[str] = {
     "windows", "program files", "program files (x86)", "programdata",
-    "$recycle.bin", "system volume information", "appdata",
-    "local settings", "temp", "tmp", "locallow",  # 临时目录（pytest 等临时 PPT 不该索引）
+    "$recycle.bin", "system volume information",
+    "local settings", "temp", "tmp",  # AppData 正式纳入覆盖，仅排除临时/自有数据路径
     "node_modules", ".git", "__pycache__", ".venv", "venv", "env",
     "$winreagent", "recovery", "msocache", "intel", "perflogs",
 }

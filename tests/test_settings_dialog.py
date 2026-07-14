@@ -731,24 +731,27 @@ def test_settings_powerpoint_task_registered_for_parent_shutdown(qtbot, monkeypa
     assert task not in parent._bg_tasks
 
 
-def test_probe_powerpoint_never_quits_powerpoint(monkeypatch):
+def test_probe_powerpoint_checks_registration_without_launching_powerpoint(monkeypatch):
     import sys
     import types
 
     from pptx_finder.ui import settings_dialog as settings_dialog_mod
 
-    class FakeApp:
-        Version = "16"
+    calls: list[object] = []
 
-        def __init__(self):
-            self.quit_calls = 0
+    def forbidden_dispatch(*_args, **_kwargs):
+        raise AssertionError("a diagnostic must not start a hidden PowerPoint process")
 
-        def Quit(self):
-            self.quit_calls += 1
-
-    app = FakeApp()
-    pythoncom = types.SimpleNamespace(CoInitialize=lambda: None, CoUninitialize=lambda: None)
-    client = types.SimpleNamespace(DispatchEx=lambda _name: app)
+    pythoncom = types.SimpleNamespace(
+        CoInitialize=lambda: calls.append("coinitialize"),
+        CoUninitialize=lambda: calls.append("couninitialize"),
+        CLSIDFromProgID=lambda value: calls.append(("progid", value)) or "clsid",
+    )
+    client = types.SimpleNamespace(
+        GetActiveObject=lambda _name: (_ for _ in ()).throw(RuntimeError("not running")),
+        DispatchEx=forbidden_dispatch,
+        Dispatch=forbidden_dispatch,
+    )
     win32com = types.SimpleNamespace(client=client)
 
     monkeypatch.setattr(settings_dialog_mod.os, "name", "nt", raising=False)
@@ -758,8 +761,9 @@ def test_probe_powerpoint_never_quits_powerpoint(monkeypatch):
 
     result = settings_dialog_mod._probe_powerpoint()
 
-    assert "PowerPoint COM 可用" in result
-    assert app.quit_calls == 0
+    assert "PowerPoint COM 已注册" in result
+    assert ("progid", "PowerPoint.Application") in calls
+    assert calls[-1] == "couninitialize"
 
 
 def test_settings_late_diagnostics_ignored_after_close(qtbot, mgr, monkeypatch):

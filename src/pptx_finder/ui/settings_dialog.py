@@ -601,7 +601,6 @@ class SettingsDialog(QDialog):
 def _probe_powerpoint() -> str:
     if os.name != "nt":
         return "当前不是 Windows，跳过 PowerPoint COM 检测。"
-    app = None
     pythoncom = None
     initialized = False
     try:
@@ -611,17 +610,23 @@ def _probe_powerpoint() -> str:
         pythoncom = _pythoncom
         pythoncom.CoInitialize()
         initialized = True
-        # Some PowerPoint builds still return the user's single COM server even
-        # for DispatchEx.  This probe is therefore strictly read-only and never
-        # closes a presentation or calls Application.Quit.
-        app = win32com.client.DispatchEx("PowerPoint.Application")
-        version = getattr(app, "Version", "")
-        return f"PowerPoint COM 可用，版本 {version or '未知'}。"
+        # Resolve the registered COM class without starting PowerPoint.  The old
+        # DispatchEx probe created a hidden automation process; that process could
+        # later be reused by a normal file open and inherit preview-session display
+        # characteristics.  GetActiveObject is read-only and never launches one.
+        pythoncom.CLSIDFromProgID("PowerPoint.Application")
+        version = ""
+        try:
+            app = win32com.client.GetActiveObject("PowerPoint.Application")
+            version = str(getattr(app, "Version", "") or "")
+        except Exception:  # noqa: BLE001 PowerPoint simply is not running
+            pass
+        if version:
+            return f"PowerPoint COM 已注册；当前运行版本 {version}。"
+        return "PowerPoint COM 已注册；当前未运行。"
     except Exception as exc:  # noqa: BLE001
         return f"PowerPoint COM 不可用：{type(exc).__name__}: {exc}"
     finally:
-        if app is not None:
-            app = None
         if initialized and pythoncom is not None:
             try:
                 pythoncom.CoUninitialize()

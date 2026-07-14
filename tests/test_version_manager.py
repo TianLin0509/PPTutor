@@ -279,7 +279,7 @@ def test_ensure_version_preview_renders_and_caches(tmp_path, monkeypatch):
     version_id = mgr.list_versions(str(p))[0]["version_id"]
     fake_png = tmp_path / "fake-preview.png"
     calls = []
-    closed = []
+    shutdowns = []
 
     def fake_render(path, page_no, cache_key=None, long_edge=0, hi_priority=False, priority=None):
         calls.append((path, page_no, cache_key, long_edge, hi_priority))
@@ -287,7 +287,10 @@ def test_ensure_version_preview_renders_and_caches(tmp_path, monkeypatch):
         return fake_png
 
     monkeypatch.setattr("pptx_finder.versioning.manager.renderer.render_page", fake_render)
-    monkeypatch.setattr("pptx_finder.versioning.manager.renderer.close_current_presentation", lambda: closed.append(True))
+    monkeypatch.setattr(
+        "pptx_finder.versioning.manager.renderer.shutdown",
+        lambda: shutdowns.append(True),
+    )
 
     first = mgr.ensure_version_preview(version_id)
     second = mgr.ensure_version_preview(version_id)
@@ -299,7 +302,7 @@ def test_ensure_version_preview_renders_and_caches(tmp_path, monkeypatch):
     assert len(calls) == 1
     assert calls[0][1] == 1
     assert calls[0][3] == 360
-    assert closed == [True]
+    assert shutdowns == [True]
 
 
 def test_list_docs_details_uses_fresh_connection_not_ui_read_conn(tmp_path):

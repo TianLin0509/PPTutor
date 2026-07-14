@@ -39,7 +39,28 @@ def test_handler_allows_explicit_root_inside_skipped_tree():
 def test_handler_still_skips_appdata_when_watching_drive_root():
     h = _Handler(lambda p: None, roots=["C:\\"])
     h._trigger("C:\\Users\\me\\AppData\\Local\\Temp\\deck.pptx")
-    assert not h._timers, "默认全盘监听仍应跳过 AppData 降噪"
+    assert not h._timers, "默认全盘监听仍应跳过 AppData 临时目录降噪"
+
+
+def test_handler_allows_company_documents_under_appdata_roaming():
+    h = _Handler(lambda p: None, roots=["C:\\"])
+    h._trigger("C:\\Users\\l00807938\\AppData\\Roaming\\CorpDocs\\deck.pptx")
+    try:
+        assert h._timers, "AppData\\Roaming 中的正式 PPT 应进入实时索引与版本守护"
+    finally:
+        for timer in h._timers.values():
+            timer.cancel()
+
+
+def test_handler_never_watches_its_own_data_store(monkeypatch):
+    monkeypatch.setattr(
+        "pptx_finder.versioning.watcher.data_dir",
+        lambda: "C:\\Users\\me\\AppData\\Local\\pptx-finder",
+        raising=False,
+    )
+    h = _Handler(lambda p: None, roots=["C:\\"])
+    h._trigger("C:\\Users\\me\\AppData\\Local\\pptx-finder\\objects\\version.pptx")
+    assert not h._timers
 
 
 def test_handler_routes_word_pdf_to_content_index_without_version_snapshot(monkeypatch):

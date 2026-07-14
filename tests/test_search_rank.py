@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import fixtures_gen as fx
 
-from pptx_finder import db, indexer, search
+from pptx_finder import db, indexer, scanner, search
 from pptx_finder.config import EXCLUDE_DIR_NAMES
 from pptx_finder.scanner import iter_ppt_files
 
@@ -54,3 +54,28 @@ def test_scanner_skips_temp(tmp_path):
 def test_exclude_has_temp_dirs():
     for d in ("temp", "tmp", "local settings"):
         assert d in EXCLUDE_DIR_NAMES
+
+
+def test_scanner_includes_company_documents_under_appdata_roaming(tmp_path):
+    roaming = tmp_path / "Users" / "l00807938" / "AppData" / "Roaming" / "CorpDocs"
+    roaming.mkdir(parents=True)
+    fx.make_pptx(roaming / "old-project.pptx", [{"body": "legacy"}])
+
+    found = {p.name for p in iter_ppt_files([str(tmp_path)])}
+
+    assert "old-project.pptx" in found
+
+
+def test_scanner_never_indexes_its_own_appdata_store(tmp_path, monkeypatch):
+    own_store = tmp_path / "Users" / "me" / "AppData" / "Local" / "pptx-finder"
+    own_store.mkdir(parents=True)
+    fx.make_pptx(own_store / "version-object.pptx", [{"body": "internal"}])
+    roaming = tmp_path / "Users" / "me" / "AppData" / "Roaming" / "CorpDocs"
+    roaming.mkdir(parents=True)
+    fx.make_pptx(roaming / "real.pptx", [{"body": "real"}])
+    monkeypatch.setattr(scanner, "data_dir", lambda: own_store)
+
+    found = {p.name for p in iter_ppt_files([str(tmp_path)])}
+
+    assert "real.pptx" in found
+    assert "version-object.pptx" not in found

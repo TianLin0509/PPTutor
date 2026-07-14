@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import collections
 import threading
+import time
 
 from PySide6.QtCore import QThread, Signal
 
@@ -17,9 +18,9 @@ from .. import renderer
 
 class RenderWorker(QThread):
     rendered = Signal(int, str)  # request_id, png_path（失败为空串）
-    # 120ms absorbs rapid result-selection churn while still getting the next page
+    # 80ms absorbs rapid result-selection churn while still getting the next page
     # ready before a normal human page-turn. Concurrency remains one COM export.
-    _PREFETCH_IDLE_GRACE_SEC = 0.12
+    _PREFETCH_IDLE_GRACE_SEC = 0.08
     _PRIORITY_PREVIEW = 0
     _PRIORITY_PREFETCH = 220
 
@@ -32,6 +33,9 @@ class RenderWorker(QThread):
         self._prefetch_active_keys: set[tuple[str, int, str | None, int, int]] = set()
         self._warm = False
         self._stopping = False
+        self._release_requested = 0
+        self._release_completed = 0
+        self._release_count = 0
         self._preview_requested = 0
         self._preview_completed = 0
         self._preview_failed = 0
@@ -104,20 +108,59 @@ class RenderWorker(QThread):
             self._prefetch_pending_keys.clear()
             self._cv.notify()
 
+    def release_session(self, timeout_sec: float = 20.0) -> bool:
+        """Close the preview presentation/COM client on this worker thread.
+
+        External PowerPoint opening must call this first.  COM state is
+        thread-local, so closing it from the caller/background thread would not
+        release the renderer's apartment and could expose that hidden session as
+        the user's normal PowerPoint window.
+        """
+        deadline = time.monotonic() + max(0.0, float(timeout_sec))
+        with self._cv:
+            if self._stopping:
+                return False
+            if not self.isRunning():
+                return True
+            if self._preview is not None:
+                self._preview_cleared += 1
+            self._preview = None
+            self._warm = False
+            self._prefetch_cleared += len(self._prefetch)
+            self._prefetch.clear()
+            self._prefetch_pending_keys.clear()
+            self._release_requested += 1
+            target = self._release_requested
+            self._cv.notify_all()
+            while self._release_completed < target and not self._stopping:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._cv.wait(remaining)
+            return self._release_completed >= target
+
     def stop(self) -> None:
         with self._cv:
             self._stopping = True
-            self._cv.notify()
+            self._cv.notify_all()
 
     def run(self) -> None:
         try:
             while True:
                 with self._cv:
-                    while not (self._stopping or self._warm or self._preview or self._prefetch):
+                    while not (
+                        self._stopping
+                        or self._release_requested > self._release_completed
+                        or self._warm
+                        or self._preview
+                        or self._prefetch
+                    ):
                         self._cv.wait()
                     if self._stopping:
                         return
-                    if self._preview is not None:
+                    if self._release_requested > self._release_completed:
+                        kind, data = "release", self._release_requested
+                    elif self._preview is not None:
                         kind, data = "preview", self._preview
                         self._preview = None
                     elif self._warm:
@@ -135,7 +178,25 @@ class RenderWorker(QThread):
                         self._prefetch_pending_keys.discard(data)
                         self._prefetch_active_keys.add(data)
                 # —— 锁外执行实际渲染 ——
-                if kind == "warm":
+                if kind == "release":
+                    try:
+                        renderer.shutdown()
+                    finally:
+                        with self._cv:
+                            # Drop anything that raced with the handoff.  UI file
+                            # operations also suppress new preview requests, but
+                            # this second clear makes the boundary self-contained.
+                            if self._preview is not None:
+                                self._preview_cleared += 1
+                            self._preview = None
+                            self._warm = False
+                            self._prefetch_cleared += len(self._prefetch)
+                            self._prefetch.clear()
+                            self._prefetch_pending_keys.clear()
+                            self._release_completed = max(self._release_completed, int(data))
+                            self._release_count += 1
+                            self._cv.notify_all()
+                elif kind == "warm":
                     try:
                         renderer.prewarm()
                     except Exception:  # noqa: BLE001
@@ -193,7 +254,9 @@ class RenderWorker(QThread):
                 f"preview_pending={self._preview is not None} "
                 f"prefetch_pending={len(self._prefetch)} "
                 f"prefetch_active={len(self._prefetch_active_keys)} "
-                f"warm_pending={self._warm} stopping={self._stopping}",
+                f"warm_pending={self._warm} "
+                f"release={self._release_completed}/{self._release_requested} "
+                f"stopping={self._stopping}",
                 "render_worker_stats: "
                 f"preview={self._preview_completed}/{self._preview_requested} "
                 f"preview_failed={self._preview_failed} preview_cleared={self._preview_cleared} "
@@ -201,5 +264,6 @@ class RenderWorker(QThread):
                 f"prefetch_failed={self._prefetch_failed} "
                 f"deduped={self._prefetch_deduped} cleared={self._prefetch_cleared} "
                 f"max_prefetch_queue={self._max_prefetch_queue} "
-                f"warm={self._warm_completed}/{self._warm_requested}",
+                f"warm={self._warm_completed}/{self._warm_requested} "
+                f"session_releases={self._release_count}",
             ]

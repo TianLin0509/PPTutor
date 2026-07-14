@@ -242,6 +242,11 @@ class ReportOverlay(QWidget):
         self.current_report = report
         self.current_year = report.scope_year
         self.current_scope = _SCOPE_YEAR if report.scope_year is not None else _SCOPE_ALL
+        initial_key = (self.current_scope, self.current_year, None, None)
+        self._report_cache: dict[tuple[str, int | None, float | None, float | None], object] = {
+            initial_key: report,
+        }
+        self._switch_cache_key: tuple[str, int | None, float | None, float | None] | None = None
         self._switch_token = 0
         self._switch_inflight: tuple[int, str, int | None] | None = None
         self._report_ready_for_export = True
@@ -396,12 +401,23 @@ class ReportOverlay(QWidget):
             return
         if self._switch_inflight is not None:
             return
+        cache_key = (scope, query_year, since_ts, until_ts)
         self.current_scope = scope
         self.current_year = query_year
+        cached = self._report_cache.get(cache_key)
+        if cached is not None:
+            self.current_report = cached
+            self._report_ready_for_export = True
+            self._set_scope_buttons_enabled(True)
+            self.copy_btn.setEnabled(True)
+            self.export_btn.setEnabled(not self._export_inflight)
+            self._fill_content()
+            return
         if self._conn is not None:
             self._switch_token += 1
             token = self._switch_token
             self._switch_inflight = (token, scope, query_year)
+            self._switch_cache_key = cache_key
             self._report_ready_for_export = False
             self._set_scope_buttons_enabled(False)
             self.export_btn.setEnabled(False)
@@ -472,11 +488,15 @@ class ReportOverlay(QWidget):
         self._set_scope_buttons_enabled(True)
         self.copy_btn.setEnabled(True)
         if report is None:
+            self._switch_cache_key = None
             self._show_switch_error(scope, year)
             return
         self.current_scope = scope
         self.current_year = year
         self.current_report = report
+        if self._switch_cache_key is not None:
+            self._report_cache[self._switch_cache_key] = report
+        self._switch_cache_key = None
         self._fill_content()
         self._report_ready_for_export = True
         self.export_btn.setEnabled(not self._export_inflight)
@@ -510,7 +530,9 @@ class ReportOverlay(QWidget):
         self._content_lay.addWidget(self._hero(report))
         self._content_lay.addWidget(self._persona_hero(report.persona))   # 称号前置：最该被晒的一张
         self._content_lay.addWidget(self._liver_card(report))
+        self._content_lay.addWidget(self._activity_card(report.activity))
         self._content_lay.addWidget(self._drama_card(report.drama))
+        self._content_lay.addWidget(self._library_dna_card(report.library_dna, report.deck_count))
         self._content_lay.addWidget(self._scale_card(report.scale))
 
         self._content.adjustSize()
@@ -655,6 +677,37 @@ class ReportOverlay(QWidget):
         zr = roast_zombie(days)
         if zr:
             lay.addWidget(self._roast_label(zr))
+        return card
+
+    def _activity_card(self, a) -> QFrame:
+        if a.peak_month:
+            year, month = a.peak_month.split("-", 1)
+            peak = f"{year} 年 {int(month)} 月"
+        else:
+            peak = "暂无"
+        lines = [
+            f"留下修改足迹 <b>{a.active_days}</b> 天　最长连续开工 <b>{a.longest_streak_days}</b> 天",
+            f"最忙月份：<b>{peak}</b>，有 {a.peak_month_count} 份胶片在那个月更新",
+        ]
+        if a.first_mtime and a.latest_mtime:
+            first = datetime.fromtimestamp(a.first_mtime).strftime("%Y-%m-%d")
+            latest = datetime.fromtimestamp(a.latest_mtime).strftime("%Y-%m-%d")
+            lines.append(f"当前库的修改时间跨度：<b>{first}</b> → <b>{latest}</b>")
+        card = self._section("📅 创作足迹", lines)
+        card.setObjectName("activityCard")
+        card.setToolTip("按当前文件的最后修改时间统计；不是逐次保存日志")
+        return card
+
+    def _library_dna_card(self, dna, deck_count: int) -> QFrame:
+        lines = [
+            f"平均 <b>{dna.avg_pages:.1f}</b> 页/份　每页平均 <b>{dna.avg_chars_per_page:.0f}</b> 字",
+            f"短平快（≤5 页）<b>{dna.brief_count}</b> 份　长篇巨制（≥50 页）<b>{dna.epic_count}</b> 份",
+            f"复用家族 <b>{dna.family_count}</b> 个，覆盖 <b>{dna.family_deck_count}</b> 份胶片（{dna.family_ratio:.0%}）",
+            f"正文索引就绪 <b>{dna.content_ready_count}/{deck_count}</b>（{dna.content_ready_ratio:.0%}）",
+        ]
+        card = self._section("🧬 胶片 DNA", lines)
+        card.setObjectName("libraryDnaCard")
+        card.setToolTip("复用家族来自已有近似内容分组；统计复用现有索引，不会重新打开 PPT")
         return card
 
     def _scale_card(self, sc) -> QFrame:

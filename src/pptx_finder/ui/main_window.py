@@ -52,7 +52,6 @@ from .result_utils import (
     time_bucket as _time_bucket,  # noqa: F401  供测试从本模块 re-export
 )
 from .search_worker import SearchWorker
-from .thumb_worker import ThumbWorker
 from .detail_panel import DetailPanel
 from .facet_panel import FacetPanel
 from .aurora_bg import AuroraCentral
@@ -60,7 +59,6 @@ from .dashboard_view import DashboardView
 from .update_ui import UpdateController
 
 _log = logging.getLogger(__name__)
-_THUMB_PLACEHOLDER_CACHE: dict[tuple[str, str, str], QPixmap] = {}
 
 
 def _make_icon(draw, color: str = "#8A8A8A", size: int = 18) -> QIcon:
@@ -305,24 +303,6 @@ def _elide_middle(s: str, maxlen: int = 72) -> str:
     return s[:head] + "\u2026" + s[-tail:]
 
 
-def _thumb_placeholder(tok: dict) -> QPixmap:
-    """缂╃暐鍥惧崰浣嶏細骞荤伅鐗囨牱瀛愶紙椤堕儴鑹叉潯 + 鍐呭绾匡級锛岀湡瀹炲浘娓叉煋濂藉悗鏇挎崲銆?"""
-    key = (str(tok["field"]), str(tok["bd2"]), str(tok["ink4"]))
-    cached = _THUMB_PLACEHOLDER_CACHE.get(key)
-    if cached is not None and not cached.isNull():
-        return cached
-    pm = QPixmap(74, 55)
-    pm.fill(QColor(tok["field"]))
-    p = QPainter(pm)
-    p.fillRect(0, 0, 74, 13, QColor(tok["bd2"]))
-    p.setPen(QPen(QColor(tok["ink4"]), 2))
-    p.drawLine(9, 27, 52, 27)
-    p.drawLine(9, 37, 40, 37)
-    p.end()
-    _THUMB_PLACEHOLDER_CACHE[key] = pm
-    return pm
-
-
 def _file_mime_for_path(path: str) -> QMimeData:
     mime = QMimeData()
     clean = str(path or "")
@@ -396,7 +376,6 @@ class ResultItem(QWidget):
         self.path = r.path
         self._on_select = on_select
         self._drag_start_pos: QPoint | None = None
-        self.thumb_page = r.hits[0].page_no if r.hits else 1
         # 版本组：ginfo 为组主卡时带 count（折叠起来的历史版本数）；为成员行时 member=True
         self._gid = ginfo.get("gid") if ginfo else None
         self._exp_btn = None  # 版本组展开器按钮（仅组主卡有），供就地切换文字 ▾/▴
@@ -410,13 +389,7 @@ class ResultItem(QWidget):
 
         outer = QHBoxLayout(self)
         outer.setContentsMargins(11 + (24 if is_member else 0), 9, 12, 9)  # 历史版本行左缩进，视觉归属上方组主卡
-        outer.setSpacing(11)
-        self._thumb = QLabel()
-        self._thumb.setObjectName("cardThumb")
-        self._thumb.setFixedSize(74, 55)
-        self._thumb.setAlignment(Qt.AlignCenter)
-        self._thumb.setPixmap(_thumb_placeholder(tok))
-        outer.addWidget(self._thumb, 0, Qt.AlignTop)
+        outer.setSpacing(0)
         lay = QVBoxLayout()
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(4)
@@ -529,10 +502,6 @@ class ResultItem(QWidget):
         outer.addLayout(lay, 1)
         self._apply("normal", True)
 
-    def set_thumbnail(self, pm: QPixmap) -> None:
-        if pm is not None and not pm.isNull():
-            self._thumb.setPixmap(pm.scaled(74, 55, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-
     def set_version_expanded(self, expanded: bool, count: int) -> None:
         """切换组主卡展开器的文字（就地展开/折叠后调用，不重建卡片）。"""
         if self._exp_btn is not None:
@@ -609,6 +578,7 @@ class ResultItem(QWidget):
 class MainWindow(QMainWindow):
     _SEARCH_SLOW_HINT_MS = 1000
     _AUTO_PREVIEW_DELAY_MS = 420
+    _SHARP_PREVIEW_DELAY_MS = 160
     _HISTORY_HINT_DELAY_MS = 900
     _UI_LOOP_INTERVAL_MS = 1000
     _UI_LOOP_SLOW_GAP_MS = 250
@@ -623,6 +593,9 @@ class MainWindow(QMainWindow):
     _INDEX_PROGRESS_UI_MS = 100
     _INDEX_STATUS_CACHE_MS = 1000
     _KNOWN_RECONCILE_INTERVAL_SEC = 24 * 60 * 60
+    _FULL_COVERAGE_INTERVAL_SEC = 7 * 24 * 60 * 60
+    _FULL_COVERAGE_DELAY_MS = 30_000
+    _FULL_COVERAGE_RETRY_MS = 5_000
     _BG_LIGHT_SHUTDOWN_WAIT_MS = 250
     _BG_LIGHT_SHUTDOWN_TOTAL_WAIT_MS = 1000
     _SEARCH_SHUTDOWN_WAIT_MS = 500
@@ -727,6 +700,7 @@ class MainWindow(QMainWindow):
         self._req_id = 0
         self._cur_pixmap: QPixmap | None = None
         self._preview_provisional = False  # 褰撳墠棰勮鏄惁涓虹缉鐣ュ浘鍗犱綅锛堥珮娓呮湭鍒帮級
+        self._sharp_preview_args: tuple[int, str, int, int, int] | None = None
         self._zoom = 1.0  # 棰勮缂╂斁锛?.0=閫傞厤绐楀彛锛?1 鏀惧ぇ鐪嬬粏鑺?
         self._to_tray_on_close = False
         self._thumb_btns: list[QToolButton] = []
@@ -751,14 +725,8 @@ class MainWindow(QMainWindow):
         if self._owns_render:
             self._render.start()
 
-        self._thumb = thumb_worker or ThumbWorker(self)
-        self._thumb.thumb_rendered.connect(self._on_thumb)
-        self._owns_thumb = thumb_worker is None
-        if self._owns_thumb and do_index:
-            self._thumb.start()  # 娴嬭瘯 do_index=False 涓嶈捣鐪熸覆鏌撶嚎绋?
-        self._thumb_cache: dict[tuple[str, int], QPixmap] = {}
-        self._thumb_items: dict[tuple[str, int], ResultItem] = {}
-        self._thumb_requested_priority: dict[tuple[str, int], int] = {}
+        # ``thumb_worker`` remains a compatibility argument for callers on the
+        # previous API. Result cards are text-only, so it is never started or used.
         self._version_mgr = version_mgr  # 鐗堟湰绠＄悊锛坅pp.py 娉ㄥ叆锛岃鎯呴潰鏉跨敤锛涘彲 None锛?
         self._facet_filters: dict[str, set] = {}  # 褰撳墠 facet 绛涢€夛紙08锛?
 
@@ -781,6 +749,10 @@ class MainWindow(QMainWindow):
         self._auto_preview_timer.timeout.connect(
             lambda: self._run_auto_preview(self._auto_preview_token, self._auto_preview_seq)
         )
+        self._sharp_preview_timer = QTimer(self)
+        self._sharp_preview_timer.setSingleShot(True)
+        self._sharp_preview_timer.setInterval(self._SHARP_PREVIEW_DELAY_MS)
+        self._sharp_preview_timer.timeout.connect(self._run_sharp_preview)
         self._history_hint_timer = QTimer(self)
         self._history_hint_timer.setSingleShot(True)
         self._history_hint_timer.setInterval(self._HISTORY_HINT_DELAY_MS)
@@ -791,10 +763,6 @@ class MainWindow(QMainWindow):
         self._detail_update_timer.timeout.connect(
             lambda: self._run_detail_update(self._detail_update_token)
         )
-        self._visible_thumb_timer = QTimer(self)
-        self._visible_thumb_timer.setSingleShot(True)
-        self._visible_thumb_timer.setInterval(40)
-        self._visible_thumb_timer.timeout.connect(self._request_visible_thumbs)
         self._detail_dot_timer = QTimer(self)
         self._detail_dot_timer.setSingleShot(True)
         self._detail_dot_timer.setInterval(self._DETAIL_DOT_DELAY_MS)
@@ -834,6 +802,12 @@ class MainWindow(QMainWindow):
             self._search_worker.start()
 
         self._indexer: IndexWorker | None = None
+        self._coverage_scan_roots: list[str] | None = None
+        self._coverage_scan_reason = ""
+        self._coverage_scan_timer = QTimer(self)
+        self._coverage_scan_timer.setSingleShot(True)
+        self._coverage_scan_timer.setInterval(self._FULL_COVERAGE_DELAY_MS)
+        self._coverage_scan_timer.timeout.connect(self._run_scheduled_coverage_scan)
         # 瀹炴椂绱㈠紩鍚庡彴绾跨▼锛氫繚瀛樹簨浠朵笉鍦ㄤ富绾跨▼ parse/鍐欏簱锛堥槻 UI 鍐荤粨锛夈€?
         # do_index=False 鐨勬祴璇曟棤姝ょ嚎绋嬶紝璧?_index_file_live 鐨勫悓姝ュ厹搴曘€?
         self._live: LiveIndexer | None = None
@@ -921,7 +895,7 @@ class MainWindow(QMainWindow):
                 lines.extend(self._version_mgr.diagnostic_lines())
             except Exception as exc:  # noqa: BLE001
                 lines.append(f"version_reconcile: diagnostic_error={type(exc).__name__}")
-        for name, worker in (("render_worker", self._render), ("thumb_worker", self._thumb)):
+        for name, worker in (("render_worker", self._render),):
             if worker is not None and hasattr(worker, "diagnostic_lines"):
                 try:
                     lines.extend(worker.diagnostic_lines())
@@ -1064,7 +1038,6 @@ class MainWindow(QMainWindow):
         self.result_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.result_list.customContextMenuRequested.connect(self._context_menu)
         result_scroll = self.result_list.verticalScrollBar()
-        result_scroll.valueChanged.connect(self._schedule_visible_thumbs)
         result_scroll.actionTriggered.connect(
             lambda _action: QTimer.singleShot(0, self._load_more_if_near_bottom))
         ll.addWidget(self.result_list, 1)
@@ -1503,8 +1476,6 @@ class MainWindow(QMainWindow):
         self._update_preview_header(None)
         self._clear_preview_empty()
         self.result_list.clear()
-        self._thumb.clear()
-        self._thumb_items.clear()
         self._set_ops_enabled(False)
 
     def _update_preview_header(self, r: FileResult | None) -> None:
@@ -1553,7 +1524,6 @@ class MainWindow(QMainWindow):
     def hideEvent(self, e):  # noqa: N802
         # 托盘常驻时不需要每秒唤醒 GUI 做卡顿采样；重新显示时 showEvent 会恢复。
         self._ui_loop_timer.stop()
-        self._visible_thumb_timer.stop()
         super().hideEvent(e)
 
     def _apply_titlebar_theme(self) -> None:
@@ -1726,13 +1696,10 @@ class MainWindow(QMainWindow):
         self._render_plan = []
         self._render_plan_pos = 0
         self._render_plan_hlcss = ""
-        if hasattr(self, "_visible_thumb_timer"):
-            self._visible_thumb_timer.stop()
         self._invalidate_preview_request(clear_deferred=False)
-        for worker in (getattr(self, "_thumb", None), getattr(self, "_render", None)):
-            clear = getattr(worker, "clear", None)
-            if callable(clear):
-                clear()
+        clear = getattr(self._render, "clear", None)
+        if callable(clear):
+            clear()
 
     def _clear_search_pending(self) -> None:
         self._search_pending_req = None
@@ -2515,21 +2482,17 @@ class MainWindow(QMainWindow):
                 self._select_first(delayed_preview=True)
 
     # 只同步创建首屏结果卡片；其余结果在滚到底部或点击“继续显示”时分批物化。
-    # 这样排序/筛选不再销毁并重建数百个 QWidget，缩略图任务也只覆盖真正看过的结果。
+    # 这样排序/筛选不再销毁并重建数百个 QWidget；结果卡保持纯文本，不派发图片任务。
     _RENDER_FIRST = 12
     _RENDER_CHUNK = 12
-    _THUMB_FIRST = 24
-    _THUMB_CACHE_MAX = 256
     _HIT_NAV_MAX = 12
     _RENDER_YIELD_MS = 1
     _PREVIEW_MIN_EDGE = 960
     _PREVIEW_MAX_EDGE = 1280
     _PREFETCH_EDGE = 960
     _PRIORITY_RIGHT_PREVIEW = 0
-    _PRIORITY_VISIBLE_THUMB = 5
-    _PRIORITY_TOP_THUMB_BASE = 10
     _PRIORITY_NEIGHBOR_PREFETCH = 220
-    _NEIGHBOR_PREFETCH_MAX = 2
+    _NEIGHBOR_PREFETCH_MAX = 1
 
     def _render_results(self, results: list[FileResult]) -> None:
         self.result_list.setEnabled(True)
@@ -2539,9 +2502,6 @@ class MainWindow(QMainWindow):
         self._hide_empty_hint(invalidate_status=bool(results))
         self._render_more_item = None
         self.result_list.clear()
-        self._thumb.clear()        # 涓㈠純涓婁竴鎵规湭娓插畬鐨勭缉鐣ュ浘璇锋眰
-        self._thumb_items.clear()
-        self._thumb_requested_priority.clear()
         # 版本组折叠状态随每次重渲染复位（新搜索/排序/筛选/换肤都回折叠态）；展开是就地插入，不走这里
         self._group_primary_item = {}
         self._group_member_items = {}
@@ -2555,7 +2515,6 @@ class MainWindow(QMainWindow):
         self._render_plan_pos = self._flush_plan(
             plan, 0, self._RENDER_FIRST, hlcss)  # 只物化首屏，后续按滚动/点击加载
         self._add_load_more_item()
-        self._schedule_visible_thumbs()
 
     def _remove_load_more_item(self) -> None:
         item = self._render_more_item
@@ -2601,7 +2560,6 @@ class MainWindow(QMainWindow):
             self._render_plan_hlcss,
         )
         self._add_load_more_item()
-        self._schedule_visible_thumbs()
 
     def _load_more_if_near_bottom(self) -> None:
         if self._render_more_item is None or self._closing:
@@ -2716,7 +2674,6 @@ class MainWindow(QMainWindow):
         w.activated.connect(lambda item=item: self._activate_result_item(item))
         if ginfo and ginfo.get("count"):
             self._group_primary_item[ginfo["gid"]] = item  # 记录组主卡列表项，供就地展开定位
-        self._request_thumb(w, idx)
 
     def _toggle_version_group(self, gid: int) -> None:
         """点「N 个历史版本」：就地展开/折叠，不重渲染整表（保留选中/滚动/预览不闪）。"""
@@ -2755,17 +2712,6 @@ class MainWindow(QMainWindow):
             self.result_list.setItemWidget(item, w)
             w.activated.connect(lambda item=item: self._activate_result_item(item))
             # 成员是用户主动展开看的，直接请求缩略图（不受首屏 THUMB_FIRST 门限限制）
-            key = (w.path, w.thumb_page)
-            self._thumb_items[key] = w
-            cached = self._thumb_cache.get(key)
-            if cached is not None and not cached.isNull():
-                w.set_thumbnail(cached)
-            else:
-                self._request_thumb_worker(
-                    w.path,
-                    w.thumb_page,
-                    priority=self._PRIORITY_VISIBLE_THUMB,
-                )
             inserted.append(item)
         self._group_member_items[gid] = inserted
         self._expanded_groups.add(gid)
@@ -2785,100 +2731,6 @@ class MainWindow(QMainWindow):
             pi = self._group_primary_item.get(gid)
             if pi is not None:
                 self.result_list.setCurrentItem(pi)
-
-    def _request_thumb(self, w: ResultItem, idx: int) -> None:
-        """缁撴灉鍗＄墖缂╃暐鍥撅細鍛戒腑缂撳瓨鐩存帴鐢紝鍚﹀垯浠呬负棣栧睆鍓嶈嫢骞蹭釜鍙戣捣娓叉煋銆?"""
-        key = (w.path, w.thumb_page)
-        self._thumb_items[key] = w
-        cached = self._thumb_cache.pop(key, None)
-        if cached is not None:
-            self._thumb_cache[key] = cached
-            w.set_thumbnail(cached)
-        elif idx < self._THUMB_FIRST:
-            self._request_thumb_worker(
-                w.path,
-                w.thumb_page,
-                priority=self._thumb_priority_for_index(idx),
-            )
-
-    def _thumb_priority_for_index(self, idx: int) -> int:
-        return self._PRIORITY_TOP_THUMB_BASE + max(0, min(int(idx), self._THUMB_FIRST - 1))
-
-    def _request_thumb_worker(self, path: str, page: int, *, priority: int) -> None:
-        if os.path.splitext(path)[1].lower() not in PPT_EXTS:
-            return
-        key = (path, page)
-        old_priority = self._thumb_requested_priority.get(key)
-        if old_priority is not None:
-            return
-        self._thumb_requested_priority[key] = int(priority)
-        try:
-            self._thumb.request(path, page, priority=int(priority))
-        except TypeError:
-            self._thumb.request(path, page)
-
-    def _schedule_visible_thumbs(self) -> None:
-        if self._closing:
-            return
-        self._visible_thumb_timer.start()
-
-    def _request_visible_thumbs(self) -> None:
-        if self._closing or self.result_list.isHidden():
-            return
-        viewport = self.result_list.viewport().rect()
-        count = self.result_list.count()
-        if count <= 0:
-            return
-        top_item = self.result_list.itemAt(1, 1)
-        bottom_item = self.result_list.itemAt(1, max(1, viewport.height() - 1))
-        top = self.result_list.row(top_item) if top_item is not None else max(0, self.result_list.currentRow())
-        bottom = self.result_list.row(bottom_item) if bottom_item is not None else min(count - 1, top + 32)
-        start = max(0, top - 2)
-        end = min(count, max(top, bottom) + 3)
-        for row in range(start, end):
-            item = self.result_list.item(row)
-            if item is None or item.data(Qt.UserRole) is None:
-                continue
-            rect = self.result_list.visualItemRect(item)
-            if not rect.isValid() or not rect.intersects(viewport):
-                continue
-            w = self.result_list.itemWidget(item)
-            if not isinstance(w, ResultItem):
-                continue
-            key = (w.path, w.thumb_page)
-            self._thumb_items[key] = w
-            cached = self._thumb_cache.get(key)
-            if cached is not None and not cached.isNull():
-                w.set_thumbnail(cached)
-            else:
-                self._request_thumb_worker(
-                    w.path,
-                    w.thumb_page,
-                    priority=self._PRIORITY_VISIBLE_THUMB,
-                )
-
-    def _remember_thumb(self, key: tuple[str, int], pm: QPixmap) -> None:
-        self._thumb_cache.pop(key, None)
-        self._thumb_cache[key] = pm
-        while len(self._thumb_cache) > self._THUMB_CACHE_MAX:
-            self._thumb_cache.pop(next(iter(self._thumb_cache)))
-
-    def _on_thumb(self, path: str, page: int, png: str) -> None:
-        if self._closing:
-            return
-        key = (path, page)
-        self._thumb_requested_priority.pop(key, None)
-        if key not in self._thumb_items:
-            return
-        w = self._thumb_items.pop(key, None)
-        if not png or not os.path.exists(png):
-            return
-        pm = QPixmap(png)
-        if pm.isNull():
-            return
-        self._remember_thumb(key, pm)
-        if w is not None:
-            w.set_thumbnail(pm)
 
     def _add_section_header(self, label: str) -> None:
         item = QListWidgetItem()
@@ -3562,6 +3414,7 @@ class MainWindow(QMainWindow):
         if clear_deferred:
             self._preview_deferred_due_to_busy = False
         self._req_id += 1
+        self._cancel_sharp_preview()
         if hasattr(self, "_spin_timer"):
             self._stop_spinner()
 
@@ -3602,30 +3455,59 @@ class MainWindow(QMainWindow):
         self._cur_pixmap = None
         self._preview_provisional = False
 
-    def _show_cached_preview_placeholder(self, path: str, page: int) -> bool:
-        """Show any cached image immediately while the sharp preview renders."""
-        thumb = self._thumb_cache.get((path, page))
-        if thumb is not None and not thumb.isNull():
-            self._cur_pixmap = thumb
-            self._preview_provisional = True
-            self._stop_spinner()
-            self._update_pixmap()
-            return True
+    def _show_cached_preview_placeholder(self, path: str, page: int, sharp_edge: int) -> str:
+        """Show cached pixels immediately; report whether they are already sharp enough."""
         cached = None
         try:
             cached = renderer_mod.find_cached_render(path, page, min_long_edge=1)
         except Exception:  # noqa: BLE001
             cached = None
         if cached is None or not os.path.exists(str(cached)):
-            return False
+            return ""
         pm = QPixmap(str(cached))
         if pm.isNull():
-            return False
+            return ""
         self._cur_pixmap = pm
-        self._preview_provisional = True
+        sharp = max(pm.width(), pm.height()) >= sharp_edge
+        self._preview_provisional = not sharp
         self._stop_spinner()
         self._update_pixmap()
-        return True
+        return "sharp" if sharp else "provisional"
+
+    def _cancel_sharp_preview(self) -> None:
+        self._sharp_preview_args = None
+        timer = getattr(self, "_sharp_preview_timer", None)
+        if timer is not None:
+            timer.stop()
+
+    def _schedule_sharp_preview(
+        self,
+        req_id: int,
+        path: str,
+        page: int,
+        long_edge: int,
+        priority: int,
+    ) -> None:
+        self._sharp_preview_args = (req_id, path, page, long_edge, priority)
+        self._sharp_preview_timer.setInterval(self._SHARP_PREVIEW_DELAY_MS)
+        self._sharp_preview_timer.start()
+
+    def _run_sharp_preview(self) -> None:
+        args = self._sharp_preview_args
+        self._sharp_preview_args = None
+        if args is None or self._closing:
+            return
+        req_id, path, page, long_edge, priority = args
+        if (
+            req_id != self._req_id
+            or self._cur is None
+            or self._cur.path != path
+            or self._view_page != page
+            or self._search_pending_req is not None
+            or self._active_heavy_op is not None
+        ):
+            return
+        self._request_render(req_id, path, page, long_edge=long_edge, priority=priority)
 
     def _request_preview(self) -> None:
         if not self._cur:
@@ -3635,6 +3517,7 @@ class MainWindow(QMainWindow):
         if self._defer_preview_if_file_op_active():
             return
         self._preview_deferred_due_to_busy = False
+        self._cancel_sharp_preview()
         self._zoom = 1.0
         page = self._view_page
         hits = self._cur.hits or []
@@ -3674,17 +3557,37 @@ class MainWindow(QMainWindow):
             b.setChecked(i < n and hits[i].page_no == page)
         # 娓愯繘寮忛瑙堬細璇ラ〉缂╃暐鍥惧凡缂撳瓨灏辩珛鍗虫斁澶ф樉绀轰綔鍗犱綅锛堢鍑哄唴瀹广€侀伄浣忔覆鏌撶瓑寰咃級锛岄珮娓呮覆鏌?
         # 濂藉悗鍦?_on_rendered 鏃犵紳鏇挎崲銆傚懡涓〉閫氬父宸叉湁缂╃暐鍥撅紙缁撴灉鍗＄墖宸︿晶閭ｅ紶灏辨槸瀹冿級銆?
-        if not self._show_cached_preview_placeholder(self._cur.path, page):
+        preview_edge = self._preview_long_edge()
+        cache_state = self._show_cached_preview_placeholder(
+            self._cur.path,
+            page,
+            preview_edge,
+        )
+        if not cache_state:
             self._preview_provisional = False
             self._start_spinner()
         self._req_id += 1
-        self._request_render(
-            self._req_id,
-            self._cur.path,
-            page,
-            long_edge=self._preview_long_edge(),
-            priority=self._PRIORITY_RIGHT_PREVIEW,
-        )
+        if cache_state == "sharp":
+            self._preview_hinted = True
+            self._prefetch_neighbors()
+        elif cache_state == "provisional":
+            # Keep the cached frame visible and sharpen only the page where the
+            # user pauses. Rapid wheel turns cancel unseen COM exports.
+            self._schedule_sharp_preview(
+                self._req_id,
+                self._cur.path,
+                page,
+                preview_edge,
+                self._PRIORITY_RIGHT_PREVIEW,
+            )
+        else:
+            self._request_render(
+                self._req_id,
+                self._cur.path,
+                page,
+                long_edge=preview_edge,
+                priority=self._PRIORITY_RIGHT_PREVIEW,
+            )
 
     def _preview_long_edge(self) -> int:
         try:
@@ -3785,15 +3688,6 @@ class MainWindow(QMainWindow):
         self._cur_pixmap = pm
         self._preview_provisional = False  # 楂樻竻宸插埌锛屼笉鍐嶆槸鍗犱綅
         self._preview_hinted = True  # 棣栨棰勮宸叉垚鍔燂紝涔嬪悗涓嶅啀鎻愩€屽敜璧?PowerPoint銆?
-        # The selected result card usually represents this same first hit page.
-        # Reuse the completed right-side render as a tiny in-memory card image:
-        # zero extra COM/CPU, and no misleading cover fallback for later hit pages.
-        if self._cur is not None and self._cur_item_widget is not None:
-            key = (self._cur.path, self._view_page)
-            if self._cur_item_widget.thumb_page == self._view_page:
-                thumb = pm.scaled(148, 110, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                self._remember_thumb(key, thumb)
-                self._cur_item_widget.set_thumbnail(thumb)
         self._update_pixmap()
         self._prefetch_neighbors()  # 鍚庡彴棰勬覆鏌撶浉閭?鍛戒腑椤碉紝缈昏繃鍘绘椂缂撳瓨鍛戒腑=鐬棿
 
@@ -3803,7 +3697,12 @@ class MainWindow(QMainWindow):
         鏂囦欢宸叉墦寮€鐫€锛岄鍙栨瘡椤靛彧鏄瀵煎嚭 ~0.07s锛屼綆浼樺厛銆佽鏂伴瑙堥殢鏃舵姠鍗犲苟浣滃簾
         锛坃request_preview鈫抮ender_worker.request 浼氭竻绌哄緟棰勫彇锛夛紝鏁呭彧棰勫彇浣犲綋鍓嶅仠鐣欓〉鐨勯偦灞呫€?
         """
-        if self._cur is None or not self._owns_render:
+        if (
+            self._cur is None
+            or not self._owns_render
+            or self._active_heavy_op is not None
+            or self._search_pending_req is not None
+        ):
             return
         if not hasattr(self._render, "prefetch"):
             return  # 娴嬭瘯娉ㄥ叆鐨?StubRender 鏃犳鏂规硶
@@ -3811,8 +3710,8 @@ class MainWindow(QMainWindow):
         cur = self._view_page
         direction = 1 if self._preview_direction >= 0 else -1
         # First cover ordinary wheel/page turning, then the next search-hit button.
-        # The opposite neighbor is only a final fallback. The hard two-page cap
-        # prevents a long result list from turning into background COM work.
+        # A COM export already in progress cannot be interrupted safely, so only
+        # one speculative page may occupy the render channel.
         directional_hits = [
             h.page_no for h in (self._cur.hits or [])
             if (h.page_no - cur) * direction > 0
@@ -3838,9 +3737,9 @@ class MainWindow(QMainWindow):
             self._prefetch_render(
                 self._cur.path,
                 p,
-                # 与右侧实际请求同一清晰度，避免先导出 960px、用户翻页后又导出
-                # 1280px 的重复 COM 工作；仍然只预取一页且先等待空闲窗口。
-                long_edge=max(self._PREFETCH_EDGE, self._preview_long_edge()),
+                # 960px normally is the final size. On a large viewport it is an
+                # instant provisional frame and is sharpened only after a pause.
+                long_edge=self._PREFETCH_EDGE,
                 priority=self._PRIORITY_NEIGHBOR_PREFETCH,
             )
             queued += 1
@@ -3947,14 +3846,40 @@ class MainWindow(QMainWindow):
         return super().eventFilter(obj, ev)
 
     # ---------- 鎵撳紑鍔ㄤ綔 ----------
+    def _release_preview_session_before_open(self, path: str) -> None:
+        """Synchronously hand off the render COM apartment before opening a PPT.
+
+        This runs inside the existing background file-operation task.  Waiting in
+        the GUI thread would freeze the app; calling ``renderer.shutdown`` here
+        would be ineffective because the COM state belongs to RenderWorker.
+        """
+        if os.path.splitext(path)[1].lower() not in PPT_EXTS:
+            return
+        release = getattr(self._render, "release_session", None)
+        if not callable(release):
+            return
+        if not bool(release(timeout_sec=20.0)):
+            raise TimeoutError("preview renderer did not release its PowerPoint session")
+
+    def _open_file_after_preview_release(self, path: str) -> bool:
+        self._release_preview_session_before_open(path)
+        return actions.open_file(path)
+
+    def _open_at_page_after_preview_release(self, path: str, page: int):
+        self._release_preview_session_before_open(path)
+        return actions.open_at_page(path, page)
+
     def _open_file_path(self, path: str) -> None:
         def _after(ok):
+            # Do not immediately recreate a hidden preview COM server while the
+            # shell-launched user PowerPoint is still registering in the ROT.
+            self._preview_deferred_due_to_busy = False
             if ok is None:
                 self._toast("打开文件时出错了，请稍后重试")
             elif not ok:
                 self._toast("文件已移动或删除")
 
-        if self._run_bg(lambda: actions.open_file(path), _after, "open"):
+        if self._run_bg(lambda: self._open_file_after_preview_release(path), _after, "open"):
             self._toast("正在打开文件…")
 
     def _open_folder_path(self, path: str) -> None:
@@ -4062,6 +3987,7 @@ class MainWindow(QMainWindow):
 
     def _open_at_page_bg(self, path: str, page: int) -> None:
         def _after(res):
+            self._preview_deferred_due_to_busy = False
             if res is None:
                 self._toast("打开时出错了，请稍后重试")
                 return
@@ -4071,7 +3997,11 @@ class MainWindow(QMainWindow):
             elif not jumped:
                 self._toast(f"\u5df2\u6253\u5f00\uff0c\u4f46\u672a\u80fd\u81ea\u52a8\u8df3\u5230\u7b2c {page} \u9875")
 
-        if self._run_bg(lambda: actions.open_at_page(path, page), _after, "open"):
+        if self._run_bg(
+            lambda: self._open_at_page_after_preview_release(path, page),
+            _after,
+            "open",
+        ):
             self._toast(f"\u6b63\u5728\u6253\u5f00\u7b2c {page} \u9875...")
 
     def _act_goto(self) -> None:
@@ -4461,6 +4391,33 @@ class MainWindow(QMainWindow):
         )
         task.start()
 
+    def _schedule_full_coverage_scan(self, roots: list[str] | None, reason: str) -> None:
+        """Queue a complete but single-worker scan after the startup interaction burst."""
+        self._coverage_scan_roots = list(roots) if roots else None
+        self._coverage_scan_reason = reason
+        self._coverage_scan_timer.setInterval(self._FULL_COVERAGE_DELAY_MS)
+        self._coverage_scan_timer.start()
+
+    def _run_scheduled_coverage_scan(self) -> None:
+        if self._closing or not self._coverage_scan_reason:
+            return
+        index_busy = self._indexer is not None and self._indexer.isRunning()
+        user_busy = (
+            self._search_pending_req is not None
+            or self._active_heavy_op is not None
+            or (self.isVisible() and bool(self.search_box.text().strip()))
+        )
+        if index_busy or user_busy:
+            self._coverage_scan_timer.setInterval(self._FULL_COVERAGE_RETRY_MS)
+            self._coverage_scan_timer.start()
+            return
+        roots = self._coverage_scan_roots
+        self._coverage_scan_roots = None
+        self._coverage_scan_reason = ""
+        # One parser worker caps automatic coverage at one CPU core. Manual and
+        # first-run scans retain their normal parallelism.
+        self._start_indexing(roots, 1)
+
     def _on_known_index_reconciled(self, token: int, payload: object) -> None:
         if self._closing or token != self._startup_index_token:
             return
@@ -4540,6 +4497,9 @@ class MainWindow(QMainWindow):
             last_known_reconcile_at = float(stats.get("last_known_reconcile_at", 0) or 0)
         except (TypeError, ValueError):
             last_known_reconcile_at = 0.0
+        stored_scan_policy = str(stats.get("scan_policy_version") or "")
+        from ..scanner import SCAN_POLICY_VERSION
+
         last_reconcile_at = max(last_completed_scan_at, last_known_reconcile_at)
         self._startup_index_check_last_files = file_count
         self._startup_index_check_last_pages = page_count
@@ -4549,6 +4509,16 @@ class MainWindow(QMainWindow):
         if file_count <= 0:
             self._startup_index_check_decision = "start_scan_rebuild" if self._index_rebuild_reason else "start_scan"
             self._start_indexing(roots, workers)
+            return
+        if stored_scan_policy != SCAN_POLICY_VERSION:
+            self._startup_index_check_decision = "schedule_full_coverage_upgrade"
+            self._apply_status_stats(None, stats)
+            self._schedule_full_coverage_scan(roots, "scan_policy_upgrade")
+            return
+        if time.time() - last_completed_scan_at >= self._FULL_COVERAGE_INTERVAL_SEC:
+            self._startup_index_check_decision = "schedule_full_coverage"
+            self._apply_status_stats(None, stats)
+            self._schedule_full_coverage_scan(roots, "periodic_coverage")
             return
         if pending_count > 0:
             self._startup_index_check_decision = "reconcile_known"
@@ -4619,6 +4589,10 @@ class MainWindow(QMainWindow):
             self._show_recent(dashboard_force_refresh=True, recent_force_refresh=True)  # 绌烘悳绱㈠仠鍦ㄤ华琛ㄧ洏 鈫?鏂版枃浠跺苟鍏ュ悗鍒锋柊缁熻
 
     def _start_indexing(self, roots: list[str] | None, workers: int | None) -> bool:
+        if hasattr(self, "_coverage_scan_timer"):
+            self._coverage_scan_timer.stop()
+            self._coverage_scan_roots = None
+            self._coverage_scan_reason = ""
         if self._indexer is not None and self._indexer.isRunning():
             self._toast("正在扫描中，请稍候…")
             return False
@@ -4721,6 +4695,8 @@ class MainWindow(QMainWindow):
                 stats["last_completed_scan_at"] = db.meta_value(own, db.META_LAST_COMPLETED_SCAN_AT, "0")
                 stats["last_known_reconcile_at"] = db.meta_value(
                     own, db.META_LAST_KNOWN_RECONCILE_AT, "0")
+                stats["scan_policy_version"] = db.meta_value(
+                    own, db.META_SCAN_POLICY_VERSION, "")
                 stats["type_counts"] = db.type_counts(own)
                 return stats
             finally:
@@ -4730,6 +4706,8 @@ class MainWindow(QMainWindow):
         stats["last_completed_scan_at"] = db.meta_value(self._conn, db.META_LAST_COMPLETED_SCAN_AT, "0")
         stats["last_known_reconcile_at"] = db.meta_value(
             self._conn, db.META_LAST_KNOWN_RECONCILE_AT, "0")
+        stats["scan_policy_version"] = db.meta_value(
+            self._conn, db.META_SCAN_POLICY_VERSION, "")
         stats["type_counts"] = db.type_counts(self._conn)
         return stats
 
@@ -4844,8 +4822,6 @@ class MainWindow(QMainWindow):
         self._closing = True
         self._render_gen += 1
         self._close_type_conn()  # 关分类型计数用的只读连接
-        if hasattr(self, "_visible_thumb_timer"):
-            self._visible_thumb_timer.stop()
         if self._search_worker is not None:
             self._search_worker.stop()
             self._search_worker.wait(self._SEARCH_SHUTDOWN_WAIT_MS)
@@ -4874,14 +4850,8 @@ class MainWindow(QMainWindow):
         if self._indexer is not None:
             self._indexer.stop()
             self._indexer.wait(5000)
-        if self._owns_thumb:
-            self._thumb.stop()
         if self._owns_render:
             self._render.stop()
-        if self._owns_thumb:
-            if not self._thumb.wait(6000):
-                self._thumb.terminate()
-                self._thumb.wait(1500)
         if self._owns_render:
             if not self._render.wait(8000):
                 self._render.terminate()

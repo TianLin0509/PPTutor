@@ -8,7 +8,7 @@ import threading
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
-from ..config import CONTENT_EXTS, PPTX_EXT
+from ..config import CONTENT_EXTS, PPTX_EXT, data_dir
 
 DEBOUNCE_SEC = 1.5
 SAVE_RETRY_DELAYS_SEC = (0.75, 2.0, 5.0)
@@ -16,7 +16,7 @@ log = logging.getLogger(__name__)
 
 _SKIP_SEGS = (
     "\\windows\\", "\\program files", "\\programdata\\", "\\$recycle.bin\\",
-    "\\appdata\\", "\\node_modules\\", "\\.git\\", "\\__pycache__\\",
+    "\\appdata\\local\\temp\\", "\\node_modules\\", "\\.git\\", "\\__pycache__\\",
 )
 
 
@@ -55,11 +55,14 @@ class _Handler(FileSystemEventHandler):
             _norm_path(r) for r in (roots or [])
             if any(seg in _norm_path(r).lower() for seg in _SKIP_SEGS)
         ]
+        self._always_skip_roots = [_norm_path(str(data_dir()))]
         self._timers: dict[str, threading.Timer] = {}
         self._retry_delays = SAVE_RETRY_DELAYS_SEC
         self._lock = threading.Lock()
 
     def _skip_path(self, path: str) -> bool:
+        if any(_under(path, root) for root in self._always_skip_roots):
+            return True
         low = _norm_path(path).lower()
         if not any(seg in low for seg in _SKIP_SEGS):
             return False

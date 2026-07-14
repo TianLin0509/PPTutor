@@ -331,3 +331,28 @@ def test_primary_prefetch_starts_quickly_without_raising_concurrency(qtbot, monk
     finally:
         w.stop()
         w.wait(3000)
+
+
+def test_release_session_runs_cleanup_on_render_thread_and_clears_queued_work(
+    qtbot, monkeypatch
+):
+    shutdown_threads: list[int] = []
+    caller_thread = threading.get_ident()
+    monkeypatch.setattr(
+        renderer,
+        "shutdown",
+        lambda: shutdown_threads.append(threading.get_ident()),
+    )
+    w = RenderWorker()
+    w.prefetch("old.pptx", 2)
+    w.start()
+    try:
+        qtbot.waitUntil(w.isRunning, timeout=1000)
+        assert w.release_session(timeout_sec=1.0) is True
+        assert shutdown_threads
+        assert shutdown_threads[0] != caller_thread
+        assert list(w._prefetch) == []
+        assert w._preview is None
+    finally:
+        w.stop()
+        w.wait(3000)

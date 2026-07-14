@@ -277,7 +277,7 @@ def update_index(
     progress_cb(done, total, cur)：total<0 = 扫描阶段（文件名渐进可搜），
     total>=0 = 内容解析阶段（done/total）。
     """
-    from .scanner import iter_ppt_files
+    from .scanner import SCAN_POLICY_VERSION, iter_ppt_files
 
     existing = db.all_indexed(conn)
     seen: set[str] = set()
@@ -528,6 +528,7 @@ def update_index(
         progress_cb(total, total, "完成")  # 进度走满
     if scan_iter is None and not stopped():
         db.set_meta(conn, db.META_LAST_COMPLETED_SCAN_AT, str(time.time()))
+        db.set_meta(conn, db.META_SCAN_POLICY_VERSION, SCAN_POLICY_VERSION)
         conn.commit()
     summary["scanned"] = len(seen)
     return summary

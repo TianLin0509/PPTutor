@@ -74,6 +74,8 @@ def test_overlay_constructs_and_exports_png(qtbot, tmp_path):
 
     ov = ro.ReportOverlay(report, theme.tok("cloud"))
     qtbot.addWidget(ov)
+    assert ov.findChild(QFrame, "activityCard") is not None
+    assert ov.findChild(QFrame, "libraryDnaCard") is not None
     assert ov.close_btn.text() == "×"
     assert ov.close_btn.width() >= 32
     assert ov.close_btn.height() >= 32
@@ -286,7 +288,9 @@ def test_overlay_year_switch_rebuilds_report(qtbot, tmp_path):
     assert ov.current_year == 2026
     assert ov.current_report.deck_count == 1     # 仅 2026 那份
     ov.switch_year(None)
-    qtbot.waitUntil(lambda: ov.current_report.deck_count == 2, timeout=1000)
+    # “全部”是浮层初始报告，切回时直接复用，不再重复扫库。
+    assert ov._switch_inflight is None
+    assert ov.current_report is report
     assert ov.current_year is None
     assert ov.current_report.deck_count == 2
 

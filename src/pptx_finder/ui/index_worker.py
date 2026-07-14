@@ -62,16 +62,27 @@ class IndexWorker(QThread):
                 self.finished_index.emit({"error": str(e)})
                 return
             self.finished_index.emit(summary)
-            try:
-                from .. import cluster
-                cluster.compute_groups(conn)  # 版本归组（后台，失败不影响搜索就绪）
-            except Exception as e:  # noqa: BLE001
-                log.warning("compute_groups failed: %s", e)
-            try:
-                maintenance = db.maintain(conn)
-                if maintenance.get("error"):
-                    log.warning("db maintenance incomplete: %s", maintenance["error"])
-            except Exception as e:  # noqa: BLE001
-                log.warning("db maintenance failed: %s", e)
+            content_changed = bool(
+                int(summary.get("indexed", 0) or 0)
+                or int(summary.get("deleted", 0) or 0)
+            )
+            database_changed = bool(
+                content_changed
+                or int(summary.get("skipped_ppt", 0) or 0)
+                or int(summary.get("errors", 0) or 0)
+            )
+            if content_changed:
+                try:
+                    from .. import cluster
+                    cluster.compute_groups(conn)  # 版本归组（后台，失败不影响搜索就绪）
+                except Exception as e:  # noqa: BLE001
+                    log.warning("compute_groups failed: %s", e)
+            if database_changed:
+                try:
+                    maintenance = db.maintain(conn)
+                    if maintenance.get("error"):
+                        log.warning("db maintenance incomplete: %s", maintenance["error"])
+                except Exception as e:  # noqa: BLE001
+                    log.warning("db maintenance failed: %s", e)
         finally:
             conn.close()

@@ -493,6 +493,68 @@ def test_preview_uses_disk_cache_as_provisional_first_paint(qtbot, tmp_path, mon
     render = PendingRender()
     win = MainWindow(conn=conn, render_worker=render, do_index=False)
     qtbot.addWidget(win)
+    qtbot.waitUntil(lambda: win._recent_load_inflight_token is None, timeout=1000)
+    win._cur = _fake_results(1)[0]
+    win._view_page = 1
+    monkeypatch.setattr(
+        main_window_mod.renderer_mod,
+        "find_cached_render",
+        lambda path, page, min_long_edge=1, cache_key=None: image,
+    )
+
+    monkeypatch.setattr(MainWindow, "_SHARP_PREVIEW_DELAY_MS", 50, raising=False)
+    win._sharp_preview_timer.setInterval(50)
+    win._request_preview()
+
+    assert win._preview_provisional is True
+    assert win._cur_pixmap is not None and not win._cur_pixmap.isNull()
+    assert render.calls == []
+    qtbot.waitUntil(lambda: bool(render.calls), timeout=500)
+
+
+def test_rapid_cached_page_turn_only_renders_latest_sharp_page(qtbot, tmp_path, monkeypatch):
+    image = tmp_path / "cached-low.png"
+    pm = QPixmap(320, 180)
+    pm.fill(Qt.green)
+    assert pm.save(str(image))
+
+    conn = _index(tmp_path)
+    render = PendingRender()
+    win = MainWindow(conn=conn, render_worker=render, do_index=False)
+    qtbot.addWidget(win)
+    qtbot.waitUntil(lambda: win._recent_load_inflight_token is None, timeout=1000)
+    result = _fake_results(1)[0]
+    result.page_count = 3
+    win._cur = result
+    monkeypatch.setattr(
+        main_window_mod.renderer_mod,
+        "find_cached_render",
+        lambda path, page, min_long_edge=1, cache_key=None: image,
+    )
+    monkeypatch.setattr(MainWindow, "_SHARP_PREVIEW_DELAY_MS", 70, raising=False)
+    win._sharp_preview_timer.setInterval(70)
+
+    win._view_page = 1
+    win._request_preview()
+    win._view_page = 2
+    win._request_preview()
+
+    assert render.calls == []
+    qtbot.waitUntil(lambda: bool(render.calls), timeout=500)
+    assert [call[2] for call in render.calls] == [2]
+
+
+def test_sharp_disk_cache_skips_redundant_com_render(qtbot, tmp_path, monkeypatch):
+    image = tmp_path / "cached-sharp.png"
+    pm = QPixmap(1280, 720)
+    pm.fill(Qt.green)
+    assert pm.save(str(image))
+
+    conn = _index(tmp_path)
+    render = PendingRender()
+    win = MainWindow(conn=conn, render_worker=render, do_index=False)
+    qtbot.addWidget(win)
+    qtbot.waitUntil(lambda: win._recent_load_inflight_token is None, timeout=1000)
     win._cur = _fake_results(1)[0]
     win._view_page = 1
     monkeypatch.setattr(
@@ -503,9 +565,10 @@ def test_preview_uses_disk_cache_as_provisional_first_paint(qtbot, tmp_path, mon
 
     win._request_preview()
 
-    assert win._preview_provisional is True
+    assert win._preview_provisional is False
     assert win._cur_pixmap is not None and not win._cur_pixmap.isNull()
-    assert render.calls
+    assert render.calls == []
+    assert not win._sharp_preview_timer.isActive()
 
 
 def test_neighbor_prefetch_is_low_priority_and_limited(qtbot, tmp_path):
@@ -552,13 +615,12 @@ def test_neighbor_prefetch_is_low_priority_and_limited(qtbot, tmp_path):
 
     assert render.prefetches == [
         ("C:/deck.pptx", 4, win._PREFETCH_EDGE, win._PRIORITY_NEIGHBOR_PREFETCH),
-        ("C:/deck.pptx", 8, win._PREFETCH_EDGE, win._PRIORITY_NEIGHBOR_PREFETCH),
     ]
-    assert len(render.prefetches) == win._NEIGHBOR_PREFETCH_MAX == 2
-    assert win._PRIORITY_NEIGHBOR_PREFETCH > win._PRIORITY_TOP_THUMB_BASE + win._THUMB_FIRST
+    assert len(render.prefetches) == win._NEIGHBOR_PREFETCH_MAX == 1
+    assert win._PRIORITY_NEIGHBOR_PREFETCH > win._PRIORITY_RIGHT_PREVIEW
 
 
-def test_completed_right_preview_is_reused_for_selected_result_thumbnail(qtbot, tmp_path):
+def test_completed_right_preview_stays_in_selected_preview_only(qtbot, tmp_path):
     image = tmp_path / "preview.png"
     pm = QPixmap(160, 90)
     pm.fill(Qt.green)
@@ -580,8 +642,9 @@ def test_completed_right_preview_is_reused_for_selected_result_thumbnail(qtbot, 
 
     win._on_rendered(77, str(image))
 
-    assert (result.path, 3) in win._thumb_cache
-    assert card._thumb.pixmap() is not None and not card._thumb.pixmap().isNull()
+    assert win._cur_pixmap is not None and not win._cur_pixmap.isNull()
+    assert not hasattr(win, "_thumb_cache")
+    assert card.findChild(QLabel, "cardThumb") is None
 
 
 def test_facet_change_auto_preview_is_delayed(qtbot, monkeypatch, tmp_path):
@@ -1247,7 +1310,7 @@ def test_deferred_live_refresh_waits_for_idle_before_rerun(qtbot, tmp_path):
     assert win._live_refresh_after_search is False
 
 
-def test_new_search_clears_stale_render_queues_before_request(qtbot, tmp_path):
+def test_new_search_clears_preview_queue_without_touching_legacy_thumb_worker(qtbot, tmp_path):
     conn = _index(tmp_path)
     render = ClearableRender()
     thumb = StubThumb()
@@ -1266,9 +1329,9 @@ def test_new_search_clears_stale_render_queues_before_request(qtbot, tmp_path):
     win._do_search()
 
     assert pending.requests == [(win._search_seq, "new query", "all")]
-    assert pending.observed == [(1, 1, old_req_id + 1)]
+    assert pending.observed == [(1, 0, old_req_id + 1)]
     assert render.clears == 1
-    assert thumb.clears == 1
+    assert thumb.clears == 0
     assert win._render_gen == old_render_gen + 1
 
 
@@ -1290,7 +1353,7 @@ def test_old_preview_result_is_ignored_after_new_search(qtbot, tmp_path):
     assert win._cur_pixmap is None
 
 
-def test_large_result_rendering_batches_first_frame_and_thumbnails(qtbot, tmp_path):
+def test_large_result_rendering_batches_first_frame_without_thumbnails(qtbot, tmp_path):
     conn = _index(tmp_path)
     thumb = StubThumb()
     win = MainWindow(conn=conn, render_worker=StubRender(), thumb_worker=thumb, do_index=False)
@@ -1303,7 +1366,7 @@ def test_large_result_rendering_batches_first_frame_and_thumbnails(qtbot, tmp_pa
     assert win._RENDER_FIRST <= 16
     assert win._RENDER_CHUNK <= 16
     assert win.result_list.count() == win._RENDER_FIRST + 1
-    assert len(thumb.requests) - initial_thumb_requests <= win._RENDER_FIRST
+    assert len(thumb.requests) == initial_thumb_requests
 
     # The list remains virtualized until the user asks for/scrolls to more.
     qtbot.wait(250)
@@ -1311,143 +1374,23 @@ def test_large_result_rendering_batches_first_frame_and_thumbnails(qtbot, tmp_pa
     while win._render_plan_pos < len(win._render_plan):
         win._load_more_results()
     assert win.result_list.count() == 80
-    assert len(thumb.requests) - initial_thumb_requests <= win._THUMB_FIRST
+    assert len(thumb.requests) == initial_thumb_requests
 
 
-def test_thumbnail_requests_are_prioritized_by_result_rank(qtbot, tmp_path):
-    class PriorityThumb(QObject):
-        thumb_rendered = Signal(str, int, str)
-
-        def __init__(self):
-            super().__init__()
-            self.requests: list[tuple[str, int, int]] = []
-
-        def request(self, path: str, page_no: int, priority: int = 0):
-            self.requests.append((path, page_no, int(priority)))
-
-        def clear(self):
-            pass
-
+def test_result_cards_do_not_have_thumbnail_scheduler_or_cache(qtbot, tmp_path):
     conn = _index(tmp_path)
-    thumb = PriorityThumb()
+    thumb = StubThumb()
     win = MainWindow(conn=conn, render_worker=StubRender(), thumb_worker=thumb, do_index=False)
     qtbot.addWidget(win)
 
     win._render_results(_fake_results(24))
 
-    priorities = [priority for _path, _page, priority in thumb.requests]
-    assert len(priorities) >= 3
-    assert priorities[:3] == [
-        win._PRIORITY_TOP_THUMB_BASE,
-        win._PRIORITY_TOP_THUMB_BASE + 1,
-        win._PRIORITY_TOP_THUMB_BASE + 2,
-    ]
-    assert priorities == sorted(priorities)
-    assert max(priorities) < win._PRIORITY_NEIGHBOR_PREFETCH
-
-
-def test_visible_thumbnail_refresh_scans_only_visible_window(qtbot, tmp_path):
-    conn = _index(tmp_path)
-    thumb = StubThumb()
-    win = MainWindow(conn=conn, render_worker=StubRender(), thumb_worker=thumb, do_index=False)
-    qtbot.addWidget(win)
-    win.resize(1180, 760)
-
-    win._flush_plan([("i", i, r, None) for i, r in enumerate(_fake_results(80))], 0, 80, "")
-    thumb.requests.clear()
-
-    win._request_visible_thumbs()
-
-    assert win.result_list.count() == 80
-    assert len(thumb.requests) <= 24
-
-
-def test_thumbnail_cache_is_bounded(qtbot, monkeypatch, tmp_path):
-    monkeypatch.setattr(MainWindow, "_THUMB_CACHE_MAX", 2)
-    conn = _index(tmp_path)
-    win = MainWindow(conn=conn, render_worker=StubRender(), do_index=False)
-    qtbot.addWidget(win)
-
-    for i in range(3):
-        png = tmp_path / f"thumb-{i}.png"
-        pm = QPixmap(8, 8)
-        pm.fill(QColor(20 + i, 30 + i, 40 + i))
-        assert pm.save(str(png), "PNG")
-        win._thumb_items[(f"C:/deck-{i}.pptx", 1)] = None
-        win._on_thumb(f"C:/deck-{i}.pptx", 1, str(png))
-
-    assert len(win._thumb_cache) == 2
-    assert ("C:/deck-0.pptx", 1) not in win._thumb_cache
-    assert ("C:/deck-1.pptx", 1) in win._thumb_cache
-    assert ("C:/deck-2.pptx", 1) in win._thumb_cache
-
-
-def test_stale_thumbnail_result_does_not_evict_current_cache(qtbot, monkeypatch, tmp_path):
-    monkeypatch.setattr(MainWindow, "_THUMB_CACHE_MAX", 2)
-    conn = _index(tmp_path)
-    win = MainWindow(conn=conn, render_worker=StubRender(), do_index=False)
-    qtbot.addWidget(win)
-    current_a = QPixmap(8, 8)
-    current_a.fill(QColor(1, 2, 3))
-    current_b = QPixmap(8, 8)
-    current_b.fill(QColor(4, 5, 6))
-    win._thumb_items = {("C:/current-a.pptx", 1): None, ("C:/current-b.pptx", 1): None}
-    win._remember_thumb(("C:/current-a.pptx", 1), current_a)
-    win._remember_thumb(("C:/current-b.pptx", 1), current_b)
-    stale_png = tmp_path / "stale.png"
-    stale = QPixmap(8, 8)
-    stale.fill(QColor(7, 8, 9))
-    assert stale.save(str(stale_png), "PNG")
-
-    win._on_thumb("C:/old-search.pptx", 1, str(stale_png))
-
-    assert ("C:/old-search.pptx", 1) not in win._thumb_cache
-    assert ("C:/current-a.pptx", 1) in win._thumb_cache
-    assert ("C:/current-b.pptx", 1) in win._thumb_cache
-
-
-def test_missing_thumbnail_result_clears_pending_item(qtbot, tmp_path):
-    conn = _index(tmp_path)
-    win = MainWindow(conn=conn, render_worker=StubRender(), do_index=False)
-    qtbot.addWidget(win)
-    key = ("C:/missing-thumb.pptx", 1)
-    win._thumb_items[key] = None
-
-    win._on_thumb(key[0], key[1], str(tmp_path / "missing-thumb.png"))
-
-    assert key not in win._thumb_items
-    assert key not in win._thumb_cache
-
-
-def test_invalid_thumbnail_result_clears_pending_item(qtbot, tmp_path):
-    conn = _index(tmp_path)
-    win = MainWindow(conn=conn, render_worker=StubRender(), do_index=False)
-    qtbot.addWidget(win)
-    key = ("C:/broken-thumb.pptx", 1)
-    broken = tmp_path / "broken-thumb.png"
-    broken.write_text("not a png", encoding="utf-8")
-    win._thumb_items[key] = None
-
-    win._on_thumb(key[0], key[1], str(broken))
-
-    assert key not in win._thumb_items
-    assert key not in win._thumb_cache
-
-
-def test_thumbnail_signal_ignored_after_closing(qtbot, tmp_path):
-    conn = _index(tmp_path)
-    win = MainWindow(conn=conn, render_worker=StubRender(), do_index=False)
-    qtbot.addWidget(win)
-    win._closing = True
-    win._thumb_items[("C:/closing.pptx", 1)] = None
-    png = tmp_path / "closing-thumb.png"
-    pm = QPixmap(8, 8)
-    pm.fill(QColor(10, 20, 30))
-    assert pm.save(str(png), "PNG")
-
-    win._on_thumb("C:/closing.pptx", 1, str(png))
-
-    assert ("C:/closing.pptx", 1) not in win._thumb_cache
+    assert thumb.requests == []
+    assert not hasattr(win, "_request_visible_thumbs")
+    assert not hasattr(win, "_thumb_cache")
+    for row in range(win._RENDER_FIRST):
+        card = win.result_list.itemWidget(win.result_list.item(row))
+        assert card.findChild(QLabel, "cardThumb") is None
 
 
 def test_large_index_async_search_streams_without_ui_slow_gap(qtbot, monkeypatch, tmp_path):
@@ -1485,7 +1428,7 @@ def test_large_index_async_search_streams_without_ui_slow_gap(qtbot, monkeypatch
         lines = "\n".join(win.diagnostic_lines())
         assert "ui_loop:" in lines
         assert "slow_gaps=0" in lines
-        assert len(thumb.requests) - initial_thumb_requests <= win._THUMB_FIRST
+        assert len(thumb.requests) == initial_thumb_requests
         assert win._search_worker is not None
         assert win._search_worker.diagnostics()["total"] >= 1
     finally:
@@ -1523,7 +1466,7 @@ def test_ui_loop_diagnostics_records_max_gap(qtbot, tmp_path):
     assert "slow_gaps=1" in lines
 
 
-def test_diagnostics_include_render_and_thumb_worker_lines(qtbot, tmp_path):
+def test_diagnostics_include_render_but_not_legacy_thumb_worker_lines(qtbot, tmp_path):
     conn = _index(tmp_path)
 
     class RenderWithDiagnostics(StubRender):
@@ -1545,7 +1488,7 @@ def test_diagnostics_include_render_and_thumb_worker_lines(qtbot, tmp_path):
     lines = "\n".join(win.diagnostic_lines())
 
     assert "render_worker: preview_pending=False" in lines
-    assert "thumb_worker: queued=0 active=0" in lines
+    assert "thumb_worker: queued=0 active=0" not in lines
 
 
 def test_ui_loop_diagnostics_flags_noticeable_mid_sized_gap(qtbot, tmp_path):
@@ -1888,19 +1831,11 @@ def test_shutdown_uses_short_wait_for_search_worker(qtbot, tmp_path):
     assert waits and waits[-1] <= 500
 
 
-def test_shutdown_signals_render_before_waiting_for_thumbnail_worker(qtbot, tmp_path):
+def test_shutdown_stops_only_selected_preview_render_worker(qtbot, tmp_path):
     conn = _index(tmp_path)
     win = MainWindow(conn=conn, render_worker=StubRender(), do_index=False)
     qtbot.addWidget(win)
     events: list[str] = []
-
-    class FakeThumb:
-        def stop(self):
-            events.append("thumb.stop")
-
-        def wait(self, _timeout_ms: int):
-            events.append("thumb.wait")
-            return True
 
     class FakeRender:
         def stop(self):
@@ -1910,9 +1845,7 @@ def test_shutdown_signals_render_before_waiting_for_thumbnail_worker(qtbot, tmp_
             events.append("render.wait")
             return True
 
-    win._thumb = FakeThumb()
     win._render = FakeRender()
-    win._owns_thumb = True
     win._owns_render = True
     win._search_worker = None
     win._bg_tasks = []
@@ -1921,7 +1854,7 @@ def test_shutdown_signals_render_before_waiting_for_thumbnail_worker(qtbot, tmp_
 
     win._shutdown()
 
-    assert events.index("render.stop") < events.index("thumb.wait")
+    assert events == ["render.stop", "render.wait"]
 
 
 def test_filename_mode_and_multi_term(qtbot, tmp_path):
@@ -2645,6 +2578,50 @@ def test_open_file_and_folder_use_background_gate(qtbot, monkeypatch, tmp_path):
     assert "正在打开所在文件夹" in win._toast_label.text()
     calls[-1][1](False)
     assert "找不到所在文件夹" in win._toast_label.text()
+
+
+def test_opening_powerpoint_releases_preview_session_before_shell_open(
+    qtbot, monkeypatch, tmp_path
+):
+    events: list[object] = []
+
+    class ReleasableRender(StubRender):
+        def release_session(self, timeout_sec=0):
+            events.append(("release", timeout_sec))
+            return True
+
+    conn = _index(tmp_path)
+    win = MainWindow(conn=conn, render_worker=ReleasableRender(), do_index=False)
+    qtbot.addWidget(win)
+    monkeypatch.setattr(
+        main_window_mod.actions,
+        "open_file",
+        lambda path: events.append(("open", path)) or True,
+    )
+
+    def fake_run_bg(fn, on_done=None, label=""):
+        result = fn()
+        if on_done is not None:
+            on_done(result)
+        return True
+
+    monkeypatch.setattr(win, "_run_bg", fake_run_bg)
+
+    win._open_file_path("C:/deck.pptx")
+
+    assert events[0][0] == "release"
+    assert events[1] == ("open", "C:/deck.pptx")
+
+    events.clear()
+    monkeypatch.setattr(
+        main_window_mod.actions,
+        "open_at_page",
+        lambda path, page: events.append(("goto", path, page)) or (True, True),
+    )
+    win._open_at_page_bg("C:/deck.pptx", 7)
+
+    assert events[0][0] == "release"
+    assert events[1] == ("goto", "C:/deck.pptx", 7)
 
 
 def test_open_at_page_shows_immediate_feedback_when_background_starts(qtbot, monkeypatch, tmp_path):

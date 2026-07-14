@@ -156,7 +156,7 @@ def test_tray_hidden_window_stops_ui_monitor_timer(qtbot, tmp_path):
     win.hide()
 
     assert not win._ui_loop_timer.isActive()
-    assert not win._visible_thumb_timer.isActive()
+    assert not hasattr(win, "_visible_thumb_timer")
 
     win.show()
     qtbot.waitUntil(win._ui_loop_timer.isActive, timeout=500)
