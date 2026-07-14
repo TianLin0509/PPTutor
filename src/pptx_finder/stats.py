@@ -10,8 +10,24 @@ import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 
 from .config import PPT_EXTS
+from .report_insights import (
+    STAT_FEATURE_KEYS,
+    ContentInsightsStat,
+    CreationInsightsStat,
+    HallOfFameStat,
+    LibraryInsightsStat,
+    VersionInsightsStat,
+    build_enhanced_insights,
+)
+
+_MIN_VALID_MTIME = datetime(1980, 1, 1).timestamp()
+
+
+def _has_real_mtime(f: "FileStat") -> bool:
+    return float(f.mtime or 0) >= _MIN_VALID_MTIME
 
 
 @dataclass
@@ -25,6 +41,9 @@ class FileStat:
     status: str
     group_id: int | None
     char_count: int
+    path: str = ""
+    file_id: int = 0
+    indexed_at: float = 0.0
 
 
 @dataclass
@@ -54,6 +73,7 @@ def _is_night(hour: int) -> bool:
 
 def night_owl(files: list[FileStat]) -> NightOwlStat:
     """深夜/周末肝度。最晚一次 = 深夜序里最靠后的（凌晨越深越狠）。"""
+    files = [f for f in files if _has_real_mtime(f)]
     total = len(files)
     night = [f for f in files if _is_night(_hour(f))]
     weekend = [f for f in files if _weekday(f) >= 5]
@@ -76,6 +96,8 @@ def heatmap(files: list[FileStat]) -> list[list[int]]:
     """7×24 修改频次矩阵：行=weekday(Mon=0..Sun=6)，列=hour(0..23)。"""
     m = [[0] * 24 for _ in range(7)]
     for f in files:
+        if not _has_real_mtime(f):
+            continue
         dt = datetime.fromtimestamp(f.mtime)
         m[dt.weekday()][dt.hour] += 1
     return m
@@ -113,7 +135,8 @@ def version_drama(files: list[FileStat]) -> VersionDramaStat:
     curse = [f for f in files if _CURSE.search(f.name)]
     total = len(files)
     # 僵尸胶片：最老的一份
-    zombie = min(files, key=lambda f: f.mtime) if files else None
+    dated_files = [f for f in files if _has_real_mtime(f)]
+    zombie = min(dated_files, key=lambda f: f.mtime) if dated_files else None
     return VersionDramaStat(
         top_group_name=top_name,
         top_group_versions=top_versions,
@@ -167,6 +190,7 @@ class ActivityStat:
 
 def activity(files: list[FileStat]) -> ActivityStat:
     """活跃天数、连续活跃期与最忙月份；同一天多份胶片只算一个活跃日。"""
+    files = [f for f in files if _has_real_mtime(f)]
     if not files:
         return ActivityStat(0, 0, None, 0, 0.0, 0.0)
 
@@ -310,6 +334,13 @@ class Report:
     activity: ActivityStat
     library_dna: LibraryDNAStat
     persona: PersonaStat
+    hall: HallOfFameStat
+    creation: CreationInsightsStat
+    content: ContentInsightsStat
+    library: LibraryInsightsStat
+    versions: VersionInsightsStat
+    achievements: tuple[str, ...]
+    one_liner: str
 
 
 def fetch_file_stats(
@@ -339,7 +370,8 @@ def fetch_file_stats(
     rows = conn.execute(
         f"""
         WITH scoped_files AS (
-            SELECT f.id, f.name, f.mtime, f.size, f.page_count, f.status
+            SELECT f.id, f.path, f.name, f.mtime, f.size, f.page_count, f.status,
+                   f.indexed_at
             FROM files f
             WHERE {' AND '.join(predicates)}
         ),
@@ -349,7 +381,8 @@ def fetch_file_stats(
             JOIN scoped_files sf2 ON sf2.id = p.file_id
             GROUP BY p.file_id
         )
-        SELECT f.name, f.mtime, f.size, f.page_count, f.status,
+        SELECT f.id, f.path, f.name, f.mtime, f.size, f.page_count, f.status,
+               f.indexed_at,
                m.group_id,
                COALESCE(c.chars, 0) AS char_count
         FROM scoped_files f
@@ -363,6 +396,7 @@ def fetch_file_stats(
             name=r["name"], mtime=r["mtime"], size=r["size"],
             page_count=r["page_count"], status=r["status"],
             group_id=r["group_id"], char_count=r["char_count"] or 0,
+            path=r["path"], file_id=r["id"], indexed_at=r["indexed_at"] or 0.0,
         )
         for r in rows
     ]
@@ -374,6 +408,8 @@ def build_report(
     year: int | None = None,
     since_ts: float | None = None,
     until_ts: float | None = None,
+    version_db_path: str | Path | None = None,
+    now_ts: float | None = None,
 ) -> Report:
     """组装完整报告。
 
@@ -389,6 +425,17 @@ def build_report(
     night = night_owl(files)
     sc = scale(files)
     drama = version_drama(files)
+    base_persona = persona(night, drama, sc)
+    enhanced = build_enhanced_insights(
+        conn,
+        files,
+        year=year,
+        since_ts=since_ts,
+        until_ts=until_ts,
+        version_db_path=version_db_path,
+        now_ts=now_ts,
+        persona_role=base_persona.role or base_persona.title,
+    )
     return Report(
         scope_year=year,
         deck_count=len(files),
@@ -398,5 +445,12 @@ def build_report(
         scale=sc,
         activity=activity(files),
         library_dna=library_dna(files),
-        persona=persona(night, drama, sc),
+        persona=base_persona,
+        hall=enhanced.hall,
+        creation=enhanced.creation,
+        content=enhanced.content,
+        library=enhanced.library,
+        versions=enhanced.versions,
+        achievements=enhanced.achievements,
+        one_liner=enhanced.one_liner,
     )

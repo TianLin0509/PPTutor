@@ -8,6 +8,7 @@ from __future__ import annotations
 import ctypes
 import logging
 import multiprocessing
+import os
 import sys
 import threading
 
@@ -161,6 +162,11 @@ class _HotkeyFilter(QAbstractNativeEventFilter):
 SINGLETON_NAME = "pptx-finder-singleton-v1"
 
 
+def _singleton_name() -> str:
+    """默认保持单实例；只允许测试/便携沙箱显式换一个本地 socket 名。"""
+    return os.environ.get("PPTX_FINDER_SINGLETON_NAME", "").strip() or SINGLETON_NAME
+
+
 def _show_window(win: MainWindow) -> None:
     win.showNormal()
     win.raise_()
@@ -225,17 +231,18 @@ def main() -> int:
     app = QApplication(sys.argv)
 
     # 单实例：已有实例在跑则通知其显示窗口并退出本实例（防重复全盘索引、数据库抢锁）
+    singleton_name = _singleton_name()
     probe = QLocalSocket()
-    probe.connectToServer(SINGLETON_NAME)
+    probe.connectToServer(singleton_name)
     if probe.waitForConnected(200):
         probe.write(b"show")
         probe.flush()
         probe.waitForBytesWritten(300)
         log.info("another instance already running; activated it, exiting")
         return 0
-    QLocalServer.removeServer(SINGLETON_NAME)
+    QLocalServer.removeServer(singleton_name)
     singleton_server = QLocalServer()
-    singleton_server.listen(SINGLETON_NAME)
+    singleton_server.listen(singleton_name)
 
     app.setQuitOnLastWindowClosed(False)
     icon = _make_icon()
