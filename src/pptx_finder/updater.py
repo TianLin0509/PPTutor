@@ -99,15 +99,26 @@ def compare(local: dict, remote: dict) -> UpdateInfo | None:
 
 
 # ---------- 网络 ----------
-def fetch_remote_manifest(base_url: str, timeout: float = _CHECK_TIMEOUT) -> dict:
+def fetch_remote_manifest(
+    base_url: str,
+    timeout: float = _CHECK_TIMEOUT,
+    response_callback=None,
+) -> dict:
     url = base_url.rstrip("/") + "/" + MANIFEST_NAME
     req = urllib.request.Request(url, headers={"Cache-Control": "no-cache"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode("utf-8"))
+        if response_callback is not None:
+            response_callback(r)
+        try:
+            return json.loads(r.read().decode("utf-8"))
+        finally:
+            if response_callback is not None:
+                response_callback(None)
 
 
 def download_delta(base_url: str, info: UpdateInfo, staging: Path,
-                   progress=None, timeout: float = _DL_TIMEOUT, cancel=None) -> Path:
+                   progress=None, timeout: float = _DL_TIMEOUT, cancel=None,
+                   response_callback=None) -> Path:
     """下载 info.changed 的每个 files/<hash> 到 staging/<relpath> 并校验 sha256；
     最后把远端清单写成 staging/manifest.json（随更新落地为新本地清单）。
 
@@ -127,6 +138,8 @@ def download_delta(base_url: str, info: UpdateInfo, staging: Path,
         dest.parent.mkdir(parents=True, exist_ok=True)
         hasher = hashlib.sha256()
         with urllib.request.urlopen(url, timeout=timeout) as r, open(dest, "wb") as f:
+            if response_callback is not None:
+                response_callback(r)
             while True:
                 chunk = r.read(_BUF)
                 if not chunk:
@@ -138,6 +151,8 @@ def download_delta(base_url: str, info: UpdateInfo, staging: Path,
                     progress(done, total)
                 if cancel is not None and cancel():
                     raise InterruptedError("下载已取消")
+        if response_callback is not None:
+            response_callback(None)
         got = hasher.hexdigest()
         if got != h:
             raise ValueError(f"哈希校验失败 {rel}：期望 {h[:12]}… 实得 {got[:12]}…")
@@ -177,7 +192,14 @@ try {
     if (Test-Path -LiteralPath $dst) { try { Remove-Item -LiteralPath $dst -Force } catch { Log "del $rel $_" } }
   }
   Log "swap done -> v$($p.version)"
-  if ($p.relaunch) { try { Start-Process -FilePath (Join-Path $dest $p.relaunch) } catch { Log "relaunch $_" } }
+  if ($p.relaunch) {
+    try {
+      # Explicit cwd avoids inheriting the helper/control directory. Besides
+      # helping relative resources, this makes ShellExecute of .bat/.cmd tests
+      # and the packaged exe much more deterministic under machine load.
+      Start-Process -FilePath (Join-Path $dest $p.relaunch) -WorkingDirectory $dest
+    } catch { Log "relaunch $_" }
+  }
   try { Remove-Item -LiteralPath $staging -Recurse -Force } catch {}
   Log "helper done"
 } catch { Log "FATAL $_" }
@@ -253,14 +275,23 @@ def local_manifest() -> dict | None:
         return None
 
 
-def check_for_update(base_url: str) -> UpdateInfo | None:
+def check_for_update(
+    base_url: str,
+    *,
+    timeout: float = _CHECK_TIMEOUT,
+    response_callback=None,
+) -> UpdateInfo | None:
     """供 UI 后台线程调用：非 frozen / 无本地清单 / 拉取失败 → None（不打扰）。"""
     if not is_frozen():
         return None
     local = local_manifest()
     if not local:
         return None
-    remote = fetch_remote_manifest(base_url)
+    remote = fetch_remote_manifest(
+        base_url,
+        timeout=timeout,
+        response_callback=response_callback,
+    )
     return compare(local, remote)
 
 

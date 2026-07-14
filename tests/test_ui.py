@@ -1857,6 +1857,40 @@ def test_shutdown_stops_only_selected_preview_render_worker(qtbot, tmp_path):
     assert events == ["render.stop", "render.wait"]
 
 
+def test_shutdown_never_force_terminates_a_busy_render_thread(qtbot, tmp_path):
+    conn = _index(tmp_path)
+    win = MainWindow(conn=conn, render_worker=StubRender(), do_index=False)
+    qtbot.addWidget(win)
+    events = []
+
+    class BusyRender:
+        def stop(self):
+            events.append("stop")
+
+        def abort_inflight(self):
+            events.append("abort")
+            return True
+
+        def wait(self, _timeout_ms):
+            events.append("wait")
+            return len([x for x in events if x == "wait"]) > 1
+
+        def terminate(self):
+            events.append("terminate")
+
+    win._render = BusyRender()
+    win._owns_render = True
+    win._search_worker = None
+    win._bg_tasks = []
+    win._live = None
+    win._indexer = None
+
+    win._shutdown()
+
+    assert "abort" in events
+    assert "terminate" not in events
+
+
 def test_filename_mode_and_multi_term(qtbot, tmp_path):
     conn = _index(tmp_path)
     stub = StubRender()
@@ -2622,6 +2656,61 @@ def test_opening_powerpoint_releases_preview_session_before_shell_open(
 
     assert events[0][0] == "release"
     assert events[1] == ("goto", "C:/deck.pptx", 7)
+
+
+def test_opening_powerpoint_waits_until_hidden_preview_process_is_gone(
+    qtbot, monkeypatch, tmp_path,
+):
+    events = []
+
+    class ReleasableRender(StubRender):
+        def release_session(self, timeout_sec=0):
+            events.append(("release", timeout_sec))
+            return True
+
+    conn = _index(tmp_path)
+    win = MainWindow(conn=conn, render_worker=ReleasableRender(), do_index=False)
+    qtbot.addWidget(win)
+    monkeypatch.setattr(
+        main_window_mod.renderer_mod,
+        "wait_for_external_open_ready",
+        lambda timeout_sec=0: events.append(("safe", timeout_sec)) or True,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        main_window_mod.actions,
+        "open_file",
+        lambda path: events.append(("open", path)) or True,
+    )
+
+    assert win._open_file_after_preview_release("C:/deck.pptx") is True
+    assert [event[0] for event in events] == ["release", "safe", "open"]
+
+
+def test_opening_powerpoint_never_shell_opens_into_a_headless_preview_session(
+    qtbot, monkeypatch, tmp_path,
+):
+    class ReleasableRender(StubRender):
+        def release_session(self, timeout_sec=0):
+            return True
+
+    conn = _index(tmp_path)
+    win = MainWindow(conn=conn, render_worker=ReleasableRender(), do_index=False)
+    qtbot.addWidget(win)
+    shell_opens = []
+    monkeypatch.setattr(
+        main_window_mod.renderer_mod,
+        "wait_for_external_open_ready",
+        lambda timeout_sec=0: False,
+    )
+    monkeypatch.setattr(
+        main_window_mod.actions,
+        "open_file",
+        lambda path: shell_opens.append(path) or True,
+    )
+
+    assert win._open_file_after_preview_release("C:/deck.pptx") == "handoff_busy"
+    assert shell_opens == []
 
 
 def test_open_at_page_shows_immediate_feedback_when_background_starts(qtbot, monkeypatch, tmp_path):

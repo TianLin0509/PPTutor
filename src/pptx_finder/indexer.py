@@ -232,17 +232,41 @@ def _ping() -> bool:
     return True
 
 
-def _make_executor(max_workers: int):
+def _set_current_process_background_mode() -> None:
+    """Best-effort low CPU/I/O priority for an automatic scan worker process."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.kernel32.SetPriorityClass(
+            ctypes.windll.kernel32.GetCurrentProcess(),
+            0x00100000,  # PROCESS_MODE_BACKGROUND_BEGIN
+        )
+    except Exception:  # noqa: BLE001 priority is an optimization only
+        pass
+
+
+def _make_executor(max_workers: int, *, background: bool = False):
     """优先 ProcessPoolExecutor：多核真并行（提速）+ GIL/崩溃隔离（单个坏/慢文件冻不住主程序）。
-    打包/受限环境子进程起不来则回退 ThreadPoolExecutor（功能不变、退化为单核+GIL）。"""
+    打包/受限环境子进程起不来时，手动扫描可回退线程；自动扫描必须安全中止，
+    避免坏文件进入无法终止的线程后长期占 CPU、拖住退出。"""
+    ex = None
     try:
         import multiprocessing as mp
         ctx = mp.get_context("spawn")
-        ex = ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx)
-        ex.submit(_ping).result(timeout=60)  # 预热并确认子进程真能 spawn（frozen 下可能失败）
+        kwargs = {"initializer": _set_current_process_background_mode} if background else {}
+        ex = ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx, **kwargs)
+        # 自动任务不值得为异常运行环境挂住一分钟；失败后留待下次计划任务重试。
+        ex.submit(_ping).result(timeout=10 if background else 60)
         log.info("索引解析用 ProcessPool（%d 进程，多核并行 + 隔离）", max_workers)
         return ex
-    except Exception as e:  # noqa: BLE001 子进程起不来不致命，回退线程
+    except Exception as e:  # noqa: BLE001
+        if ex is not None:
+            _shutdown_executor(ex)
+        if background:
+            log.error("自动扫描隔离进程不可用，已安全中止：%s", e)
+            raise RuntimeError("isolated worker unavailable for automatic scan") from e
         log.warning("ProcessPool 不可用，回退 ThreadPool：%s", e)
         return ThreadPoolExecutor(max_workers=max_workers)
 
@@ -250,13 +274,14 @@ def _make_executor(max_workers: int):
 def _shutdown_executor(ex) -> None:
     """关执行器：不等待被超时放弃的卡死任务（否则在此重新卡住），并强制终止 ProcessPool
     残留 worker 进程（防卡死任务占核空转）。ThreadPool 无法杀线程，随主进程退出回收。"""
+    raw_procs = getattr(ex, "_processes", None)
+    worker_processes = list(raw_procs.values()) if raw_procs else []
     try:
         ex.shutdown(wait=False, cancel_futures=True)
     except Exception:  # noqa: BLE001
         pass
-    procs = getattr(ex, "_processes", None)  # ProcessPoolExecutor 私有：{pid: Process}
-    if procs:
-        for pr in list(procs.values()):
+    if worker_processes:
+        for pr in worker_processes:
             try:
                 if pr.is_alive():
                     pr.terminate()
@@ -271,6 +296,7 @@ def update_index(
     workers: int | None = None,
     stop_event: Any = None,
     scan_iter: Iterable[Path] | None = None,
+    isolated_worker: bool = False,
 ) -> dict[str, int]:
     """增量更新：流式扫描 → 即时登记文件名 → 并行解析补全内容。
 
@@ -290,11 +316,16 @@ def update_index(
     }
     source = scan_iter if scan_iter is not None else iter_ppt_files(roots)
 
-    inline = workers == 1
+    inline = workers == 1 and not isolated_worker
     max_workers = workers or min(os.cpu_count() or 4, 8)
     if not inline:
         tokenize("预热")  # 主线程先触发 OpenCC 繁简词典加载，避免多线程首次并发竞态
-    ex = None if inline else _make_executor(max_workers)
+    if inline:
+        ex = None
+    elif isolated_worker:
+        ex = _make_executor(max_workers, background=True)
+    else:
+        ex = _make_executor(max_workers)
     summary["executor"] = (
         "inline" if ex is None
         else ("process" if isinstance(ex, ProcessPoolExecutor) else "thread")

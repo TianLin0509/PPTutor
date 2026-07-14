@@ -50,6 +50,7 @@ def _vget(v, key, default=""):
 
 class VersionWindow(QWidget):
     _FILE_OP_BUSY_NOTICE = "已有文件操作正在进行，请稍候…"
+    _DOC_POPULATE_BATCH = 160
 
     def __init__(self, manager, parent=None):
         super().__init__(parent)
@@ -80,6 +81,7 @@ class VersionWindow(QWidget):
         self._all_docs: list[dict] = []
         self._doc_filter_signature: tuple | None = None
         self._doc_filter_token = 0
+        self._doc_population_token = 0
         self.setObjectName("versionWin")
         self.setWindowTitle("版本管理 · PPT 版 git")
         self.resize(940, 580)
@@ -208,6 +210,7 @@ class VersionWindow(QWidget):
         self._docs_load_token += 1
         self._search_token += 1
         self._versions_load_token += 1
+        self._doc_population_token += 1
         super().closeEvent(event)
 
     def _set_file_ops_enabled(self, enabled: bool) -> None:
@@ -445,6 +448,8 @@ class VersionWindow(QWidget):
                 ).casefold()
             )
         ]
+        self._doc_population_token += 1
+        population_token = self._doc_population_token
         self.doc_list.clear()
         if not docs:
             self._cur_doc = None
@@ -456,17 +461,40 @@ class VersionWindow(QWidget):
             self.right_title.setText("还没有可恢复的版本历史")
             self._update_file_ops_state()
             return
-        selected_row = 0
-        for row, d in enumerate(docs):
+        selected_row = next(
+            (row for row, d in enumerate(docs) if selected and d["doc_id"] == selected),
+            0,
+        )
+        self._append_doc_population_batch(population_token, docs, 0, selected_row)
+
+    def _append_doc_population_batch(
+        self,
+        token: int,
+        docs: list[dict],
+        start: int,
+        selected_row: int,
+    ) -> None:
+        """Build large document lists incrementally so scope changes never freeze Qt."""
+        if token != self._doc_population_token or self._closing:
+            return
+        end = min(start + self._DOC_POPULATE_BATCH, len(docs))
+        self.doc_list.setUpdatesEnabled(False)
+        for d in docs[start:end]:
             name = os.path.basename(d["path"])
             label = ("🗑 " + name + "（已删·可找回）") if d["status"] == "deleted" else name
             it = QListWidgetItem(label)
             it.setToolTip(str(d["path"]))
             it.setData(Qt.UserRole, (d["doc_id"], d["path"], d["status"]))
             self.doc_list.addItem(it)
-            if selected and d["doc_id"] == selected:
-                selected_row = row
-        self.doc_list.setCurrentRow(selected_row)
+        self.doc_list.setUpdatesEnabled(True)
+        if self.doc_list.currentRow() < 0 and selected_row < end:
+            self.doc_list.setCurrentRow(selected_row)
+        if end < len(docs):
+            QTimer.singleShot(
+                0,
+                lambda token=token, docs=docs, start=end, selected_row=selected_row:
+                    self._append_doc_population_batch(token, docs, start, selected_row),
+            )
 
     def _on_doc(self, cur, prev=None) -> None:
         if not self._ui_alive():

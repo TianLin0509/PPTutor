@@ -27,7 +27,7 @@ def handle_request(req: dict[str, Any]) -> dict[str, Any]:
     try:
         if op == "ping":
             return {"id": req_id, "ok": True, "pong": True}
-        if op == "render":
+        if op in {"render", "render_once"}:
             render_kwargs = {
                 "cache_key": req.get("cache_key"),
                 "long_edge": int(req.get("long_edge") or 2560),
@@ -37,11 +37,15 @@ def handle_request(req: dict[str, Any]) -> dict[str, Any]:
             }
             if req.get("existing_session_only"):
                 render_kwargs["existing_session_only"] = True
-            png = renderer.render_page(
-                str(req.get("path") or ""),
-                int(req.get("page_no") or 1),
-                **render_kwargs,
-            )
+            try:
+                png = renderer.render_page(
+                    str(req.get("path") or ""),
+                    int(req.get("page_no") or 1),
+                    **render_kwargs,
+                )
+            finally:
+                if op == "render_once":
+                    renderer.close_current_presentation()
             return {"id": req_id, "ok": True, "path": str(png) if png else ""}
         if op == "close_current":
             renderer.close_current_presentation()

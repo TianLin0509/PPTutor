@@ -8,6 +8,8 @@ from __future__ import annotations
 import shutil
 import sys
 import tempfile
+import logging
+import threading
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QThread, Signal
@@ -19,12 +21,36 @@ except Exception:  # noqa: BLE001
 
 from .. import updater
 
+log = logging.getLogger(__name__)
+
+
+class _CancelableNetworkThread:
+    """Close an active urllib response so shutdown wakes a blocked read."""
+
+    def _init_response_cancel(self) -> None:
+        self._response_lock = threading.Lock()
+        self._response = None
+
+    def _set_response(self, response) -> None:
+        with self._response_lock:
+            self._response = response
+
+    def _close_response(self) -> None:
+        with self._response_lock:
+            response = self._response
+            self._response = None
+        if response is not None:
+            try:
+                response.close()
+            except Exception:  # noqa: BLE001 cancellation is best-effort
+                pass
+
 
 def _staging_dir() -> Path:
     return Path(tempfile.gettempdir()) / "pptutor_update"
 
 
-class _CheckThread(QThread):
+class _CheckThread(QThread, _CancelableNetworkThread):
     found = Signal(object)  # UpdateInfo
     checked = Signal()
     failed = Signal(str)
@@ -33,13 +59,19 @@ class _CheckThread(QThread):
         super().__init__(parent)
         self._url = base_url
         self._cancel = False
+        self._init_response_cancel()
 
     def stop(self) -> None:
         self._cancel = True
+        self._close_response()
 
     def run(self) -> None:
         try:
-            info = updater.check_for_update(self._url)
+            info = updater.check_for_update(
+                self._url,
+                timeout=5.0,
+                response_callback=self._set_response,
+            )
             if self._cancel:
                 return
             if info is not None:
@@ -52,7 +84,7 @@ class _CheckThread(QThread):
             self.failed.emit(f"{type(exc).__name__}: {exc}")
 
 
-class _DownloadThread(QThread):
+class _DownloadThread(QThread, _CancelableNetworkThread):
     progress = Signal(int)   # 0-100
     done = Signal()
     failed = Signal(str)
@@ -63,9 +95,11 @@ class _DownloadThread(QThread):
         self._info = info
         self._staging = staging
         self._cancel = False
+        self._init_response_cancel()
 
     def stop(self) -> None:
         self._cancel = True
+        self._close_response()
 
     def run(self) -> None:
         try:
@@ -73,7 +107,10 @@ class _DownloadThread(QThread):
             updater.download_delta(
                 self._url, self._info, self._staging,
                 progress=lambda d, t: self.progress.emit(int(d * 100 / t) if t else 100),
-                cancel=lambda: self._cancel)
+                timeout=5.0,
+                cancel=lambda: self._cancel,
+                response_callback=self._set_response,
+            )
             if self._cancel:
                 return
             self.done.emit()
@@ -155,8 +192,14 @@ class UpdateController(QObject):
                 if not th.isRunning():
                     continue
                 if not th.wait(wait_ms):
-                    th.terminate()
-                    th.wait(800)
+                    # QThread.terminate can kill Python while it owns urllib/Qt
+                    # locks. stop() already closed the response; allow one
+                    # bounded socket-timeout tail instead of corrupting process state.
+                    if not th.wait(max(1000, min(5000, wait_ms))):
+                        log.warning(
+                            "update network thread still stopping: %s",
+                            type(th).__name__,
+                        )
             except RuntimeError:
                 pass
 

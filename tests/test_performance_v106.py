@@ -217,7 +217,7 @@ def test_renderer_timeout_is_not_retried_for_another_full_timeout(monkeypatch):
     client = render_client.RendererProcessClient(request_timeout=0.01)
     calls = []
 
-    def timeout(_payload):
+    def timeout(_payload, *, abort_generation=None):
         calls.append(1)
         raise socket.timeout("renderer stuck")
 

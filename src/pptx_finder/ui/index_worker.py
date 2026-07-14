@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 
@@ -12,22 +13,50 @@ from .. import db, indexer
 log = logging.getLogger(__name__)
 
 
+def _set_windows_background_mode(enabled: bool) -> bool:
+    """Lower both CPU and I/O priority for the weekly automatic full scan."""
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+
+        # THREAD_MODE_BACKGROUND_BEGIN / THREAD_MODE_BACKGROUND_END.
+        priority = 0x00010000 if enabled else 0x00020000
+        handle = ctypes.windll.kernel32.GetCurrentThread()
+        return bool(ctypes.windll.kernel32.SetThreadPriority(handle, priority))
+    except Exception:  # noqa: BLE001 priority is an optimization, never a blocker
+        return False
+
+
 class IndexWorker(QThread):
     progress = Signal(int, int, str)  # done, total, current_path
     finished_index = Signal(dict)     # summary
     _PROGRESS_EMIT_MS = 80
 
-    def __init__(self, db_path: str, roots: list[str], workers: int | None = None, parent=None):
+    def __init__(
+        self,
+        db_path: str,
+        roots: list[str],
+        workers: int | None = None,
+        parent=None,
+        *,
+        background_priority: bool = False,
+    ):
         super().__init__(parent)
         self._db_path = db_path
         self._roots = roots
         self._workers = workers
+        self._background_priority = bool(background_priority)
         self._stop = threading.Event()
 
     def stop(self) -> None:
         self._stop.set()
 
     def run(self) -> None:
+        background_mode = (
+            _set_windows_background_mode(True)
+            if self._background_priority else False
+        )
         conn = db.connect(self._db_path)
         db.init_db(conn)
         last_emit_at = 0.0
@@ -52,12 +81,16 @@ class IndexWorker(QThread):
 
         try:
             try:
-                summary = indexer.update_index(
-                    conn, self._roots,
-                    progress_cb=emit_progress,
-                    workers=self._workers,
-                    stop_event=self._stop,
-                )
+                index_kwargs = {
+                    "progress_cb": emit_progress,
+                    "workers": self._workers,
+                    "stop_event": self._stop,
+                }
+                if self._background_priority:
+                    # Automatic full coverage still uses only one CPU core, but
+                    # it must retain process isolation and per-file timeouts.
+                    index_kwargs["isolated_worker"] = True
+                summary = indexer.update_index(conn, self._roots, **index_kwargs)
             except Exception as e:  # noqa: BLE001 索引线程兜底，不让异常杀进程
                 self.finished_index.emit({"error": str(e)})
                 return
@@ -86,3 +119,5 @@ class IndexWorker(QThread):
                     log.warning("db maintenance failed: %s", e)
         finally:
             conn.close()
+            if background_mode:
+                _set_windows_background_mode(False)

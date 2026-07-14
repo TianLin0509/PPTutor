@@ -377,11 +377,42 @@ def test_update_threads_have_stop(qtbot, tmp_path):
     assert dl._cancel is True and chk._cancel is True
 
 
+def test_controller_shutdown_never_force_terminates_network_threads(qtbot):
+    events = []
+
+    class SlowThread:
+        def stop(self):
+            events.append("stop")
+
+        def isRunning(self):
+            return True
+
+        def wait(self, timeout_ms):
+            events.append(("wait", timeout_ms))
+            return False
+
+        def terminate(self):
+            events.append("terminate")
+
+    chip = QPushButton()
+    qtbot.addWidget(chip)
+    ctrl = UpdateController(chip, "http://127.0.0.1:9", lambda: None)
+    ctrl._check = SlowThread()
+
+    ctrl.shutdown(wait_ms=1)
+
+    assert "stop" in events
+    assert "terminate" not in events
+
+
 def test_controller_shutdown_stops_running_download(qtbot, tmp_path, monkeypatch):
     """P1 回归：下载进行中关窗，shutdown() 必须停下真 QThread，否则「运行中被析构」崩溃。"""
     started = threading.Event()
 
-    def slow_download(base_url, info, staging, progress=None, timeout=30, cancel=None):
+    def slow_download(
+        base_url, info, staging, progress=None, timeout=30, cancel=None,
+        response_callback=None,
+    ):
         started.set()
         while not (cancel and cancel()):  # 尊重 cancel，模拟慢下载
             time.sleep(0.01)

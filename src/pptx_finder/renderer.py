@@ -45,6 +45,10 @@ class PowerPointSessionBusy(RuntimeError):
     """A user/foreign PowerPoint COM server already exists; preview must stand down."""
 
 
+class PowerPointHandoffBusy(RuntimeError):
+    """A hidden preview PowerPoint process has not finished exiting yet."""
+
+
 def _env_bool(name: str) -> bool | None:
     raw = os.environ.get(name)
     if raw is None:
@@ -152,6 +156,23 @@ def _pid_has_visible_window(pid: int) -> bool:
     """Conservative visible-window check; errors mean 'visible' (never quit)."""
     if os.name != "nt":
         return True
+
+
+def wait_for_external_open_ready(timeout_sec: float = 3.0) -> bool:
+    """Wait until Windows cannot reuse a headless PowerPoint preview process.
+
+    A visible PowerPoint session belongs to the user and is safe for shell-open.
+    A headless process is not: Windows may reuse it and expose preview DPI/state.
+    """
+    deadline = time.monotonic() + max(0.0, float(timeout_sec))
+    while True:
+        pids = _powerpoint_process_ids()
+        if pids is not None and all(_pid_has_visible_window(pid) for pid in pids):
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(0.05, remaining))
     try:
         import win32gui  # type: ignore
         import win32process  # type: ignore
@@ -562,6 +583,7 @@ def render_page(
     priority: int | None = None,
     use_snapshot: bool = False,
     existing_session_only: bool = False,
+    one_shot: bool = False,
 ) -> Path | None:
     """Render a page, using a child process in packaged GUI builds."""
     if not _ipc_enabled():
@@ -574,6 +596,11 @@ def render_page(
         }
         if existing_session_only:
             direct_kwargs["existing_session_only"] = True
+        if one_shot:
+            try:
+                return _render_page_direct(path, page_no, **direct_kwargs)
+            finally:
+                shutdown()
         return _render_page_direct(path, page_no, **direct_kwargs)
 
     path = os.path.abspath(path)
@@ -604,10 +631,46 @@ def render_page(
         }
         if existing_session_only:
             client_kwargs["existing_session_only"] = True
+        if one_shot:
+            return render_client.render_page_once(path, page_no, **client_kwargs)
         return render_client.render_page(path, page_no, **client_kwargs)
     except Exception as e:  # noqa: BLE001
         log.warning("renderer ipc failed path=%s page=%s: %s", path, page_no, e)
         return None
+
+
+def render_page_once(
+    path: str,
+    page_no: int,
+    cache_key: str | None = None,
+    long_edge: int = 2560,
+    hi_priority: bool = False,
+    priority: int | None = None,
+    use_snapshot: bool = False,
+) -> Path | None:
+    """Render one historical preview and close that presentation atomically."""
+    return render_page(
+        path,
+        page_no,
+        cache_key=cache_key,
+        long_edge=long_edge,
+        hi_priority=hi_priority,
+        priority=priority,
+        use_snapshot=use_snapshot,
+        one_shot=True,
+    )
+
+
+def abort_inflight() -> bool:
+    """Abort only the isolated packaged renderer child; never user PowerPoint."""
+    if not _ipc_enabled():
+        return False
+    try:
+        from . import render_client
+
+        return bool(render_client.abort_inflight())
+    except Exception:  # noqa: BLE001 emergency cleanup must be best-effort
+        return False
 
 
 def shutdown() -> None:

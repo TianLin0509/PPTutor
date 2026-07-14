@@ -330,3 +330,72 @@ def test_update_index_skips_hung_file_via_timeout(tmp_path, monkeypatch):
         assert rows.get("hang.pptx") == "timeout"  # 卡住文件被超时跳过
     finally:
         release.set()
+
+
+def test_isolated_single_worker_uses_executor_instead_of_inline(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
+    made = []
+
+    def make_executor(n, **kwargs):
+        made.append((n, kwargs))
+        return ThreadPoolExecutor(max_workers=1)
+
+    monkeypatch.setattr(indexer, "_make_executor", make_executor)
+    fx.make_pptx(tmp_path / "safe.pptx", [{"body": "isolated"}])
+    conn = db.connect(tmp_path / "isolated.db")
+    db.init_db(conn)
+
+    summary = indexer.update_index(
+        conn,
+        [],
+        scan_iter=iter([tmp_path / "safe.pptx"]),
+        workers=1,
+        isolated_worker=True,
+    )
+
+    assert made == [(1, {"background": True})]
+    assert summary["executor"] == "thread"
+    assert summary["indexed"] == 1
+
+
+def test_shutdown_executor_keeps_worker_handles_before_shutdown_clears_them():
+    events = []
+
+    class Proc:
+        def is_alive(self):
+            return True
+
+        def terminate(self):
+            events.append("terminate")
+
+    class Executor:
+        def __init__(self):
+            self._processes = {1: Proc()}
+
+        def shutdown(self, **kwargs):
+            events.append(("shutdown", kwargs))
+            self._processes = None
+
+    indexer._shutdown_executor(Executor())
+
+    assert events[0][0] == "shutdown"
+    assert events[1] == "terminate"
+
+
+def test_background_executor_never_falls_back_to_unstoppable_thread(monkeypatch):
+    """An automatic scan must fail closed when process isolation is unavailable."""
+    import pytest
+
+    class BrokenProcessPool:
+        def __init__(self, **_kwargs):
+            raise OSError("spawn unavailable")
+
+    def forbidden_thread_pool(**_kwargs):
+        raise AssertionError("background scan must not use an unkillable thread pool")
+
+    monkeypatch.setattr(indexer, "ProcessPoolExecutor", BrokenProcessPool)
+    monkeypatch.setattr(indexer, "ThreadPoolExecutor", forbidden_thread_pool)
+
+    with pytest.raises(RuntimeError, match="isolated worker"):
+        indexer._make_executor(1, background=True)

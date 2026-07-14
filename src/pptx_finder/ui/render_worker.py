@@ -23,6 +23,7 @@ class RenderWorker(QThread):
     _PREFETCH_IDLE_GRACE_SEC = 0.08
     _PRIORITY_PREVIEW = 0
     _PRIORITY_PREFETCH = 220
+    _RELEASE_ABORT_GRACE_SEC = 0.75
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -132,6 +133,22 @@ class RenderWorker(QThread):
             self._release_requested += 1
             target = self._release_requested
             self._cv.notify_all()
+            soft_deadline = min(
+                deadline,
+                time.monotonic() + self._RELEASE_ABORT_GRACE_SEC,
+            )
+            while self._release_completed < target and not self._stopping:
+                remaining = soft_deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._cv.wait(remaining)
+            completed = self._release_completed >= target
+        if not completed and not self._stopping:
+            # Packaged renders live in a disposable child process.  Breaking its
+            # socket is the only safe way to interrupt a COM export that may be
+            # hung; the worker then reaches the queued release operation.
+            self.abort_inflight()
+        with self._cv:
             while self._release_completed < target and not self._stopping:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -139,10 +156,20 @@ class RenderWorker(QThread):
                 self._cv.wait(remaining)
             return self._release_completed >= target
 
+    def abort_inflight(self) -> bool:
+        abort = getattr(renderer, "abort_inflight", None)
+        if not callable(abort):
+            return False
+        try:
+            return bool(abort())
+        except Exception:  # noqa: BLE001 emergency cleanup must not crash exit
+            return False
+
     def stop(self) -> None:
         with self._cv:
             self._stopping = True
             self._cv.notify_all()
+        self.abort_inflight()
 
     def run(self) -> None:
         try:

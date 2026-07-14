@@ -175,7 +175,7 @@ def test_helper_swap_real(tmp_path):
         ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
          "-File", h["ps1"], "-MainPid", "0", "-Plan", h["plan_path"]],
         check=True, capture_output=True, timeout=60)
-    for _ in range(50):  # relaunch.bat 是异步启动，给它落地时间
+    for _ in range(150):  # Windows 满载时 ShellExecute 可能排队，允许最多 15 秒
         if marker.exists():
             break
         time.sleep(0.1)

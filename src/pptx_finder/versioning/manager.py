@@ -604,20 +604,13 @@ class VersionManager:
             if not vault.rebuild_to(doc_id, version_id, tmp):
                 return None
             page = max(1, int(page_no))
-            try:
-                png = renderer.render_page(
-                    tmp,
-                    page,
-                    cache_key=f"version-{version_id}-p{page}",
-                    long_edge=long_edge,
-                    hi_priority=False,
-                )
-            finally:
-                # Historical previews run in one-shot BackgroundTask threads.
-                # Tear down the complete renderer client/apartment here; merely
-                # closing the presentation can leave a hidden PowerPoint server
-                # (and its random tempfile title) alive in the user's taskbar.
-                renderer.shutdown()
+            png = renderer.render_page_once(
+                tmp,
+                page,
+                cache_key=f"version-{version_id}-p{page}",
+                long_edge=long_edge,
+                hi_priority=False,
+            )
             if not png or not os.path.exists(png):
                 return None
             out = str(png)

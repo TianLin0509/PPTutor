@@ -19,6 +19,10 @@ _FALSE = {"0", "false", "no", "off"}
 _TRUE = {"1", "true", "yes", "on"}
 
 
+class RendererRequestAborted(RuntimeError):
+    """The GUI explicitly cancelled an in-flight renderer request."""
+
+
 def should_use_ipc() -> bool:
     """Return whether GUI-side renderer calls should go through a child process."""
     if os.environ.get("PPTUTOR_RENDERER_CHILD") == "1":
@@ -35,9 +39,16 @@ class RendererProcessClient:
         self.connect_timeout = float(connect_timeout)
         self.request_timeout = float(request_timeout)
         self._lock = threading.RLock()
+        # ``abort`` must remain callable while ``request`` owns ``_lock`` and is
+        # blocked in socket.readline().  Keep transport ownership on a separate,
+        # very short-lived lock so the UI can cut the child process loose.
+        self._transport_lock = threading.Lock()
         self._proc: subprocess.Popen | None = None
         self._sock: socket.socket | None = None
         self._file = None
+        self._request_active = False
+        self._abort_generation = 0
+        self._aborts = 0
         self._seq = 0
         self._total = 0
         self._restarts = 0
@@ -53,7 +64,10 @@ class RendererProcessClient:
         return [sys.executable, "-m", "pptx_finder", "--renderer-worker", str(port), token]
 
     def _start_locked(self) -> None:
-        if self._proc is not None and self._proc.poll() is None and self._sock is not None:
+        with self._transport_lock:
+            proc = self._proc
+            sock = self._sock
+        if proc is not None and proc.poll() is None and sock is not None:
             return
         self._hard_stop_locked()
 
@@ -71,7 +85,7 @@ class RendererProcessClient:
         if os.name == "nt":
             creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
         try:
-            self._proc = subprocess.Popen(
+            proc = subprocess.Popen(
                 self._command(port, token),
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
@@ -80,14 +94,17 @@ class RendererProcessClient:
                 cwd=str(Path.home()),
                 creationflags=creationflags,
             )
+            with self._transport_lock:
+                self._proc = proc
             sock, _addr = listener.accept()
             sock.settimeout(self.request_timeout)
             f = sock.makefile("rwb", buffering=0)
             hello = json.loads(f.readline().decode("utf-8"))
             if hello.get("token") != token:
                 raise RuntimeError("renderer worker handshake token mismatch")
-            self._sock = sock
-            self._file = f
+            with self._transport_lock:
+                self._sock = sock
+                self._file = f
             self._restarts += 1
             self._last_error = ""
         except Exception:
@@ -97,22 +114,34 @@ class RendererProcessClient:
             listener.close()
 
     def _hard_stop_locked(self) -> None:
-        f = self._file
-        self._file = None
+        with self._transport_lock:
+            f = self._file
+            self._file = None
+            sock = self._sock
+            self._sock = None
+            proc = self._proc
+            self._proc = None
+        self._stop_transport(f, sock, proc)
+
+    @staticmethod
+    def _stop_transport(f, sock: socket.socket | None, proc) -> None:
+        # ``shutdown`` is what wakes a different thread blocked in ``readline``;
+        # closing the file object first can itself wait on that reader on Windows.
         try:
-            if f is not None:
-                f.close()
+            if sock is not None:
+                sock.shutdown(socket.SHUT_RDWR)
         except Exception:  # noqa: BLE001
             pass
-        sock = self._sock
-        self._sock = None
         try:
             if sock is not None:
                 sock.close()
         except Exception:  # noqa: BLE001
             pass
-        proc = self._proc
-        self._proc = None
+        try:
+            if f is not None:
+                f.close()
+        except Exception:  # noqa: BLE001
+            pass
         if proc is None:
             return
         if proc.poll() is None:
@@ -126,9 +155,27 @@ class RendererProcessClient:
                 except Exception:  # noqa: BLE001
                     pass
 
-    def _request_locked(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def _current_abort_generation(self) -> int:
+        with self._transport_lock:
+            return self._abort_generation
+
+    def _request_locked(
+        self,
+        payload: dict[str, Any],
+        *,
+        abort_generation: int | None = None,
+    ) -> dict[str, Any]:
+        generation = (
+            self._current_abort_generation()
+            if abort_generation is None else int(abort_generation)
+        )
         self._start_locked()
-        assert self._file is not None
+        if self._current_abort_generation() != generation:
+            self._hard_stop_locked()
+            raise RendererRequestAborted("renderer request aborted before send")
+        with self._transport_lock:
+            channel = self._file
+        assert channel is not None
         self._seq += 1
         req_id = self._seq
         payload = dict(payload)
@@ -136,8 +183,8 @@ class RendererProcessClient:
         raw = (json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
         start = time.perf_counter()
         try:
-            self._file.write(raw)
-            line = self._file.readline()
+            channel.write(raw)
+            line = channel.readline()
             if not line:
                 raise RuntimeError("renderer worker exited")
             resp = json.loads(line.decode("utf-8"))
@@ -151,11 +198,19 @@ class RendererProcessClient:
                 self._last_error = str(resp.get("error") or "renderer error")
             return resp
         except socket.timeout:
+            if self._current_abort_generation() != generation:
+                self._last_error = "aborted"
+                self._hard_stop_locked()
+                raise RendererRequestAborted("renderer request aborted")
             self._timeouts += 1
             self._last_error = f"timeout after {self.request_timeout:.0f}s"
             self._hard_stop_locked()
             raise
         except Exception as exc:
+            if self._current_abort_generation() != generation:
+                self._last_error = "aborted"
+                self._hard_stop_locked()
+                raise RendererRequestAborted("renderer request aborted") from exc
             self._crashes += 1
             self._last_error = f"{type(exc).__name__}: {exc}"
             self._hard_stop_locked()
@@ -163,15 +218,54 @@ class RendererProcessClient:
 
     def request(self, payload: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
+            with self._transport_lock:
+                generation = self._abort_generation
+                self._request_active = True
             try:
-                return self._request_locked(payload)
+                return self._request_locked(payload, abort_generation=generation)
+            except RendererRequestAborted:
+                raise
             except (socket.timeout, TimeoutError):
                 # A full COM timeout already means the page is unhealthy/too slow. Repeating the
                 # same call would turn a 20s failure into 40s of spinner with no new information.
                 raise
             except Exception:
                 # One restart attempt covers renderer crashes during a request.
-                return self._request_locked(payload)
+                if self._current_abort_generation() != generation:
+                    raise RendererRequestAborted("renderer request aborted")
+                return self._request_locked(
+                    payload,
+                    abort_generation=self._current_abort_generation(),
+                )
+            finally:
+                with self._transport_lock:
+                    self._request_active = False
+
+    def abort(self) -> bool:
+        """Immediately break an in-flight/idle renderer child without ``_lock``.
+
+        This is the emergency path used for external-open handoff and app exit.
+        It never touches PowerPoint directly; only the isolated child process and
+        its private socket are stopped.
+        """
+        with self._transport_lock:
+            active = bool(
+                self._request_active
+                or self._proc is not None
+                or self._sock is not None
+                or self._file is not None
+            )
+            self._abort_generation += 1
+            if active:
+                self._aborts += 1
+            f = self._file
+            self._file = None
+            sock = self._sock
+            self._sock = None
+            proc = self._proc
+            self._proc = None
+        self._stop_transport(f, sock, proc)
+        return active
 
     def render_page(
         self,
@@ -184,10 +278,11 @@ class RendererProcessClient:
         priority: int | None,
         use_snapshot: bool = False,
         existing_session_only: bool = False,
+        one_shot: bool = False,
     ) -> Path | None:
         try:
             resp = self.request({
-                "op": "render",
+                "op": "render_once" if one_shot else "render",
                 "path": path,
                 "page_no": int(page_no),
                 "cache_key": cache_key,
@@ -227,17 +322,27 @@ class RendererProcessClient:
                 self._hard_stop_locked()
 
     def diagnostic_lines(self) -> list[str]:
-        with self._lock:
-            samples = sorted(self._samples)
+        acquired = self._lock.acquire(blocking=False)
+        try:
+            # Samples are written while ``_lock`` is held. If a request owns it,
+            # skip percentile calculation instead of iterating a mutating deque.
+            samples = sorted(self._samples) if acquired else []
             p95 = samples[int(len(samples) * 0.95) - 1] if samples else 0.0
-            alive = self._proc is not None and self._proc.poll() is None
+            proc = self._proc
+            try:
+                alive = proc is not None and proc.poll() is None
+            except Exception:  # noqa: BLE001 diagnostic reads must never block/fail UI
+                alive = False
             return [
                 "renderer_ipc: "
-                f"enabled={should_use_ipc()} alive={alive} total={self._total} "
+                f"enabled={should_use_ipc()} alive={alive} busy={not acquired} total={self._total} "
                 f"restarts={self._restarts} crashes={self._crashes} timeouts={self._timeouts} "
-                f"last_ms={self._last_ms:.1f} p95_ms={p95:.1f}",
+                f"aborts={self._aborts} last_ms={self._last_ms:.1f} p95_ms={p95:.1f}",
                 f"renderer_ipc_last_error: {self._last_error or '-'}",
             ]
+        finally:
+            if acquired:
+                self._lock.release()
 
 
 _client = RendererProcessClient()
@@ -254,6 +359,7 @@ def render_page(
     priority: int | None,
     use_snapshot: bool = False,
     existing_session_only: bool = False,
+    one_shot: bool = False,
 ) -> Path | None:
     return _client.render_page(
         path,
@@ -264,6 +370,29 @@ def render_page(
         priority=priority,
         use_snapshot=use_snapshot,
         existing_session_only=existing_session_only,
+        one_shot=one_shot,
+    )
+
+
+def render_page_once(
+    path: str,
+    page_no: int,
+    *,
+    cache_key: str | None,
+    long_edge: int,
+    hi_priority: bool,
+    priority: int | None,
+    use_snapshot: bool = False,
+) -> Path | None:
+    return render_page(
+        path,
+        page_no,
+        cache_key=cache_key,
+        long_edge=long_edge,
+        hi_priority=hi_priority,
+        priority=priority,
+        use_snapshot=use_snapshot,
+        one_shot=True,
     )
 
 
@@ -277,6 +406,10 @@ def prewarm() -> None:
 
 def shutdown() -> None:
     _client.shutdown()
+
+
+def abort_inflight() -> bool:
+    return _client.abort()
 
 
 def diagnostic_lines() -> list[str]:

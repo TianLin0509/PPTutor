@@ -54,7 +54,7 @@ def test_background_task_limits_concurrent_work(qtbot):
             active -= 1
         return "ok"
 
-    limit = bg_task._MAX_CONCURRENT
+    limit = bg_task._REGULAR_CONCURRENT
     tasks = [BackgroundTask(fn, label=f"limit-{i}") for i in range(limit + 3)]
     for task in tasks:
         task.start()
@@ -68,3 +68,68 @@ def test_background_task_limits_concurrent_work(qtbot):
     release.set()
     for task in tasks:
         assert task.wait(5000)
+
+
+def test_interactive_open_keeps_one_reserved_background_slot(qtbot):
+    if bg_task._MAX_CONCURRENT < 2:
+        return
+    release = threading.Event()
+    entered = []
+    lock = threading.Lock()
+
+    def work(label):
+        def _run():
+            with lock:
+                entered.append(label)
+            release.wait(3)
+            return label
+        return _run
+
+    regular = [
+        BackgroundTask(work(f"regular-{i}"), label=f"regular-{i}")
+        for i in range(bg_task._MAX_CONCURRENT)
+    ]
+    urgent = BackgroundTask(work("open"), label="open")
+    for task in regular:
+        task.start()
+    try:
+        qtbot.waitUntil(
+            lambda: len(entered) >= bg_task._MAX_CONCURRENT - 1,
+            timeout=2000,
+        )
+        urgent.start()
+        qtbot.waitUntil(lambda: "open" in entered, timeout=800)
+        with lock:
+            assert len([x for x in entered if x.startswith("regular-")]) == bg_task._MAX_CONCURRENT - 1
+    finally:
+        release.set()
+        for task in [*regular, urgent]:
+            task.wait(5000)
+
+
+def test_waiting_background_task_can_be_cancelled_before_it_runs(qtbot):
+    if bg_task._MAX_CONCURRENT < 2:
+        return
+    release = threading.Event()
+    blockers = [
+        BackgroundTask(lambda: release.wait(3), label=f"blocker-{i}")
+        for i in range(bg_task._MAX_CONCURRENT - 1)
+    ]
+    ran = []
+    queued = BackgroundTask(lambda: ran.append(True), label="queued-low-priority")
+    for task in blockers:
+        task.start()
+    try:
+        qtbot.waitUntil(
+            lambda: f"active={bg_task._MAX_CONCURRENT - 1}" in bg_task.diagnostic_lines()[0],
+            timeout=2000,
+        )
+        queued.start()
+        qtbot.waitUntil(lambda: "waiting=1" in bg_task.diagnostic_lines()[0], timeout=1000)
+        queued.stop()
+        assert queued.wait(1000)
+        assert ran == []
+    finally:
+        release.set()
+        for task in blockers:
+            task.wait(5000)

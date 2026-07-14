@@ -356,3 +356,71 @@ def test_release_session_runs_cleanup_on_render_thread_and_clears_queued_work(
     finally:
         w.stop()
         w.wait(3000)
+
+
+def test_release_session_aborts_a_stuck_packaged_render(monkeypatch):
+    started = threading.Event()
+    unblock = threading.Event()
+    aborts = []
+
+    def stuck_render(*_args, **_kwargs):
+        started.set()
+        unblock.wait(2)
+        return None
+
+    def abort_inflight():
+        aborts.append(time.perf_counter())
+        unblock.set()
+        return True
+
+    monkeypatch.setattr(renderer, "render_page", stuck_render)
+    monkeypatch.setattr(renderer, "abort_inflight", abort_inflight, raising=False)
+    monkeypatch.setattr(renderer, "shutdown", lambda: None)
+    monkeypatch.setattr(RenderWorker, "_RELEASE_ABORT_GRACE_SEC", 0.03, raising=False)
+
+    w = RenderWorker()
+    w.start()
+    try:
+        w.request(1, "stuck.pptx", 1)
+        assert started.wait(1)
+        before = time.perf_counter()
+        assert w.release_session(timeout_sec=0.5) is True
+        assert time.perf_counter() - before < 0.45
+        assert len(aborts) == 1
+    finally:
+        unblock.set()
+        w.stop()
+        w.wait(3000)
+
+
+def test_stop_aborts_inflight_renderer_before_waiting(monkeypatch):
+    started = threading.Event()
+    unblock = threading.Event()
+    aborts = []
+
+    def stuck_render(*_args, **_kwargs):
+        started.set()
+        unblock.wait(2)
+        return None
+
+    def abort_inflight():
+        aborts.append(True)
+        unblock.set()
+        return True
+
+    monkeypatch.setattr(renderer, "render_page", stuck_render)
+    monkeypatch.setattr(renderer, "abort_inflight", abort_inflight, raising=False)
+    monkeypatch.setattr(renderer, "shutdown", lambda: None)
+
+    w = RenderWorker()
+    w.start()
+    try:
+        w.request(1, "stuck.pptx", 1)
+        assert started.wait(1)
+        w.stop()
+        assert w.wait(800)
+        assert aborts == [True]
+    finally:
+        unblock.set()
+        if w.isRunning():
+            w.wait(3000)

@@ -390,7 +390,9 @@ def test_scheduled_coverage_defers_when_busy_then_uses_one_worker(qtbot, monkeyp
     monkeypatch.setattr(
         win,
         "_start_indexing",
-        lambda roots, workers: starts.append((roots, workers)) or True,
+        lambda roots, workers: starts.append(
+            (roots, workers, win._starting_automatic_coverage)
+        ) or True,
     )
     win._coverage_scan_roots = ["C:/"]
     win._coverage_scan_reason = "periodic_coverage"
@@ -405,7 +407,7 @@ def test_scheduled_coverage_defers_when_busy_then_uses_one_worker(qtbot, monkeyp
     win._search_pending_req = None
     win._run_scheduled_coverage_scan()
 
-    assert starts == [(["C:/"], 1)]
+    assert starts == [(["C:/"], 1, True)]
 
 
 def test_startup_existing_index_with_pending_reconciles_known_files_only(
@@ -893,6 +895,36 @@ def test_index_worker_throttles_progress_burst_before_ui(monkeypatch, qtbot, tmp
     assert emitted[0] == (1, 100, "deck-1.pptx")
     assert emitted[-1] == (100, 100, "完成")
     assert len(emitted) <= 3
+
+
+def test_automatic_coverage_worker_uses_windows_background_priority(
+    monkeypatch, qtbot, tmp_path,
+):
+    priority = []
+    update_kwargs = []
+    monkeypatch.setattr(
+        "pptx_finder.ui.index_worker._set_windows_background_mode",
+        lambda enabled: priority.append(enabled) or True,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        indexer,
+        "update_index",
+        lambda *args, **kwargs: update_kwargs.append(kwargs) or {"indexed": 0, "deleted": 0},
+    )
+
+    worker = IndexWorker(
+        str(tmp_path / "i.db"),
+        [str(tmp_path)],
+        workers=1,
+        background_priority=True,
+    )
+    worker.start()
+    with qtbot.waitSignal(worker.finished_index, timeout=3000):
+        pass
+    assert worker.wait(1000)
+    assert priority == [True, False]
+    assert update_kwargs and update_kwargs[0]["isolated_worker"] is True
 
 
 def test_thumb_worker_coalesces_duplicate_requests():

@@ -25,8 +25,46 @@ try:
     _MAX_CONCURRENT = max(1, int(os.environ.get("PPTUTOR_BG_TASKS", "4")))
 except ValueError:
     _MAX_CONCURRENT = 4
-_gate = threading.BoundedSemaphore(_MAX_CONCURRENT)
+# Keep one lane available for operations where a person is visibly waiting.
+# Without this, four slow diagnostics/history jobs can leave "正在打开" queued
+# indefinitely even though the main UI itself remains responsive.
+_REGULAR_CONCURRENT = max(1, _MAX_CONCURRENT - 1) if _MAX_CONCURRENT > 1 else 1
+_INTERACTIVE_LABELS = {
+    "open", "restore", "export",
+    "version-restore", "version-export", "version-recover",
+    "ppt-slim-create",
+}
+_gate_cv = threading.Condition()
+_active_slots = 0
 _waiting = 0
+
+
+def _acquire_slot(label: str, cancelled: threading.Event) -> bool:
+    global _active_slots, _waiting
+    interactive = label in _INTERACTIVE_LABELS
+    limit = _MAX_CONCURRENT if interactive else _REGULAR_CONCURRENT
+    with _diag_lock:
+        _waiting += 1
+    try:
+        with _gate_cv:
+            while _active_slots >= limit:
+                if cancelled.is_set():
+                    return False
+                _gate_cv.wait(0.05)
+            if cancelled.is_set():
+                return False
+            _active_slots += 1
+            return True
+    finally:
+        with _diag_lock:
+            _waiting -= 1
+
+
+def _release_slot() -> None:
+    global _active_slots
+    with _gate_cv:
+        _active_slots = max(0, _active_slots - 1)
+        _gate_cv.notify_all()
 
 
 def diagnostic_lines() -> list[str]:
@@ -49,21 +87,31 @@ class BackgroundTask(QThread):
         super().__init__(parent)
         self._fn = fn
         self._label = label
+        self._cancelled = threading.Event()
 
     @property
     def label(self) -> str:
         return self._label
 
+    def stop(self) -> None:
+        """Cancel a task that is still waiting for a background slot."""
+        self._cancelled.set()
+        with _gate_cv:
+            _gate_cv.notify_all()
+
     def run(self) -> None:
         global _failed, _max_ms, _total, _waiting
         result = None
         ident = id(self)
-        with _diag_lock:
-            _waiting += 1
-        _gate.acquire()
+        if not _acquire_slot(self._label, self._cancelled):
+            self.done.emit(None)
+            return
+        if self._cancelled.is_set():
+            _release_slot()
+            self.done.emit(None)
+            return
         start = time.perf_counter()
         with _diag_lock:
-            _waiting -= 1
             _active[ident] = (self._label, start)
             _total += 1
         try:
@@ -78,5 +126,5 @@ class BackgroundTask(QThread):
                 _active.pop(ident, None)
                 _samples.append(elapsed)
                 _max_ms = max(_max_ms, elapsed)
-            _gate.release()
+            _release_slot()
         self.done.emit(result)

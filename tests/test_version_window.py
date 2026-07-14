@@ -298,6 +298,50 @@ def test_version_window_filters_documents_by_name_and_status(qtbot, monkeypatch)
     assert not win.btn_export.isEnabled()
 
 
+def test_version_window_large_doc_filter_populates_in_bounded_batches(qtbot, monkeypatch):
+    """Changing the scope must not build thousands of Qt items in one GUI turn."""
+    scheduled = []
+
+    class FakeSignal:
+        def connect(self, _callback):
+            return None
+
+    class FakeTask:
+        def __init__(self, *_args, **_kwargs):
+            self.done = FakeSignal()
+            self.finished = FakeSignal()
+
+        def start(self):
+            return None
+
+    monkeypatch.setattr(
+        version_window_mod.QTimer,
+        "singleShot",
+        lambda delay, callback: scheduled.append((delay, callback)),
+    )
+    monkeypatch.setattr(version_window_mod, "BackgroundTask", FakeTask, raising=False)
+    win = VersionWindow(FakeVersionManager())
+    qtbot.addWidget(win)
+    scheduled.clear()  # constructor's deferred database load is unrelated
+    docs = [
+        {
+            "doc_id": f"doc-{i}",
+            "path": f"C:/archive/deck-{i:04d}.pptx",
+            "status": "active",
+        }
+        for i in range(3_000)
+    ]
+
+    win._populate_docs(docs)
+
+    assert win.doc_list.count() <= win._DOC_POPULATE_BATCH
+    assert scheduled, "remaining rows should yield back to the Qt event loop"
+    while scheduled:
+        _delay, callback = scheduled.pop(0)
+        callback()
+    assert win.doc_list.count() == len(docs)
+
+
 def test_version_window_quarantines_unhealthy_restore_point(qtbot, monkeypatch):
     monkeypatch.setattr(version_window_mod.QTimer, "singleShot", lambda *_args: None)
     win = VersionWindow(FakeVersionManager())

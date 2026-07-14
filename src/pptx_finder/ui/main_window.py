@@ -804,6 +804,7 @@ class MainWindow(QMainWindow):
         self._indexer: IndexWorker | None = None
         self._coverage_scan_roots: list[str] | None = None
         self._coverage_scan_reason = ""
+        self._starting_automatic_coverage = False
         self._coverage_scan_timer = QTimer(self)
         self._coverage_scan_timer.setSingleShot(True)
         self._coverage_scan_timer.setInterval(self._FULL_COVERAGE_DELAY_MS)
@@ -3858,15 +3859,28 @@ class MainWindow(QMainWindow):
         release = getattr(self._render, "release_session", None)
         if not callable(release):
             return
-        if not bool(release(timeout_sec=20.0)):
-            raise TimeoutError("preview renderer did not release its PowerPoint session")
+        if not bool(release(timeout_sec=6.0)):
+            raise renderer_mod.PowerPointHandoffBusy(
+                "preview renderer did not release its PowerPoint session"
+            )
+        ready = getattr(renderer_mod, "wait_for_external_open_ready", None)
+        if callable(ready) and not bool(ready(timeout_sec=3.0)):
+            raise renderer_mod.PowerPointHandoffBusy(
+                "headless preview PowerPoint process is still exiting"
+            )
 
-    def _open_file_after_preview_release(self, path: str) -> bool:
-        self._release_preview_session_before_open(path)
+    def _open_file_after_preview_release(self, path: str) -> bool | str:
+        try:
+            self._release_preview_session_before_open(path)
+        except renderer_mod.PowerPointHandoffBusy:
+            return "handoff_busy"
         return actions.open_file(path)
 
     def _open_at_page_after_preview_release(self, path: str, page: int):
-        self._release_preview_session_before_open(path)
+        try:
+            self._release_preview_session_before_open(path)
+        except renderer_mod.PowerPointHandoffBusy:
+            return "handoff_busy"
         return actions.open_at_page(path, page)
 
     def _open_file_path(self, path: str) -> None:
@@ -3874,7 +3888,9 @@ class MainWindow(QMainWindow):
             # Do not immediately recreate a hidden preview COM server while the
             # shell-launched user PowerPoint is still registering in the ROT.
             self._preview_deferred_due_to_busy = False
-            if ok is None:
+            if ok == "handoff_busy":
+                self._toast("预览进程还在安全退出，请稍后再点一次；没有打开到低清会话。")
+            elif ok is None:
                 self._toast("打开文件时出错了，请稍后重试")
             elif not ok:
                 self._toast("文件已移动或删除")
@@ -3988,6 +4004,9 @@ class MainWindow(QMainWindow):
     def _open_at_page_bg(self, path: str, page: int) -> None:
         def _after(res):
             self._preview_deferred_due_to_busy = False
+            if res == "handoff_busy":
+                self._toast("预览进程还在安全退出，请稍后再点一次；没有打开到低清会话。")
+                return
             if res is None:
                 self._toast("打开时出错了，请稍后重试")
                 return
@@ -4416,7 +4435,11 @@ class MainWindow(QMainWindow):
         self._coverage_scan_reason = ""
         # One parser worker caps automatic coverage at one CPU core. Manual and
         # first-run scans retain their normal parallelism.
-        self._start_indexing(roots, 1)
+        self._starting_automatic_coverage = True
+        try:
+            self._start_indexing(roots, 1)
+        finally:
+            self._starting_automatic_coverage = False
 
     def _on_known_index_reconciled(self, token: int, payload: object) -> None:
         if self._closing or token != self._startup_index_token:
@@ -4602,7 +4625,12 @@ class MainWindow(QMainWindow):
             if env:
                 roots = [r for r in env.split(os.pathsep) if r]
         roots = roots or fixed_drives()
-        self._indexer = IndexWorker(self._db_path, roots, workers=workers)
+        self._indexer = IndexWorker(
+            self._db_path,
+            roots,
+            workers=workers,
+            background_priority=bool(self._starting_automatic_coverage),
+        )
         self._indexer.progress.connect(self._on_index_progress)
         self._indexer.finished_index.connect(self._on_index_done)
         self._indexer.finished.connect(self._flush_deferred_live_index)
@@ -4832,6 +4860,15 @@ class MainWindow(QMainWindow):
             if callable(sd):
                 sd()
         light_elapsed_ms = 0.0
+        # Cancel tasks that have not acquired a background slot yet. Running
+        # file operations remain untouched and still receive their normal wait.
+        for t in list(self._bg_tasks):
+            stop = getattr(t, "stop", None)
+            if callable(stop):
+                try:
+                    stop()
+                except RuntimeError:
+                    pass
         for t in list(self._bg_tasks):
             wait = getattr(t, "wait", None)
             if callable(wait):
@@ -4853,9 +4890,15 @@ class MainWindow(QMainWindow):
         if self._owns_render:
             self._render.stop()
         if self._owns_render:
-            if not self._render.wait(8000):
-                self._render.terminate()
-                self._render.wait(2000)
+            if not self._render.wait(3000):
+                abort = getattr(self._render, "abort_inflight", None)
+                if callable(abort):
+                    try:
+                        abort()
+                    except Exception:  # noqa: BLE001 best-effort exit cleanup
+                        pass
+                if not self._render.wait(5000):
+                    _log.error("render worker did not stop after isolated renderer abort")
 
     def _bg_task_shutdown_wait_ms(self, task) -> int:
         if self._is_heavy_bg_task(task):
