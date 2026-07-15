@@ -658,7 +658,10 @@ class MainWindow(QMainWindow):
                  smart_grouping_enabled: bool | None = None):
         super().__init__()
         self.setWindowTitle(f"PPT Doctor · PPT 查询助手   v{__version__}")
-        self.setWindowIcon(QIcon(_asset_path("logo.png")))  # 绐楀彛鏍囬/浠诲姟鏍忓浘鏍?
+        app_icon = QApplication.instance().windowIcon()
+        if app_icon.isNull():
+            app_icon = QIcon(_asset_path("app.ico"))
+        self.setWindowIcon(app_icon)
         self.resize(1180, 760)
         self._title_h = 40  # 鑷粯鐜荤拑鏍囬鏍忛珮搴︼紙nativeEvent 鎷栧姩鍖?缂╂斁杈瑰垽瀹氱敤锛?
         self.setWindowFlag(Qt.FramelessWindowHint, True)  # 鏃犺竟妗?鈫?鑷粯鐜荤拑鏍囬鏍?
@@ -3702,9 +3705,10 @@ class MainWindow(QMainWindow):
     def _show_preview_unavailable(self) -> None:
         self.image_label.setPixmap(QPixmap())
         self.image_label.setText(
-            '<div style="font-size:30px">📫</div>'
-            '<div style="color:#888;font-size:13px;margin-top:12px">此页暂时无法预览<br>'
-            '点“打开文件”直接查看</div>')
+            '<div style="font-size:30px">🖼️</div>'
+            '<div style="color:#666;font-size:13px;margin-top:12px">原始页面无法预览<br>'
+            '<span style="color:#999">常见原因：PowerPoint 正在使用，且独立预览引擎未安装。<br>'
+            '可关闭 PowerPoint 后重试，或改用带预览引擎的完整版。</span></div>')
         self._cur_pixmap = None
         self._preview_provisional = False
 
@@ -3862,12 +3866,6 @@ class MainWindow(QMainWindow):
                 self._PRIORITY_RIGHT_PREVIEW,
             )
         else:
-            self._request_safe_preview(
-                self._req_id,
-                self._cur.path,
-                page,
-                long_edge=min(preview_edge, 800),
-            )
             self._request_render(
                 self._req_id,
                 self._cur.path,

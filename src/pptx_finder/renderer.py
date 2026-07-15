@@ -519,15 +519,39 @@ def _cleanup_stale_snapshots(max_age_sec: float = 24 * 60 * 60) -> int:
     return removed
 
 
+def _application_dir() -> Path:
+    if bool(getattr(sys, "frozen", False)):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parents[2]
+
+
 def _find_soffice() -> Path | None:
     """Locate an optional LibreOffice CLI used only when PowerPoint is busy."""
     configured = str(os.environ.get("PPTUTOR_SOFFICE_PATH", "") or "").strip()
-    candidates = [
-        configured,
+    engine_dir = str(os.environ.get("PPTUTOR_PREVIEW_ENGINE_DIR", "") or "").strip()
+    engine_roots = [
+        Path(engine_dir).expanduser() if engine_dir else None,
+        _application_dir() / "preview-engine",
+    ]
+    candidates = [configured]
+    for root in engine_roots:
+        if root is None:
+            continue
+        candidates.extend([
+            str(root / "LibreOfficePortable/App/libreoffice/program/soffice.com"),
+            str(root / "LibreOfficePortable/App/libreoffice/program/soffice.exe"),
+            str(root / "LibreOffice/program/soffice.com"),
+            str(root / "LibreOffice/program/soffice.exe"),
+            str(root / "program/soffice.com"),
+            str(root / "program/soffice.exe"),
+            str(root / "soffice.com"),
+            str(root / "soffice.exe"),
+        ])
+    candidates.extend([
         shutil.which("soffice.com") or "",
         shutil.which("soffice.exe") or "",
         shutil.which("soffice") or "",
-    ]
+    ])
     if os.name == "nt":
         candidates.extend([
             r"C:\Program Files\LibreOffice\program\soffice.com",
@@ -545,6 +569,27 @@ def _find_soffice() -> Path | None:
         except OSError:
             continue
     return None
+
+
+def preview_engine_status() -> dict[str, object]:
+    """Describe the independent image renderer without starting any process."""
+    soffice = _find_soffice()
+    if soffice is None:
+        return {"available": False, "source": "missing", "path": "-"}
+    source = "system"
+    try:
+        resolved = soffice.resolve()
+        bundled_root = (_application_dir() / "preview-engine").resolve()
+        if resolved.is_relative_to(bundled_root):
+            source = "bundled"
+        elif (
+            str(os.environ.get("PPTUTOR_SOFFICE_PATH", "") or "").strip()
+            or str(os.environ.get("PPTUTOR_PREVIEW_ENGINE_DIR", "") or "").strip()
+        ):
+            source = "configured"
+    except OSError:
+        resolved = soffice
+    return {"available": True, "source": source, "path": str(resolved)}
 
 
 def _terminate_compat_processes(profile_uri: str) -> int:
@@ -658,7 +703,12 @@ def _render_page_compat(
             ))
             out_dir = work / "out"
             out_dir.mkdir()
-            profile = work / "profile"
+            # Keep one isolated profile across decks.  A fresh LibreOffice
+            # profile can spend 8-12 seconds on first-run initialization; a
+            # stable private profile makes later files start in roughly 1-2s
+            # while remaining completely separate from the user's LibreOffice.
+            profile = root / "compat_profile"
+            profile.mkdir(parents=True, exist_ok=True)
             snapshot = work / f"source{Path(path).suffix or '.pptx'}"
             shutil.copy2(path, snapshot)
             profile_uri = profile.resolve().as_uri()
@@ -1258,11 +1308,24 @@ def shutdown() -> None:
 
 
 def diagnostic_lines() -> list[str]:
+    engine = preview_engine_status()
+    engine_line = (
+        "preview_engine: "
+        f"available={engine['available']} "
+        f"source={engine['source']} "
+        f"path={engine['path']}"
+    )
     if not _ipc_enabled():
-        return [f"renderer_ipc: enabled=False frozen={bool(getattr(sys, 'frozen', False))}"]
+        return [
+            f"renderer_ipc: enabled=False frozen={bool(getattr(sys, 'frozen', False))}",
+            engine_line,
+        ]
     try:
         from . import render_client
 
-        return render_client.diagnostic_lines()
+        return [*render_client.diagnostic_lines(), engine_line]
     except Exception as e:  # noqa: BLE001
-        return [f"renderer_ipc: enabled=True unavailable ({type(e).__name__}: {e})"]
+        return [
+            f"renderer_ipc: enabled=True unavailable ({type(e).__name__}: {e})",
+            engine_line,
+        ]

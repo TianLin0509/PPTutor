@@ -532,16 +532,11 @@ def test_worker_cover_fallback_survives_failed_high_resolution_render(qtbot, tmp
     assert "无法预览" not in win.image_label.text()
 
 
-def test_safe_page_preview_is_independent_of_a_blocked_render_worker(
+def test_preview_does_not_launch_parallel_text_or_shell_renderer(
     qtbot,
     tmp_path,
     monkeypatch,
 ):
-    image = tmp_path / "safe-page.png"
-    pm = QPixmap(320, 180)
-    pm.fill(Qt.blue)
-    assert pm.save(str(image))
-
     conn = _index(tmp_path)
     render = PendingRender()  # accepts requests but deliberately never completes one
     win = MainWindow(conn=conn, render_worker=render, do_index=False)
@@ -559,16 +554,33 @@ def test_safe_page_preview_is_independent_of_a_blocked_render_worker(
     monkeypatch.setattr(
         main_window_mod.thumbnailer,
         "find_non_com_page_preview",
-        lambda *_args, **_kwargs: image,
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("selected preview must use one serialized original-image worker")
+        ),
         raising=False,
     )
 
     win._request_preview()
 
     assert render.calls
-    qtbot.waitUntil(lambda: win._cur_pixmap is not None, timeout=1000)
-    assert win._preview_provisional is True
-    assert "无法预览" not in win.image_label.text()
+    assert win._cur_pixmap is None
+    assert win._spin_timer.isActive()
+
+
+def test_unavailable_preview_explains_how_original_image_rendering_is_restored(
+    qtbot,
+    tmp_path,
+):
+    conn = _index(tmp_path)
+    win = MainWindow(conn=conn, render_worker=PendingRender(), do_index=False)
+    qtbot.addWidget(win)
+
+    win._show_preview_unavailable()
+
+    message = win.image_label.text()
+    assert "原始页面无法预览" in message
+    assert "独立预览引擎" in message
+    assert "关闭 PowerPoint" in message
 
 
 def test_late_safe_preview_never_overwrites_hd_for_the_same_request(qtbot, tmp_path):

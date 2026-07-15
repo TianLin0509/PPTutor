@@ -9,6 +9,60 @@ from pypdf import PdfWriter
 from pptx_finder import renderer
 
 
+def test_find_soffice_discovers_adjacent_portable_preview_engine(tmp_path, monkeypatch):
+    bundled = (
+        tmp_path
+        / "preview-engine"
+        / "LibreOfficePortable"
+        / "App"
+        / "libreoffice"
+        / "program"
+        / "soffice.com"
+    )
+    bundled.parent.mkdir(parents=True)
+    bundled.write_bytes(b"portable")
+    monkeypatch.delenv("PPTUTOR_SOFFICE_PATH", raising=False)
+    monkeypatch.delenv("PPTUTOR_PREVIEW_ENGINE_DIR", raising=False)
+    monkeypatch.setattr(renderer, "_application_dir", lambda: tmp_path, raising=False)
+    monkeypatch.setattr(renderer.shutil, "which", lambda _name: None)
+
+    assert renderer._find_soffice() == bundled
+
+
+def test_preview_engine_status_identifies_adjacent_engine(tmp_path, monkeypatch):
+    bundled = (
+        tmp_path
+        / "preview-engine"
+        / "LibreOfficePortable"
+        / "App"
+        / "libreoffice"
+        / "program"
+        / "soffice.com"
+    )
+    bundled.parent.mkdir(parents=True)
+    bundled.write_bytes(b"portable")
+    monkeypatch.setattr(renderer, "_application_dir", lambda: tmp_path, raising=False)
+    monkeypatch.setattr(renderer, "_find_soffice", lambda: bundled, raising=False)
+
+    status = renderer.preview_engine_status()
+
+    assert status["available"] is True
+    assert status["source"] == "bundled"
+    assert status["path"] == str(bundled)
+    assert any(
+        "preview_engine: available=True source=bundled" in line
+        for line in renderer.diagnostic_lines()
+    )
+
+
+def test_preview_engine_status_explains_missing_engine(monkeypatch):
+    monkeypatch.setattr(renderer, "_find_soffice", lambda: None, raising=False)
+
+    status = renderer.preview_engine_status()
+
+    assert status == {"available": False, "source": "missing", "path": "-"}
+
+
 def test_compat_renderer_converts_once_then_renders_any_page(tmp_path, monkeypatch):
     source = tmp_path / "deck.pptx"
     source.write_bytes(b"pptx")
@@ -55,7 +109,9 @@ def test_compat_renderer_converts_once_then_renders_any_page(tmp_path, monkeypat
     assert not QImage(str(second)).isNull()
     assert len(calls) == 1
     assert "--headless" in calls[0]
-    assert any(arg.startswith("-env:UserInstallation=") for arg in calls[0])
+    profile_arg = next(arg for arg in calls[0] if arg.startswith("-env:UserInstallation="))
+    assert "compat_profile" in profile_arg
+    assert "compat_work" not in profile_arg
     assert run_options[0]["timeout"] <= 30
     if renderer.os.name == "nt":
         assert run_options[0]["creationflags"] & subprocess.BELOW_NORMAL_PRIORITY_CLASS
@@ -144,6 +200,36 @@ def test_active_powerpoint_falls_back_to_isolated_compat(
         hi_priority=True,
         use_snapshot=True,
     ) == compat
+
+
+def test_active_powerpoint_never_uses_preview_handler_when_compat_is_unavailable(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "deck.pptx"
+    source.write_bytes(b"pptx")
+    monkeypatch.setattr(renderer, "cache_dir", lambda: tmp_path)
+    monkeypatch.setattr(renderer, "_ipc_enabled", lambda: False)
+    monkeypatch.setattr(renderer, "_powerpoint_active", lambda **_kwargs: True)
+    monkeypatch.setattr(
+        renderer,
+        "_render_page_compat",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        renderer,
+        "_get_app",
+        lambda: (_ for _ in ()).throw(AssertionError("must not attach to user PowerPoint")),
+    )
+
+    assert renderer._render_page_direct(
+        str(source),
+        2,
+        cache_key="shell-fallback",
+        long_edge=901,
+        hi_priority=True,
+        use_snapshot=True,
+    ) is None
 
 
 def test_compat_timeout_terminates_only_the_isolated_profile_processes(

@@ -29,6 +29,7 @@ except Exception:  # noqa: BLE001
 import fixtures_gen as fx  # noqa: E402
 
 _data_tmp = Path(tempfile.mkdtemp(prefix="frozen_verify_"))
+_run_id = f"{os.getpid()}-{int(time.time())}"
 DATA = _data_tmp / "appdata"
 DATA.mkdir(parents=True)
 # Frozen smoke tests must not rewrite the user's real Windows Startup link to
@@ -43,13 +44,14 @@ DATA.mkdir(parents=True)
     encoding="utf-8",
 )
 # DECKS 必须在被全盘 watcher 监听的位置（Desktop），不能放 AppData/Temp（被排除）
-DECKS = Path(os.path.expanduser("~")) / "Desktop" / "_pptxverify_decks"
+DECKS = Path(os.path.expanduser("~")) / "Desktop" / f"_pptxverify_decks_{_run_id}"
 DECKS.mkdir(parents=True, exist_ok=True)
 PPTX = DECKS / "测试方案.pptx"
 
 ENV = dict(os.environ)
 ENV["PPTX_FINDER_DATA_DIR"] = str(DATA)
 ENV["PPTX_FINDER_ROOTS"] = str(DECKS)  # 限搜索索引范围（版本 watcher 走全盘 default_watch_paths）
+ENV["PPTX_FINDER_SINGLETON_NAME"] = f"ppt-doctor-frozen-verify-{_run_id}"
 
 
 def _cleanup() -> None:

@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('assets/logo.png', 'assets')]
+datas = [('assets/logo.png', 'assets'), ('assets/app.ico', 'assets')]
 binaries = []
 hiddenimports = []
 # OpenCC 繁简转换：必须打包它的 .ocd2/.json 词典 + opencc_clib .pyd，
