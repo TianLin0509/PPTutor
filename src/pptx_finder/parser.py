@@ -129,6 +129,41 @@ def parse_pptx(path: str) -> ParsedDeck:
         return deck
 
 
+def parse_pptx_page(path: str, page_no: int) -> SlidePage | None:
+    """Parse only one requested slide in presentation order.
+
+    Preview fallback runs on the interaction path, so parsing every slide in a
+    large deck would trade one kind of waiting for another.  This helper reads
+    presentation order plus the requested slide (and its notes/SmartArt) only.
+    Corrupt, encrypted, missing, or out-of-range files fail closed with ``None``.
+    """
+    page_no = int(page_no)
+    if page_no < 1:
+        return None
+    try:
+        with open(ext_path(path), "rb") as source:
+            if source.read(8)[:4] == OLE_MAGIC:
+                return None
+        with zipfile.ZipFile(ext_path(path)) as zf:
+            pres = "ppt/presentation.xml"
+            pres_root = etree.fromstring(zf.read(pres))
+            slide_ids = pres_root.find(P_SLDIDLST)
+            if slide_ids is None:
+                return None
+            ordered = list(slide_ids.findall(P_SLDID))
+            if page_no > len(ordered):
+                return None
+            rid = ordered[page_no - 1].get(R_ID)
+            rels = _read_rels(zf, pres)
+            slide_part = rels[rid][1] if rid and rid in rels else ""
+            if not slide_part:
+                return None
+            return _parse_slide(zf, slide_part, page_no)
+    except Exception as exc:  # noqa: BLE001 one fallback must never break preview worker
+        log.debug("single slide parse failed path=%s page=%s: %s", path, page_no, exc)
+        return None
+
+
 def _parse_zip(zf: zipfile.ZipFile, deck: ParsedDeck) -> ParsedDeck:
     pres = "ppt/presentation.xml"
     try:

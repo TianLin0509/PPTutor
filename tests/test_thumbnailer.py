@@ -86,3 +86,46 @@ def test_find_non_com_thumbnail_prefers_existing_render_cache(tmp_path, monkeypa
 
     assert thumbnailer.find_non_com_thumbnail("deck.pptx", 7, long_edge=480) == cached
     assert calls == [("deck.pptx", 7, 480)]
+
+
+def test_text_page_preview_renders_requested_non_first_page_without_office(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(thumbnailer, "cache_dir", lambda: tmp_path)
+    monkeypatch.setattr(renderer, "cache_dir", lambda: tmp_path)
+    src = tmp_path / "deck.pptx"
+    fx.make_pptx(src, [
+        {"body": "封面"},
+        {"body": "第二页的命中内容 AI SP"},
+    ])
+    monkeypatch.setattr(
+        renderer,
+        "render_page",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("Office is forbidden")),
+    )
+
+    out = thumbnailer.text_page_preview(str(src), 2, long_edge=800)
+
+    assert out is not None
+    assert out.exists()
+    image = QImage(str(out))
+    assert not image.isNull()
+    assert image.width() == 800
+
+
+def test_non_com_page_preview_uses_text_fallback_for_later_pages(tmp_path, monkeypatch):
+    safe = tmp_path / "page-7-safe.png"
+    safe.write_bytes(b"safe")
+    monkeypatch.setattr(thumbnailer, "find_non_com_thumbnail", lambda *_a, **_k: None)
+    calls: list[tuple[str, int, int]] = []
+
+    def fake_text(path, page_no, *, long_edge):
+        calls.append((path, page_no, long_edge))
+        return safe
+
+    monkeypatch.setattr(thumbnailer, "text_page_preview", fake_text)
+
+    assert thumbnailer.find_non_com_page_preview("deck.pptx", 7, long_edge=720) == safe
+    assert calls == [("deck.pptx", 7, 720)]

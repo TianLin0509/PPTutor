@@ -13,7 +13,9 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -40,10 +42,14 @@ _TRUE = {"1", "true", "yes", "on"}
 _POWERPOINT_ACTIVE_TTL_SEC = 2.0
 _powerpoint_active_cache_at = 0.0
 _powerpoint_active_cache = False
-_RENDER_CACHE_PATTERN = re.compile(r"^[0-9a-f]{16}_\d+_\d+\.png$", re.IGNORECASE)
+_RENDER_CACHE_PATTERN = re.compile(
+    r"^[0-9a-f]{16}_(?:\d+_\d+|safe_\d+_\d+)\.png$",
+    re.IGNORECASE,
+)
 _RENDER_CACHE_MAX_BYTES = 2 * 1024 * 1024 * 1024
 _RENDER_CACHE_MAX_FILES = 2000
 _RENDER_CACHE_TRIM_RATIO = 0.8
+_COMPAT_RENDER_TIMEOUT_SEC = 30.0
 
 
 class PowerPointSessionBusy(RuntimeError):
@@ -513,6 +519,174 @@ def _cleanup_stale_snapshots(max_age_sec: float = 24 * 60 * 60) -> int:
     return removed
 
 
+def _find_soffice() -> Path | None:
+    """Locate an optional LibreOffice CLI used only when PowerPoint is busy."""
+    configured = str(os.environ.get("PPTUTOR_SOFFICE_PATH", "") or "").strip()
+    candidates = [
+        configured,
+        shutil.which("soffice.com") or "",
+        shutil.which("soffice.exe") or "",
+        shutil.which("soffice") or "",
+    ]
+    if os.name == "nt":
+        candidates.extend([
+            r"C:\Program Files\LibreOffice\program\soffice.com",
+            r"C:\Program Files\LibreOffice\program\soffice.exe",
+            r"C:\Program Files (x86)\LibreOffice\program\soffice.com",
+            str(Path.home() / "AppData/Local/Programs/LibreOffice/program/soffice.com"),
+        ])
+    for raw in candidates:
+        if not raw:
+            continue
+        candidate = Path(raw).expanduser()
+        try:
+            if candidate.is_file():
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
+def _render_pdf_page(pdf_path: Path, page_no: int, long_edge: int, out: Path) -> Path | None:
+    """Render one local PDF page through QtPdf without another long-lived process."""
+    from PySide6.QtCore import QSize
+    from PySide6.QtPdf import QPdfDocument
+
+    document = QPdfDocument()
+    try:
+        error = document.load(str(pdf_path))
+        if error != QPdfDocument.Error.None_:
+            return None
+        page_index = int(page_no) - 1
+        if page_index < 0 or page_index >= int(document.pageCount()):
+            return None
+        points = document.pagePointSize(page_index)
+        page_width = max(1.0, float(points.width()))
+        page_height = max(1.0, float(points.height()))
+        edge = max(64, int(long_edge))
+        if page_width >= page_height:
+            width = edge
+            height = max(1, int(round(edge * page_height / page_width)))
+        else:
+            height = edge
+            width = max(1, int(round(edge * page_width / page_height)))
+        image = document.render(page_index, QSize(width, height))
+        if image.isNull():
+            return None
+        out.parent.mkdir(parents=True, exist_ok=True)
+        tmp = out.with_suffix(out.suffix + ".tmp")
+        if not image.save(str(tmp), "PNG"):
+            return None
+        os.replace(tmp, out)
+        return out if out.exists() and out.stat().st_size > 0 else None
+    finally:
+        document.close()
+
+
+def _render_page_compat(
+    path: str,
+    page_no: int,
+    cache_key: str,
+    long_edge: int,
+    out: Path,
+) -> Path | None:
+    """Render without touching a running PowerPoint session.
+
+    LibreOffice is an optional, isolated fallback.  The first clicked page
+    converts a safe copy to a cached PDF; later page turns rasterize that PDF
+    directly and do not keep LibreOffice, PowerPoint, or another worker alive.
+    """
+    soffice = _find_soffice()
+    if soffice is None:
+        log.info("compat preview unavailable: LibreOffice was not found")
+        return None
+    root = cache_dir()
+    pdf_dir = root / "compat_pdf"
+    pdf_dir.mkdir(parents=True, exist_ok=True)
+    pdf_path = pdf_dir / f"{cache_key}.pdf"
+    try:
+        pdf_ready = pdf_path.exists() and pdf_path.stat().st_size > 0
+    except OSError:
+        pdf_ready = False
+    if not pdf_ready:
+        work_root = root / "compat_work"
+        work_root.mkdir(parents=True, exist_ok=True)
+        work: Path | None = None
+        try:
+            work = Path(tempfile.mkdtemp(
+                prefix=f"{cache_key}-",
+                dir=str(work_root),
+            ))
+            out_dir = work / "out"
+            out_dir.mkdir()
+            profile = work / "profile"
+            snapshot = work / f"source{Path(path).suffix or '.pptx'}"
+            shutil.copy2(path, snapshot)
+            command = [
+                str(soffice),
+                "--headless",
+                "--nologo",
+                "--nodefault",
+                "--nolockcheck",
+                "--nofirststartwizard",
+                "--norestore",
+                f"-env:UserInstallation={profile.resolve().as_uri()}",
+                "--convert-to",
+                "pdf:impress_pdf_Export",
+                "--outdir",
+                str(out_dir),
+                str(snapshot),
+            ]
+            creationflags = (
+                int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                | int(getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0))
+                if os.name == "nt"
+                else 0
+            )
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=_COMPAT_RENDER_TIMEOUT_SEC,
+                check=False,
+                creationflags=creationflags,
+            )
+            produced = out_dir / f"{snapshot.stem}.pdf"
+            if (
+                completed.returncode != 0
+                or not produced.exists()
+                or produced.stat().st_size <= 0
+            ):
+                log.warning(
+                    "compat preview conversion failed rc=%s path=%s stderr=%s",
+                    completed.returncode,
+                    path,
+                    str(completed.stderr or "")[-400:],
+                )
+                return None
+            tmp_pdf = pdf_path.with_suffix(".pdf.tmp")
+            shutil.copy2(produced, tmp_pdf)
+            os.replace(tmp_pdf, pdf_path)
+        except Exception as exc:  # noqa: BLE001 isolated fallback must fail quietly
+            log.warning("compat preview failed path=%s: %s", path, exc)
+            return None
+        finally:
+            if work is not None:
+                try:
+                    shutil.rmtree(work)
+                except OSError as exc:
+                    # soffice.com can return a fraction before soffice.bin has
+                    # released its profile registry.  The cached PDF is already
+                    # atomic and valid; a transient temp cleanup race must never
+                    # erase the user's successful first preview.
+                    log.info("compat workdir cleanup deferred path=%s: %s", work, exc)
+    try:
+        return _render_pdf_page(pdf_path, page_no, long_edge, out)
+    except Exception as exc:  # noqa: BLE001 malformed PDFs must not kill the worker
+        log.warning("compat PDF render failed path=%s page=%s: %s", path, page_no, exc)
+        return None
+
+
 def maintain_render_cache(
     *,
     max_bytes: int = _RENDER_CACHE_MAX_BYTES,
@@ -778,7 +952,21 @@ def _render_page_direct(
             and getattr(_state, "app", None) is None
             and _powerpoint_active(force=True)
         ):
-            log.info("preview skipped because another PowerPoint session is active")
+            if hi_priority and use_snapshot:
+                # Never open even an owned snapshot inside the user's visible
+                # PowerPoint process.  If COM rejects Close, that snapshot can
+                # remain in their taskbar and recreate the original pollution.
+                rendered = _render_page_compat(
+                    path,
+                    int(page_no),
+                    cache_key,
+                    int(long_edge),
+                    out,
+                )
+                if rendered is not None:
+                    _failed_until.pop(fail_key, None)
+                    return rendered
+            log.info("PowerPoint is active and isolated compatibility preview was unavailable")
             return None
         try:
             if existing_session_only:
@@ -819,7 +1007,18 @@ def _render_page_direct(
         except PowerPointSessionBusy as e:
             # This is an expected safety decision, not a broken-file failure;
             # do not poison the page's 90-second retry cache.
-            log.info("preview skipped: %s", e)
+            if hi_priority and use_snapshot:
+                rendered = _render_page_compat(
+                    path,
+                    int(page_no),
+                    cache_key,
+                    int(long_edge),
+                    out,
+                )
+                if rendered is not None:
+                    _failed_until.pop(fail_key, None)
+                    return rendered
+            log.info("preview skipped after isolated fallback: %s", e)
             return None
         except Exception as e:  # noqa: BLE001
             log.warning("render_page failed path=%s page=%s: %s", path, page_no, e)

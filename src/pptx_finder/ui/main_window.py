@@ -784,6 +784,9 @@ class MainWindow(QMainWindow):
 
         self._render = render_worker or RenderWorker(self)
         self._render.rendered.connect(self._on_rendered)
+        provisional_signal = getattr(self._render, "provisional_rendered", None)
+        if provisional_signal is not None:
+            provisional_signal.connect(self._on_provisional_rendered)
         self._owns_render = render_worker is None
         if self._owns_render:
             self._render.start()
@@ -3947,6 +3950,18 @@ class MainWindow(QMainWindow):
         self._resize_preview_timer.stop()
         self._update_pixmap()
         self._toast("原尺寸放大 · 再双击还原" if self._zoom > 1.0 else "已适配窗口")
+
+    def _on_provisional_rendered(self, req_id: int, png: str) -> None:
+        """Keep a safe non-COM page preview visible while HD rendering continues."""
+        if self._closing or req_id != self._req_id or not png or not os.path.exists(png):
+            return
+        pm = QPixmap(png)
+        if pm.isNull():
+            return
+        self._cur_pixmap = pm
+        self._preview_provisional = True
+        self._stop_spinner()
+        self._update_pixmap()
 
     def _on_rendered(self, req_id: int, png: str) -> None:
         if self._closing:

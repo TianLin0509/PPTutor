@@ -512,6 +512,26 @@ def test_preview_uses_disk_cache_as_provisional_first_paint(qtbot, tmp_path, mon
     qtbot.waitUntil(lambda: bool(render.calls), timeout=500)
 
 
+def test_worker_cover_fallback_survives_failed_high_resolution_render(qtbot, tmp_path):
+    image = tmp_path / "embedded-cover.png"
+    pm = QPixmap(320, 180)
+    pm.fill(Qt.green)
+    assert pm.save(str(image))
+
+    conn = _index(tmp_path)
+    render = PendingRender()
+    win = MainWindow(conn=conn, render_worker=render, do_index=False)
+    qtbot.addWidget(win)
+    win._req_id = 51
+
+    win._on_provisional_rendered(51, str(image))
+    win._on_rendered(51, "")
+
+    assert win._preview_provisional is True
+    assert win._cur_pixmap is not None and not win._cur_pixmap.isNull()
+    assert "无法预览" not in win.image_label.text()
+
+
 def test_preview_cache_lookup_uses_index_metadata_without_source_stat(
     qtbot, tmp_path, monkeypatch
 ):

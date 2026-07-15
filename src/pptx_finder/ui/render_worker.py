@@ -14,7 +14,7 @@ import time
 
 from PySide6.QtCore import QThread, Signal
 
-from .. import renderer
+from .. import renderer, thumbnailer
 
 
 log = logging.getLogger(__name__)
@@ -22,6 +22,7 @@ log = logging.getLogger(__name__)
 
 class RenderWorker(QThread):
     rendered = Signal(int, str)  # request_id, png_path（失败为空串）
+    provisional_rendered = Signal(int, str)  # request_id, safe page preview while HD renders
     # 80ms absorbs rapid result-selection churn while still getting the next page
     # ready before a normal human page-turn. Concurrency remains one COM export.
     _PREFETCH_IDLE_GRACE_SEC = 0.08
@@ -278,6 +279,16 @@ class RenderWorker(QThread):
                         self._session_last_activity = time.monotonic()
                 elif kind == "preview":
                     req_id, path, page_no, key, long_edge, priority = data
+                    try:
+                        fallback = thumbnailer.find_non_com_page_preview(
+                            path,
+                            page_no,
+                            long_edge=min(int(long_edge), 800),
+                        )
+                    except Exception:  # noqa: BLE001 safe fallback must never block HD
+                        fallback = None
+                    if fallback:
+                        self.provisional_rendered.emit(req_id, str(fallback))
                     try:
                         png = renderer.render_page(
                             path,
