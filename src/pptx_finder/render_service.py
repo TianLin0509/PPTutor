@@ -34,6 +34,7 @@ def handle_request(req: dict[str, Any]) -> dict[str, Any]:
                 "hi_priority": bool(req.get("hi_priority")),
                 "priority": req.get("priority"),
                 "use_snapshot": bool(req.get("use_snapshot")),
+                "allow_borrowed_session": bool(req.get("allow_borrowed_session")),
             }
             if req.get("existing_session_only"):
                 render_kwargs["existing_session_only"] = True
@@ -50,6 +51,12 @@ def handle_request(req: dict[str, Any]) -> dict[str, Any]:
         if op == "close_current":
             renderer.close_current_presentation()
             return {"id": req_id, "ok": True}
+        if op == "release_session":
+            return {
+                "id": req_id,
+                "ok": True,
+                "released": bool(renderer.release_session()),
+            }
         if op == "prewarm":
             return {"id": req_id, "ok": True, "prewarmed": bool(renderer.prewarm())}
         if op == "shutdown":

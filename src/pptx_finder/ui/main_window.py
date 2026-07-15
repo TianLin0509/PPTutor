@@ -3651,7 +3651,7 @@ class MainWindow(QMainWindow):
         accent = self._tok.get("acc", "#0A84FF")
         sub = self._tok.get("ink3", "#888")
         msg = (
-            "正在启动 PowerPoint COM 并生成原始页面..."
+            "正在连接 PowerPoint COM 并生成原始页面..."
             if not getattr(self, "_preview_hinted", False)
             else "正在等待 PowerPoint COM 原图渲染..."
         )
@@ -3693,8 +3693,8 @@ class MainWindow(QMainWindow):
         self.image_label.setText(
             '<div style="font-size:30px">🖼️</div>'
             '<div style="color:#666;font-size:13px;margin-top:12px">COM 原图渲染失败<br>'
-            '<span style="color:#999">若 PowerPoint 正在使用，请关闭 PowerPoint 后重新点击此文件；<br>'
-            '也可能是文件加密、损坏或页码已失效。</span></div>')
+            '<span style="color:#999">若 PowerPoint 正忙或有弹窗，请完成当前操作后重试；<br>'
+            '无需关闭正在编辑的文稿。也可能是文件加密、损坏或页码已失效。</span></div>')
         self._cur_pixmap = None
 
     def _show_non_powerpoint_preview(self, ext: str) -> None:

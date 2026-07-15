@@ -20,6 +20,7 @@ def _fake_renderer(monkeypatch, tmp_path, delay=0.05):
 
     monkeypatch.setattr(renderer, "render_page", fake_render)
     monkeypatch.setattr(renderer, "background_powerpoint_allowed", lambda: True, raising=False)
+    monkeypatch.setattr(renderer, "release_session", lambda: True, raising=False)
     monkeypatch.setattr(renderer, "shutdown", lambda: None)
     return calls, lock
 
@@ -43,7 +44,7 @@ def test_preview_then_prefetch(qtbot, monkeypatch, tmp_path):
         w.wait(3000)
 
 
-def test_clicked_preview_never_borrows_active_user_powerpoint_session(
+def test_clicked_preview_allows_safe_borrow_only_for_user_request(
     qtbot,
     monkeypatch,
     tmp_path,
@@ -64,9 +65,9 @@ def test_clicked_preview_never_borrows_active_user_powerpoint_session(
         w.prefetch("clicked.pptx", 4)
         qtbot.waitUntil(lambda: len(calls) >= 2, timeout=1500)
 
-        assert "allow_foreign_session" not in calls[0]
+        assert calls[0]["allow_borrowed_session"] is True
         assert calls[0].get("existing_session_only", False) is False
-        assert "allow_foreign_session" not in calls[1]
+        assert calls[1].get("allow_borrowed_session", False) is False
         assert calls[1]["existing_session_only"] is True
     finally:
         w.stop()
@@ -74,14 +75,21 @@ def test_clicked_preview_never_borrows_active_user_powerpoint_session(
 
 
 def test_idle_after_preview_releases_hidden_powerpoint(qtbot, monkeypatch, tmp_path):
-    """A preview session must not linger for Explorer to reuse later."""
+    """PowerPoint must exit while the zero-CPU renderer service stays reusable."""
     released = threading.Event()
+    shutdowns = []
     monkeypatch.setattr(
         renderer,
         "render_page",
         lambda *_args, **_kwargs: tmp_path / "preview.png",
     )
-    monkeypatch.setattr(renderer, "shutdown", released.set)
+    monkeypatch.setattr(
+        renderer,
+        "release_session",
+        lambda: released.set() or True,
+        raising=False,
+    )
+    monkeypatch.setattr(renderer, "shutdown", lambda: shutdowns.append("shutdown"))
     monkeypatch.setattr(RenderWorker, "_SESSION_IDLE_RELEASE_SEC", 0.03, raising=False)
 
     w = RenderWorker()
@@ -90,9 +98,11 @@ def test_idle_after_preview_releases_hidden_powerpoint(qtbot, monkeypatch, tmp_p
         with qtbot.waitSignal(w.rendered, timeout=1000):
             w.request(1, "f.pptx", 1)
         assert released.wait(0.5), "hidden PowerPoint was kept alive after preview became idle"
+        assert shutdowns == [], "idle cleanup must not restart the renderer child next time"
     finally:
         w.stop()
         w.wait(3000)
+    assert shutdowns == ["shutdown"]
 
 
 def test_idle_release_failure_does_not_kill_future_preview_requests(qtbot, monkeypatch, tmp_path):
@@ -104,13 +114,15 @@ def test_idle_release_failure_does_not_kill_future_preview_requests(qtbot, monke
         shutdown_calls += 1
         if shutdown_calls == 1:
             raise RuntimeError("PowerPoint rejected shutdown")
+        return True
 
     monkeypatch.setattr(
         renderer,
         "render_page",
         lambda _path, page_no, **_kwargs: tmp_path / f"{page_no}.png",
     )
-    monkeypatch.setattr(renderer, "shutdown", flaky_shutdown)
+    monkeypatch.setattr(renderer, "release_session", flaky_shutdown, raising=False)
+    monkeypatch.setattr(renderer, "shutdown", lambda: None)
     monkeypatch.setattr(RenderWorker, "_SESSION_IDLE_RELEASE_SEC", 0.03, raising=False)
 
     w = RenderWorker()
@@ -142,7 +154,13 @@ def test_rapid_preview_burst_eventually_releases_hidden_powerpoint(
         return tmp_path / f"{page_no}.png"
 
     monkeypatch.setattr(renderer, "render_page", fake_render)
-    monkeypatch.setattr(renderer, "shutdown", lambda: shutdowns.append(time.monotonic()))
+    monkeypatch.setattr(
+        renderer,
+        "release_session",
+        lambda: shutdowns.append(time.monotonic()) or True,
+        raising=False,
+    )
+    monkeypatch.setattr(renderer, "shutdown", lambda: None)
     monkeypatch.setattr(RenderWorker, "_SESSION_IDLE_RELEASE_SEC", 0.03, raising=False)
 
     w = RenderWorker()
@@ -182,6 +200,7 @@ def test_preview_and_prefetch_reuse_the_same_safe_snapshot(qtbot, monkeypatch, t
     monkeypatch.setattr(renderer, "render_page", fake_render)
     monkeypatch.setattr(renderer, "background_powerpoint_allowed", lambda: True, raising=False)
     monkeypatch.setattr(renderer, "shutdown", lambda: None)
+    monkeypatch.setattr(renderer, "release_session", lambda: True, raising=False)
 
     w = RenderWorker()
     w.start()
@@ -454,21 +473,23 @@ def test_primary_prefetch_starts_quickly_without_raising_concurrency(qtbot, monk
 def test_release_session_runs_cleanup_on_render_thread_and_clears_queued_work(
     qtbot, monkeypatch
 ):
-    shutdown_threads: list[int] = []
+    release_threads: list[int] = []
     caller_thread = threading.get_ident()
     monkeypatch.setattr(
         renderer,
-        "shutdown",
-        lambda: shutdown_threads.append(threading.get_ident()),
+        "release_session",
+        lambda: release_threads.append(threading.get_ident()) or True,
+        raising=False,
     )
+    monkeypatch.setattr(renderer, "shutdown", lambda: None)
     w = RenderWorker()
     w.prefetch("old.pptx", 2)
     w.start()
     try:
         qtbot.waitUntil(w.isRunning, timeout=1000)
         assert w.release_session(timeout_sec=1.0) is True
-        assert shutdown_threads
-        assert shutdown_threads[0] != caller_thread
+        assert release_threads
+        assert release_threads[0] != caller_thread
         assert list(w._prefetch) == []
         assert w._preview is None
     finally:

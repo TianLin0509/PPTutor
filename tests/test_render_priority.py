@@ -10,6 +10,8 @@ import threading
 import time
 import types
 
+import pytest
+
 from pptx_finder import renderer
 
 
@@ -215,6 +217,31 @@ def test_shutdown_closes_owned_presentation_but_never_quits_powerpoint(monkeypat
     assert closed == [True]
     assert app.quit_calls == 0
     assert getattr(renderer._state, "app", None) is None
+
+
+def test_release_session_closes_borrowed_snapshot_but_never_quits_user_powerpoint(
+    monkeypatch,
+):
+    app = _FakeApp()
+    pres = _FakePres()
+    closed = []
+    pres.Close = lambda: closed.append("snapshot")
+    monkeypatch.setattr(renderer, "_ipc_enabled", lambda: False)
+    renderer._state.app = app
+    renderer._state.app_mode = "borrowed"
+    renderer._state.app_owned_pid = None
+    renderer._state.app_owned_handle = None
+    renderer._state.pres = pres
+    renderer._state.pres_path = "C:/cache/snapshot.pptx"
+    renderer._state.pres_key = "snapshot"
+    renderer._state.owned_presentations = [pres]
+
+    assert renderer.release_session() is True
+
+    assert closed == ["snapshot"]
+    assert app.quit_calls == 0
+    assert renderer._state.app is None
+    assert renderer._state.app_mode is None
 
 
 def test_shutdown_closes_every_renderer_owned_presentation_reference(monkeypatch):
@@ -599,6 +626,63 @@ def test_owned_powerpoint_pid_falls_back_to_new_process_diff(monkeypatch):
     assert pid == 4242
 
 
+def test_get_app_refuses_process_not_created_by_renderer_com_activation(monkeypatch):
+    events = []
+    app = types.SimpleNamespace()
+    pythoncom = types.SimpleNamespace(
+        CoInitialize=lambda: events.append("coinit"),
+        CoUninitialize=lambda: events.append("couninit"),
+    )
+    client = types.SimpleNamespace(
+        DispatchEx=lambda progid: events.append(("dispatch", progid)) or app,
+    )
+    monkeypatch.setitem(sys.modules, "pythoncom", pythoncom)
+    monkeypatch.setitem(sys.modules, "win32com", types.SimpleNamespace(client=client))
+    monkeypatch.setitem(sys.modules, "win32com.client", client)
+    monkeypatch.setattr(renderer, "_powerpoint_process_ids", lambda: set())
+    monkeypatch.setattr(renderer, "_powerpoint_active", lambda **_kwargs: False)
+    monkeypatch.setattr(renderer, "_discover_owned_powerpoint_pid", lambda *_a, **_k: 4242)
+    monkeypatch.setattr(
+        renderer,
+        "_powerpoint_process_has_renderer_activation_parent",
+        lambda _pid: False,
+        raising=False,
+    )
+    opened_handles = []
+    monkeypatch.setattr(
+        renderer,
+        "_open_owned_powerpoint_handle",
+        lambda pid: opened_handles.append(pid),
+    )
+    renderer._state.app = None
+    renderer._state.app_mode = None
+    renderer._state.app_owned_pid = None
+    renderer._state.app_owned_handle = None
+    renderer._state.owned_presentations = []
+    renderer._state.com_initialized_by_renderer = False
+
+    with pytest.raises(renderer.PowerPointSessionBusy, match="activation parent"):
+        renderer._get_app()
+
+    assert opened_handles == []
+    assert renderer._state.app is None
+    assert renderer._state.app_owned_pid is None
+    assert events == ["coinit", ("dispatch", "PowerPoint.Application"), "couninit"]
+
+
+def test_renderer_activation_parent_accepts_current_process_or_dcom(monkeypatch):
+    monkeypatch.setattr(renderer, "_parent_pid_for_process", lambda _pid: 111, raising=False)
+    monkeypatch.setattr(renderer.os, "getpid", lambda: 111)
+    monkeypatch.setattr(renderer, "_dcom_launch_service_pid", lambda: 222, raising=False)
+    assert renderer._powerpoint_process_has_renderer_activation_parent(4242) is True
+
+    monkeypatch.setattr(renderer, "_parent_pid_for_process", lambda _pid: 222, raising=False)
+    assert renderer._powerpoint_process_has_renderer_activation_parent(4242) is True
+
+    monkeypatch.setattr(renderer, "_parent_pid_for_process", lambda _pid: 333, raising=False)
+    assert renderer._powerpoint_process_has_renderer_activation_parent(4242) is False
+
+
 def test_render_page_snapshot_opens_temp_copy_not_live_file(tmp_path, monkeypatch):
     renderer.shutdown()
     renderer._failed_until.clear()
@@ -691,6 +775,203 @@ def test_active_powerpoint_fails_closed_without_getting_user_app(
 
     assert out is None
     assert get_app_calls == []
+
+
+def test_explicit_preview_borrows_active_powerpoint_but_opens_only_hidden_readonly_snapshot(
+    tmp_path,
+    monkeypatch,
+):
+    renderer.shutdown()
+    renderer._failed_until.clear()
+    monkeypatch.setattr(renderer, "cache_dir", lambda: tmp_path)
+    monkeypatch.setattr(renderer, "_ipc_enabled", lambda: False)
+    monkeypatch.setattr(renderer, "_powerpoint_active", lambda **_kwargs: True)
+    src = tmp_path / "user-session-active.pptx"
+    src.write_bytes(b"dummy")
+    opened = []
+
+    class Count:
+        def __init__(self, value):
+            self.Count = value
+
+    class BorrowedPres(_FakePres):
+        ReadOnly = -1
+
+        def __init__(self, path):
+            super().__init__()
+            self.FullName = path
+            self.Windows = Count(0)
+
+    class BorrowedApp:
+        def __init__(self):
+            self.Windows = Count(1)
+            self.ActivePresentation = types.SimpleNamespace(FullName="C:/user/editing.pptx")
+            self.Presentations = self.PresentationsImpl(self)
+
+        class PresentationsImpl:
+            def __init__(self, app):
+                self.app = app
+
+            def Open(self, path, ReadOnly=1, WithWindow=0):
+                opened.append((path, ReadOnly, WithWindow))
+                return BorrowedPres(path)
+
+    app = BorrowedApp()
+    borrowed = []
+
+    def borrow():
+        borrowed.append(True)
+        renderer._state.app = app
+        renderer._state.app_mode = "borrowed"
+        renderer._state.app_owned_pid = None
+        return app
+
+    monkeypatch.setattr(renderer, "_attach_borrowed_powerpoint", borrow)
+
+    out = renderer._render_page_direct(
+        str(src),
+        1,
+        cache_key="borrowed-active",
+        long_edge=962,
+        hi_priority=True,
+        use_snapshot=True,
+        allow_borrowed_session=True,
+    )
+
+    assert out == tmp_path / "borrowed-active_1_962.png"
+    assert borrowed == [True]
+    assert len(opened) == 1
+    assert opened[0][0] != str(src)
+    assert opened[0][1:] == (1, 0)
+    assert app.Windows.Count == 1
+    assert app.ActivePresentation.FullName == "C:/user/editing.pptx"
+    renderer.shutdown()
+
+
+def test_borrowed_snapshot_is_closed_if_powerpoint_creates_a_user_visible_window(
+    tmp_path,
+):
+    closed = []
+
+    class Count:
+        def __init__(self, value):
+            self.Count = value
+
+    class UnsafePres(_FakePres):
+        ReadOnly = -1
+
+        def __init__(self, path):
+            super().__init__()
+            self.FullName = path
+            self.Windows = Count(1)
+
+        def Close(self):
+            closed.append("snapshot")
+
+    class UnsafeApp:
+        def __init__(self):
+            self.Windows = Count(1)
+            self.ActivePresentation = types.SimpleNamespace(FullName="C:/user/editing.pptx")
+            self.Presentations = self.PresentationsImpl(self)
+
+        class PresentationsImpl:
+            def __init__(self, app):
+                self.app = app
+
+            def Open(self, path, ReadOnly=1, WithWindow=0):
+                self.app.Windows.Count = 2
+                return UnsafePres(path)
+
+    app = UnsafeApp()
+    renderer._state.app_mode = "borrowed"
+    renderer._state.owned_presentations = []
+
+    with pytest.raises(renderer.PowerPointSessionBusy, match="hidden snapshot audit"):
+        renderer._open_pres(app, str(tmp_path / "snapshot.pptx"), "unsafe")
+
+    assert closed == ["snapshot"]
+    assert renderer._state.owned_presentations == []
+
+
+def test_owned_session_is_demoted_before_reuse_if_user_window_appears(monkeypatch):
+    class Handle:
+        def __init__(self):
+            self.closed = False
+
+        def Close(self):
+            self.closed = True
+
+    app = types.SimpleNamespace(Presentations=types.SimpleNamespace(Count=0))
+    handle = Handle()
+    renderer._state.app = app
+    renderer._state.app_mode = "owned"
+    renderer._state.app_owned_pid = 777
+    renderer._state.app_owned_handle = handle
+    renderer._state.owned_presentations = []
+    monkeypatch.setattr(renderer, "_pid_has_visible_window", lambda _pid: True)
+
+    got = renderer._app_for_render(allow_borrowed_session=True)
+
+    assert got is app
+    assert renderer._state.app_mode == "borrowed"
+    assert renderer._state.app_owned_pid is None
+    assert renderer._state.app_owned_handle is None
+    assert handle.closed is True
+    renderer._state.app = None
+    renderer._state.app_mode = None
+
+
+def test_attach_borrowed_powerpoint_uses_rot_and_never_dispatches_or_quits(monkeypatch):
+    events = []
+
+    class BorrowedApp:
+        def Quit(self):
+            events.append("quit")
+
+    app = BorrowedApp()
+    pythoncom = types.SimpleNamespace(
+        CoInitialize=lambda: events.append("coinit"),
+        CoUninitialize=lambda: events.append("couninit"),
+    )
+    client = types.SimpleNamespace(
+        GetActiveObject=lambda progid: events.append(("get-active", progid)) or app,
+        DispatchEx=lambda _progid: (_ for _ in ()).throw(
+            AssertionError("borrowed path must not start another PowerPoint")
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "pythoncom", pythoncom)
+    monkeypatch.setitem(sys.modules, "win32com", types.SimpleNamespace(client=client))
+    monkeypatch.setitem(sys.modules, "win32com.client", client)
+    monkeypatch.setattr(renderer, "_powerpoint_process_ids", lambda: {321})
+    monkeypatch.setattr(renderer, "_pid_for_app", lambda _app: 321)
+    renderer._state.app = None
+    renderer._state.app_mode = None
+    renderer._state.app_owned_pid = None
+    renderer._state.app_owned_handle = None
+    renderer._state.owned_presentations = []
+    renderer._state.com_initialized_by_renderer = False
+
+    got = renderer._attach_borrowed_powerpoint()
+
+    assert got is app
+    assert renderer._state.app_mode == "borrowed"
+    assert renderer._state.app_borrowed_pid == 321
+    renderer._release_local_app_reference()
+    assert events == ["coinit", ("get-active", "PowerPoint.Application"), "couninit"]
+
+
+def test_background_work_cannot_reuse_a_borrowed_user_session():
+    app = object()
+    renderer._state.app = app
+    renderer._state.app_mode = "borrowed"
+    renderer._state.app_owned_pid = None
+    renderer._state.owned_presentations = []
+    try:
+        with pytest.raises(renderer.PowerPointSessionBusy, match="background work"):
+            renderer._app_for_render(allow_borrowed_session=False)
+    finally:
+        renderer._state.app = None
+        renderer._state.app_mode = None
 
 
 def test_powerpoint_session_busy_returns_none_without_poisoning_retry_cache(

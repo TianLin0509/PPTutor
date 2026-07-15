@@ -50,7 +50,7 @@ _RENDER_CACHE_GENERATION = "com-only-v1"
 
 
 class PowerPointSessionBusy(RuntimeError):
-    """A user/foreign PowerPoint COM server already exists; preview must stand down."""
+    """PowerPoint cannot be used without crossing the preview safety boundary."""
 
 
 class PowerPointHandoffBusy(RuntimeError):
@@ -144,6 +144,149 @@ def _powerpoint_process_ids() -> set[int] | None:
                 except Exception:  # noqa: BLE001
                     pass
     return found
+
+
+def _parent_pid_for_process(pid: int) -> int | None:
+    """Return a process parent PID through the documented Toolhelp API."""
+    if os.name != "nt" or int(pid or 0) <= 0:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.c_size_t),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", wintypes.LONG),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", wintypes.WCHAR * 260),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_snapshot = kernel32.CreateToolhelp32Snapshot
+        create_snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        create_snapshot.restype = wintypes.HANDLE
+        process_first = kernel32.Process32FirstW
+        process_first.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+        process_first.restype = wintypes.BOOL
+        process_next = kernel32.Process32NextW
+        process_next.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+        process_next.restype = wintypes.BOOL
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [wintypes.HANDLE]
+        close_handle.restype = wintypes.BOOL
+
+        snapshot = create_snapshot(0x00000002, 0)  # TH32CS_SNAPPROCESS
+        if snapshot in (None, ctypes.c_void_p(-1).value):
+            return None
+        try:
+            entry = PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+            if not process_first(snapshot, ctypes.byref(entry)):
+                return None
+            while True:
+                if int(entry.th32ProcessID) == int(pid):
+                    parent = int(entry.th32ParentProcessID or 0)
+                    return parent if parent > 0 else None
+                if not process_next(snapshot, ctypes.byref(entry)):
+                    return None
+        finally:
+            close_handle(snapshot)
+    except Exception:  # noqa: BLE001 ownership proof must fail closed
+        return None
+
+
+def _dcom_launch_service_pid() -> int | None:
+    """Return the Windows DcomLaunch service PID without WMI or subprocesses."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class SERVICE_STATUS_PROCESS(ctypes.Structure):
+            _fields_ = [
+                ("dwServiceType", wintypes.DWORD),
+                ("dwCurrentState", wintypes.DWORD),
+                ("dwControlsAccepted", wintypes.DWORD),
+                ("dwWin32ExitCode", wintypes.DWORD),
+                ("dwServiceSpecificExitCode", wintypes.DWORD),
+                ("dwCheckPoint", wintypes.DWORD),
+                ("dwWaitHint", wintypes.DWORD),
+                ("dwProcessId", wintypes.DWORD),
+                ("dwServiceFlags", wintypes.DWORD),
+            ]
+
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        open_manager = advapi32.OpenSCManagerW
+        open_manager.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD]
+        open_manager.restype = wintypes.HANDLE
+        open_service = advapi32.OpenServiceW
+        open_service.argtypes = [wintypes.HANDLE, wintypes.LPCWSTR, wintypes.DWORD]
+        open_service.restype = wintypes.HANDLE
+        query_status = advapi32.QueryServiceStatusEx
+        query_status.argtypes = [
+            wintypes.HANDLE,
+            wintypes.INT,
+            ctypes.POINTER(wintypes.BYTE),
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        query_status.restype = wintypes.BOOL
+        close_service = advapi32.CloseServiceHandle
+        close_service.argtypes = [wintypes.HANDLE]
+        close_service.restype = wintypes.BOOL
+
+        manager = open_manager(None, None, 0x0001)  # SC_MANAGER_CONNECT
+        if not manager:
+            return None
+        service = None
+        try:
+            service = open_service(manager, "DcomLaunch", 0x0004)  # SERVICE_QUERY_STATUS
+            if not service:
+                return None
+            status = SERVICE_STATUS_PROCESS()
+            needed = wintypes.DWORD()
+            ok = query_status(
+                service,
+                0,  # SC_STATUS_PROCESS_INFO
+                ctypes.cast(ctypes.byref(status), ctypes.POINTER(wintypes.BYTE)),
+                ctypes.sizeof(status),
+                ctypes.byref(needed),
+            )
+            if not ok:
+                return None
+            service_pid = int(status.dwProcessId or 0)
+            return service_pid if service_pid > 0 else None
+        finally:
+            if service:
+                close_service(service)
+            close_service(manager)
+    except Exception:  # noqa: BLE001 ownership proof must fail closed
+        return None
+
+
+def _powerpoint_process_has_renderer_activation_parent(pid: int) -> bool:
+    """Prove the new PowerPoint came from this renderer or Windows COM SCM.
+
+    A plain before/after PID diff is not enough: the user could manually launch
+    PowerPoint in the same narrow window as DispatchEx.  COM activation on
+    Windows is parented by the DcomLaunch service (or, on some Office builds,
+    directly by this renderer process); a shell/user launch is not.
+    """
+    parent_pid = _parent_pid_for_process(int(pid))
+    if parent_pid is None:
+        return False
+    if parent_pid == os.getpid():
+        return True
+    dcom_pid = _dcom_launch_service_pid()
+    return dcom_pid is not None and parent_pid == dcom_pid
 
 
 def _app_hwnd(app) -> int | None:
@@ -301,6 +444,119 @@ def _com_slot(hi_priority: bool, priority: int | None = None):
             _cv.notify_all()
 
 
+def _initialize_renderer_com() -> None:
+    """Initialize COM once for the renderer thread/apartment."""
+    if bool(getattr(_state, "com_initialized_by_renderer", False)):
+        return
+    import pythoncom
+
+    pythoncom.CoInitialize()
+    _state.com_initialized_by_renderer = True
+
+
+def _attach_borrowed_powerpoint():
+    """Attach to an existing user PowerPoint for one explicit preview session.
+
+    PowerPoint is a single-instance COM server.  There is no supported way to
+    create a second, process-isolated automation server beside the user's app.
+    This path therefore borrows only the Application reference; the renderer
+    still opens an exact, read-only, windowless snapshot and owns only that
+    Presentation.  Cleanup never calls Quit or terminates this process.
+    """
+    app = getattr(_state, "app", None)
+    if app is not None:
+        return app
+    existing_pids = _powerpoint_process_ids()
+    if not existing_pids:
+        raise PowerPointSessionBusy("no existing PowerPoint process is available to borrow")
+
+    import win32com.client
+
+    _initialize_renderer_com()
+    try:
+        app = win32com.client.GetActiveObject("PowerPoint.Application")
+    except Exception:
+        _release_local_app_reference()
+        raise PowerPointSessionBusy("the active PowerPoint COM server is unavailable") from None
+
+    borrowed_pid = _pid_for_app(app)
+    if borrowed_pid is None and len(existing_pids) == 1:
+        borrowed_pid = next(iter(existing_pids))
+    if borrowed_pid is None or borrowed_pid not in existing_pids:
+        _state.app = app
+        _state.app_mode = "borrowed"
+        _release_local_app_reference()
+        raise PowerPointSessionBusy("cannot audit the active PowerPoint process")
+
+    _state.app = app
+    _state.app_mode = "borrowed"
+    _state.app_borrowed_pid = int(borrowed_pid)
+    _state.app_owned_pid = None
+    _state.app_owned_handle = None
+    log.info("borrowing active PowerPoint for a hidden read-only snapshot: pid=%s", borrowed_pid)
+    return app
+
+
+def _demote_owned_session_if_shared(app) -> bool:
+    """Relinquish all process-exit authority if the owned server became user-visible."""
+    owned_pid = getattr(_state, "app_owned_pid", None)
+    if owned_pid is None:
+        return False
+    try:
+        visible = _pid_has_visible_window(int(owned_pid))
+        total_presentations = int(app.Presentations.Count)
+        renderer_presentations = len(list(getattr(_state, "owned_presentations", [])))
+        has_foreign_document = total_presentations > renderer_presentations
+    except Exception:  # noqa: BLE001 an uncertain ownership audit must fail closed
+        visible = True
+        has_foreign_document = True
+    if not visible and not has_foreign_document:
+        return False
+
+    handle = getattr(_state, "app_owned_handle", None)
+    _close_process_handle(handle)
+    _state.app_owned_pid = None
+    _state.app_owned_handle = None
+    _state.app_borrowed_pid = int(owned_pid)
+    _state.app_mode = "borrowed"
+    log.info(
+        "preview PowerPoint became user-owned; process-exit authority relinquished: pid=%s",
+        owned_pid,
+    )
+    return True
+
+
+def _app_for_render(*, allow_borrowed_session: bool):
+    """Return an owned app, or explicitly borrow the already-running user app."""
+    app = getattr(_state, "app", None)
+    if app is not None:
+        _demote_owned_session_if_shared(app)
+        if getattr(_state, "app_mode", None) == "borrowed" and not allow_borrowed_session:
+            raise PowerPointSessionBusy("background work may not borrow the user PowerPoint session")
+        return app
+
+    existing_pids = _powerpoint_process_ids()
+    if existing_pids is None:
+        raise PowerPointSessionBusy(
+            "cannot audit PowerPoint process ownership; preview renderer disabled"
+        )
+    if existing_pids or _powerpoint_active(force=True):
+        if allow_borrowed_session:
+            return _attach_borrowed_powerpoint()
+        raise PowerPointSessionBusy(
+            "PowerPoint is already running; background renderer will not attach"
+        )
+    try:
+        return _get_app()
+    except PowerPointSessionBusy:
+        # Close the race where the user starts PowerPoint between the process
+        # audit above and DispatchEx.  Only the explicit clicked-preview path may
+        # recover by borrowing the now-active server.
+        if allow_borrowed_session and _powerpoint_active(force=True):
+            return _attach_borrowed_powerpoint()
+        raise
+
+
 def _get_app():
     app = getattr(_state, "app", None)
     if app is not None:
@@ -314,27 +570,29 @@ def _get_app():
         raise PowerPointSessionBusy(
             "PowerPoint is already running; refusing to attach the preview renderer"
         )
-    import pythoncom
     import win32com.client
 
-    pythoncom.CoInitialize()
-    _state.com_initialized_by_renderer = True
+    _initialize_renderer_com()
     try:
         app = win32com.client.DispatchEx("PowerPoint.Application")
     except Exception:
-        try:
-            pythoncom.CoUninitialize()
-        except Exception:  # noqa: BLE001
-            pass
-        _state.com_initialized_by_renderer = False
+        _release_local_app_reference()
         raise
     _state.app = app
+    _state.app_mode = "owned"
+    _state.app_borrowed_pid = None
     owned_pid = _discover_owned_powerpoint_pid(app, existing_pids=existing_pids)
     if owned_pid is None or owned_pid in existing_pids:
         _state.app_owned_pid = None
         _release_local_app_reference()
         raise PowerPointSessionBusy(
             "could not prove exclusive ownership of the preview PowerPoint process"
+        )
+    if not _powerpoint_process_has_renderer_activation_parent(owned_pid):
+        _state.app_owned_pid = None
+        _release_local_app_reference()
+        raise PowerPointSessionBusy(
+            "could not prove the PowerPoint COM activation parent"
         )
     _state.app_owned_pid = owned_pid
     _state.app_owned_handle = _open_owned_powerpoint_handle(owned_pid)
@@ -383,6 +641,8 @@ def _release_local_app_reference() -> None:
             log.debug("owned preview PowerPoint did not quit cleanly: %s", exc)
     _close_process_handle(owned_handle)
     _state.app = None
+    _state.app_mode = None
+    _state.app_borrowed_pid = None
     _state.app_owned_pid = None
     _state.app_owned_handle = None
     _invalidate_powerpoint_active_cache()
@@ -647,6 +907,76 @@ def prewarm() -> bool:
         return False
 
 
+def _normalized_com_path(value: object) -> str:
+    try:
+        return os.path.normcase(os.path.abspath(str(value or "")))
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _active_presentation_path(app) -> str | None:
+    try:
+        value = str(app.ActivePresentation.FullName or "")
+        return _normalized_com_path(value) if value else None
+    except Exception:  # noqa: BLE001 no active presentation is a valid state
+        return None
+
+
+def _audit_borrowed_hidden_presentation(
+    app,
+    pres,
+    expected_path: str,
+    *,
+    windows_before: int,
+    active_before: str | None,
+) -> None:
+    """Prove that borrowing did not create/activate a user-visible document window."""
+    problems: list[str] = []
+    try:
+        if int(pres.ReadOnly) == 0:
+            problems.append("snapshot is writable")
+    except Exception:  # noqa: BLE001 missing proof is unsafe in a user session
+        problems.append("read-only state unavailable")
+    try:
+        if int(pres.Windows.Count) != 0:
+            problems.append("snapshot created a document window")
+    except Exception:  # noqa: BLE001
+        problems.append("snapshot window state unavailable")
+    try:
+        if _normalized_com_path(pres.FullName) != _normalized_com_path(expected_path):
+            problems.append("PowerPoint opened a different document")
+    except Exception:  # noqa: BLE001
+        problems.append("snapshot identity unavailable")
+    try:
+        if int(app.Windows.Count) != int(windows_before):
+            problems.append("user window count changed")
+    except Exception:  # noqa: BLE001
+        problems.append("application window state unavailable")
+    active_after = _active_presentation_path(app)
+    if active_before is not None and active_after != active_before:
+        problems.append("active user presentation changed")
+    if problems:
+        raise PowerPointSessionBusy(
+            "borrowed PowerPoint hidden snapshot audit failed: " + "; ".join(problems)
+        )
+
+
+def _close_unaccepted_presentation(pres) -> bool:
+    """Close an opened snapshot that failed the borrowed-session audit."""
+    for attempt in range(3):
+        try:
+            pres.Close()
+            return True
+        except Exception:  # noqa: BLE001 PowerPoint may transiently reject RPC calls
+            if attempt < 2:
+                time.sleep(0.05)
+    owned = list(getattr(_state, "owned_presentations", []))
+    if not any(item is pres for item in owned):
+        owned.append(pres)
+    _state.owned_presentations = owned
+    return False
+
+
 def _open_pres(app, path: str, cache_key: str):
     """复用上次打开的 Presentation：同文件同内容直接返回，免重复 Open（翻页 / 多次预览
     同一稿，最耗时的就是 Open，大稿尤甚）；换文件或文件已变（cache_key 含 mtime+size）
@@ -654,10 +984,45 @@ def _open_pres(app, path: str, cache_key: str):
     if (getattr(_state, "pres", None) is not None
             and getattr(_state, "pres_path", None) == path
             and getattr(_state, "pres_key", None) == cache_key):
+        if getattr(_state, "app_mode", None) == "borrowed":
+            try:
+                if int(_state.pres.Windows.Count) != 0:
+                    raise PowerPointSessionBusy(
+                        "borrowed PowerPoint snapshot unexpectedly became visible"
+                    )
+            except PowerPointSessionBusy:
+                raise
+            except Exception:
+                raise PowerPointSessionBusy(
+                    "borrowed PowerPoint snapshot visibility cannot be audited"
+                ) from None
         return _state.pres
     if not _close_pres(clean_snapshot=False):
         raise RuntimeError("previous preview presentation is still closing")
+    borrowed = getattr(_state, "app_mode", None) == "borrowed"
+    windows_before = 0
+    active_before = None
+    if borrowed:
+        try:
+            windows_before = int(app.Windows.Count)
+        except Exception:
+            raise PowerPointSessionBusy(
+                "borrowed PowerPoint application windows cannot be audited"
+            ) from None
+        active_before = _active_presentation_path(app)
     pres = app.Presentations.Open(path, ReadOnly=1, WithWindow=0)
+    if borrowed:
+        try:
+            _audit_borrowed_hidden_presentation(
+                app,
+                pres,
+                path,
+                windows_before=windows_before,
+                active_before=active_before,
+            )
+        except Exception:
+            _close_unaccepted_presentation(pres)
+            raise
     _state.pres = pres
     owned = list(getattr(_state, "owned_presentations", []))
     if not any(item is pres for item in owned):
@@ -747,6 +1112,26 @@ def close_current_presentation() -> None:
     _close_pres()
 
 
+def release_session() -> bool:
+    """Release all PowerPoint state but keep the isolated renderer service alive.
+
+    The packaged GUI pays Python/PyInstaller child startup only once.  After an
+    idle preview we close the exact snapshot and either exit our proven-owned
+    headless PowerPoint or drop the borrowed user Application reference.  The
+    child then blocks on its local socket with no polling and no COM server.
+    """
+    if _ipc_enabled():
+        try:
+            from . import render_client
+
+            return bool(render_client.release_session())
+        except Exception:  # noqa: BLE001
+            return False
+    closed = _close_pres()
+    _release_local_app_reference()
+    return bool(closed and getattr(_state, "app", None) is None)
+
+
 def find_cached_render(
     path: str,
     page_no: int,
@@ -793,6 +1178,7 @@ def _render_page_direct(
     priority: int | None = None,
     use_snapshot: bool = False,
     existing_session_only: bool = False,
+    allow_borrowed_session: bool = False,
 ) -> Path | None:
     """导出 path 第 page_no 页（1-based）为高清 PNG，返回缓存路径；失败返回 None。
 
@@ -823,10 +1209,11 @@ def _render_page_direct(
             not existing_session_only
             and getattr(_state, "app", None) is None
             and _powerpoint_active(force=True)
+            and not allow_borrowed_session
         ):
-            # Strict COM-only contract: never attach a preview snapshot to the
-            # user's visible PowerPoint and never substitute another renderer.
-            log.info("PowerPoint is active; COM-only preview declined safely")
+            # Background work must never attach to the user's PowerPoint.  An
+            # explicit clicked preview may use the audited borrowed path below.
+            log.info("PowerPoint is active; background COM render declined safely")
             return None
         try:
             if existing_session_only:
@@ -847,7 +1234,9 @@ def _render_page_direct(
                 ):
                     return None
             else:
-                app = _get_app()
+                app = _app_for_render(
+                    allow_borrowed_session=bool(allow_borrowed_session)
+                )
                 open_path = path
                 if use_snapshot:
                     open_path = _snapshot_for_render(path, cache_key)
@@ -887,6 +1276,7 @@ def render_page(
     priority: int | None = None,
     use_snapshot: bool = False,
     existing_session_only: bool = False,
+    allow_borrowed_session: bool = False,
     one_shot: bool = False,
 ) -> Path | None:
     """Render a page, using a child process in packaged GUI builds."""
@@ -897,6 +1287,7 @@ def render_page(
             "hi_priority": hi_priority,
             "priority": priority,
             "use_snapshot": use_snapshot,
+            "allow_borrowed_session": bool(allow_borrowed_session),
         }
         if existing_session_only:
             direct_kwargs["existing_session_only"] = True
@@ -932,6 +1323,7 @@ def render_page(
             "hi_priority": hi_priority,
             "priority": priority,
             "use_snapshot": use_snapshot,
+            "allow_borrowed_session": bool(allow_borrowed_session),
         }
         if existing_session_only:
             client_kwargs["existing_session_only"] = True
@@ -951,6 +1343,7 @@ def render_page_once(
     hi_priority: bool = False,
     priority: int | None = None,
     use_snapshot: bool = False,
+    allow_borrowed_session: bool = False,
 ) -> Path | None:
     """Render one historical preview and close that presentation atomically."""
     return render_page(
@@ -961,6 +1354,7 @@ def render_page_once(
         hi_priority=hi_priority,
         priority=priority,
         use_snapshot=use_snapshot,
+        allow_borrowed_session=allow_borrowed_session,
         one_shot=True,
     )
 

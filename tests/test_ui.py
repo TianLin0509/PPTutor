@@ -566,7 +566,8 @@ def test_unavailable_preview_explains_how_original_image_rendering_is_restored(
     message = win.image_label.text()
     assert "COM 原图渲染失败" in message
     assert "独立预览引擎" not in message
-    assert "关闭 PowerPoint" in message
+    assert "无需关闭正在编辑的文稿" in message
+    assert "请关闭 PowerPoint" not in message
 
 
 def test_preview_cache_lookup_uses_index_metadata_without_source_stat(

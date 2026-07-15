@@ -403,6 +403,7 @@ class RendererProcessClient:
         priority: int | None,
         use_snapshot: bool = False,
         existing_session_only: bool = False,
+        allow_borrowed_session: bool = False,
         one_shot: bool = False,
     ) -> Path | None:
         try:
@@ -416,6 +417,7 @@ class RendererProcessClient:
                 "priority": priority,
                 "use_snapshot": bool(use_snapshot),
                 "existing_session_only": bool(existing_session_only),
+                "allow_borrowed_session": bool(allow_borrowed_session),
             })
         except Exception:
             return None
@@ -428,6 +430,21 @@ class RendererProcessClient:
                 self._request_locked({"op": "close_current"})
             except Exception:
                 pass
+
+    def release_session(self) -> bool:
+        """Release PowerPoint/COM while keeping the renderer child ready and idle."""
+        with self._lock:
+            proc = self._proc
+            try:
+                if proc is None or proc.poll() is not None:
+                    return True
+            except Exception:
+                return False
+            try:
+                resp = self._request_locked({"op": "release_session"})
+                return bool(resp.get("ok") and resp.get("released"))
+            except Exception:
+                return False
 
     def prewarm(self) -> None:
         with self._lock:
@@ -491,6 +508,7 @@ def render_page(
     priority: int | None,
     use_snapshot: bool = False,
     existing_session_only: bool = False,
+    allow_borrowed_session: bool = False,
     one_shot: bool = False,
 ) -> Path | None:
     return _client.render_page(
@@ -502,6 +520,7 @@ def render_page(
         priority=priority,
         use_snapshot=use_snapshot,
         existing_session_only=existing_session_only,
+        allow_borrowed_session=allow_borrowed_session,
         one_shot=one_shot,
     )
 
@@ -515,6 +534,7 @@ def render_page_once(
     hi_priority: bool,
     priority: int | None,
     use_snapshot: bool = False,
+    allow_borrowed_session: bool = False,
 ) -> Path | None:
     return render_page(
         path,
@@ -524,12 +544,17 @@ def render_page_once(
         hi_priority=hi_priority,
         priority=priority,
         use_snapshot=use_snapshot,
+        allow_borrowed_session=allow_borrowed_session,
         one_shot=True,
     )
 
 
 def close_current_presentation() -> None:
     _client.close_current_presentation()
+
+
+def release_session() -> bool:
+    return _client.release_session()
 
 
 def prewarm() -> None:
