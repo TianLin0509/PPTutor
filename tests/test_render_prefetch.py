@@ -43,6 +43,36 @@ def test_preview_then_prefetch(qtbot, monkeypatch, tmp_path):
         w.wait(3000)
 
 
+def test_clicked_preview_never_borrows_active_user_powerpoint_session(
+    qtbot,
+    monkeypatch,
+    tmp_path,
+):
+    calls: list[dict] = []
+
+    def fake_render(*_args, **kwargs):
+        calls.append(dict(kwargs))
+        return tmp_path / "rendered.png"
+
+    monkeypatch.setattr(renderer, "render_page", fake_render)
+    monkeypatch.setattr(renderer, "shutdown", lambda: None)
+    w = RenderWorker()
+    w.start()
+    try:
+        with qtbot.waitSignal(w.rendered, timeout=1000):
+            w.request(1, "clicked.pptx", 3)
+        w.prefetch("clicked.pptx", 4)
+        qtbot.waitUntil(lambda: len(calls) >= 2, timeout=1500)
+
+        assert "allow_foreign_session" not in calls[0]
+        assert calls[0].get("existing_session_only", False) is False
+        assert "allow_foreign_session" not in calls[1]
+        assert calls[1]["existing_session_only"] is True
+    finally:
+        w.stop()
+        w.wait(3000)
+
+
 def test_idle_after_preview_releases_hidden_powerpoint(qtbot, monkeypatch, tmp_path):
     """A preview session must not linger for Explorer to reuse later."""
     released = threading.Event()

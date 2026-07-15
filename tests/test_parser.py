@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import fixtures_gen as fx
 
-from pptx_finder.parser import parse_pptx
+from pptx_finder import parser as parser_mod
+from pptx_finder.parser import parse_pptx, parse_pptx_page
 
 
 def test_basic_parse_and_notes(tmp_path):
@@ -21,6 +22,30 @@ def test_basic_parse_and_notes(tmp_path):
     # 备注被抓到，且归属第 2 页
     assert "NOTEWORD" in deck.pages[1].notes
     assert "NOTEWORD" in deck.pages[1].raw_text
+
+
+def test_parse_single_page_does_not_parse_the_rest_of_the_deck(tmp_path, monkeypatch):
+    p = tmp_path / "single-page-read.pptx"
+    fx.make_pptx(p, [
+        {"body": "第一页"},
+        {"body": "只读取这一页"},
+        {"body": "第三页"},
+    ])
+    parsed_pages: list[int] = []
+    original = parser_mod._parse_slide
+
+    def tracked(zf, slide_part, page_no):
+        parsed_pages.append(page_no)
+        return original(zf, slide_part, page_no)
+
+    monkeypatch.setattr(parser_mod, "_parse_slide", tracked)
+
+    page = parse_pptx_page(str(p), 2)
+
+    assert page is not None
+    assert page.page_no == 2
+    assert page.body == "只读取这一页"
+    assert parsed_pages == [2]
 
 
 def test_page_order_follows_sldidlst(tmp_path):

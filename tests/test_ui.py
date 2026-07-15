@@ -512,6 +512,88 @@ def test_preview_uses_disk_cache_as_provisional_first_paint(qtbot, tmp_path, mon
     qtbot.waitUntil(lambda: bool(render.calls), timeout=500)
 
 
+def test_worker_cover_fallback_survives_failed_high_resolution_render(qtbot, tmp_path):
+    image = tmp_path / "embedded-cover.png"
+    pm = QPixmap(320, 180)
+    pm.fill(Qt.green)
+    assert pm.save(str(image))
+
+    conn = _index(tmp_path)
+    render = PendingRender()
+    win = MainWindow(conn=conn, render_worker=render, do_index=False)
+    qtbot.addWidget(win)
+    win._req_id = 51
+
+    win._on_provisional_rendered(51, str(image))
+    win._on_rendered(51, "")
+
+    assert win._preview_provisional is True
+    assert win._cur_pixmap is not None and not win._cur_pixmap.isNull()
+    assert "无法预览" not in win.image_label.text()
+
+
+def test_safe_page_preview_is_independent_of_a_blocked_render_worker(
+    qtbot,
+    tmp_path,
+    monkeypatch,
+):
+    image = tmp_path / "safe-page.png"
+    pm = QPixmap(320, 180)
+    pm.fill(Qt.blue)
+    assert pm.save(str(image))
+
+    conn = _index(tmp_path)
+    render = PendingRender()  # accepts requests but deliberately never completes one
+    win = MainWindow(conn=conn, render_worker=render, do_index=False)
+    qtbot.addWidget(win)
+    qtbot.waitUntil(lambda: win._recent_load_inflight_token is None, timeout=1000)
+    result = _fake_results(1)[0]
+    result.path = str(tmp_path / "blocked-render.pptx")
+    win._cur = result
+    win._view_page = 1
+    monkeypatch.setattr(
+        main_window_mod.renderer_mod,
+        "find_cached_render",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        main_window_mod.thumbnailer,
+        "find_non_com_page_preview",
+        lambda *_args, **_kwargs: image,
+        raising=False,
+    )
+
+    win._request_preview()
+
+    assert render.calls
+    qtbot.waitUntil(lambda: win._cur_pixmap is not None, timeout=1000)
+    assert win._preview_provisional is True
+    assert "无法预览" not in win.image_label.text()
+
+
+def test_late_safe_preview_never_overwrites_hd_for_the_same_request(qtbot, tmp_path):
+    hd = tmp_path / "hd.png"
+    safe = tmp_path / "safe.png"
+    hd_pm = QPixmap(64, 36)
+    hd_pm.fill(Qt.red)
+    assert hd_pm.save(str(hd))
+    safe_pm = QPixmap(64, 36)
+    safe_pm.fill(Qt.blue)
+    assert safe_pm.save(str(safe))
+
+    conn = _index(tmp_path)
+    win = MainWindow(conn=conn, render_worker=PendingRender(), do_index=False)
+    qtbot.addWidget(win)
+    win._req_id = 73
+
+    win._on_rendered(73, str(hd))
+    win._on_provisional_rendered(73, str(safe))
+
+    assert win._preview_provisional is False
+    assert win._cur_pixmap is not None
+    assert win._cur_pixmap.toImage().pixelColor(1, 1) == QColor(Qt.red)
+
+
 def test_preview_cache_lookup_uses_index_metadata_without_source_stat(
     qtbot, tmp_path, monkeypatch
 ):

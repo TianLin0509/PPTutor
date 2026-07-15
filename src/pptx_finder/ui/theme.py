@@ -269,10 +269,18 @@ QLabel#kbd { color: $ink1; background: $field; border: 1px solid $bd2; border-ra
 QLabel#verShield { color: $grn; font-size: 11.5px; font-weight: 600; background: transparent; padding: 0 6px; }
 QLabel#navDot { color: #ff453a; font-size: 13px; font-weight: 700; background: transparent; }
 
-/* 索引进度条 + 百分比 + 就绪绿点 */
-QProgressBar#indexBar { background: $bd2; border: none; border-radius: 4px; max-height: 7px; min-height: 7px; }
-QProgressBar#indexBar::chunk { background: $acc; border-radius: 4px; }
-QLabel#pctLabel { color: $acc; font-size: 12px; font-weight: 700; padding: 0 4px; background: transparent; }
+/* 索引状态：单色阶段胶囊 + 克制的自绘进度轨，不再使用系统 busy 跑马灯 */
+QLabel#indexPhase {
+  color: $acc; background: rgba($hl_r,$hl_g,$hl_b,0.13);
+  border: 1px solid rgba($hl_r,$hl_g,$hl_b,0.28); border-radius: 7px;
+  padding: 2px 7px; font-size: 10.5px; font-weight: 700;
+}
+QProgressBar#indexBar { background: transparent; border: none; min-height: 8px; max-height: 8px; }
+QLabel#indexCount { color: $ink2; font-size: 11.5px; font-weight: 600; padding: 0 3px; background: transparent; }
+QLabel#pctLabel {
+  color: $acc; background: rgba($hl_r,$hl_g,$hl_b,0.10);
+  border-radius: 6px; font-size: 11px; font-weight: 700; padding: 1px 5px;
+}
 QLabel#statusDot { color: $grn; font-size: 13px; padding: 0 2px 0 4px; background: transparent; }
 QFrame#typeRail { background: transparent; }
 

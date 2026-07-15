@@ -36,6 +36,7 @@ _INTERACTIVE_LABELS = {
     "ppt-slim-create",
     "ppt-slim-open",
     "copy-page-text",
+    "preview-provisional",
     "autostart-toggle", "version-retention-update",
 }
 _gate_cv = threading.Condition()

@@ -53,3 +53,36 @@ def test_stale_snapshot_cleanup_keeps_current_and_recent_files(monkeypatch, tmp_
 
     # One pass per renderer session prevents repeated directory walks.
     assert renderer._cleanup_stale_snapshots(max_age_sec=0) == 0
+
+
+def test_render_cache_maintenance_bounds_compat_pdfs_and_stale_workdirs(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(renderer, "cache_dir", lambda: tmp_path)
+    now = 20_000.0
+    monkeypatch.setattr(renderer.time, "time", lambda: now)
+
+    pdf_dir = tmp_path / "compat_pdf"
+    pdf_dir.mkdir()
+    old_pdf = pdf_dir / "old-key.pdf"
+    old_pdf.write_bytes(b"p" * 400)
+    os.utime(old_pdf, (100, 100))
+
+    work_root = tmp_path / "compat_work"
+    stale_work = work_root / "stale"
+    recent_work = work_root / "recent"
+    stale_work.mkdir(parents=True)
+    recent_work.mkdir(parents=True)
+    (stale_work / "source.pptx").write_bytes(b"stale")
+    (recent_work / "source.pptx").write_bytes(b"recent")
+    os.utime(stale_work, (now - 10_000, now - 10_000))
+    os.utime(recent_work, (now - 10, now - 10))
+
+    result = renderer.maintain_render_cache(max_bytes=250, max_files=3)
+
+    assert not old_pdf.exists()
+    assert not stale_work.exists()
+    assert recent_work.exists()
+    assert result["compat_pdfs_deleted"] == 1
+    assert result["workdirs_deleted"] == 1

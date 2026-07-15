@@ -34,7 +34,12 @@ DATA.mkdir(parents=True)
 # Frozen smoke tests must not rewrite the user's real Windows Startup link to
 # the temporary dist build before the release is installed.
 (DATA / "ui.json").write_text(
-    json.dumps({"autostart": False}),
+    json.dumps({
+        "autostart": False,
+        # v1.0.12+ defaults new profiles to basic mode.  This probe is
+        # specifically for the optional version watcher, so opt in explicitly.
+        "version_management_enabled": True,
+    }),
     encoding="utf-8",
 )
 # DECKS 必须在被全盘 watcher 监听的位置（Desktop），不能放 AppData/Temp（被排除）

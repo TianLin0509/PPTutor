@@ -9,6 +9,7 @@ import datetime
 import html
 import logging
 import os
+import re
 from collections import deque
 
 import sys
@@ -29,7 +30,7 @@ try:
 except Exception:  # noqa: BLE001
     _WIN = False
 
-from .. import actions, db, history, indexer as indexer_mod, renderer as renderer_mod, search as search_mod, updater, __version__
+from .. import actions, db, history, indexer as indexer_mod, renderer as renderer_mod, search as search_mod, thumbnailer, updater, __version__
 from ..config import (
     DOCX_EXT, PDF_EXT, PPTX_EXT, PPT_EXTS, SUPPORTED_EXTS, db_path as cfg_db_path,
     enabled_index_exts as cfg_enabled_index_exts, ext_path,
@@ -46,6 +47,7 @@ from ..query_explain import explain_query, mode_label, suggestion_keys
 from . import theme
 from .bg_task import BackgroundTask
 from .index_worker import IndexWorker
+from .index_activity_bar import IndexActivityBar
 from .live_indexer import LiveIndexer
 from .path_helpers import ensure_pptx_suffix
 from .render_worker import RenderWorker
@@ -681,6 +683,7 @@ class MainWindow(QMainWindow):
         self._results_raw: list[FileResult] = []
         self._render_gen = 0
         self._bg_tasks: list[BackgroundTask] = []
+        self._safe_preview_task: BackgroundTask | None = None
         self._settings_dialogs: list = []
         self._active_heavy_op: str | None = None
         self._closing = False  # 鍏崇獥涓細鍚庡彴浠诲姟鍥炶皟涓嶅啀纰?UI锛堥槻瑙﹁揪宸查攢姣佹帶浠讹級
@@ -761,6 +764,7 @@ class MainWindow(QMainWindow):
         self._req_id = 0
         self._cur_pixmap: QPixmap | None = None
         self._preview_provisional = False  # 褰撳墠棰勮鏄惁涓虹缉鐣ュ浘鍗犱綅锛堥珮娓呮湭鍒帮級
+        self._preview_hd_req_id: int | None = None
         self._sharp_preview_args: tuple[int, str, int, int, int] | None = None
         self._zoom = 1.0  # 棰勮缂╂斁锛?.0=閫傞厤绐楀彛锛?1 鏀惧ぇ鐪嬬粏鑺?
         self._to_tray_on_close = False
@@ -782,6 +786,9 @@ class MainWindow(QMainWindow):
 
         self._render = render_worker or RenderWorker(self)
         self._render.rendered.connect(self._on_rendered)
+        provisional_signal = getattr(self._render, "provisional_rendered", None)
+        if provisional_signal is not None:
+            provisional_signal.connect(self._on_provisional_rendered)
         self._owns_render = render_worker is None
         if self._owns_render:
             self._render.start()
@@ -1204,17 +1211,26 @@ class MainWindow(QMainWindow):
 
         self.status = self.statusBar()
         self.status.setObjectName("statusBar")
-        self.index_bar = QProgressBar()
+        self.index_phase_label = QLabel("")
+        self.index_phase_label.setObjectName("indexPhase")
+        self.index_phase_label.hide()
+        self.status.addWidget(self.index_phase_label)
+        self.index_bar = IndexActivityBar()
         self.index_bar.setObjectName("indexBar")
-        self.index_bar.setTextVisible(False)
-        self.index_bar.setFixedWidth(200)
+        self.index_bar.set_accent_color(self._tok["acc"])
         self.index_bar.hide()
         self.status.addWidget(self.index_bar)
+        self.index_count_label = QLabel("")
+        self.index_count_label.setObjectName("indexCount")
+        self.index_count_label.hide()
+        self.status.addWidget(self.index_count_label)
         self.pct_label = QLabel("")
         self.pct_label.setObjectName("pctLabel")
+        self.pct_label.hide()
         self.status.addWidget(self.pct_label)
         self.type_rail = self._build_type_rail()  # 分类型索引进度迷你条（设计 D）
         self.status.addWidget(self.type_rail)
+        self.type_rail.hide()
         self._type_conn = None          # 分类型计数用的独立只读连接（懒开，避免主线程抢写锁）
         self._type_rail_last_at = 0.0   # 分类型条刷新节流时间戳
         self.status_dot = QLabel("●")
@@ -1661,6 +1677,8 @@ class MainWindow(QMainWindow):
         app = QApplication.instance()
         if app is not None:
             app.setStyleSheet(theme.build_qss(name))
+        if getattr(self, "index_bar", None) is not None:
+            self.index_bar.set_accent_color(self._tok["acc"])
         self.theme_btn.setText(f"🎨 {dict(theme.THEMES).get(name, name)}")
         if persist:
             _save_theme(name)
@@ -3844,6 +3862,12 @@ class MainWindow(QMainWindow):
                 self._PRIORITY_RIGHT_PREVIEW,
             )
         else:
+            self._request_safe_preview(
+                self._req_id,
+                self._cur.path,
+                page,
+                long_edge=min(preview_edge, 800),
+            )
             self._request_render(
                 self._req_id,
                 self._cur.path,
@@ -3851,6 +3875,46 @@ class MainWindow(QMainWindow):
                 long_edge=preview_edge,
                 priority=self._PRIORITY_RIGHT_PREVIEW,
             )
+
+    def _request_safe_preview(
+        self,
+        req_id: int,
+        path: str,
+        page: int,
+        *,
+        long_edge: int,
+    ) -> None:
+        """Render a latest-only safe first paint outside the serial HD worker."""
+        previous = self._safe_preview_task
+        if previous is not None:
+            try:
+                previous.stop()
+            except RuntimeError:
+                pass
+        task = BackgroundTask(
+            lambda: thumbnailer.find_non_com_page_preview(
+                path,
+                page,
+                long_edge=long_edge,
+            ),
+            "preview-provisional",
+        )
+        self._safe_preview_task = task
+        self._bg_tasks.append(task)
+
+        def _done(result, request_id=req_id):
+            if result:
+                self._on_provisional_rendered(request_id, str(result))
+
+        def _cleanup(task=task):
+            if task in self._bg_tasks:
+                self._bg_tasks.remove(task)
+            if self._safe_preview_task is task:
+                self._safe_preview_task = None
+
+        task.done.connect(_done)
+        task.finished.connect(_cleanup)
+        task.start()
 
     def _preview_long_edge(self) -> int:
         try:
@@ -3935,6 +3999,24 @@ class MainWindow(QMainWindow):
         self._update_pixmap()
         self._toast("原尺寸放大 · 再双击还原" if self._zoom > 1.0 else "已适配窗口")
 
+    def _on_provisional_rendered(self, req_id: int, png: str) -> None:
+        """Keep a safe non-COM page preview visible while HD rendering continues."""
+        if (
+            self._closing
+            or req_id != self._req_id
+            or self._preview_hd_req_id == req_id
+            or not png
+            or not os.path.exists(png)
+        ):
+            return
+        pm = QPixmap(png)
+        if pm.isNull():
+            return
+        self._cur_pixmap = pm
+        self._preview_provisional = True
+        self._stop_spinner()
+        self._update_pixmap()
+
     def _on_rendered(self, req_id: int, png: str) -> None:
         if self._closing:
             return
@@ -3954,6 +4036,7 @@ class MainWindow(QMainWindow):
             return
         self._cur_pixmap = pm
         self._preview_provisional = False  # 楂樻竻宸插埌锛屼笉鍐嶆槸鍗犱綅
+        self._preview_hd_req_id = req_id
         self._preview_hinted = True  # 棣栨棰勮宸叉垚鍔燂紝涔嬪悗涓嶅啀鎻愩€屽敜璧?PowerPoint銆?
         self._update_pixmap()
         self._prefetch_neighbors()  # 鍚庡彴棰勬覆鏌撶浉閭?鍛戒腑椤碉紝缈昏繃鍘绘椂缂撳瓨鍛戒腑=鐬棿
@@ -5005,6 +5088,12 @@ class MainWindow(QMainWindow):
         self._index_rate_last_at = self._index_started_at
         self._index_status_cache = None
         self.type_rail.hide()  # 避免建库写锁期间在 GUI 线程反复查 type_counts
+        self.index_phase_label.setText("升级" if self._index_rebuild_reason else "扫描")
+        self.index_phase_label.show()
+        self.index_count_label.setText("准备中")
+        self.index_count_label.show()
+        self.pct_label.clear()
+        self.pct_label.hide()
         self.index_bar.setRange(0, 0)
         self.index_bar.show()
         self.status_dot.hide()
@@ -5071,22 +5160,36 @@ class MainWindow(QMainWindow):
         self._index_progress_last_phase = phase
         self.status_dot.hide()
         self.type_rail.hide()
+        self.index_phase_label.show()
+        self.index_count_label.show()
         self.index_bar.show()
         if getattr(self, "_welcome", None) is not None and done > 0:
             self._welcome.update_progress(done)
         preserve_search_status = self._search_pending_req is not None
         if total < 0:
-            self.index_bar.setRange(0, 0)  # busy锛氳繘搴︽潯鏉ュ洖娴佸姩锛堟壂鎻忥紝鎬绘暟鏈煡锛?
-            self.pct_label.setText("")
+            self.index_bar.setRange(0, 0)
+            self.index_phase_label.setText("升级" if self._index_rebuild_reason else "扫描")
+            found = re.search(r"发现\s*([\d,]+)", str(cur or ""))
+            if found:
+                self.index_count_label.setText(f"发现 {found.group(1)}")
+            elif done > 0:
+                self.index_count_label.setText(f"已整理 {done:,}")
+            else:
+                self.index_count_label.setText("盘点中")
+            self.pct_label.clear()
+            self.pct_label.hide()
+            self.status_label.setToolTip(str(cur or ""))
             if not preserve_search_status:
                 prefix = "升级索引中" if self._index_rebuild_reason else "扫描磁盘中"
-                self.status_label.setText(
-                    f"{prefix}…　{cur} · 文件总数尚未确定（可边扫边搜）"
-                )
+                self.status_label.setText(f"{prefix} · 可边扫边搜")
         else:
             self.index_bar.setRange(0, max(1, total))
             self.index_bar.setValue(done)
+            self.index_phase_label.setText("升级" if self._index_rebuild_reason else "建库")
+            self.index_count_label.setText(f"{done:,} / {total:,}")
             self.pct_label.setText(f"{int(done / max(1, total) * 100)}%")
+            self.pct_label.show()
+            self.status_label.setToolTip(str(cur or ""))
             if not preserve_search_status:
                 speed = f" · {rate:.1f} 个/秒" if rate > 0 else ""
                 remaining = (
@@ -5094,7 +5197,7 @@ class MainWindow(QMainWindow):
                     if eta is not None and done < total else ""
                 )
                 self.status_label.setText(
-                    f"正在建库　{done}/{total}{speed}{remaining}（前台操作优先）"
+                    f"正在建库{speed}{remaining} · 前台操作优先"
                 )
 
     def _on_index_done(self, summary: dict) -> None:
@@ -5107,10 +5210,14 @@ class MainWindow(QMainWindow):
         cancelled = bool(int((summary or {}).get("cancelled", 0) or 0))
         if error or cancelled:
             self.index_bar.hide()
+            self.index_phase_label.hide()
+            self.index_count_label.hide()
             self.type_rail.hide()
             self._close_type_conn()
-            self.pct_label.setText("")
+            self.pct_label.clear()
+            self.pct_label.hide()
             self.status_dot.hide()
+            self.status_label.setToolTip("")
             if error:
                 self.status_label.setText(
                     f"建库遇到问题，已有结果仍可搜索 · {error}"
@@ -5132,9 +5239,13 @@ class MainWindow(QMainWindow):
                 pass
             self._index_rebuild_reason = ""
         self.index_bar.hide()
+        self.index_phase_label.hide()
+        self.index_count_label.hide()
         self.type_rail.hide()
         self._close_type_conn()
-        self.pct_label.setText("")
+        self.pct_label.clear()
+        self.pct_label.hide()
+        self.status_label.setToolTip("")
         celebrate = not getattr(self, "_index_celebrated", False)
         if celebrate:
             self._index_celebrated = True
