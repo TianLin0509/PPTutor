@@ -21,13 +21,14 @@ class SearchWorker(QThread):
     searched = Signal(int, str, object, float, object)
     _SLOW_DIAG_MS = 1000.0
     _DIAG_SAMPLE_LIMIT = 64
+    _READ_BUSY_TIMEOUT_MS = 400
 
     def __init__(self, db_path: str | None = None, parent=None, conn=None) -> None:
         super().__init__(parent)
         self._db_path = db_path
         self._conn_injected = conn
         self._cv = threading.Condition()
-        self._pending: tuple[int, str, str, tuple[str, ...] | None, bool] | None = None
+        self._pending: tuple[int, str, str, tuple[str, ...] | None, bool, bool] | None = None
         self._stop = False
         self._active_conn = None
         self._cancel_active = False
@@ -47,9 +48,17 @@ class SearchWorker(QThread):
 
     def request(self, req_id: int, query: str, mode_key: str,
                 exts: tuple[str, ...] | None = None,
-                case_sensitive: bool = False) -> None:
+                case_sensitive: bool = False,
+                group_similar: bool = True) -> None:
         with self._cv:
-            self._pending = (req_id, query, mode_key, exts, bool(case_sensitive))
+            self._pending = (
+                req_id,
+                query,
+                mode_key,
+                exts,
+                bool(case_sensitive),
+                bool(group_similar),
+            )
             self._cancel_active = False
             with self._diag_lock:
                 self._diag["pending_query_chars"] = len(query)
@@ -149,12 +158,6 @@ class SearchWorker(QThread):
     def run(self) -> None:
         own_conn = None
         conn = self._conn_injected
-        if conn is None:
-            if not self._db_path:
-                self.searched.emit(0, "", [], 0.0, "missing db path")
-                return
-            own_conn = db.connect(self._db_path)
-            conn = own_conn
         try:
             while True:
                 with self._cv:
@@ -162,7 +165,7 @@ class SearchWorker(QThread):
                         self._cv.wait()
                     if self._stop:
                         return
-                    req_id, query, mode_key, exts, case_sensitive = self._pending
+                    req_id, query, mode_key, exts, case_sensitive, group_similar = self._pending
                     self._pending = None
                     self._cancel_active = False
                     self._active_conn = conn  # 在同一把锁内提前置位，消除「取消落在赋值之前」的窗口
@@ -174,11 +177,33 @@ class SearchWorker(QThread):
                 error = None
                 results = []
                 try:
+                    if conn is None:
+                        if not self._db_path:
+                            raise RuntimeError("missing db path")
+                        # Connect lazily for the request. A transient startup
+                        # lock/path failure must be reported to the UI, not kill
+                        # this QThread and leave every later query on “searching”.
+                        # Interactive search is read-only and must fail fast
+                        # behind a rare schema/VACUUM lock. The normal writer
+                        # connection waits up to eight seconds and also issues
+                        # journal-mode PRAGMAs, which used to leave the UI on
+                        # “searching” for ~7.4 seconds in the reproduced case.
+                        own_conn = db.connect_readonly(
+                            self._db_path,
+                            busy_timeout_ms=self._READ_BUSY_TIMEOUT_MS,
+                        )
+                        conn = own_conn
+                        with self._cv:
+                            if self._stop or self._cancel_active or self._pending is not None:
+                                raise RuntimeError("interrupted")
+                            self._active_conn = conn
                     search_kwargs = {"exts": exts}
                     # Keep the default call shape backward-compatible with test/fake
                     # search functions and older integrations; only opt in explicitly.
                     if case_sensitive:
                         search_kwargs["case_sensitive"] = True
+                    if not group_similar:
+                        search_kwargs["group_similar"] = False
                     results = self._apply_mode(
                         search_mod.search(conn, query, **search_kwargs),
                         mode_key,

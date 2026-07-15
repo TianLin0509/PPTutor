@@ -48,6 +48,17 @@ def _vget(v, key, default=""):
         return default
 
 
+def _manager_supports(manager, name: str) -> bool:
+    """Probe a lazy manager without triggering its ``__getattr__`` factory."""
+    supports = getattr(type(manager), "supports", None)
+    if callable(supports):
+        try:
+            return bool(supports(manager, name))
+        except Exception:  # noqa: BLE001 capability hints are optional
+            return False
+    return callable(getattr(manager, name, None))
+
+
 class VersionWindow(QWidget):
     _FILE_OP_BUSY_NOTICE = "已有文件操作正在进行，请稍候…"
     _DOC_POPULATE_BATCH = 160
@@ -246,7 +257,7 @@ class VersionWindow(QWidget):
             on
             and has_version
             and healthy
-            and hasattr(self._mgr, "ensure_version_preview")
+            and _manager_supports(self._mgr, "ensure_version_preview")
             and version_id not in self._version_preview_inflight
         )
 
@@ -297,7 +308,7 @@ class VersionWindow(QWidget):
 
     def _preview_selected_version(self) -> None:
         ctx = self._sel_version_context()
-        if not ctx or not hasattr(self._mgr, "ensure_version_preview"):
+        if not ctx or not _manager_supports(self._mgr, "ensure_version_preview"):
             return
         if self._block_if_file_op_active():
             return
@@ -681,21 +692,61 @@ class VersionWindow(QWidget):
         vid, path = ctx
         if self._block_if_file_op_active():
             return
-        path = path or self._doc_path_for_version(vid)
+        prev_title = self.right_title.text()
+        self._active_file_op = True
+        self._set_file_ops_enabled(False)
+        self._set_navigation_enabled(False)
+        self.right_title.setText("正在读取版本差异…")
+
+        def prepare_restore():
+            resolved_path = path or self._doc_path_for_version(vid)
+            diff = None
+            if resolved_path and _manager_supports(self._mgr, "describe_version_diff"):
+                try:
+                    diff = self._mgr.describe_version_diff(vid)
+                except Exception:  # noqa: BLE001 diff is helpful but not required
+                    diff = None
+            return {"path": resolved_path, "diff": diff}
+
+        task = BackgroundTask(prepare_restore, "version-restore-prepare", self)
+        self._track_bg_task(task, self._file_tasks)
+        task.done.connect(
+            lambda payload, vid=vid, prev_title=prev_title:
+            self._on_restore_prepared(vid, prev_title, payload)
+        )
+        task.finished.connect(
+            lambda task=task: self._forget_bg_task(task, self._file_tasks)
+        )
+        task.start()
+
+    def _on_restore_prepared(self, vid: str, prev_title: str, payload: object) -> None:
+        if not self._ui_alive() or not self._active_file_op:
+            return
+        data = payload if isinstance(payload, dict) else {}
+        path = str(data.get("path") or "")
         if not path:
+            self._finish_restore_prepare(prev_title)
             QMessageBox.warning(self, "恢复", "找不到该版本对应的文档路径")
             return
         msg = f"用此版本恢复：\n{os.path.basename(path)}\n\n若当前文件存在，会先自动留一版，不会丢。"
-        if hasattr(self._mgr, "describe_version_diff"):
-            try:
-                diff = self._mgr.describe_version_diff(vid)
-                lines = [str(x).strip() for x in (diff.get("lines") or []) if str(x).strip()]
-                if lines:
-                    msg = "这版的主要变化：\n" + "\n".join(f"• {line}" for line in lines[:6]) + "\n\n" + msg
-            except Exception:  # noqa: BLE001
-                pass
+        diff = data.get("diff")
+        if isinstance(diff, dict):
+            lines = [str(x).strip() for x in (diff.get("lines") or []) if str(x).strip()]
+            if lines:
+                msg = (
+                    "这版的主要变化：\n"
+                    + "\n".join(f"• {line}" for line in lines[:6])
+                    + "\n\n"
+                    + msg
+                )
         if QMessageBox.question(self, "恢复", msg) != QMessageBox.Yes:
+            self._finish_restore_prepare(prev_title)
             return
+
+        # Hand the busy state directly to the actual restore task; pending
+        # timeline refreshes remain queued across both phases.
+        self._active_file_op = False
+        self.right_title.setText(prev_title)
         self._run_file_op(
             "version-restore",
             lambda: self._mgr.restore_to(path, vid),
@@ -705,6 +756,20 @@ class VersionWindow(QWidget):
             "恢复失败",
             lambda: self._on_doc(self.doc_list.currentItem()) if self.doc_list.currentItem() else None,
         )
+
+    def _finish_restore_prepare(self, prev_title: str) -> None:
+        reload_after = self._reload_docs_after_file_op
+        self._reload_docs_after_file_op = False
+        self._active_file_op = False
+        self._set_navigation_enabled(True)
+        if reload_after:
+            self._pending_versions_after_file_op = None
+            self.schedule_reload_docs()
+        else:
+            self._apply_pending_versions_after_file_op()
+        self._set_file_ops_enabled(True)
+        if self.right_title.text() in ("正在读取版本差异…", self._FILE_OP_BUSY_NOTICE):
+            self.right_title.setText(prev_title)
 
     def _export(self) -> None:
         ctx = self._sel_version_context()

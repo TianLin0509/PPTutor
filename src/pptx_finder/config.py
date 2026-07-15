@@ -10,6 +10,10 @@ APP_NAME = "pptx-finder"
 DEFAULT_THEME = "cloud"
 DEFAULT_AUTOSTART = True
 DEFAULT_VERSION_KEEP_PER_DOC = 100
+# 高阶功能默认关闭：基础模式只承担全盘 PPT 搜索与 PPT 统计。
+DEFAULT_VERSION_MANAGEMENT_ENABLED = False
+DEFAULT_DOCUMENT_SEARCH_ENABLED = False
+DEFAULT_SMART_GROUPING_ENABLED = False
 
 
 def resource_path(*parts: str) -> Path:
@@ -71,7 +75,7 @@ def mark_version_intro_done() -> None:
 EXCLUDE_DIR_NAMES: set[str] = {
     "windows", "program files", "program files (x86)", "programdata",
     "$recycle.bin", "system volume information",
-    "local settings", "temp", "tmp",  # AppData 正式纳入覆盖，仅排除临时/自有数据路径
+    "local settings",  # AppData 正式纳入覆盖；系统 Temp 由 scanner 按完整路径排除
     "node_modules", ".git", "__pycache__", ".venv", "venv", "env",
     "$winreagent", "recovery", "msocache", "intel", "perflogs",
 }
@@ -148,6 +152,92 @@ def get_autostart(default: bool = DEFAULT_AUTOSTART) -> bool:
 
 def set_autostart(enabled: bool) -> None:
     update_ui_settings(autostart=bool(enabled))
+
+
+def _get_bool_setting(key: str, default: bool) -> bool:
+    value = load_ui_settings().get(key)
+    return value if isinstance(value, bool) else bool(default)
+
+
+def get_version_management_enabled(
+    default: bool = DEFAULT_VERSION_MANAGEMENT_ENABLED,
+) -> bool:
+    return _get_bool_setting("version_management_enabled", default)
+
+
+def set_version_management_enabled(enabled: bool) -> None:
+    update_ui_settings(version_management_enabled=bool(enabled))
+
+
+def get_document_search_enabled(
+    default: bool = DEFAULT_DOCUMENT_SEARCH_ENABLED,
+) -> bool:
+    return _get_bool_setting("document_search_enabled", default)
+
+
+def set_document_search_enabled(enabled: bool) -> None:
+    update_ui_settings(document_search_enabled=bool(enabled))
+
+
+def get_smart_grouping_enabled(
+    default: bool = DEFAULT_SMART_GROUPING_ENABLED,
+) -> bool:
+    return _get_bool_setting("smart_grouping_enabled", default)
+
+
+def set_smart_grouping_enabled(enabled: bool) -> None:
+    update_ui_settings(smart_grouping_enabled=bool(enabled))
+
+
+def enabled_index_exts(document_search_enabled: bool | None = None) -> tuple[str, ...]:
+    """当前产品层允许进入索引/搜索的扩展名。
+
+    PPT 始终开启；Word/PDF 是主动选择的高阶能力。调用方可传入内存态，避免
+    watcher 热路径反复读取 ui.json。
+    """
+    docs_on = (
+        get_document_search_enabled()
+        if document_search_enabled is None
+        else bool(document_search_enabled)
+    )
+    return PPT_EXTS + ((DOCX_EXT, PDF_EXT) if docs_on else ())
+
+
+def index_feature_signature(
+    document_search_enabled: bool | None = None,
+    smart_grouping_enabled: bool | None = None,
+) -> str:
+    docs_on = (
+        get_document_search_enabled()
+        if document_search_enabled is None else bool(document_search_enabled)
+    )
+    groups_on = (
+        get_smart_grouping_enabled()
+        if smart_grouping_enabled is None else bool(smart_grouping_enabled)
+    )
+    return f"documents={int(docs_on)};smart_grouping={int(groups_on)}"
+
+
+def get_completed_index_feature_signature(default: str = "") -> str:
+    value = load_ui_settings().get("completed_index_feature_signature")
+    return value if isinstance(value, str) else default
+
+
+def set_completed_index_feature_signature(signature: str) -> None:
+    update_ui_settings(completed_index_feature_signature=str(signature or ""))
+
+
+def ensure_completed_index_feature_signature(signature: str) -> str:
+    """Upgrade baseline: old releases already have a usable PPT index.
+
+    Persist the current basic scope once so a later opt-in can be distinguished
+    from an upgrade that merely lacks the new bookkeeping key.
+    """
+    current = get_completed_index_feature_signature()
+    if current:
+        return current
+    set_completed_index_feature_signature(signature)
+    return str(signature)
 
 
 def get_version_keep_per_doc(default: int = DEFAULT_VERSION_KEEP_PER_DOC) -> int:

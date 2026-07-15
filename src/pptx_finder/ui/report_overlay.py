@@ -1,18 +1,19 @@
-"""报告浮层 ReportOverlay：盖在主界面上的「我的胶片报告」卡片流。
+"""报告浮层 ReportOverlay：盖在主界面上的「我的胶片报告」主题 Tab。
 
 - 文案格式化纯函数（human_bytes / redmansion_equiv / hour_label）便于单测。
 - 跟随主题（tok 传入），用内联样式而非全局 QSS（不依赖 theme 模块，互不冲突）。
-- 给定 conn 时 header 提供「全部 / 本年」年度切换；导出 PNG；Esc / 点遮罩关闭。
+- 给定 conn 时 header 提供「全部 / 本年 / 本月 / 本周」切换；导出当前 Tab；Esc 关闭。
 """
 from __future__ import annotations
 
+import html
 from datetime import datetime, timedelta
 
 from PySide6.QtCore import QPoint, QRect, QEasingCurve, Qt, QVariantAnimation
 from PySide6.QtGui import QPainter, QPixmap, QRegion
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QFrame, QHBoxLayout, QLabel, QMessageBox, QPushButton,
-    QScrollArea, QVBoxLayout, QWidget,
+    QScrollArea, QTabBar, QVBoxLayout, QWidget,
 )
 try:
     from shiboken6 import isValid as _qt_is_valid
@@ -20,8 +21,7 @@ except Exception:  # noqa: BLE001
     def _qt_is_valid(_obj) -> bool:
         return True
 
-from .. import db
-from .. import stats
+from .. import actions, db, stats
 from .bg_task import BackgroundTask
 from .heatmap import HeatmapWidget
 
@@ -44,6 +44,14 @@ _SCOPE_LABELS = {
     _SCOPE_MONTH: "本月",
     _SCOPE_WEEK: "本周",
 }
+_REPORT_TABS = (
+    ("overview", "总览"),
+    ("hall", "名人堂"),
+    ("rhythm", "创作节奏"),
+    ("versions", "版本时光机"),
+    ("content", "内容人格"),
+    ("library", "片库版图"),
+)
 
 
 # ---------- 文案格式化（纯函数，可测） ----------
@@ -116,12 +124,21 @@ def _conn_path(conn) -> str | None:
         return None
 
 
-def _build_report_off_ui(conn, *, year=None, since_ts=None, until_ts=None):
+def _build_report_off_ui(
+    conn,
+    *,
+    year=None,
+    since_ts=None,
+    until_ts=None,
+    version_db_path=None,
+):
     kwargs = {"year": year}
     if since_ts is not None:
         kwargs["since_ts"] = since_ts
     if until_ts is not None:
         kwargs["until_ts"] = until_ts
+    if version_db_path is not None:
+        kwargs["version_db_path"] = version_db_path
     path = _conn_path(conn)
     if path:
         own = db.connect(path)
@@ -232,12 +249,13 @@ class RollNumber(QLabel):
 class ReportOverlay(QWidget):
     """半透明遮罩 + 居中卡片。给定 conn 时支持年度切换（重算重建内容）。"""
 
-    def __init__(self, report, tok, parent=None, *, conn=None):
+    def __init__(self, report, tok, parent=None, *, conn=None, version_db_path=None):
         super().__init__(parent)
         tok = FILM  # 固定暗黑胶片质感，忽略传入主题（报告自成一套，导出图也始终高级一致）
         self._tok = tok
         self._rolls: list[RollNumber] = []
         self._conn = conn
+        self._version_db_path = version_db_path
         self._closing_owner = parent
         self.current_report = report
         self.current_year = report.scope_year
@@ -273,6 +291,7 @@ class ReportOverlay(QWidget):
         self._card_lay.setSpacing(13)
 
         self._build_header()
+        self._build_tabs()
         self._content = QWidget()
         self._content_lay = QVBoxLayout(self._content)
         self._content_lay.setContentsMargins(0, 0, 0, 0)
@@ -363,7 +382,7 @@ class ReportOverlay(QWidget):
                 head.addWidget(b)
 
         self.copy_btn = QPushButton("复制")
-        self.copy_btn.setToolTip("复制报告图片到剪贴板，可直接粘贴到微信 / 钉钉")
+        self.copy_btn.setToolTip("复制当前 Tab 的完整报告图片，可直接粘贴到微信 / 钉钉")
         self.copy_btn.setCursor(Qt.PointingHandCursor)
         self.copy_btn.setStyleSheet(
             f"QPushButton{{background:{tok['field']};color:{tok['ink2']};border:1px solid #343041;"
@@ -387,6 +406,47 @@ class ReportOverlay(QWidget):
         self.close_btn.clicked.connect(self.close)
         head.addWidget(self.close_btn)
         self._card_lay.addLayout(head)
+
+    def _build_tabs(self) -> None:
+        """真正的 QTabBar：支持键盘左右键、焦点可见和窄窗口滚动。"""
+        tok = self._tok
+        self._tab_bar = QTabBar()
+        self._tab_bar.setObjectName("reportTabs")
+        self._tab_bar.setAccessibleName("胶片报告统计分组")
+        self._tab_bar.setExpanding(False)
+        self._tab_bar.setUsesScrollButtons(True)
+        self._tab_bar.setElideMode(Qt.ElideRight)
+        self._tab_bar.setDrawBase(False)
+        for key, label in _REPORT_TABS:
+            index = self._tab_bar.addTab(label)
+            self._tab_bar.setTabData(index, key)
+            self._tab_bar.setTabToolTip(index, f"查看{label}统计")
+        self._tab_bar.setStyleSheet(
+            "QTabBar{background:transparent;border:none;}"
+            f"QTabBar::tab{{background:{tok['field']};color:{tok['ink3']};"
+            "border:1px solid #343041;border-radius:9px;padding:7px 14px;margin-right:6px;"
+            "font-size:12px;font-weight:600;min-width:64px;}"
+            f"QTabBar::tab:selected{{background:#3a2830;color:{tok['acc']};"
+            f"border-color:{tok['acc']};}}"
+            f"QTabBar::tab:hover{{color:{tok['ink1']};border-color:#5b5368;}}"
+            f"QTabBar::tab:focus{{border:2px solid {tok['acc']};padding:6px 13px;}}"
+        )
+        self._tab_bar.currentChanged.connect(self._on_tab_changed)
+        self._card_lay.addWidget(self._tab_bar)
+
+    def _on_tab_changed(self, _index: int) -> None:
+        if hasattr(self, "_content") and self._ui_alive():
+            self._fill_content()
+
+    def _current_tab_key(self) -> str:
+        if not hasattr(self, "_tab_bar"):
+            return _REPORT_TABS[0][0]
+        return str(self._tab_bar.tabData(self._tab_bar.currentIndex()) or _REPORT_TABS[0][0])
+
+    def _current_tab_label(self) -> str:
+        if not hasattr(self, "_tab_bar"):
+            return _REPORT_TABS[0][1]
+        return self._tab_bar.tabText(self._tab_bar.currentIndex())
 
     def switch_year(self, year: int | None) -> None:
         self.switch_scope(_SCOPE_ALL if year is None else _SCOPE_YEAR, year=year)
@@ -425,7 +485,13 @@ class ReportOverlay(QWidget):
             self._show_loading(scope, query_year)
             task = BackgroundTask(
                 lambda year=query_year, since_ts=since_ts, until_ts=until_ts:
-                    _build_report_off_ui(self._conn, year=year, since_ts=since_ts, until_ts=until_ts),
+                    _build_report_off_ui(
+                        self._conn,
+                        year=year,
+                        since_ts=since_ts,
+                        until_ts=until_ts,
+                        version_db_path=self._version_db_path,
+                    ),
                 "stats-report-switch",
                 None,
             )
@@ -442,6 +508,8 @@ class ReportOverlay(QWidget):
     def _set_scope_buttons_enabled(self, enabled: bool) -> None:
         for btn in self._scope_buttons.values():
             btn.setEnabled(enabled)
+        if hasattr(self, "_tab_bar"):
+            self._tab_bar.setEnabled(enabled)
 
     def _set_scope_buttons_checked(self) -> None:
         for scope, btn in self._scope_buttons.items():
@@ -455,10 +523,7 @@ class ReportOverlay(QWidget):
         return _SCOPE_LABELS.get(scope, _SCOPE_LABELS[_SCOPE_ALL])
 
     def _show_loading(self, scope: str, year: int | None) -> None:
-        while self._content_lay.count():
-            it = self._content_lay.takeAt(0)
-            if it.widget():
-                it.widget().deleteLater()
+        self._clear_content()
         if self._conn is not None:
             self._set_scope_buttons_checked()
         scope_text = self._scope_text(scope, year)
@@ -468,10 +533,7 @@ class ReportOverlay(QWidget):
         self._content_lay.addWidget(lab)
 
     def _show_switch_error(self, scope: str, year: int | None) -> None:
-        while self._content_lay.count():
-            it = self._content_lay.takeAt(0)
-            if it.widget():
-                it.widget().deleteLater()
+        self._clear_content()
         if self._conn is not None:
             self._set_scope_buttons_checked()
         scope_text = self._scope_text(scope, year)
@@ -517,27 +579,93 @@ class ReportOverlay(QWidget):
             parent_tasks.remove(task)
 
 
-    def _fill_content(self) -> None:
+    def _clear_content(self) -> None:
+        """立即脱离旧 Tab 组件，避免 deleteLater 前的一帧内容叠影。"""
         while self._content_lay.count():
             it = self._content_lay.takeAt(0)
-            if it.widget():
-                it.widget().deleteLater()
+            widget = it.widget()
+            if widget is not None:
+                widget.hide()
+                widget.setParent(None)
+                widget.deleteLater()
+
+    def _fill_content(self) -> None:
+        self._clear_content()
         self._rolls = []
         report = self.current_report
         if self._conn is not None:
             self._set_scope_buttons_checked()
 
-        self._content_lay.addWidget(self._hero(report))
-        self._content_lay.addWidget(self._persona_hero(report.persona))   # 称号前置：最该被晒的一张
-        self._content_lay.addWidget(self._liver_card(report))
-        self._content_lay.addWidget(self._activity_card(report.activity))
-        self._content_lay.addWidget(self._drama_card(report.drama))
-        self._content_lay.addWidget(self._library_dna_card(report.library_dna, report.deck_count))
-        self._content_lay.addWidget(self._scale_card(report.scale))
+        builders = {
+            "overview": self._fill_overview_tab,
+            "hall": self._fill_hall_tab,
+            "rhythm": self._fill_rhythm_tab,
+            "versions": self._fill_versions_tab,
+            "content": self._fill_content_tab,
+            "library": self._fill_library_tab,
+        }
+        builders.get(self._current_tab_key(), self._fill_overview_tab)(report)
+        self._content_lay.addStretch(1)
 
         self._content.adjustSize()
         for r in self._rolls:
             r.start()
+
+    def _add_cards(self, *cards: QFrame) -> None:
+        for card in cards:
+            self._content_lay.addWidget(card)
+
+    def _fill_overview_tab(self, report) -> None:
+        self._add_cards(
+            self._hero(report),
+            self._persona_hero(report.persona),
+            self._achievement_card(report),
+            self._overview_version_card(report.versions),
+            self._activity_card(report.activity),
+            self._library_dna_card(report.library_dna, report.deck_count),
+        )
+
+    def _fill_hall_tab(self, report) -> None:
+        self._add_cards(
+            self._hall_of_fame_card(report),
+            self._fun_records_card(report),
+            self._anniversary_card(report.hall),
+        )
+
+    def _fill_rhythm_tab(self, report) -> None:
+        self._add_cards(
+            self._liver_card(report),
+            self._real_save_clock_card(report.versions),
+            self._creation_seasons_card(report),
+            self._revision_night_card(report.versions),
+        )
+
+    def _fill_versions_tab(self, report) -> None:
+        self._add_cards(
+            self._real_most_edited_card(report.versions),
+            self._growth_story_card(report.versions),
+            self._version_safety_card(report.versions),
+            self._version_fun_card(report.versions),
+        )
+
+    def _fill_content_tab(self, report) -> None:
+        self._add_cards(
+            self._catchphrase_card(report.content),
+            self._topic_constellation_card(report.content),
+            self._opening_ending_card(report.content),
+            self._language_persona_card(report.content),
+            self._keyword_trend_card(report.content),
+        )
+
+    def _fill_library_tab(self, report) -> None:
+        self._add_cards(
+            self._library_map_card(report),
+            self._shape_distribution_card(report),
+            self._filename_dna_card(report.library),
+            self._library_fun_card(report),
+            self._library_dna_card(report.library_dna, report.deck_count),
+            self._scale_card(report.scale),
+        )
 
     # ---- 卡片构建（暗黑胶片质感） ----
     def _stat_box(self, value_widget, label: str) -> QFrame:
@@ -718,6 +846,331 @@ class ReportOverlay(QWidget):
         slines.append(f"磁盘占用 <b>{human_bytes(sc.total_bytes)}</b>")
         return self._section("📊 规模仓鼠", slines)
 
+    @staticmethod
+    def _h(value: object) -> str:
+        return html.escape(str(value or ""), quote=True)
+
+    @staticmethod
+    def _date(ts: float) -> str:
+        return datetime.fromtimestamp(float(ts)).strftime("%Y-%m-%d") if ts else "暂无"
+
+    @staticmethod
+    def _count_items(items, *, limit: int = 8) -> str:
+        picked = list(items or ())[:limit]
+        if not picked:
+            return "暂无足够数据"
+        return "　".join(f"<b>{html.escape(str(item.label))}</b> × {item.count}" for item in picked)
+
+    def _achievement_card(self, report) -> QFrame:
+        badges = "　".join(f"🏅 {self._h(item)}" for item in report.achievements)
+        lines = [self._h(report.one_liner), badges]
+        memory = report.hall.today_memory
+        if memory.name:
+            lines.append(
+                f"📽️ 今日胶片回忆：《{self._h(memory.name)}》在 {memory.value} 年前的今天留下修改足迹"
+            )
+        return self._section("🏆 成就徽章与片库一句话", lines)
+
+    def _overview_version_card(self, versions) -> QFrame:
+        if not versions.available:
+            return self._section(
+                "🛡️ 时光机概览",
+                ["当前未连接版本元数据库；文件统计仍可正常使用。"],
+            )
+        return self._section(
+            "🛡️ 时光机概览",
+            [
+                f"真实保存点 <b>{versions.version_count:,}</b> 个，覆盖 <b>{versions.protected_docs}</b> 份 PPT",
+                f"可回退（至少 2 个健康版本）<b>{versions.rollback_docs}</b> 份",
+                f"已删除但仍可恢复 <b>{versions.recoverable_deleted_docs}</b> 份",
+            ],
+        )
+
+    def _award_section(self, title: str, rows: list[tuple[str, object, str]]) -> QFrame:
+        """名人堂行可一键在资源管理器定位；没有路径的记录保持纯展示。"""
+        tok = self._tok
+        card = QFrame()
+        card.setStyleSheet(f"background:{tok['canvas']};border:1px solid {tok['bd']};border-radius:12px;")
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(16, 13, 16, 14)
+        lay.setSpacing(7)
+        head = QLabel(title)
+        head.setStyleSheet(
+            f"font-size:14px;font-weight:700;color:{tok['ink1']};background:transparent;border:none;"
+        )
+        lay.addWidget(head)
+        for label, metric, value_text in rows:
+            row = QHBoxLayout()
+            row.setSpacing(8)
+            name = getattr(metric, "name", None)
+            text = f"<b>{self._h(label)}</b>　"
+            text += f"《{self._h(name)}》　{value_text}" if name else "暂无"
+            value = QLabel(text)
+            value.setTextFormat(Qt.RichText)
+            value.setWordWrap(True)
+            value.setStyleSheet(
+                f"font-size:12.5px;color:{tok['ink2']};background:transparent;border:none;"
+            )
+            row.addWidget(value, 1)
+            path = getattr(metric, "path", None)
+            if path:
+                locate = QPushButton("定位")
+                locate.setAccessibleName(f"定位{label}{name}")
+                locate.setToolTip(str(path))
+                locate.setCursor(Qt.PointingHandCursor)
+                locate.setStyleSheet(
+                    f"QPushButton{{background:{tok['field']};color:{tok['ink3']};"
+                    "border:1px solid #3b3548;border-radius:7px;padding:3px 9px;}"
+                    f"QPushButton:hover{{color:{tok['acc']};border-color:{tok['acc']};}}"
+                )
+                locate.clicked.connect(lambda _=False, p=str(path): actions.open_folder(p))
+                row.addWidget(locate)
+            lay.addLayout(row)
+        return card
+
+    def _hall_of_fame_card(self, report) -> QFrame:
+        h = report.hall
+        return self._award_section(
+            "🏆 我的 PPT 之最",
+            [
+                ("页数之最", h.most_pages, f"<b>{int(h.most_pages.value or 0)}</b> 页"),
+                ("体积之最", h.largest, f"<b>{human_bytes(float(h.largest.value or 0))}</b>"),
+                ("名字最长", h.longest_filename, f"<b>{int(h.longest_filename.value or 0)}</b> 字"),
+                ("名字最短", h.shortest_filename, f"<b>{int(h.shortest_filename.value or 0)}</b> 字"),
+                ("最老胶片", h.oldest, f"修改于 <b>{self._date(float(h.oldest.value or 0))}</b>"),
+                ("最新胶片", h.newest, f"修改于 <b>{self._date(float(h.newest.value or 0))}</b>"),
+                ("目录最深", h.deepest_path, f"路径深度 <b>{int(h.deepest_path.value or 0)}</b> 层"),
+            ],
+        )
+
+    def _fun_records_card(self, report) -> QFrame:
+        h = report.hall
+        lines = [
+            f"一日爆肝纪录：<b>{self._h(h.busiest_day.name or '暂无')}</b> 一天更新 {int(h.busiest_day.value or 0)} 份",
+            f"最常见页数：<b>{h.common_page_count}</b> 页，共 {h.common_page_count_decks} 份",
+            f"终版诅咒：{report.drama.final_curse_count} 份名字含 最终/final/vN",
+        ]
+        return self._section("🎯 趣味纪录", lines)
+
+    def _anniversary_card(self, hall) -> QFrame:
+        lines = []
+        if hall.today_memory.name:
+            lines.append(
+                f"今日胶片回忆：《{self._h(hall.today_memory.name)}》—— {int(hall.today_memory.value)} 年前的今天"
+            )
+        for item in hall.anniversaries:
+            lines.append(f"周年纪念：《{self._h(item.name)}》 · {int(item.value)} 周年 · {self._h(item.detail)}")
+        if not lines:
+            lines.append("今天暂时没有同日往年的胶片回忆，明天再来会换一批彩蛋。")
+        return self._section("🎂 今日回忆与周年纪念", lines)
+
+    def _real_save_clock_card(self, versions) -> QFrame:
+        lines = []
+        if versions.available:
+            lines.append(f"按真实自动快照统计，共 <b>{versions.version_count}</b> 次保存留版；不是拿文件修改时间代替。")
+        else:
+            lines.append("版本元数据库暂不可用，因此不会拿文件修改时间冒充真实保存记录。")
+        card = self._section("⏱️ 真实保存时钟", lines)
+        if versions.available:
+            hmw = HeatmapWidget(
+                versions.save_heatmap,
+                accent=(int(self._tok["hl_r"]), int(self._tok["hl_g"]), int(self._tok["hl_b"])),
+                empty=self._tok["field"],
+                ink=self._tok["ink3"],
+            )
+            card.layout().addWidget(hmw)
+        return card
+
+    def _creation_seasons_card(self, report) -> QFrame:
+        creation = report.creation
+        seasons = "　".join(f"<b>{i.label}</b> {i.count}" for i in creation.season_counts)
+        years = self._count_items(creation.yearly_counts[-8:], limit=8)
+        months = self._count_items(creation.monthly_counts[-12:], limit=12)
+        lines = [
+            f"创作年轮：{years}",
+            f"四季分布：{seasons or '暂无'}",
+            f"最近月份：{months}",
+            f"活跃 <b>{report.activity.active_days}</b> 天，最长连续开工 <b>{report.activity.longest_streak_days}</b> 天",
+        ]
+        return self._section("🌳 创作年轮与旺季", lines)
+
+    def _revision_night_card(self, versions) -> QFrame:
+        if not versions.available:
+            return self._section("🌙 年度最大改稿夜与冲刺榜", ["需要版本快照后才能统计真实改稿夜。"])
+        lines = [
+            f"年度最大改稿夜：<b>{self._h(versions.peak_revision_night or '暂无')}</b>，留版 {versions.peak_revision_night_count} 次"
+        ]
+        for i, sprint in enumerate(versions.revision_sprints[:5], 1):
+            lines.append(
+                f"改稿冲刺榜 #{i}：《{self._h(sprint.name)}》72 小时内留版 <b>{sprint.count}</b> 次"
+            )
+        if len(lines) == 1:
+            lines.append("还没有形成两次以上的连续改稿冲刺。")
+        return self._section("🌙 年度最大改稿夜与冲刺榜", lines)
+
+    def _real_most_edited_card(self, versions) -> QFrame:
+        if not versions.available:
+            return self._section(
+                "🕰️ 真正的「最能改奖」",
+                ["版本库未连接；这里不再用相似文件分组冒充版本次数。"],
+            )
+        if not versions.most_edited_name:
+            return self._section("🕰️ 真正的「最能改奖」", ["暂无真实版本快照。"])
+        return self._section(
+            "🕰️ 真正的「最能改奖」",
+            [
+                f"《{self._h(versions.most_edited_name)}》留下 <b>{versions.most_edited_versions}</b> 个真实快照",
+                f"当前范围共有 <b>{versions.version_count}</b> 个健康版本点，覆盖 {versions.protected_docs} 份 PPT",
+            ],
+        )
+
+    def _growth_story_card(self, versions) -> QFrame:
+        if not versions.growth_points:
+            return self._section("📈 一份 PPT 的成长史", ["至少留下一个真实版本后，这里会出现页数与体积的成长轨迹。"])
+        first, last = versions.growth_points[0], versions.growth_points[-1]
+        lines = [
+            f"主角：《{self._h(versions.most_edited_name)}》 · 展示最近 {len(versions.growth_points)} 个点",
+            f"页数：<b>{first.page_count}</b> → <b>{last.page_count}</b>　体积：{human_bytes(first.size)} → {human_bytes(last.size)}",
+        ]
+        recent = versions.growth_points[-8:]
+        lines.append("最近轨迹：" + "　".join(
+            f"{datetime.fromtimestamp(p.ts).strftime('%m-%d')}·{p.page_count}页" for p in recent
+        ))
+        return self._section("📈 一份 PPT 的成长史", lines)
+
+    def _version_safety_card(self, versions) -> QFrame:
+        if not versions.available:
+            return self._section("🛟 被时光机救下的胶片", ["版本库未连接。"])
+        return self._section(
+            "🛟 被时光机救下的胶片",
+            [
+                f"已删除但仍有健康恢复点：<b>{versions.recoverable_deleted_docs}</b> 份",
+                f"真正可回退（≥2 版）：<b>{versions.rollback_docs}</b> 份",
+                f"越改越长 <b>{versions.growing_docs}</b> 份　越改越瘦 <b>{versions.slimming_docs}</b> 份",
+            ],
+        )
+
+    def _version_fun_card(self, versions) -> QFrame:
+        lines = []
+        if versions.biggest_revision_name:
+            lines.append(
+                f"最大单次改稿：《{self._h(versions.biggest_revision_name)}》 · "
+                f"{self._date(versions.biggest_revision_ts)} · 强度 {versions.biggest_revision_score}"
+                + (f" · {self._h(versions.biggest_revision_summary)}" if versions.biggest_revision_summary else "")
+            )
+        if versions.sleeping_revival_name:
+            lines.append(
+                f"沉睡后复活：《{self._h(versions.sleeping_revival_name)}》隔了 <b>{versions.sleeping_revival_days}</b> 天再改"
+            )
+        lines.extend([
+            f"最能改名：《{self._h(versions.most_renamed_name or '暂无')}》出现 {versions.most_renamed_count} 个名字",
+            f"迁徙最远：《{self._h(versions.most_migrated_name or '暂无')}》待过 {versions.most_migrated_count} 个目录",
+            f"页数反复横跳：《{self._h(versions.page_flip_flop_name or '暂无')}》方向切换 {versions.page_flip_flops} 次",
+        ])
+        return self._section("🎢 改稿奇闻", lines)
+
+    def _sample_note(self, content) -> str:
+        mode = "有界抽样" if content.sample_truncated else "全量索引"
+        return (
+            f"{mode}：{content.sampled_decks} 份 / {content.sampled_pages} 页 / "
+            f"{content.sampled_chars:,} 字；全程本地，不打开 PPT。"
+        )
+
+    def _catchphrase_card(self, content) -> QFrame:
+        return self._section(
+            "💬 我的 PPT 口头禅",
+            [self._count_items(content.catchphrases, limit=10), self._sample_note(content)],
+        )
+
+    def _topic_constellation_card(self, content) -> QFrame:
+        return self._section(
+            "✨ 我的主题星座",
+            [
+                self._count_items(content.topics, limit=10),
+                "星座按“覆盖了多少份 PPT”排序，避免某一份超长文档霸榜。",
+            ],
+        )
+
+    def _opening_ending_card(self, content) -> QFrame:
+        lines = [
+            f"开场仪式：<b>{self._h(content.opening_phrase or '暂无')}</b> · {content.opening_count} 次",
+            f"收尾仪式：<b>{self._h(content.ending_phrase or '暂无')}</b> · {content.ending_count} 次",
+            f"最常重复的一句话：<b>{self._h(content.repeated_sentence or '暂无')}</b> · {content.repeated_sentence_count} 次",
+        ]
+        return self._section("🎬 开场、收尾与复读机", lines)
+
+    def _language_persona_card(self, content) -> QFrame:
+        return self._section(
+            "🗣️ 内容语言人格",
+            [
+                f"你的内容人格：<b>{self._h(content.language_persona)}</b>",
+                f"英文字母占比 {content.english_ratio:.1%}　数字占比 {content.digit_ratio:.1%}　问号 {content.question_marks} 个",
+                f"低文字收尾 <b>{content.low_text_ending_count}</b> 份（≤30 字，完整的一页讲完统计见片库版图）",
+            ],
+        )
+
+    def _keyword_trend_card(self, content) -> QFrame:
+        lines = [
+            f"<b>{self._h(item.period)}</b>　" + " / ".join(self._h(term) for term in item.terms)
+            for item in content.keyword_trends
+        ]
+        return self._section("🌊 关键词趋势河流", lines or ["暂无跨月份内容趋势。"])
+
+    def _library_map_card(self, report) -> QFrame:
+        folders = report.library.top_folders
+        compact = []
+        for item in folders[:8]:
+            parts = [p for p in str(item.label).replace("/", "\\").split("\\") if p]
+            label = "\\".join(parts[-2:]) if parts else str(item.label)
+            if len(parts) > 2:
+                label = "…\\" + label
+            compact.append(f"<b>{self._h(label)}</b> × {item.count}")
+        lines = ["　".join(compact) or "暂无目录数据"]
+        if report.hall.deepest_path.name:
+            lines.append(
+                f"目录最深：《{self._h(report.hall.deepest_path.name)}》 · {int(report.hall.deepest_path.value)} 层"
+            )
+        card = self._section("🗺️ 我的胶片版图", lines)
+        if folders:
+            card.setToolTip("\n".join(f"{item.label} × {item.count}" for item in folders[:8]))
+        return card
+
+    def _shape_distribution_card(self, report) -> QFrame:
+        bins = report.library.shape_bins
+        distribution = "　".join(f"<b>{self._h(label)}</b> {count}" for label, count in bins.items())
+        return self._section(
+            "📐 胶片身材分布",
+            [
+                distribution or "暂无",
+                f"最常见页数：<b>{report.hall.common_page_count}</b> 页 · {report.hall.common_page_count_decks} 份",
+            ],
+        )
+
+    def _filename_dna_card(self, library) -> QFrame:
+        examples = "、".join(self._h(name) for name in library.same_name_examples) or "暂无"
+        generic = "、".join(self._h(name) for name in library.generic_name_examples) or "暂无"
+        return self._section(
+            "🧬 文件名 DNA",
+            [
+                "高频词：" + self._count_items(library.filename_terms, limit=10),
+                f"同名双胞胎：{library.same_name_twin_groups} 组 / {library.same_name_twin_files} 份 · {examples}",
+                f"默认名俱乐部：{library.generic_name_count} 份 · {generic}",
+                f"标点人格：<b>{self._h(library.punctuation_label)}</b>",
+            ],
+        )
+
+    def _library_fun_card(self, report) -> QFrame:
+        minutes = report.library.meeting_minutes
+        hours, remain = divmod(minutes, 60)
+        return self._section(
+            "🎞️ 片库脑洞换算",
+            [
+                f"全部讲完预计 <b>{hours} 小时 {remain} 分</b>（按每页 2 分钟估算）",
+                f"全部打印约摞成 <b>{report.library.paper_height_mm:.1f} mm</b> 高（按每张 0.1 mm）",
+                f"一页讲完 <b>{report.library.one_page_count}</b> 份　低文字收尾 <b>{report.content.low_text_ending_count}</b> 份",
+            ],
+        )
+
     def _finish_rolls(self) -> None:
         for r in getattr(self, "_rolls", []):
             try:
@@ -798,7 +1251,11 @@ class ReportOverlay(QWidget):
         if not self._ui_alive() or self._switch_inflight is not None:
             return   # 年度切换重算中：内容是 loading 占位，别抓到空卡
         QApplication.clipboard().setPixmap(self._grab_full_report_pixmap())
-        QMessageBox.information(self, "复制图片", "已复制报告图片，可粘贴到微信 / 钉钉")
+        QMessageBox.information(
+            self,
+            "复制图片",
+            f"已复制“{self._current_tab_label()}”完整图片，可粘贴到微信 / 钉钉",
+        )
 
     def _section(self, title: str, html_lines: list[str]) -> QFrame:
         tok = self._tok
@@ -825,7 +1282,8 @@ class ReportOverlay(QWidget):
         if not self._ui_alive() or self._export_inflight or not self.export_btn.isEnabled():
             return
         scope = self._scope_text().replace(" ", "")
-        default_name = f"胶片报告_{scope}.png"
+        tab = self._current_tab_label().replace(" ", "")
+        default_name = f"胶片报告_{scope}_{tab}.png"
         path, _ = QFileDialog.getSaveFileName(self, "导出胶片报告图片", default_name, "PNG Image (*.png)")
         if not path:
             return

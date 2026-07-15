@@ -21,13 +21,17 @@ def mgr():
     m.stop()
 
 
-def test_settings_builds_with_autostart_toggle(qtbot, mgr):
+def test_settings_builds_with_basic_mode_defaults(qtbot, mgr, monkeypatch, tmp_path):
+    monkeypatch.setenv("PPTX_FINDER_DATA_DIR", str(tmp_path / "cfg"))
     dlg = SettingsDialog(mgr)
     qtbot.addWidget(dlg)
     assert "PPT Doctor" in dlg.windowTitle()
     qtbot.waitUntil(lambda: "data_dir:" in dlg.diagnostic_text.toPlainText(), timeout=1000)
     assert dlg.auto is not None          # 自启开关存在
-    assert "守护" in dlg.stat.text()       # 显示已守护文件数
+    assert not dlg.version_feature.isChecked()
+    assert not dlg.document_feature.isChecked()
+    assert not dlg.grouping_feature.isChecked()
+    assert "已关闭" in dlg.stat.text()
     assert dlg.tabs.count() == 3
     assert "data_dir:" in dlg.diagnostic_text.toPlainText()
     assert "diagnostic_summary:" in dlg.diagnostic_text.toPlainText()
@@ -73,7 +77,110 @@ def test_autostart_toggle_persists_preference(qtbot, mgr, monkeypatch, tmp_path)
     dlg.auto.setChecked(False)
 
     assert config.get_autostart() is False
+    qtbot.waitUntil(lambda: calls == [False], timeout=1000)
     assert calls == [False]
+
+
+def test_autostart_toggle_defers_shortcut_com_io(qtbot, mgr, monkeypatch, tmp_path):
+    """A slow WScript.Shell call must never run in the settings UI callback."""
+    tasks = []
+    calls = []
+
+    class FakeSignal:
+        def __init__(self):
+            self.callbacks = []
+
+        def connect(self, callback):
+            self.callbacks.append(callback)
+
+        def emit(self, value=None):
+            for callback in list(self.callbacks):
+                callback(value) if value is not None else callback()
+
+    class FakeTask:
+        def __init__(self, fn, label="", parent=None):
+            self.fn = fn
+            self.label = label
+            self.done = FakeSignal()
+            self.finished = FakeSignal()
+
+        def start(self):
+            tasks.append(self)
+
+    monkeypatch.setenv("PPTX_FINDER_DATA_DIR", str(tmp_path / "cfg"))
+    monkeypatch.setattr(settings_dialog_mod, "BackgroundTask", FakeTask)
+    monkeypatch.setattr(
+        settings_dialog_mod,
+        "_set_autostart_enabled_off_ui",
+        lambda on: calls.append(on) or True,
+        raising=False,
+    )
+
+    dlg = SettingsDialog(mgr)
+    qtbot.addWidget(dlg)
+    dlg.auto.setChecked(False)
+
+    assert config.get_autostart() is False
+    assert calls == []
+    task = next(task for task in tasks if task.label == "autostart-toggle")
+    assert not dlg.auto.isEnabled()
+
+    result = task.fn()
+    task.done.emit(result)
+    task.finished.emit()
+
+    assert calls == [False]
+    assert dlg.auto.isEnabled()
+
+
+def test_settings_diagnostics_defers_autostart_com_probe(
+    qtbot, mgr, monkeypatch, tmp_path
+):
+    """Opening settings must not probe a shell shortcut on the GUI thread."""
+    scheduled = []
+    tasks = []
+    calls = []
+
+    class FakeTimer:
+        @staticmethod
+        def singleShot(delay_ms, callback):
+            scheduled.append((delay_ms, callback))
+
+    class FakeSignal:
+        def __init__(self):
+            self.callbacks = []
+
+        def connect(self, callback):
+            self.callbacks.append(callback)
+
+    class FakeTask:
+        def __init__(self, fn, label="", parent=None):
+            self.fn = fn
+            self.label = label
+            self.done = FakeSignal()
+            self.finished = FakeSignal()
+
+        def start(self):
+            tasks.append(self)
+
+    monkeypatch.setenv("PPTX_FINDER_DATA_DIR", str(tmp_path / "cfg"))
+    monkeypatch.setattr(settings_dialog_mod, "QTimer", FakeTimer)
+    monkeypatch.setattr(settings_dialog_mod, "BackgroundTask", FakeTask)
+    monkeypatch.setattr(
+        settings_dialog_mod,
+        "_read_autostart_status_off_ui",
+        lambda: calls.append("probe") or (True, "C:\\PPT Doctor.exe"),
+        raising=False,
+    )
+
+    dlg = SettingsDialog(mgr)
+    qtbot.addWidget(dlg)
+    scheduled.pop(0)[1]()
+
+    assert calls == []
+    task = next(task for task in tasks if task.label == "settings-diagnostics")
+    task.fn()
+    assert calls == ["probe"]
 
 
 def test_retention_setting_updates_config_and_running_manager(qtbot, monkeypatch):
@@ -100,7 +207,114 @@ def test_retention_setting_updates_config_and_running_manager(qtbot, monkeypatch
 
     dlg.retention.setCurrentIndex(dlg.retention.findData(200))
 
+    qtbot.waitUntil(lambda: ("manager", 200) in calls, timeout=1000)
     assert calls == [("config", 200), ("manager", 200)]
+
+
+def test_retention_manager_lock_is_never_waited_in_ui_thread(qtbot, monkeypatch):
+    tasks = []
+    calls = []
+
+    class FakeTimer:
+        @staticmethod
+        def singleShot(_delay_ms, _callback):
+            return None
+
+    class FakeSignal:
+        def __init__(self):
+            self.callbacks = []
+
+        def connect(self, callback):
+            self.callbacks.append(callback)
+
+        def emit(self, value=None):
+            for callback in list(self.callbacks):
+                callback(value) if value is not None else callback()
+
+    class FakeTask:
+        def __init__(self, fn, label="", parent=None):
+            self.fn = fn
+            self.label = label
+            self.done = FakeSignal()
+            self.finished = FakeSignal()
+
+        def start(self):
+            tasks.append(self)
+
+    class FakeMgr:
+        def set_retention_limit(self, limit):
+            calls.append(("manager", limit))
+
+    monkeypatch.setattr(settings_dialog_mod, "QTimer", FakeTimer, raising=False)
+    monkeypatch.setattr(settings_dialog_mod, "BackgroundTask", FakeTask)
+    monkeypatch.setattr(settings_dialog_mod, "get_version_keep_per_doc", lambda: 100)
+    monkeypatch.setattr(settings_dialog_mod, "get_version_management_enabled", lambda: True)
+    monkeypatch.setattr(
+        settings_dialog_mod,
+        "set_version_keep_per_doc",
+        lambda limit: calls.append(("config", limit)),
+    )
+    dlg = SettingsDialog(FakeMgr())
+    qtbot.addWidget(dlg)
+
+    dlg.retention.setCurrentIndex(dlg.retention.findData(200))
+
+    assert calls == [("config", 200)]
+    task = next(task for task in tasks if task.label == "version-retention-update")
+    assert not dlg.retention.isEnabled()
+    task.fn()
+    task.done.emit(True)
+    task.finished.emit()
+    assert calls == [("config", 200), ("manager", 200)]
+    assert dlg.retention.isEnabled()
+
+
+def test_retention_does_not_resolve_lazy_version_backend_on_ui_thread(qtbot, monkeypatch):
+    tasks = []
+    resolved = []
+
+    class FakeTimer:
+        @staticmethod
+        def singleShot(_delay_ms, _callback):
+            return None
+
+    class FakeSignal:
+        def __init__(self):
+            self.callbacks = []
+
+        def connect(self, callback):
+            self.callbacks.append(callback)
+
+    class FakeTask:
+        def __init__(self, fn, label="", parent=None):
+            self.fn = fn
+            self.label = label
+            self.done = FakeSignal()
+            self.finished = FakeSignal()
+
+        def start(self):
+            tasks.append(self)
+
+    class LazyManager:
+        def __getattr__(self, name):
+            resolved.append(name)
+            if name == "set_retention_limit":
+                return lambda _limit: None
+            raise AttributeError(name)
+
+    monkeypatch.setattr(settings_dialog_mod, "QTimer", FakeTimer, raising=False)
+    monkeypatch.setattr(settings_dialog_mod, "BackgroundTask", FakeTask)
+    monkeypatch.setattr(settings_dialog_mod, "get_version_keep_per_doc", lambda: 100)
+    monkeypatch.setattr(settings_dialog_mod, "get_version_management_enabled", lambda: True)
+
+    dlg = SettingsDialog(LazyManager())
+    qtbot.addWidget(dlg)
+    dlg.retention.setCurrentIndex(dlg.retention.findData(200))
+
+    assert resolved == []
+    task = next(task for task in tasks if task.label == "version-retention-update")
+    task.fn()
+    assert resolved == ["set_retention_limit"]
 
 
 def test_deep_vault_audit_runs_in_background_and_reports_result(qtbot, monkeypatch):
@@ -164,6 +378,52 @@ def test_deep_vault_audit_runs_in_background_and_reports_result(qtbot, monkeypat
     assert calls == [True]
     assert dlg.vault_audit_btn.isEnabled()
     assert "ok=True versions=9 objects=17 invalid=0" in dlg.diagnostic_text.toPlainText()
+
+
+def test_vault_audit_does_not_resolve_lazy_version_backend_on_ui_thread(qtbot, monkeypatch):
+    tasks = []
+    resolved = []
+
+    class FakeTimer:
+        @staticmethod
+        def singleShot(_delay_ms, _callback):
+            return None
+
+    class FakeSignal:
+        def __init__(self):
+            self.callbacks = []
+
+        def connect(self, callback):
+            self.callbacks.append(callback)
+
+    class FakeTask:
+        def __init__(self, fn, label="", parent=None):
+            self.fn = fn
+            self.label = label
+            self.done = FakeSignal()
+            self.finished = FakeSignal()
+
+        def start(self):
+            tasks.append(self)
+
+    class LazyManager:
+        def __getattr__(self, name):
+            resolved.append(name)
+            if name == "audit_repository":
+                return lambda **_kwargs: {"ok": True}
+            raise AttributeError(name)
+
+    monkeypatch.setattr(settings_dialog_mod, "QTimer", FakeTimer, raising=False)
+    monkeypatch.setattr(settings_dialog_mod, "BackgroundTask", FakeTask, raising=False)
+    dlg = SettingsDialog(LazyManager())
+    qtbot.addWidget(dlg)
+
+    qtbot.mouseClick(dlg.vault_audit_btn, Qt.LeftButton)
+
+    assert resolved == []
+    task = next(task for task in tasks if task.label == "vault-fsck-deep")
+    task.fn()
+    assert resolved == ["audit_repository"]
 
 
 def test_health_rescan_button_invokes_callback(qtbot, mgr):
@@ -281,7 +541,7 @@ def test_settings_constructor_defers_heavy_diagnostics(qtbot, monkeypatch):
     monkeypatch.setattr(
         settings_dialog_mod.db,
         "stats",
-        lambda _conn: calls.append("stats") or {"file_count": 0, "page_count": 0},
+        lambda _conn, **_kwargs: calls.append("stats") or {"file_count": 0, "page_count": 0},
     )
 
     dlg = SettingsDialog(FakeMgr())
@@ -339,7 +599,7 @@ def test_settings_diagnostics_refresh_runs_heavy_work_in_background(qtbot, monke
     monkeypatch.setattr(
         settings_dialog_mod.db,
         "stats",
-        lambda _conn: calls.append("stats") or {"file_count": 0, "page_count": 0},
+        lambda _conn, **_kwargs: calls.append("stats") or {"file_count": 0, "page_count": 0},
     )
 
     dlg = SettingsDialog(FakeMgr())
@@ -405,7 +665,7 @@ def test_settings_diagnostics_task_registered_for_parent_shutdown(qtbot, monkeyp
     monkeypatch.setattr(
         settings_dialog_mod.db,
         "stats",
-        lambda _conn: {"file_count": 0, "page_count": 0},
+        lambda _conn, **_kwargs: {"file_count": 0, "page_count": 0},
     )
 
     parent = Parent()
@@ -465,7 +725,7 @@ def test_settings_diagnostics_refresh_reuses_inflight_task(qtbot, monkeypatch):
     monkeypatch.setattr(
         settings_dialog_mod.db,
         "stats",
-        lambda _conn: {"file_count": 0, "page_count": 0},
+        lambda _conn, **_kwargs: {"file_count": 0, "page_count": 0},
     )
 
     dlg = SettingsDialog(FakeMgr())

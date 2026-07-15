@@ -30,15 +30,23 @@ def _conn_path(conn) -> str | None:
         return None
 
 
-def _build_report_off_ui(conn, *, year=None):
+def _build_report_off_ui(conn, *, year=None, version_db_path=None):
+    kwargs = {"year": year}
+    if version_db_path is not None:
+        kwargs["version_db_path"] = version_db_path
     path = _conn_path(conn)
     if path:
         own = db.connect(path)
         try:
-            return stats.build_report(own, year=year)
+            return stats.build_report(own, **kwargs)
         finally:
             own.close()
-    return stats.build_report(conn, year=year)
+    return stats.build_report(conn, **kwargs)
+
+
+def _version_db_path(mw):
+    manager = getattr(mw, "_version_mgr", None)
+    return getattr(manager, "_db_path", None) if manager is not None else None
 
 
 def _main_window_alive(mw) -> bool:
@@ -94,7 +102,16 @@ def _open_report(mw) -> None:
     mw._stats_report_loading = True
     if hasattr(mw, "_toast"):
         mw._toast("正在生成胶片报告…")
-    task = BackgroundTask(lambda: _build_report_off_ui(mw._conn, year=None), "stats-report-build", mw)
+    version_db_path = _version_db_path(mw)
+    task = BackgroundTask(
+        lambda: _build_report_off_ui(
+            mw._conn,
+            year=None,
+            version_db_path=version_db_path,
+        ),
+        "stats-report-build",
+        mw,
+    )
     if not hasattr(mw, "_stats_report_tasks"):
         mw._stats_report_tasks = []
     mw._stats_report_tasks.append(task)
@@ -111,7 +128,13 @@ def _open_report(mw) -> None:
             if hasattr(mw, "_toast"):
                 mw._toast("胶片报告生成失败，请稍后重试")
             return
-        ov = ReportOverlay(report, theme.tok(mw._theme), parent=mw, conn=mw._conn)
+        ov = ReportOverlay(
+            report,
+            theme.tok(mw._theme),
+            parent=mw,
+            conn=mw._conn,
+            version_db_path=version_db_path,
+        )
         ov.setGeometry(mw.rect())
         ov.show()
         ov.raise_()
@@ -136,8 +159,15 @@ def _open_report(mw) -> None:
 
 
 def _open_report_sync(mw) -> None:
-    report = _build_report_off_ui(mw._conn, year=None)
-    ov = ReportOverlay(report, theme.tok(mw._theme), parent=mw, conn=mw._conn)
+    version_db_path = _version_db_path(mw)
+    report = _build_report_off_ui(mw._conn, year=None, version_db_path=version_db_path)
+    ov = ReportOverlay(
+        report,
+        theme.tok(mw._theme),
+        parent=mw,
+        conn=mw._conn,
+        version_db_path=version_db_path,
+    )
     ov.setGeometry(mw.rect())
     ov.show()
     ov.raise_()

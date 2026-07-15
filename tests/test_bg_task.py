@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import threading
 
+from PySide6.QtCore import QObject
+from shiboken6 import isValid as qt_is_valid
+
 from pptx_finder.ui import bg_task
 from pptx_finder.ui.bg_task import BackgroundTask
 
@@ -34,6 +37,21 @@ def test_background_task_swallows_exception(qtbot):
     assert blocker.args == [None]          # 异常 → 结果 None，线程不崩
     task.wait(2000)
     assert "failed=" in "\n".join(bg_task.diagnostic_lines())
+
+
+def test_finished_background_tasks_release_qthread_objects(qtbot):
+    """One-shot workers must not accumulate as children of a long-lived window."""
+    parent = QObject()
+    tasks = [BackgroundTask(lambda: None, parent=parent) for _ in range(8)]
+
+    for task in tasks:
+        task.start()
+    for task in tasks:
+        assert task.wait(3000)
+
+    qtbot.waitUntil(lambda: all(not qt_is_valid(task) for task in tasks), timeout=3000)
+    assert parent.findChildren(BackgroundTask) == []
+    assert all(not qt_is_valid(task) for task in tasks)
 
 
 def test_background_task_limits_concurrent_work(qtbot):

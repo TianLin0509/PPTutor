@@ -43,6 +43,94 @@ def test_preview_then_prefetch(qtbot, monkeypatch, tmp_path):
         w.wait(3000)
 
 
+def test_idle_after_preview_releases_hidden_powerpoint(qtbot, monkeypatch, tmp_path):
+    """A preview session must not linger for Explorer to reuse later."""
+    released = threading.Event()
+    monkeypatch.setattr(
+        renderer,
+        "render_page",
+        lambda *_args, **_kwargs: tmp_path / "preview.png",
+    )
+    monkeypatch.setattr(renderer, "shutdown", released.set)
+    monkeypatch.setattr(RenderWorker, "_SESSION_IDLE_RELEASE_SEC", 0.03, raising=False)
+
+    w = RenderWorker()
+    w.start()
+    try:
+        with qtbot.waitSignal(w.rendered, timeout=1000):
+            w.request(1, "f.pptx", 1)
+        assert released.wait(0.5), "hidden PowerPoint was kept alive after preview became idle"
+    finally:
+        w.stop()
+        w.wait(3000)
+
+
+def test_idle_release_failure_does_not_kill_future_preview_requests(qtbot, monkeypatch, tmp_path):
+    """A transient shutdown/RPC error must not leave the UI spinning forever."""
+    shutdown_calls = 0
+
+    def flaky_shutdown():
+        nonlocal shutdown_calls
+        shutdown_calls += 1
+        if shutdown_calls == 1:
+            raise RuntimeError("PowerPoint rejected shutdown")
+
+    monkeypatch.setattr(
+        renderer,
+        "render_page",
+        lambda _path, page_no, **_kwargs: tmp_path / f"{page_no}.png",
+    )
+    monkeypatch.setattr(renderer, "shutdown", flaky_shutdown)
+    monkeypatch.setattr(RenderWorker, "_SESSION_IDLE_RELEASE_SEC", 0.03, raising=False)
+
+    w = RenderWorker()
+    w.start()
+    try:
+        with qtbot.waitSignal(w.rendered, timeout=1000):
+            w.request(1, "first.pptx", 1)
+        qtbot.waitUntil(lambda: shutdown_calls >= 1, timeout=1000)
+
+        with qtbot.waitSignal(w.rendered, timeout=1000) as recovered:
+            w.request(2, "second.pptx", 2)
+        assert recovered.args == [2, str(tmp_path / "2.png")]
+        assert w.isRunning()
+    finally:
+        w.stop()
+        w.wait(3000)
+
+
+def test_rapid_preview_burst_eventually_releases_hidden_powerpoint(
+    qtbot, monkeypatch, tmp_path
+):
+    """Repeated page changes may delay, but must not cancel, idle cleanup."""
+    rendered_pages: list[int] = []
+    shutdowns: list[float] = []
+
+    def fake_render(_path, page_no, **_kwargs):
+        rendered_pages.append(page_no)
+        time.sleep(0.005)
+        return tmp_path / f"{page_no}.png"
+
+    monkeypatch.setattr(renderer, "render_page", fake_render)
+    monkeypatch.setattr(renderer, "shutdown", lambda: shutdowns.append(time.monotonic()))
+    monkeypatch.setattr(RenderWorker, "_SESSION_IDLE_RELEASE_SEC", 0.03, raising=False)
+
+    w = RenderWorker()
+    w.start()
+    try:
+        for page_no in range(1, 21):
+            w.request(page_no, "burst.pptx", page_no)
+            time.sleep(0.002)
+
+        qtbot.waitUntil(lambda: bool(rendered_pages), timeout=1000)
+        qtbot.waitUntil(lambda: bool(shutdowns), timeout=1500)
+        assert w._idle_session_releases >= 1
+        assert w.isRunning()
+    finally:
+        w.stop()
+        w.wait(3000)
+
+
 def test_preview_and_prefetch_reuse_the_same_safe_snapshot(qtbot, monkeypatch, tmp_path):
     calls: list[tuple[int, bool, bool]] = []
     lock = threading.Lock()
@@ -358,7 +446,14 @@ def test_release_session_runs_cleanup_on_render_thread_and_clears_queued_work(
         w.wait(3000)
 
 
-def test_release_session_aborts_a_stuck_packaged_render(monkeypatch):
+def test_release_session_never_hard_aborts_an_inflight_render(monkeypatch):
+    """An external-open handoff must not strand the child-owned POWERPNT.EXE.
+
+    Killing the renderer Python child does not kill the separate PowerPoint COM
+    server it launched.  A timed-out handoff should therefore fail cleanly and
+    let the render finish/clean up in its own apartment instead of producing a
+    hash-named ghost presentation in the taskbar.
+    """
     started = threading.Event()
     unblock = threading.Event()
     aborts = []
@@ -376,24 +471,22 @@ def test_release_session_aborts_a_stuck_packaged_render(monkeypatch):
     monkeypatch.setattr(renderer, "render_page", stuck_render)
     monkeypatch.setattr(renderer, "abort_inflight", abort_inflight, raising=False)
     monkeypatch.setattr(renderer, "shutdown", lambda: None)
-    monkeypatch.setattr(RenderWorker, "_RELEASE_ABORT_GRACE_SEC", 0.03, raising=False)
-
     w = RenderWorker()
     w.start()
     try:
         w.request(1, "stuck.pptx", 1)
         assert started.wait(1)
         before = time.perf_counter()
-        assert w.release_session(timeout_sec=0.5) is True
-        assert time.perf_counter() - before < 0.45
-        assert len(aborts) == 1
+        assert w.release_session(timeout_sec=0.08) is False
+        assert time.perf_counter() - before < 0.3
+        assert aborts == []
     finally:
         unblock.set()
         w.stop()
         w.wait(3000)
 
 
-def test_stop_aborts_inflight_renderer_before_waiting(monkeypatch):
+def test_stop_first_allows_inflight_renderer_to_finish_cooperatively(monkeypatch):
     started = threading.Event()
     unblock = threading.Event()
     aborts = []
@@ -418,8 +511,10 @@ def test_stop_aborts_inflight_renderer_before_waiting(monkeypatch):
         w.request(1, "stuck.pptx", 1)
         assert started.wait(1)
         w.stop()
+        assert w.wait(50) is False
+        assert aborts == []
+        unblock.set()
         assert w.wait(800)
-        assert aborts == [True]
     finally:
         unblock.set()
         if w.isRunning():

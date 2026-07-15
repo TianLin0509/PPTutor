@@ -186,7 +186,7 @@ class DetailPanel(QWidget):
         is_pptx = bool(self._path and str(self._path).lower().endswith(".pptx"))
         self._slim_btn.setEnabled(self._file_actions_enabled and is_pptx)
 
-    def update_for(self, r, versions: list) -> None:
+    def update_for(self, r, versions: list, *, versioning_enabled: bool = True) -> None:
         self._path = r.path
         self._sync_slim_button()
         parts = []
@@ -195,12 +195,21 @@ class DetailPanel(QWidget):
             parts.append(f"大小 {sz}")
         if r.page_count:
             parts.append(f"{r.page_count} 页")
-        parts.append(f"{len(versions)} 个版本" if versions else "暂无版本")
+        if versioning_enabled:
+            parts.append(f"{len(versions)} 个版本" if versions else "暂无版本")
+        else:
+            parts.append("版本管理未开启")
         self._meta_label.setText("　·　".join(parts))
 
         self._clear(self._version_box)
         self._version_nodes = []
         self._version_preview_labels = {}
+        if not versioning_enabled:
+            tip = QLabel("版本管理当前关闭\n如需自动留存历史版本，可在设置 → 高阶功能中手动开启")
+            tip.setObjectName("detailMuted")
+            tip.setWordWrap(True)
+            self._version_box.addWidget(tip)
+            return
         if not versions:
             tip = QLabel("还没有历史版本\n用 PowerPoint 改一改、保存一下，就会自动留版本——全盘自动，无需任何设置")
             tip.setObjectName("detailMuted")

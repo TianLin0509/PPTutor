@@ -107,3 +107,11 @@ def test_sync_autostart_preference_respects_user_disabled(monkeypatch, tmp_path)
 
     assert app_mod._sync_autostart_preference() is True
     assert calls == [False]
+
+
+def test_singleton_name_can_be_isolated_for_frozen_smoke(monkeypatch):
+    monkeypatch.setenv("PPTX_FINDER_SINGLETON_NAME", "ppt-doctor-isolated-smoke")
+    assert app_mod._singleton_name() == "ppt-doctor-isolated-smoke"
+
+    monkeypatch.delenv("PPTX_FINDER_SINGLETON_NAME")
+    assert app_mod._singleton_name() == app_mod.SINGLETON_NAME

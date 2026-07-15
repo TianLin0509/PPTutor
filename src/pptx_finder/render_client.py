@@ -46,6 +46,17 @@ class RendererProcessClient:
         self._proc: subprocess.Popen | None = None
         self._sock: socket.socket | None = None
         self._file = None
+        # Before the authenticated handshake the child cannot have received a
+        # render request, so terminating a failed startup is safe.  Afterwards
+        # it may own a separate POWERPNT.EXE COM server and must be allowed to
+        # unwind through render_service.main()'s finally cleanup.
+        self._child_ready = False
+        self._detached_cleanup = 0
+        self._detached_alive = 0
+        # Keep exact Popen objects until their handshake-complete children have
+        # really exited.  This makes the safety gate self-healing via poll() even
+        # if Windows refuses to create the optional daemon reaper thread.
+        self._detached_procs: list[Any] = []
         self._request_active = False
         self._abort_generation = 0
         self._aborts = 0
@@ -67,9 +78,22 @@ class RendererProcessClient:
         with self._transport_lock:
             proc = self._proc
             sock = self._sock
+            detached_alive = self._prune_detached_locked()
+        if detached_alive:
+            self._last_error = "previous renderer is still cleaning up PowerPoint"
+            raise RendererRequestAborted(self._last_error)
         if proc is not None and proc.poll() is None and sock is not None:
             return
         self._hard_stop_locked()
+        # ``_hard_stop_locked`` may itself detach a handshake-complete child.
+        # Starting another child now can create a second hidden POWERPNT.EXE while
+        # the first still owns its COM session and snapshot deck.  Sacrifice one
+        # preview request instead of multiplying Office pollution.
+        with self._transport_lock:
+            detached_alive = self._prune_detached_locked()
+        if detached_alive:
+            self._last_error = "previous renderer is still cleaning up PowerPoint"
+            raise RendererRequestAborted(self._last_error)
 
         token = secrets.token_hex(16)
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -105,6 +129,7 @@ class RendererProcessClient:
             with self._transport_lock:
                 self._sock = sock
                 self._file = f
+                self._child_ready = True
             self._restarts += 1
             self._last_error = ""
         except Exception:
@@ -121,10 +146,99 @@ class RendererProcessClient:
             self._sock = None
             proc = self._proc
             self._proc = None
-        self._stop_transport(f, sock, proc)
+            child_ready = self._child_ready
+            self._child_ready = False
+        if child_ready:
+            self._disconnect_ready_child(f, sock, proc)
+        else:
+            self._stop_transport(f, sock, proc)
+
+    def _graceful_stop_locked(self) -> None:
+        """Detach transport and let a shutdown-acknowledging child exit itself.
+
+        The child sends its reply after closing the owned Presentation and
+        PowerPoint application, then still has a very small Python ``finally``
+        cleanup window.  Terminating it immediately in that window can strand a
+        hash-named snapshot deck in POWERPNT.EXE.
+        """
+        with self._transport_lock:
+            f = self._file
+            self._file = None
+            sock = self._sock
+            self._sock = None
+            proc = self._proc
+            self._proc = None
+            self._child_ready = False
+        self._stop_transport(f, sock, proc, graceful_wait_sec=2.0)
+
+    def _disconnect_ready_child(self, f, sock: socket.socket | None, proc) -> None:
+        """Wake a ready renderer without terminating its COM-cleanup process.
+
+        POWERPNT.EXE is not a child of the Python renderer in a way that
+        ``Popen.terminate`` cleans up.  Closing the authenticated transport wakes
+        the parent request immediately; once an in-flight COM call returns, the
+        renderer sees the broken socket and executes its ``finally: shutdown``.
+        A daemon reaper only releases the process handle and never kills it.
+        """
+        self._stop_transport(f, sock, None)
+        if proc is None:
+            return
+        try:
+            if proc.poll() is not None:
+                return
+        except Exception:  # noqa: BLE001 process may already be gone
+            return
+        with self._transport_lock:
+            self._detached_cleanup += 1
+            self._detached_procs.append(proc)
+            self._detached_alive = len(self._detached_procs)
+
+        def _reap() -> None:
+            try:
+                proc.wait()
+            except Exception:  # noqa: BLE001 detached cleanup is best-effort
+                pass
+            finally:
+                with self._transport_lock:
+                    self._detached_procs = [
+                        item for item in self._detached_procs if item is not proc
+                    ]
+                    self._detached_alive = len(self._detached_procs)
+
+        try:
+            reaper = threading.Thread(
+                target=_reap,
+                name="pptdoctor-render-cleanup",
+                daemon=True,
+            )
+            reaper.start()
+        except Exception as exc:  # noqa: BLE001 request-time poll remains the fallback
+            self._last_error = (
+                "renderer cleanup thread unavailable; polling child process: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    def _prune_detached_locked(self) -> int:
+        """Refresh the detached-child gate; caller owns ``_transport_lock``."""
+        alive = []
+        for proc in self._detached_procs:
+            try:
+                if proc.poll() is None:
+                    alive.append(proc)
+            except Exception:  # noqa: BLE001 uncertainty must fail closed
+                alive.append(proc)
+        self._detached_procs = alive
+        self._detached_alive = len(alive)
+        return self._detached_alive
 
     @staticmethod
-    def _stop_transport(f, sock: socket.socket | None, proc) -> None:
+    def _stop_transport(
+        f,
+        sock: socket.socket | None,
+        proc,
+        *,
+        graceful_wait_sec: float = 0.0,
+    ) -> None:
         # ``shutdown`` is what wakes a different thread blocked in ``readline``;
         # closing the file object first can itself wait on that reader on Windows.
         try:
@@ -145,6 +259,12 @@ class RendererProcessClient:
         if proc is None:
             return
         if proc.poll() is None:
+            if graceful_wait_sec > 0:
+                try:
+                    proc.wait(timeout=float(graceful_wait_sec))
+                    return
+                except Exception:  # noqa: BLE001 child is genuinely stuck
+                    pass
             try:
                 proc.terminate()
                 proc.wait(timeout=3)
@@ -264,7 +384,12 @@ class RendererProcessClient:
             self._sock = None
             proc = self._proc
             self._proc = None
-        self._stop_transport(f, sock, proc)
+            child_ready = self._child_ready
+            self._child_ready = False
+        if child_ready:
+            self._disconnect_ready_child(f, sock, proc)
+        else:
+            self._stop_transport(f, sock, proc)
         return active
 
     def render_page(
@@ -313,13 +438,18 @@ class RendererProcessClient:
 
     def shutdown(self) -> None:
         with self._lock:
+            graceful = False
             try:
                 if self._proc is not None and self._proc.poll() is None:
-                    self._request_locked({"op": "shutdown"})
+                    resp = self._request_locked({"op": "shutdown"})
+                    graceful = bool(resp.get("ok") and resp.get("shutdown"))
             except Exception:
                 pass
             finally:
-                self._hard_stop_locked()
+                if graceful:
+                    self._graceful_stop_locked()
+                else:
+                    self._hard_stop_locked()
 
     def diagnostic_lines(self) -> list[str]:
         acquired = self._lock.acquire(blocking=False)
@@ -337,7 +467,9 @@ class RendererProcessClient:
                 "renderer_ipc: "
                 f"enabled={should_use_ipc()} alive={alive} busy={not acquired} total={self._total} "
                 f"restarts={self._restarts} crashes={self._crashes} timeouts={self._timeouts} "
-                f"aborts={self._aborts} last_ms={self._last_ms:.1f} p95_ms={p95:.1f}",
+                f"aborts={self._aborts} detached_cleanup={self._detached_cleanup} "
+                f"detached_alive={self._detached_alive} "
+                f"last_ms={self._last_ms:.1f} p95_ms={p95:.1f}",
                 f"renderer_ipc_last_error: {self._last_error or '-'}",
             ]
         finally:

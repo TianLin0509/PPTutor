@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
@@ -18,6 +19,22 @@ _SKIP_SEGS = (
     "\\windows\\", "\\program files", "\\programdata\\", "\\$recycle.bin\\",
     "\\appdata\\local\\temp\\", "\\node_modules\\", "\\.git\\", "\\__pycache__\\",
 )
+
+
+class _PendingCall:
+    """One logical debounce entry; many entries share a single wake timer."""
+
+    def __init__(self, owner, path: str, deadline: float, attempt: int):
+        self.owner = owner
+        self.path = path
+        self.deadline = float(deadline)
+        self.attempt = int(attempt)
+        self.cancelled = False
+
+    def cancel(self) -> None:
+        # Preserve the old timer-like testing/debugging surface without creating
+        # a native thread for every changed file.
+        self.cancelled = True
 
 
 def default_watch_paths() -> list[str]:
@@ -46,19 +63,29 @@ class _Handler(FileSystemEventHandler):
         roots: list[str] | None = None,
         on_content_saved=None,
         on_removed=None,
+        allowed_exts=None,
     ):
         self._on_saved = on_saved
         self._on_moved = on_moved
         self._on_content_saved = on_content_saved
         self._on_removed = on_removed
+        self._allowed_exts_source = allowed_exts
         self._explicit_skip_roots = [
             _norm_path(r) for r in (roots or [])
             if any(seg in _norm_path(r).lower() for seg in _SKIP_SEGS)
         ]
         self._always_skip_roots = [_norm_path(str(data_dir()))]
-        self._timers: dict[str, threading.Timer] = {}
+        self._timers: dict[str, _PendingCall] = {}
         self._retry_delays = SAVE_RETRY_DELAYS_SEC
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self._wake_timer: threading.Timer | None = None
+        self._wake_deadline = 0.0
+        self._stopped = False
+
+    def _allowed_exts(self) -> set[str]:
+        source = self._allowed_exts_source
+        values = source() if callable(source) else source
+        return {e.lower() for e in (values if values is not None else CONTENT_EXTS)}
 
     def _skip_path(self, path: str) -> bool:
         if any(_under(path, root) for root in self._always_skip_roots):
@@ -69,41 +96,100 @@ class _Handler(FileSystemEventHandler):
         return not any(_under(path, root) for root in self._explicit_skip_roots)
 
     def _trigger(self, path: str) -> None:
-        if os.path.splitext(path)[1].lower() not in CONTENT_EXTS:
+        if os.path.splitext(path)[1].lower() not in self._allowed_exts():
             return
         if os.path.basename(path).startswith("~$"):
             return
         if self._skip_path(path):
             return
+        self._schedule(path, DEBOUNCE_SEC, 0)
+
+    def _schedule(self, path: str, delay: float, attempt: int) -> None:
         with self._lock:
+            if self._stopped:
+                return
             old = self._timers.get(path)
-            if old:
-                old.cancel()
-            t = threading.Timer(DEBOUNCE_SEC, self._fire, args=(path,))
-            self._timers[path] = t
-            t.start()
+            if old is not None:
+                old.cancelled = True
+            pending = _PendingCall(
+                self,
+                path,
+                time.monotonic() + max(0.0, float(delay)),
+                attempt,
+            )
+            self._timers[path] = pending
+            self._arm_wake_timer_locked()
+
+    def _arm_wake_timer_locked(self) -> None:
+        active = [entry for entry in self._timers.values() if not entry.cancelled]
+        if not active or self._stopped:
+            if self._wake_timer is not None:
+                self._wake_timer.cancel()
+            self._wake_timer = None
+            self._wake_deadline = 0.0
+            return
+        deadline = min(entry.deadline for entry in active)
+        # A timer already due no later than the new earliest entry can service
+        # the whole batch. Reusing it is what turns 1,000 saves into one thread.
+        if self._wake_timer is not None and self._wake_deadline <= deadline + 0.001:
+            return
+        if self._wake_timer is not None:
+            self._wake_timer.cancel()
+        timer = threading.Timer(
+            max(0.0, deadline - time.monotonic()),
+            self._drain_due,
+        )
+        timer.daemon = True
+        self._wake_timer = timer
+        self._wake_deadline = deadline
+        timer.start()
+
+    def _drain_due(self) -> None:
+        ready: list[_PendingCall] = []
+        with self._lock:
+            self._wake_timer = None
+            self._wake_deadline = 0.0
+            if self._stopped:
+                return
+            now = time.monotonic()
+            for path, entry in list(self._timers.items()):
+                if entry.cancelled:
+                    if self._timers.get(path) is entry:
+                        self._timers.pop(path, None)
+                    continue
+                if entry.deadline <= now + 0.01:
+                    if self._timers.get(path) is entry:
+                        self._timers.pop(path, None)
+                        ready.append(entry)
+            self._arm_wake_timer_locked()
+        for entry in ready:
+            self._fire(entry.path, entry.attempt, _scheduled=True)
+
+    def stop(self) -> None:
+        with self._lock:
+            self._stopped = True
+            for entry in self._timers.values():
+                entry.cancelled = True
+            self._timers.clear()
+            if self._wake_timer is not None:
+                self._wake_timer.cancel()
+            self._wake_timer = None
+            self._wake_deadline = 0.0
 
     def _schedule_retry(self, path: str, attempt: int) -> None:
         if attempt >= len(self._retry_delays):
             log.warning("watcher save retry exhausted: %s", path)
             return
-        with self._lock:
-            old = self._timers.get(path)
-            if old:
-                old.cancel()
-            timer = threading.Timer(
-                self._retry_delays[attempt],
-                self._fire,
-                args=(path, attempt + 1),
-            )
-            self._timers[path] = timer
-            timer.start()
+        self._schedule(path, self._retry_delays[attempt], attempt + 1)
 
-    def _fire(self, path: str, attempt: int = 0) -> None:
+    def _fire(self, path: str, attempt: int = 0, *, _scheduled: bool = False) -> None:
         with self._lock:
-            self._timers.pop(path, None)
+            if self._stopped:
+                return
+            if not _scheduled:
+                self._timers.pop(path, None)
         ext = os.path.splitext(path)[1].lower()
-        if ext not in CONTENT_EXTS:
+        if ext not in self._allowed_exts():
             return
         callback = self._on_saved if ext == PPTX_EXT else self._on_content_saved
         if callback is None:
@@ -128,7 +214,10 @@ class _Handler(FileSystemEventHandler):
 
     def on_moved(self, e):  # noqa: N802
         if not e.is_directory:
-            if self._on_content_saved is not None and os.path.splitext(e.src_path)[1].lower() in CONTENT_EXTS:
+            if (
+                self._on_content_saved is not None
+                and os.path.splitext(e.src_path)[1].lower() in self._allowed_exts()
+            ):
                 try:
                     self._on_content_saved(e.src_path)  # 删除旧路径的搜索索引
                 except Exception:  # noqa: BLE001
@@ -144,7 +233,7 @@ class _Handler(FileSystemEventHandler):
         if e.is_directory:
             return
         ext = os.path.splitext(e.src_path)[1].lower()
-        if ext not in CONTENT_EXTS:
+        if ext not in self._allowed_exts():
             return
         if self._on_content_saved is not None:
             try:
@@ -166,9 +255,18 @@ class VaultWatcher:
         on_moved=None,
         on_content_saved=None,
         on_removed=None,
+        allowed_exts=None,
     ):
         self._obs = Observer()
-        handler = _Handler(on_saved, on_moved, roots, on_content_saved, on_removed)
+        handler = _Handler(
+            on_saved,
+            on_moved,
+            roots,
+            on_content_saved,
+            on_removed,
+            allowed_exts,
+        )
+        self._handler = handler
         for r in roots:
             if os.path.isdir(r):
                 self._obs.schedule(handler, r, recursive=True)
@@ -178,6 +276,7 @@ class VaultWatcher:
 
     def stop(self) -> None:
         try:
+            self._handler.stop()
             self._obs.stop()
             self._obs.join(timeout=3)
         except Exception:  # noqa: BLE001
