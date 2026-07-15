@@ -9,6 +9,7 @@ import datetime
 import html
 import logging
 import os
+import re
 from collections import deque
 
 import sys
@@ -46,6 +47,7 @@ from ..query_explain import explain_query, mode_label, suggestion_keys
 from . import theme
 from .bg_task import BackgroundTask
 from .index_worker import IndexWorker
+from .index_activity_bar import IndexActivityBar
 from .live_indexer import LiveIndexer
 from .path_helpers import ensure_pptx_suffix
 from .render_worker import RenderWorker
@@ -1204,17 +1206,26 @@ class MainWindow(QMainWindow):
 
         self.status = self.statusBar()
         self.status.setObjectName("statusBar")
-        self.index_bar = QProgressBar()
+        self.index_phase_label = QLabel("")
+        self.index_phase_label.setObjectName("indexPhase")
+        self.index_phase_label.hide()
+        self.status.addWidget(self.index_phase_label)
+        self.index_bar = IndexActivityBar()
         self.index_bar.setObjectName("indexBar")
-        self.index_bar.setTextVisible(False)
-        self.index_bar.setFixedWidth(200)
+        self.index_bar.set_accent_color(self._tok["acc"])
         self.index_bar.hide()
         self.status.addWidget(self.index_bar)
+        self.index_count_label = QLabel("")
+        self.index_count_label.setObjectName("indexCount")
+        self.index_count_label.hide()
+        self.status.addWidget(self.index_count_label)
         self.pct_label = QLabel("")
         self.pct_label.setObjectName("pctLabel")
+        self.pct_label.hide()
         self.status.addWidget(self.pct_label)
         self.type_rail = self._build_type_rail()  # 分类型索引进度迷你条（设计 D）
         self.status.addWidget(self.type_rail)
+        self.type_rail.hide()
         self._type_conn = None          # 分类型计数用的独立只读连接（懒开，避免主线程抢写锁）
         self._type_rail_last_at = 0.0   # 分类型条刷新节流时间戳
         self.status_dot = QLabel("●")
@@ -1661,6 +1672,8 @@ class MainWindow(QMainWindow):
         app = QApplication.instance()
         if app is not None:
             app.setStyleSheet(theme.build_qss(name))
+        if getattr(self, "index_bar", None) is not None:
+            self.index_bar.set_accent_color(self._tok["acc"])
         self.theme_btn.setText(f"🎨 {dict(theme.THEMES).get(name, name)}")
         if persist:
             _save_theme(name)
@@ -5005,6 +5018,12 @@ class MainWindow(QMainWindow):
         self._index_rate_last_at = self._index_started_at
         self._index_status_cache = None
         self.type_rail.hide()  # 避免建库写锁期间在 GUI 线程反复查 type_counts
+        self.index_phase_label.setText("升级" if self._index_rebuild_reason else "扫描")
+        self.index_phase_label.show()
+        self.index_count_label.setText("准备中")
+        self.index_count_label.show()
+        self.pct_label.clear()
+        self.pct_label.hide()
         self.index_bar.setRange(0, 0)
         self.index_bar.show()
         self.status_dot.hide()
@@ -5071,22 +5090,36 @@ class MainWindow(QMainWindow):
         self._index_progress_last_phase = phase
         self.status_dot.hide()
         self.type_rail.hide()
+        self.index_phase_label.show()
+        self.index_count_label.show()
         self.index_bar.show()
         if getattr(self, "_welcome", None) is not None and done > 0:
             self._welcome.update_progress(done)
         preserve_search_status = self._search_pending_req is not None
         if total < 0:
-            self.index_bar.setRange(0, 0)  # busy锛氳繘搴︽潯鏉ュ洖娴佸姩锛堟壂鎻忥紝鎬绘暟鏈煡锛?
-            self.pct_label.setText("")
+            self.index_bar.setRange(0, 0)
+            self.index_phase_label.setText("升级" if self._index_rebuild_reason else "扫描")
+            found = re.search(r"发现\s*([\d,]+)", str(cur or ""))
+            if found:
+                self.index_count_label.setText(f"发现 {found.group(1)}")
+            elif done > 0:
+                self.index_count_label.setText(f"已整理 {done:,}")
+            else:
+                self.index_count_label.setText("盘点中")
+            self.pct_label.clear()
+            self.pct_label.hide()
+            self.status_label.setToolTip(str(cur or ""))
             if not preserve_search_status:
                 prefix = "升级索引中" if self._index_rebuild_reason else "扫描磁盘中"
-                self.status_label.setText(
-                    f"{prefix}…　{cur} · 文件总数尚未确定（可边扫边搜）"
-                )
+                self.status_label.setText(f"{prefix} · 可边扫边搜")
         else:
             self.index_bar.setRange(0, max(1, total))
             self.index_bar.setValue(done)
+            self.index_phase_label.setText("升级" if self._index_rebuild_reason else "建库")
+            self.index_count_label.setText(f"{done:,} / {total:,}")
             self.pct_label.setText(f"{int(done / max(1, total) * 100)}%")
+            self.pct_label.show()
+            self.status_label.setToolTip(str(cur or ""))
             if not preserve_search_status:
                 speed = f" · {rate:.1f} 个/秒" if rate > 0 else ""
                 remaining = (
@@ -5094,7 +5127,7 @@ class MainWindow(QMainWindow):
                     if eta is not None and done < total else ""
                 )
                 self.status_label.setText(
-                    f"正在建库　{done}/{total}{speed}{remaining}（前台操作优先）"
+                    f"正在建库{speed}{remaining} · 前台操作优先"
                 )
 
     def _on_index_done(self, summary: dict) -> None:
@@ -5107,10 +5140,14 @@ class MainWindow(QMainWindow):
         cancelled = bool(int((summary or {}).get("cancelled", 0) or 0))
         if error or cancelled:
             self.index_bar.hide()
+            self.index_phase_label.hide()
+            self.index_count_label.hide()
             self.type_rail.hide()
             self._close_type_conn()
-            self.pct_label.setText("")
+            self.pct_label.clear()
+            self.pct_label.hide()
             self.status_dot.hide()
+            self.status_label.setToolTip("")
             if error:
                 self.status_label.setText(
                     f"建库遇到问题，已有结果仍可搜索 · {error}"
@@ -5132,9 +5169,13 @@ class MainWindow(QMainWindow):
                 pass
             self._index_rebuild_reason = ""
         self.index_bar.hide()
+        self.index_phase_label.hide()
+        self.index_count_label.hide()
         self.type_rail.hide()
         self._close_type_conn()
-        self.pct_label.setText("")
+        self.pct_label.clear()
+        self.pct_label.hide()
+        self.status_label.setToolTip("")
         celebrate = not getattr(self, "_index_celebrated", False)
         if celebrate:
             self._index_celebrated = True
