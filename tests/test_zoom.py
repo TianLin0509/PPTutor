@@ -26,6 +26,22 @@ def test_zoom_by_increases(qtbot, tmp_path):
     assert win._zoom > 1.0
 
 
+def test_rapid_ctrl_wheel_zoom_coalesces_expensive_pixmap_scaling(qtbot, tmp_path, monkeypatch):
+    win = _win(qtbot, tmp_path)
+    calls = 0
+
+    def record_scale():
+        nonlocal calls
+        calls += 1
+
+    monkeypatch.setattr(win, "_update_pixmap", record_scale)
+    for _ in range(12):
+        win._zoom_by(1.05)
+
+    assert calls == 0
+    qtbot.waitUntil(lambda: calls == 1, timeout=1000)
+
+
 def test_zoom_floor_is_fit(qtbot, tmp_path):
     win = _win(qtbot, tmp_path)
     win._zoom_by(0.5)

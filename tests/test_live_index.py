@@ -142,7 +142,7 @@ def test_startup_empty_index_check_runs_in_background(qtbot, monkeypatch, tmp_pa
     calls = []
     starts = []
 
-    def fake_stats(_conn):
+    def fake_stats(_conn, **_kwargs):
         calls.append("stats")
         return {"file_count": 0, "page_count": 0}
 
@@ -166,13 +166,13 @@ def test_startup_empty_index_check_runs_in_background(qtbot, monkeypatch, tmp_pa
     )
     qtbot.addWidget(win)
 
-    assert calls == []
     assert starts == []
     startup_task = next(t for t in tasks if t.label == "startup-index-check")
+    calls_before_startup_check = len(calls)
 
     _finish_fake_task(startup_task)
 
-    assert calls == ["stats"]
+    assert len(calls) == calls_before_startup_check + 1
     assert starts == [(["C:/docs"], 2)]
     lines = "\n".join(win.diagnostic_lines())
     assert "startup_index_check:" in lines
@@ -221,7 +221,7 @@ def test_startup_existing_index_check_updates_status_without_scan(qtbot, monkeyp
     monkeypatch.setattr(
         main_window_mod.db,
         "stats",
-        lambda _conn: {
+        lambda _conn, **_kwargs: {
             "file_count": 4,
             "page_count": 9,
             "last_completed_scan_at": time.time(),
@@ -263,7 +263,7 @@ def test_startup_stale_index_reconciles_known_files_without_full_disk_scan(
     monkeypatch.setattr(
         main_window_mod.db,
         "stats",
-        lambda _conn: {
+        lambda _conn, **_kwargs: {
             "file_count": 4,
             "page_count": 9,
             "last_completed_scan_at": time.time() - MainWindow._KNOWN_RECONCILE_INTERVAL_SEC - 1,
@@ -368,9 +368,10 @@ def test_startup_week_old_full_scan_schedules_single_worker_coverage(
             "page_count": 9,
             "pending_count": 0,
             "last_completed_scan_at": time.time() - win._FULL_COVERAGE_INTERVAL_SEC - 1,
-            "last_known_reconcile_at": time.time(),
-            "scan_policy_version": SCAN_POLICY_VERSION,
-        },
+                "last_known_reconcile_at": time.time(),
+                "scan_policy_version": SCAN_POLICY_VERSION,
+                "completed_feature_signature": win._current_index_feature_signature(),
+            },
     )
 
     assert scheduled == [(None, "periodic_coverage")]
@@ -419,7 +420,7 @@ def test_startup_existing_index_with_pending_reconciles_known_files_only(
     monkeypatch.setattr(
         main_window_mod.db,
         "stats",
-        lambda _conn: {
+        lambda _conn, **_kwargs: {
             "file_count": 4,
             "page_count": 9,
             "pending_count": 2,
@@ -637,8 +638,8 @@ def test_pending_resume_drips_all_paths_in_current_session(qtbot, tmp_path):
     assert not win._startup_pending_timer.isActive()
 
 
-def test_index_progress_updates_type_rail(qtbot, tmp_path):
-    """建库中底部分类型迷你条（设计 D）：每类显示 已建/发现 x/y，建完打 ✓，无此类显 —。"""
+def test_index_progress_uses_lock_free_aggregate_bar(qtbot, tmp_path):
+    """建库中不在 GUI 线程轮询 type_counts，避免与写库/VACUUM 争锁。"""
     conn = db.connect(tmp_path / "i.db")
     db.init_db(conn)
 
@@ -656,11 +657,11 @@ def test_index_progress_updates_type_rail(qtbot, tmp_path):
 
     win._on_index_progress(2, 3, r"C:\docs\c.docx")
 
-    assert not win.type_rail.isHidden()
-    assert win._type_bars["PPT"]._cap.text() == "PPT 2/2 ✓"   # 2 个 pptx 都已建
-    assert win._type_bars["Word"]._cap.text() == "Word 0/1"   # 1 个 docx 待补建
-    assert win._type_bars["PDF"]._cap.text() == "PDF —"       # 没有 PDF（xlsx/txt 已砍，桶=PPT/Word/PDF）
-    win._close_type_conn()
+    assert win.type_rail.isHidden()
+    assert not win.index_bar.isHidden()
+    assert win.index_bar.maximum() == 3
+    assert win.index_bar.value() == 2
+    assert "前台操作优先" in win.status_label.text()
 
 
 def test_live_indexer_async_off_main_thread(qtbot, tmp_path):
@@ -695,6 +696,39 @@ def test_live_indexer_coalesces_duplicate_paths(tmp_path):
     li.submit(p)
     li.submit(p)
     assert li._q.qsize() == 1
+
+
+def test_live_indexer_retries_transient_database_connect_failure(
+    monkeypatch, qtbot, tmp_path
+):
+    attempts = []
+
+    class FakeConn:
+        def close(self):
+            return None
+
+    def flaky_connect(_path):
+        attempts.append(True)
+        if len(attempts) < 3:
+            raise OSError("database temporarily unavailable")
+        return FakeConn()
+
+    monkeypatch.setattr("pptx_finder.ui.live_indexer.db.connect", flaky_connect)
+    monkeypatch.setattr(
+        "pptx_finder.ui.live_indexer.indexer.index_single",
+        lambda _conn, _path, **_kwargs: True,
+    )
+    monkeypatch.setattr(LiveIndexer, "_CONNECT_RETRY_SEC", 0.01, raising=False)
+    li = LiveIndexer(str(tmp_path / "i.db"))
+    li.start()
+    try:
+        with qtbot.waitSignal(li.indexed, timeout=1000):
+            li.submit(str(tmp_path / "deck.pptx"))
+        assert len(attempts) == 3
+        assert li.isRunning()
+    finally:
+        li.stop()
+        li.wait(3000)
 
 
 def test_live_index_deferred_while_full_index_running(qtbot, tmp_path):
@@ -804,7 +838,7 @@ def test_deferred_live_flush_does_not_sort_entire_storm(qtbot, monkeypatch, tmp_
     assert scheduled[-1][0] >= 1
 
 
-def test_index_worker_reports_search_ready_before_clustering(monkeypatch, qtbot, tmp_path):
+def test_index_worker_reports_done_only_after_clustering(monkeypatch, qtbot, tmp_path):
     cluster_started = threading.Event()
     release_cluster = threading.Event()
     emitted = []
@@ -826,10 +860,12 @@ def test_index_worker_reports_search_ready_before_clustering(monkeypatch, qtbot,
     try:
         assert cluster_started.wait(1), "cluster should start in worker thread"
         qtbot.wait(80)
-        assert emitted == [{"indexed": 1, "deleted": 0}]
+        assert emitted == []
     finally:
         release_cluster.set()
         worker.wait(1000)
+    qtbot.waitUntil(lambda: bool(emitted), timeout=1000)
+    assert emitted == [{"indexed": 1, "deleted": 0}]
 
 
 def test_no_change_coverage_skips_cluster_and_database_maintenance(monkeypatch, qtbot, tmp_path):
@@ -865,6 +901,22 @@ def test_no_change_coverage_skips_cluster_and_database_maintenance(monkeypatch, 
         worker.wait(1000)
 
     assert heavy_calls == []
+
+
+def test_index_worker_connection_failure_emits_terminal_error(monkeypatch, qtbot, tmp_path):
+    monkeypatch.setattr(
+        "pptx_finder.ui.index_worker.db.connect",
+        lambda _path: (_ for _ in ()).throw(OSError("index database unavailable")),
+    )
+    worker = IndexWorker(str(tmp_path / "i.db"), [str(tmp_path)], workers=1)
+    worker.start()
+    try:
+        with qtbot.waitSignal(worker.finished_index, timeout=1000) as blocker:
+            pass
+        assert "index database unavailable" in str(blocker.args[0].get("error"))
+    finally:
+        worker.stop()
+        worker.wait(3000)
 
 
 def test_index_worker_throttles_progress_burst_before_ui(monkeypatch, qtbot, tmp_path):

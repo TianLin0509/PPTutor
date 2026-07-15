@@ -131,6 +131,40 @@ def test_version_window_constructor_schedules_doc_load(qtbot, monkeypatch):
     assert "deck-a.pptx" in win.doc_list.item(0).text()
 
 
+def test_version_window_constructor_does_not_resolve_lazy_backend_on_ui_thread(
+    qtbot, monkeypatch
+):
+    scheduled = []
+    resolved = []
+
+    class FakeTimer:
+        @staticmethod
+        def singleShot(delay_ms, callback):
+            scheduled.append((delay_ms, callback))
+
+    class LazyManager:
+        def supports(self, name):
+            return name == "ensure_version_preview"
+
+        def __getattr__(self, name):
+            resolved.append(name)
+            raise AssertionError(f"lazy backend resolved on UI thread: {name}")
+
+    monkeypatch.setattr(version_window_mod, "QTimer", FakeTimer, raising=False)
+
+    win = VersionWindow(LazyManager())
+    qtbot.addWidget(win)
+    win.ver_list.addItem("v1")
+    win.ver_list.item(0).setData(version_window_mod.Qt.UserRole, {
+        "version_id": "v1",
+        "doc_path": "C:/deck.pptx",
+    })
+    win.ver_list.setCurrentRow(0)
+
+    assert scheduled
+    assert resolved == []
+
+
 def test_version_window_background_tasks_registered_for_parent_shutdown(qtbot, monkeypatch):
     scheduled: list[tuple[int, object]] = []
     tasks = []
@@ -2061,8 +2095,14 @@ def test_version_window_restore_runs_in_background(qtbot, monkeypatch):
     win._restore()
 
     assert not any(call[0] == "restore_to" for call in mgr.calls if isinstance(call, tuple))
-    assert tasks and tasks[-1].label == "version-restore"
+    assert ("describe_version_diff", "v1") not in mgr.calls
+    assert tasks and tasks[-1].label == "version-restore-prepare"
+    assert questions == []
+    prepared = tasks[-1].fn()
+    tasks[-1].done.emit(prepared)
+
     assert questions and "文本改动 1 页" in questions[-1][2]
+    assert tasks[-1].label == "version-restore"
     assert not win.btn_restore.isEnabled()
 
     result = tasks[-1].fn()
@@ -2111,7 +2151,11 @@ def test_version_window_restore_does_not_probe_path_on_ui_thread(qtbot, monkeypa
     win._restore()
 
     assert exists_calls == []
-    assert tasks and tasks[-1].label == "version-restore"
+    assert tasks and tasks[-1].label == "version-restore-prepare"
+    prepared = tasks[-1].fn()
+    tasks[-1].done.callbacks[0](prepared)
+    assert tasks[-1].label == "version-restore"
+    assert exists_calls == []
 
 
 def test_version_window_restore_skips_confirm_when_file_op_active(qtbot, monkeypatch):

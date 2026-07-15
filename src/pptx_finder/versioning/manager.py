@@ -879,9 +879,10 @@ class VersionManager:
         self._conn.commit()
 
     # ---------- Watcher lifecycle ----------
-    def start(self) -> None:
+    def start(self, *, watch: bool = True) -> None:
         self.scan_deleted()
-        self._start_watcher()
+        if watch:
+            self._start_watcher()
         self._start_reconcile_loop()
         self._start_vault_maintenance()
 

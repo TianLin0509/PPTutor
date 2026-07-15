@@ -512,6 +512,32 @@ def test_preview_uses_disk_cache_as_provisional_first_paint(qtbot, tmp_path, mon
     qtbot.waitUntil(lambda: bool(render.calls), timeout=500)
 
 
+def test_preview_cache_lookup_uses_index_metadata_without_source_stat(
+    qtbot, tmp_path, monkeypatch
+):
+    conn = _index(tmp_path)
+    render = PendingRender()
+    win = MainWindow(conn=conn, render_worker=render, do_index=False)
+    qtbot.addWidget(win)
+    qtbot.waitUntil(lambda: win._recent_load_inflight_token is None, timeout=1000)
+    result = _fake_results(1)[0]
+    result.mtime = 1234.5
+    result.size = 6789
+    win._cur = result
+    win._view_page = 1
+    seen = []
+
+    def fake_cached(path, page, min_long_edge=1, cache_key=None):
+        seen.append((path, page, cache_key))
+        return None
+
+    monkeypatch.setattr(main_window_mod.renderer_mod, "find_cached_render", fake_cached)
+
+    win._request_preview()
+
+    assert seen and seen[0][2]
+
+
 def test_rapid_cached_page_turn_only_renders_latest_sharp_page(qtbot, tmp_path, monkeypatch):
     image = tmp_path / "cached-low.png"
     pm = QPixmap(320, 180)
@@ -615,8 +641,10 @@ def test_neighbor_prefetch_is_low_priority_and_limited(qtbot, tmp_path):
 
     assert render.prefetches == [
         ("C:/deck.pptx", 4, win._PREFETCH_EDGE, win._PRIORITY_NEIGHBOR_PREFETCH),
+        ("C:/deck.pptx", 5, win._PREFETCH_EDGE, win._PRIORITY_NEIGHBOR_PREFETCH),
+        ("C:/deck.pptx", 6, win._PREFETCH_EDGE, win._PRIORITY_NEIGHBOR_PREFETCH),
     ]
-    assert len(render.prefetches) == win._NEIGHBOR_PREFETCH_MAX == 1
+    assert len(render.prefetches) == win._NEIGHBOR_PREFETCH_MAX == 3
     assert win._PRIORITY_NEIGHBOR_PREFETCH > win._PRIORITY_RIGHT_PREVIEW
 
 
@@ -835,6 +863,29 @@ def test_async_search_failure_reenables_retained_result_actions(qtbot, tmp_path)
     assert win.goto_btn.isEnabled()
     assert win.folder_btn.isEnabled()
     assert win.clip_btn.isEnabled()
+
+
+def test_async_search_lock_failure_is_explained_without_technical_jargon(qtbot, tmp_path):
+    conn = _index(tmp_path)
+    win = MainWindow(conn=conn, render_worker=StubRender(), do_index=False)
+    qtbot.addWidget(win)
+    pending = PendingSearchWorker()
+    win._search_worker = pending
+    win.search_box.setText("AI SP")
+    win._do_search()
+    req_id, query, _mode = pending.requests[-1]
+
+    win._on_search_done(
+        req_id,
+        query,
+        [],
+        401.0,
+        "OperationalError: database is locked",
+    )
+
+    assert "后台收尾" in win.status_label.text()
+    assert "稍后再搜一次" in win.status_label.text()
+    assert "database is locked" not in win.status_label.text()
 
 
 def test_async_pending_blocks_stale_hit_navigation(qtbot, tmp_path):
@@ -1165,7 +1216,7 @@ def test_refresh_status_reads_stats_in_background(qtbot, monkeypatch, tmp_path):
     tasks = _install_fake_background_task(monkeypatch)
     calls = []
 
-    def fake_stats(_conn):
+    def fake_stats(_conn, **_kwargs):
         calls.append("stats")
         return {"file_count": 7, "page_count": 11}
 
@@ -1194,7 +1245,7 @@ def test_refresh_status_reuses_inflight_background_task(qtbot, monkeypatch, tmp_
     tasks = _install_fake_background_task(monkeypatch)
     calls = []
 
-    def fake_stats(_conn):
+    def fake_stats(_conn, **_kwargs):
         calls.append("stats")
         return {"file_count": 5, "page_count": 8}
 
@@ -1226,7 +1277,7 @@ def test_stale_status_refresh_does_not_override_search_pending(qtbot, monkeypatc
     monkeypatch.setattr(
         main_window_mod.db,
         "stats",
-        lambda _conn: {"file_count": 2, "page_count": 3},
+        lambda _conn, **_kwargs: {"file_count": 2, "page_count": 3},
     )
     win = MainWindow(conn=_index(tmp_path), render_worker=StubRender(), do_index=False)
     qtbot.addWidget(win)
@@ -1248,7 +1299,7 @@ def test_index_done_status_refresh_does_not_override_search_pending(qtbot, monke
     monkeypatch.setattr(
         main_window_mod.db,
         "stats",
-        lambda _conn: {"file_count": 7, "page_count": 11},
+        lambda _conn, **_kwargs: {"file_count": 7, "page_count": 11},
     )
     win = MainWindow(conn=_index(tmp_path), render_worker=StubRender(), do_index=False)
     qtbot.addWidget(win)
@@ -1754,6 +1805,92 @@ def test_shutdown_uses_short_wait_for_light_background_tasks(qtbot, tmp_path):
     assert ("index-status-refresh", 3000) not in waits
     assert dict(waits)["recent-files-load"] <= 500
     assert dict(waits)["index-status-refresh"] <= 500
+
+
+def test_shutdown_also_stops_optional_feature_runtime(qtbot, tmp_path):
+    """Every real exit path, including updater-driven exit, must stop watchers."""
+    conn = _index(tmp_path)
+    win = MainWindow(conn=conn, render_worker=StubRender(), do_index=False)
+    qtbot.addWidget(win)
+    calls: list[str] = []
+
+    class FakeFeatureRuntime:
+        def stop(self):
+            calls.append("stop")
+
+    win._feature_runtime = FakeFeatureRuntime()
+    win._bg_tasks = []
+    win._owns_thumb = False
+    win._owns_render = False
+    win._search_worker = None
+    win._live = None
+    win._indexer = None
+
+    win._shutdown()
+
+    assert calls == ["stop"]
+
+
+def test_shutdown_is_idempotent_when_quit_and_close_paths_overlap(qtbot, tmp_path):
+    """Qt close-after-quit must not repeat multi-second worker teardown."""
+    conn = _index(tmp_path)
+    win = MainWindow(conn=conn, render_worker=StubRender(), do_index=False)
+    qtbot.addWidget(win)
+    calls = []
+
+    class FakeFeatureRuntime:
+        def stop(self):
+            calls.append("feature.stop")
+
+    class FakeWorker:
+        def stop(self):
+            calls.append("worker.stop")
+
+        def wait(self, _timeout_ms):
+            calls.append("worker.wait")
+            return True
+
+    win._feature_runtime = FakeFeatureRuntime()
+    win._search_worker = FakeWorker()
+    win._bg_tasks = []
+    win._owns_render = False
+    win._live = None
+    win._indexer = None
+
+    win._shutdown()
+    win._shutdown()
+
+    assert calls == ["feature.stop", "worker.stop", "worker.wait"]
+
+
+def test_window_resize_coalesces_expensive_preview_scaling(qtbot, tmp_path):
+    conn = _index(tmp_path)
+    win = MainWindow(conn=conn, render_worker=StubRender(), do_index=False)
+    qtbot.addWidget(win)
+    win.show()
+    qtbot.waitExposed(win)
+    win._cur_pixmap = QPixmap(1280, 720)
+    calls = []
+    win._update_pixmap = lambda: calls.append("scale")
+
+    for width in range(1180, 1300, 10):
+        win.resize(width, 760)
+
+    assert calls == []
+    qtbot.waitUntil(lambda: calls == ["scale"], timeout=500)
+
+
+def test_completed_scan_discloses_unreadable_folders(qtbot, tmp_path):
+    conn = _index(tmp_path)
+    win = MainWindow(conn=conn, render_worker=StubRender(), do_index=False)
+    qtbot.addWidget(win)
+
+    win._apply_status_stats(
+        {"unreadable_dirs": 3},
+        {"file_count": 2, "page_count": 4, "type_counts": {".pptx": (2, 2)}},
+    )
+
+    assert "3 个文件夹无权限" in win.status_label.text()
 
 
 def test_shutdown_treats_version_file_ops_as_heavy_background_tasks(qtbot, tmp_path):
@@ -2319,7 +2456,7 @@ def test_late_detail_payload_does_not_override_newer_payload(qtbot, monkeypatch,
     monkeypatch.setattr(
         win.detail_panel,
         "update_for",
-        lambda _result, versions: updates.append(versions[0]["version_id"]),
+        lambda _result, versions, **_kwargs: updates.append(versions[0]["version_id"]),
     )
     monkeypatch.setattr(win.detail_panel, "set_outline", lambda _titles: None)
 
@@ -2713,6 +2850,27 @@ def test_opening_powerpoint_never_shell_opens_into_a_headless_preview_session(
     assert shell_opens == []
 
 
+def test_opening_powerpoint_stops_when_preview_worker_cannot_release_session(
+    qtbot, monkeypatch, tmp_path,
+):
+    class BusyRender(StubRender):
+        def release_session(self, timeout_sec=0):
+            return False
+
+    conn = _index(tmp_path)
+    win = MainWindow(conn=conn, render_worker=BusyRender(), do_index=False)
+    qtbot.addWidget(win)
+    shell_opens = []
+    monkeypatch.setattr(
+        main_window_mod.actions,
+        "open_file",
+        lambda path: shell_opens.append(path) or True,
+    )
+
+    assert win._open_file_after_preview_release("C:/deck.pptx") == "handoff_busy"
+    assert shell_opens == []
+
+
 def test_open_at_page_shows_immediate_feedback_when_background_starts(qtbot, monkeypatch, tmp_path):
     conn = _index(tmp_path)
     win = MainWindow(conn=conn, render_worker=StubRender(), do_index=False)
@@ -2880,7 +3038,7 @@ def test_show_recent_loads_uncached_files_in_background(qtbot, monkeypatch, tmp_
     calls = 0
     fake = _fake_results(2)
 
-    def fake_recent_files(_conn, limit=20):
+    def fake_recent_files(_conn, limit=20, **_kwargs):
         nonlocal calls
         if limit != 20:
             return []
@@ -2919,7 +3077,7 @@ def test_show_recent_reuses_inflight_uncached_load(qtbot, monkeypatch, tmp_path)
     calls = 0
     fake = _fake_results(2)
 
-    def fake_recent_files(_conn, limit=20):
+    def fake_recent_files(_conn, limit=20, **_kwargs):
         nonlocal calls
         if limit != 20:
             return []
@@ -2952,7 +3110,7 @@ def test_show_recent_force_reuses_inflight_uncached_load(qtbot, monkeypatch, tmp
     calls = 0
     fake = _fake_results(2)
 
-    def fake_recent_files(_conn, limit=20):
+    def fake_recent_files(_conn, limit=20, **_kwargs):
         nonlocal calls
         if limit != 20:
             return []
@@ -2985,7 +3143,11 @@ def test_show_recent_cache_hit_clears_stale_inflight_marker(qtbot, monkeypatch, 
     tasks = _install_fake_background_task(monkeypatch)
     fake = _fake_results(2)
 
-    monkeypatch.setattr(main_window_mod.db, "recent_files", lambda _conn, limit=20: list(fake))
+    monkeypatch.setattr(
+        main_window_mod.db,
+        "recent_files",
+        lambda _conn, limit=20, **_kwargs: list(fake),
+    )
 
     win = MainWindow(conn=conn, render_worker=StubRender(), do_index=False)
     qtbot.addWidget(win)
@@ -3032,7 +3194,7 @@ def test_live_refresh_forces_recent_cache_refresh(qtbot, monkeypatch, tmp_path):
     tasks = _install_fake_background_task(monkeypatch)
     calls = 0
 
-    def fake_recent_files(_conn, limit=20):
+    def fake_recent_files(_conn, limit=20, **_kwargs):
         nonlocal calls
         if limit != 20:
             return []
@@ -3063,7 +3225,7 @@ def test_stale_recent_load_does_not_override_search_results(qtbot, monkeypatch, 
     monkeypatch.setattr(
         main_window_mod.db,
         "recent_files",
-        lambda _conn, limit=20: _fake_results(2),
+        lambda _conn, limit=20, **_kwargs: _fake_results(2),
     )
 
     win = MainWindow(conn=conn, render_worker=StubRender(), do_index=False)

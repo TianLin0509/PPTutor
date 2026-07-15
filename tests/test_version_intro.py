@@ -50,6 +50,15 @@ def test_bridge_emits_signal(qtbot):
     assert got == [("C:/x.pptx", "v1")]
 
 
+def test_bridge_queues_feature_runtime_rollback(qtbot):
+    bridge = VersionBridge()
+    got = []
+    bridge.feature_state.connect(lambda key, enabled: got.append((key, enabled)))
+    with qtbot.waitSignal(bridge.feature_state, timeout=500):
+        bridge.emit_feature_state("version_management", False)
+    assert got == [("version_management", False)]
+
+
 # ---------- 主窗盾牌 + 首次告知 ----------
 class _StubVer:
     def __init__(self, docs=0, versions=None):

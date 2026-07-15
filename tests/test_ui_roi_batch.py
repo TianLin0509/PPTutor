@@ -167,7 +167,10 @@ def test_copy_page_text_uses_indexed_raw(qtbot, tmp_path):
     qtbot.waitUntil(lambda: win._cur is not None, timeout=2000)
     win._view_page = 2
     win._act_copy_page_text()
-    assert "乙丙丁戊" in QApplication.clipboard().text()
+    qtbot.waitUntil(
+        lambda: "乙丙丁戊" in QApplication.clipboard().text(),
+        timeout=2000,
+    )
 
 
 def test_copy_page_text_button_visibility_follows_selection(qtbot, tmp_path):

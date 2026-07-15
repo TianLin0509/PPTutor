@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import re
 import shutil
 import sys
 import threading
@@ -39,6 +40,10 @@ _TRUE = {"1", "true", "yes", "on"}
 _POWERPOINT_ACTIVE_TTL_SEC = 2.0
 _powerpoint_active_cache_at = 0.0
 _powerpoint_active_cache = False
+_RENDER_CACHE_PATTERN = re.compile(r"^[0-9a-f]{16}_\d+_\d+\.png$", re.IGNORECASE)
+_RENDER_CACHE_MAX_BYTES = 2 * 1024 * 1024 * 1024
+_RENDER_CACHE_MAX_FILES = 2000
+_RENDER_CACHE_TRIM_RATIO = 0.8
 
 
 class PowerPointSessionBusy(RuntimeError):
@@ -138,41 +143,82 @@ def _powerpoint_process_ids() -> set[int] | None:
     return found
 
 
+def _app_hwnd(app) -> int | None:
+    """Return PowerPoint's HWND across early- and dynamic-dispatch wrappers."""
+    try:
+        value = getattr(app, "HWND")
+        if callable(value):
+            value = value()
+        hwnd = int(value or 0)
+        return hwnd if hwnd > 0 else None
+    except Exception:  # noqa: BLE001 a missing HWND must never widen ownership
+        return None
+
+
 def _pid_for_app(app) -> int | None:
     if os.name != "nt":
         return None
     try:
         import win32process  # type: ignore
 
-        hwnd = int(app.HWND)
-        if hwnd <= 0:
+        hwnd = _app_hwnd(app)
+        if hwnd is None:
             return None
         return int(win32process.GetWindowThreadProcessId(hwnd)[1])
     except Exception:  # noqa: BLE001
         return None
 
 
+def _discover_owned_powerpoint_pid(
+    app,
+    *,
+    existing_pids: set[int],
+    timeout_sec: float = 1.0,
+) -> int | None:
+    """Prove ownership even when a hidden Application has no usable HWND yet."""
+    direct = _pid_for_app(app)
+    if direct is not None and direct not in existing_pids:
+        return direct
+    deadline = time.monotonic() + max(0.0, float(timeout_sec))
+    while True:
+        observed = _powerpoint_process_ids()
+        if observed is None:
+            return None
+        created = set(observed) - set(existing_pids)
+        if len(created) == 1:
+            return next(iter(created))
+        if len(created) > 1 or time.monotonic() >= deadline:
+            return None
+        time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+
+
+def _open_owned_powerpoint_handle(pid: int):
+    """Pin the exact preview process so PID reuse can never widen cleanup."""
+    if os.name != "nt" or int(pid or 0) <= 0:
+        return None
+    try:
+        import win32api  # type: ignore
+        import win32con  # type: ignore
+
+        access = int(win32con.PROCESS_TERMINATE) | int(win32con.SYNCHRONIZE)
+        return win32api.OpenProcess(access, False, int(pid))
+    except Exception:  # noqa: BLE001 no process handle means no hard-exit authority
+        return None
+
+
+def _close_process_handle(handle) -> None:
+    if handle is None:
+        return
+    try:
+        handle.Close()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _pid_has_visible_window(pid: int) -> bool:
     """Conservative visible-window check; errors mean 'visible' (never quit)."""
     if os.name != "nt":
         return True
-
-
-def wait_for_external_open_ready(timeout_sec: float = 3.0) -> bool:
-    """Wait until Windows cannot reuse a headless PowerPoint preview process.
-
-    A visible PowerPoint session belongs to the user and is safe for shell-open.
-    A headless process is not: Windows may reuse it and expose preview DPI/state.
-    """
-    deadline = time.monotonic() + max(0.0, float(timeout_sec))
-    while True:
-        pids = _powerpoint_process_ids()
-        if pids is not None and all(_pid_has_visible_window(pid) for pid in pids):
-            return True
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return False
-        time.sleep(min(0.05, remaining))
     try:
         import win32gui  # type: ignore
         import win32process  # type: ignore
@@ -196,6 +242,21 @@ def wait_for_external_open_ready(timeout_sec: float = 3.0) -> bool:
         return True
 
 
+def wait_for_external_open_ready(timeout_sec: float = 3.0) -> bool:
+    """Wait until Windows cannot reuse a headless PowerPoint preview process.
+
+    A visible PowerPoint session belongs to the user and is safe for shell-open.
+    A headless process is not: Windows may reuse it and expose preview DPI/state.
+    """
+    deadline = time.monotonic() + max(0.0, float(timeout_sec))
+    while True:
+        pids = _powerpoint_process_ids()
+        if pids is not None and all(_pid_has_visible_window(pid) for pid in pids):
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(0.05, remaining))
 def background_powerpoint_allowed() -> bool:
     """Return whether non-user-triggered PowerPoint rendering may run."""
     flag = _env_bool("PPTUTOR_BACKGROUND_POWERPOINT_RENDER")
@@ -265,7 +326,7 @@ def _get_app():
         _state.com_initialized_by_renderer = False
         raise
     _state.app = app
-    owned_pid = _pid_for_app(app)
+    owned_pid = _discover_owned_powerpoint_pid(app, existing_pids=existing_pids)
     if owned_pid is None or owned_pid in existing_pids:
         _state.app_owned_pid = None
         _release_local_app_reference()
@@ -273,6 +334,7 @@ def _get_app():
             "could not prove exclusive ownership of the preview PowerPoint process"
         )
     _state.app_owned_pid = owned_pid
+    _state.app_owned_handle = _open_owned_powerpoint_handle(owned_pid)
     # Force every future first-session decision to observe current ROT state,
     # not the cached pre-creation "no PowerPoint" result.
     _invalidate_powerpoint_active_cache()
@@ -283,17 +345,43 @@ def _release_local_app_reference() -> None:
     """Release this COM apartment; quit only a proven-owned, empty, headless app."""
     app = getattr(_state, "app", None)
     owned_pid = getattr(_state, "app_owned_pid", None)
+    owned_handle = getattr(_state, "app_owned_handle", None)
+    # A transient RPC rejection can make Presentation.Close fail.  Dropping the
+    # COM apartment here would orphan the hash-named snapshot in PowerPoint and
+    # let Windows later reuse that hidden session for a user's real document.
+    # Keep the proven-owned reference so a later close/shutdown can retry.
+    if app is not None and list(getattr(_state, "owned_presentations", [])):
+        return
     if app is not None and owned_pid is not None:
         try:
-            same_process = _pid_for_app(app) == int(owned_pid)
+            # Headless PowerPoint commonly exposes no usable HWND.  The process
+            # handle captured at creation is stronger proof than a late HWND
+            # lookup and remains bound to the same process even after PID reuse.
+            same_process = owned_handle is not None or _pid_for_app(app) == int(owned_pid)
             empty = int(app.Presentations.Count) == 0
             headless = not _pid_has_visible_window(int(owned_pid))
             if same_process and empty and headless:
-                app.Quit()
+                if not _request_owned_powerpoint_exit(
+                    app,
+                    int(owned_pid),
+                    owned_handle=owned_handle,
+                ):
+                    log.warning(
+                        "owned preview PowerPoint did not accept bounded exit: pid=%s",
+                        owned_pid,
+                    )
+                    # Keep the exact process handle and COM reference for a later
+                    # idle-cleanup retry.  Forgetting them here can leave a
+                    # headless POWERPNT.EXE alive for Explorer to reuse, carrying
+                    # the preview snapshot name and rendering state into the
+                    # user's next normal presentation.
+                    return
         except Exception as exc:  # noqa: BLE001 release below remains mandatory
             log.debug("owned preview PowerPoint did not quit cleanly: %s", exc)
+    _close_process_handle(owned_handle)
     _state.app = None
     _state.app_owned_pid = None
+    _state.app_owned_handle = None
     _invalidate_powerpoint_active_cache()
     if bool(getattr(_state, "com_initialized_by_renderer", False)):
         try:
@@ -303,6 +391,87 @@ def _release_local_app_reference() -> None:
         except Exception:  # noqa: BLE001
             pass
     _state.com_initialized_by_renderer = False
+
+
+def _request_owned_powerpoint_exit(
+    app,
+    owned_pid: int,
+    *,
+    owned_handle=None,
+    graceful_wait_sec: float = 0.35,
+) -> bool:
+    """Bounded exit for this renderer's proven-empty, headless POWERPNT.EXE.
+
+    ``PowerPoint.Application.Quit`` can block the COM apartment for roughly a
+    minute even after the last presentation is closed.  That leaves every next
+    page preview queued behind cleanup.  We instead post the normal window-close
+    message, wait briefly, and only if the *same exact process* is still both
+    empty and headless terminate that process handle.  Any visible window,
+    foreign PID, user document, audit failure, or non-Windows platform makes the
+    operation fail closed without touching PowerPoint.
+    """
+    if os.name != "nt":
+        return False
+    pid = int(owned_pid or 0)
+    if pid <= 0:
+        return False
+    opened_here = False
+    try:
+        if owned_handle is None and _pid_for_app(app) != pid:
+            return False
+        if int(app.Presentations.Count) != 0:
+            return False
+        if _pid_has_visible_window(pid):
+            return False
+
+        import win32api  # type: ignore
+        import win32con  # type: ignore
+        import win32event  # type: ignore
+        import win32gui  # type: ignore
+
+        handle = owned_handle
+        if handle is None:
+            access = int(win32con.PROCESS_TERMINATE) | int(win32con.SYNCHRONIZE)
+            handle = win32api.OpenProcess(access, False, pid)
+            opened_here = True
+    except Exception:  # noqa: BLE001 ownership/handle uncertainty means no action
+        return False
+
+    try:
+        status = win32event.WaitForSingleObject(handle, 0)
+        if status == win32event.WAIT_OBJECT_0:
+            return True
+        if status != win32event.WAIT_TIMEOUT:
+            return False
+        try:
+            hwnd = _app_hwnd(app)
+            if hwnd is not None:
+                win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+        except Exception:  # noqa: BLE001 bounded hard exit remains available
+            pass
+
+        wait_ms = max(0, int(float(graceful_wait_sec) * 1000))
+        if win32event.WaitForSingleObject(handle, wait_ms) == win32event.WAIT_OBJECT_0:
+            return True
+
+        # Re-check the only property available without another potentially
+        # blocking COM round-trip.  A user-visible session is never terminated.
+        if _pid_has_visible_window(pid):
+            return False
+        # Close the race where a user's document is routed into the preview
+        # server between the first audit and the bounded exit request.
+        if int(app.Presentations.Count) != 0:
+            return False
+        win32api.TerminateProcess(handle, 0)
+        return (
+            win32event.WaitForSingleObject(handle, 2000)
+            == win32event.WAIT_OBJECT_0
+        )
+    except Exception:  # noqa: BLE001 never widen the kill boundary on failure
+        return False
+    finally:
+        if opened_here:
+            _close_process_handle(handle)
 
 
 def _cleanup_snapshot() -> None:
@@ -317,6 +486,77 @@ def _cleanup_snapshot() -> None:
             pass
 
 
+def _cleanup_stale_snapshots(max_age_sec: float = 24 * 60 * 60) -> int:
+    if bool(getattr(_state, "stale_snapshots_checked", False)):
+        return 0
+    _state.stale_snapshots_checked = True
+    removed = 0
+    cutoff = time.time() - max(0.0, float(max_age_sec))
+    directory = cache_dir() / "render_snapshots"
+    try:
+        candidates = list(directory.iterdir())
+    except OSError:
+        return 0
+    current = os.path.normcase(str(getattr(_state, "snapshot_path", "") or ""))
+    for candidate in candidates:
+        try:
+            if (
+                not candidate.is_file()
+                or os.path.normcase(str(candidate)) == current
+                or candidate.stat().st_mtime >= cutoff
+            ):
+                continue
+            candidate.unlink()
+            removed += 1
+        except OSError:
+            continue
+    return removed
+
+
+def maintain_render_cache(
+    *,
+    max_bytes: int = _RENDER_CACHE_MAX_BYTES,
+    max_files: int = _RENDER_CACHE_MAX_FILES,
+) -> dict[str, int]:
+    """Bound only page-render PNGs; leave logos and other app assets untouched."""
+    maximum_bytes = max(1, int(max_bytes))
+    maximum_files = max(1, int(max_files))
+    candidates: list[tuple[float, int, Path]] = []
+    try:
+        entries = list(cache_dir().iterdir())
+    except OSError:
+        return {"files": 0, "bytes": 0, "deleted": 0}
+    for candidate in entries:
+        if not _RENDER_CACHE_PATTERN.fullmatch(candidate.name):
+            continue
+        try:
+            stat = candidate.stat()
+            if not candidate.is_file():
+                continue
+        except OSError:
+            continue
+        candidates.append((float(stat.st_mtime), int(stat.st_size), candidate))
+    total_bytes = sum(size for _mtime, size, _path in candidates)
+    if len(candidates) <= maximum_files and total_bytes <= maximum_bytes:
+        return {"files": len(candidates), "bytes": total_bytes, "deleted": 0}
+
+    target_bytes = max(1, int(maximum_bytes * _RENDER_CACHE_TRIM_RATIO))
+    target_files = max(1, int(maximum_files * _RENDER_CACHE_TRIM_RATIO))
+    deleted = 0
+    remaining = len(candidates)
+    for _mtime, size, candidate in sorted(candidates, key=lambda item: item[0]):
+        if remaining <= target_files and total_bytes <= target_bytes:
+            break
+        try:
+            candidate.unlink()
+        except OSError:
+            continue
+        deleted += 1
+        remaining -= 1
+        total_bytes = max(0, total_bytes - size)
+    return {"files": remaining, "bytes": total_bytes, "deleted": deleted}
+
+
 def _snapshot_for_render(path: str, cache_key: str) -> str | None:
     """Copy the source file once per render key so COM never opens the live file."""
     snapshot = getattr(_state, "snapshot_path", None)
@@ -329,6 +569,7 @@ def _snapshot_for_render(path: str, cache_key: str) -> str | None:
         return snapshot
 
     _cleanup_snapshot()
+    _cleanup_stale_snapshots()
     try:
         snap_dir = cache_dir() / "render_snapshots"
         snap_dir.mkdir(parents=True, exist_ok=True)
@@ -374,7 +615,8 @@ def _open_pres(app, path: str, cache_key: str):
             and getattr(_state, "pres_path", None) == path
             and getattr(_state, "pres_key", None) == cache_key):
         return _state.pres
-    _close_pres(clean_snapshot=False)
+    if not _close_pres(clean_snapshot=False):
+        raise RuntimeError("previous preview presentation is still closing")
     pres = app.Presentations.Open(path, ReadOnly=1, WithWindow=0)
     _state.pres = pres
     owned = list(getattr(_state, "owned_presentations", []))
@@ -392,7 +634,7 @@ def _open_pres(app, path: str, cache_key: str):
     return pres
 
 
-def _close_pres(*, clean_snapshot: bool = True):
+def _close_pres(*, clean_snapshot: bool = True) -> bool:
     pres = getattr(_state, "pres", None)
     owned = list(getattr(_state, "owned_presentations", []))
     if pres is not None and not any(item is pres for item in owned):
@@ -400,17 +642,32 @@ def _close_pres(*, clean_snapshot: bool = True):
     # Close only presentations explicitly opened by this renderer.  Keeping all
     # references (not just the latest) lets shutdown recover from a prior Close
     # failure instead of leaking hash-named snapshot decks into the taskbar.
+    failed = []
     for item in owned:
-        try:
-            item.Close()
-        except Exception:  # noqa: BLE001
-            pass
-    _state.owned_presentations = []
+        closed = False
+        for attempt in range(3):
+            try:
+                item.Close()
+                closed = True
+                break
+            except Exception:  # noqa: BLE001 PowerPoint may temporarily reject RPC calls
+                if attempt < 2:
+                    time.sleep(0.05)
+        if not closed:
+            failed.append(item)
+    _state.owned_presentations = failed
     _state.pres = None
     _state.pres_path = None
     _state.pres_key = None
-    if clean_snapshot:
+    if clean_snapshot and not failed:
         _cleanup_snapshot()
+    return not failed
+
+
+def cache_key_for_metadata(path: str, mtime: float, size: int) -> str:
+    """Pure cache-key calculation safe for the GUI thread."""
+    raw = f"{os.path.abspath(path)}|{float(mtime)}|{int(size)}"
+    return xxhash.xxh64(raw.encode("utf-8")).hexdigest()
 
 
 def default_cache_key(path: str) -> str | None:
@@ -419,8 +676,7 @@ def default_cache_key(path: str) -> str | None:
         st = os.stat(path)
     except OSError:
         return None
-    raw = f"{os.path.abspath(path)}|{st.st_mtime}|{st.st_size}"
-    return xxhash.xxh64(raw.encode("utf-8")).hexdigest()
+    return cache_key_for_metadata(path, st.st_mtime, st.st_size)
 
 
 def _ipc_enabled() -> bool:
@@ -685,7 +941,9 @@ def shutdown() -> None:
     _close_pres()  # 关掉保持打开的 Presentation
     app = getattr(_state, "app", None)
     if app is None:
+        _close_process_handle(getattr(_state, "app_owned_handle", None))
         _state.app_owned_pid = None
+        _state.app_owned_handle = None
         _invalidate_powerpoint_active_cache()
         return
     # DispatchEx may still reuse a single-instance server, so Application.Quit is

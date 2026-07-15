@@ -340,7 +340,12 @@ def _recall(
             if all(nw in raw_norm for nw in nws):
                 content.setdefault(fid, []).append((pg, r["rank"], raw, raw_norm))
     except sqlite3.OperationalError as e:
-        if "interrupted" in str(e).casefold():
+        db_error = str(e).casefold()
+        # A lock/busy error is a database availability condition, not an empty
+        # FTS result. Propagate it once so SearchWorker can clear the spinner
+        # promptly; swallowing it makes the remaining fallback queries each
+        # consume another busy-timeout window.
+        if any(marker in db_error for marker in ("interrupted", "locked", "busy")):
             raise
         log.warning("FTS match failed %r: %s", m_and, e)
 
@@ -351,7 +356,8 @@ def _recall(
 
 def search(conn: sqlite3.Connection, query: str, scope: str | None = None,
            limit: int = 200, exts: tuple[str, ...] | None = None,
-           case_sensitive: bool = False) -> list[FileResult]:
+           case_sensitive: bool = False,
+           group_similar: bool = True) -> list[FileResult]:
     ext_filter = {e.lower() for e in exts} if exts else None  # 文件类型过滤；None=全部类型
     terms, phrases = parse_query(query)
     if not terms and not phrases:
@@ -408,7 +414,8 @@ def search(conn: sqlite3.Connection, query: str, scope: str | None = None,
                     tuple(name_params),
                 )
             except sqlite3.OperationalError as e:
-                if "interrupted" in str(e).casefold():
+                db_error = str(e).casefold()
+                if any(marker in db_error for marker in ("interrupted", "locked", "busy")):
                     raise
                 log.warning("filename fts match failed %r: %s", match, e)
                 name_rows = ()
@@ -425,7 +432,9 @@ def search(conn: sqlite3.Connection, query: str, scope: str | None = None,
     if not file_ids:
         return []
 
-    gmap = cluster.group_map(conn)  # file_id -> group_id（仅多成员版本组）
+    # 相似稿归组是高阶功能。关闭时连旧 minhash 表也不读，避免基础搜索
+    # 为低频能力承担额外查询和折叠语义。
+    gmap = cluster.group_map(conn) if group_similar else {}
 
     rows: dict[int, sqlite3.Row] = {}
     qmarks = ",".join("?" * len(file_ids))

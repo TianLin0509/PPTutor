@@ -13,6 +13,18 @@ import types
 from pptx_finder import renderer
 
 
+def test_pid_for_app_accepts_powerpoint_hwnd_as_callable(monkeypatch):
+    """Real PowerPoint dynamic dispatch exposes HWND as a bound method."""
+    app = types.SimpleNamespace(HWND=lambda: 4321)
+    monkeypatch.setitem(
+        sys.modules,
+        "win32process",
+        types.SimpleNamespace(GetWindowThreadProcessId=lambda hwnd: (7, 9001)),
+    )
+
+    assert renderer._pid_for_app(app) == 9001
+
+
 class _FakeSlide:
     def Export(self, out, fmt, w, h):
         time.sleep(0.2)                       # 模拟一次 COM 导出耗时
@@ -229,7 +241,70 @@ def test_shutdown_closes_every_renderer_owned_presentation_reference(monkeypatch
     assert getattr(renderer._state, "owned_presentations", []) == []
 
 
-def test_shutdown_quits_only_proven_owned_empty_headless_powerpoint(monkeypatch):
+def test_failed_close_keeps_owned_presentation_for_a_later_retry(tmp_path):
+    snapshot = tmp_path / "hash-like-preview.pptx"
+    snapshot.write_bytes(b"preview")
+
+    class FlakyPresentation:
+        allow_close = False
+
+        def Close(self):
+            if not self.allow_close:
+                raise RuntimeError("PowerPoint busy")
+
+    pres = FlakyPresentation()
+    renderer._state.pres = pres
+    renderer._state.pres_path = str(snapshot)
+    renderer._state.pres_key = "hash-like-preview"
+    renderer._state.snapshot_path = str(snapshot)
+    renderer._state.snapshot_src = "C:/user/deck.pptx"
+    renderer._state.snapshot_key = "hash-like-preview"
+    renderer._state.owned_presentations = [pres]
+
+    assert renderer._close_pres() is False
+    assert getattr(renderer._state, "owned_presentations", []) == [pres]
+    assert snapshot.exists()
+    assert getattr(renderer._state, "snapshot_path", None) == str(snapshot)
+
+    pres.allow_close = True
+    assert renderer._close_pres() is True
+    assert getattr(renderer._state, "owned_presentations", []) == []
+    assert not snapshot.exists()
+
+
+def test_failed_owned_powerpoint_exit_keeps_reference_and_handle_for_retry(monkeypatch):
+    """Do not forget a proven-owned headless process that failed bounded exit."""
+
+    class Handle:
+        closed = False
+
+        def Close(self):
+            self.closed = True
+
+    app = types.SimpleNamespace(Presentations=types.SimpleNamespace(Count=0))
+    handle = Handle()
+    monkeypatch.setattr(renderer, "_pid_has_visible_window", lambda _pid: False)
+    monkeypatch.setattr(renderer, "_request_owned_powerpoint_exit", lambda *_a, **_k: False)
+    renderer._state.app = app
+    renderer._state.app_owned_pid = 9004
+    renderer._state.app_owned_handle = handle
+    renderer._state.owned_presentations = []
+
+    try:
+        renderer._release_local_app_reference()
+
+        assert renderer._state.app is app
+        assert renderer._state.app_owned_pid == 9004
+        assert renderer._state.app_owned_handle is handle
+        assert not handle.closed
+    finally:
+        renderer._state.app = None
+        renderer._state.app_owned_pid = None
+        renderer._state.app_owned_handle = None
+        renderer._state.owned_presentations = []
+
+
+def test_shutdown_uses_bounded_exit_for_proven_owned_empty_headless_powerpoint(monkeypatch):
     class EmptyPresentations:
         Count = 0
 
@@ -242,8 +317,10 @@ def test_shutdown_quits_only_proven_owned_empty_headless_powerpoint(monkeypatch)
 
         def Quit(self):
             self.quit_calls += 1
+            raise AssertionError("synchronous Application.Quit may block for a minute")
 
     app = OwnedHeadlessApp()
+    exit_requests = []
     monkeypatch.setattr(renderer, "_ipc_enabled", lambda: False)
     monkeypatch.setattr(renderer, "_pid_for_app", lambda _app: 9001, raising=False)
     monkeypatch.setattr(
@@ -252,14 +329,177 @@ def test_shutdown_quits_only_proven_owned_empty_headless_powerpoint(monkeypatch)
         lambda _pid: False,
         raising=False,
     )
+    monkeypatch.setattr(
+        renderer,
+        "_request_owned_powerpoint_exit",
+        lambda got_app, pid, *, owned_handle=None: exit_requests.append(
+            (got_app, pid, owned_handle)
+        )
+        or True,
+        raising=False,
+    )
     renderer._state.app = app
     renderer._state.app_owned_pid = 9001
+    renderer._state.app_owned_handle = None
     renderer._state.pres = None
     renderer._state.owned_presentations = []
 
     renderer.shutdown()
 
-    assert app.quit_calls == 1
+    assert app.quit_calls == 0
+    assert exit_requests == [(app, 9001, None)]
+
+
+def test_shutdown_uses_creation_time_process_handle_when_headless_hwnd_is_unavailable(
+    monkeypatch,
+):
+    class EmptyHeadlessApp:
+        Presentations = types.SimpleNamespace(Count=0)
+
+        def HWND(self):
+            raise RuntimeError("headless PowerPoint has no HWND member yet")
+
+    class OwnedHandle:
+        def __init__(self):
+            self.closed = False
+
+        def Close(self):
+            self.closed = True
+
+    app = EmptyHeadlessApp()
+    handle = OwnedHandle()
+    exit_requests = []
+    monkeypatch.setattr(renderer, "_ipc_enabled", lambda: False)
+    monkeypatch.setattr(renderer, "_pid_for_app", lambda _app: None)
+    monkeypatch.setattr(renderer, "_pid_has_visible_window", lambda _pid: False)
+    monkeypatch.setattr(
+        renderer,
+        "_request_owned_powerpoint_exit",
+        lambda got_app, pid, *, owned_handle=None: exit_requests.append(
+            (got_app, pid, owned_handle)
+        )
+        or True,
+    )
+    renderer._state.app = app
+    renderer._state.app_owned_pid = 9001
+    renderer._state.app_owned_handle = handle
+    renderer._state.pres = None
+    renderer._state.owned_presentations = []
+
+    renderer.shutdown()
+
+    assert exit_requests == [(app, 9001, handle)]
+    assert handle.closed
+
+
+def test_bounded_owned_exit_terminates_only_after_grace_and_second_visibility_check(
+    monkeypatch,
+):
+    events = []
+
+    class FakeHandle:
+        def Close(self):
+            events.append("close-handle")
+
+    app = types.SimpleNamespace(
+        HWND=123,
+        Presentations=types.SimpleNamespace(Count=0),
+    )
+    waits = iter([258, 258, 0])  # alive, grace timeout, then terminated
+    fake_con = types.SimpleNamespace(
+        PROCESS_TERMINATE=1,
+        SYNCHRONIZE=2,
+        WAIT_OBJECT_0=0,
+        WM_CLOSE=0x0010,
+    )
+    monkeypatch.setitem(sys.modules, "win32con", fake_con)
+    monkeypatch.setitem(
+        sys.modules,
+        "win32api",
+        types.SimpleNamespace(
+            OpenProcess=lambda access, inherit, pid: events.append(
+                ("open", access, inherit, pid)
+            )
+            or FakeHandle(),
+            TerminateProcess=lambda _handle, code: events.append(("terminate", code)),
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "win32event",
+        types.SimpleNamespace(
+            WAIT_OBJECT_0=0,
+            WAIT_TIMEOUT=258,
+            WaitForSingleObject=lambda _handle, timeout: events.append(("wait", timeout))
+            or next(waits),
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "win32gui",
+        types.SimpleNamespace(
+            PostMessage=lambda hwnd, msg, wparam, lparam: events.append(
+                ("post", hwnd, msg, wparam, lparam)
+            )
+        ),
+    )
+    monkeypatch.setattr(renderer, "_pid_for_app", lambda _app: 9001)
+    monkeypatch.setattr(renderer, "_pid_has_visible_window", lambda _pid: False)
+
+    assert renderer._request_owned_powerpoint_exit(app, 9001, graceful_wait_sec=0.01)
+    assert ("post", 123, 0x0010, 0, 0) in events
+    assert ("terminate", 0) in events
+    assert events[-1] == "close-handle"
+
+
+def test_bounded_owned_exit_never_terminates_if_session_becomes_visible(monkeypatch):
+    events = []
+
+    class FakeHandle:
+        def Close(self):
+            events.append("close-handle")
+
+    app = types.SimpleNamespace(
+        HWND=123,
+        Presentations=types.SimpleNamespace(Count=0),
+    )
+    visible = iter([False, True])
+    fake_con = types.SimpleNamespace(
+        PROCESS_TERMINATE=1,
+        SYNCHRONIZE=2,
+        WAIT_OBJECT_0=0,
+        WM_CLOSE=0x0010,
+    )
+    monkeypatch.setitem(sys.modules, "win32con", fake_con)
+    monkeypatch.setitem(
+        sys.modules,
+        "win32api",
+        types.SimpleNamespace(
+            OpenProcess=lambda *_args: FakeHandle(),
+            TerminateProcess=lambda *_args: events.append("terminate"),
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "win32event",
+        types.SimpleNamespace(
+            WAIT_OBJECT_0=0,
+            WAIT_TIMEOUT=258,
+            WaitForSingleObject=lambda *_args: 258,
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "win32gui",
+        types.SimpleNamespace(PostMessage=lambda *_args: events.append("post")),
+    )
+    monkeypatch.setattr(renderer, "_pid_for_app", lambda _app: 9001)
+    monkeypatch.setattr(renderer, "_pid_has_visible_window", lambda _pid: next(visible))
+
+    assert not renderer._request_owned_powerpoint_exit(app, 9001, graceful_wait_sec=0)
+    assert "post" in events
+    assert "terminate" not in events
+    assert events[-1] == "close-handle"
 
 
 def test_shutdown_never_quits_owned_pid_after_it_becomes_user_visible(monkeypatch):
@@ -338,6 +578,25 @@ def test_shutdown_never_uninitializes_a_com_apartment_it_did_not_initialize(monk
     renderer.shutdown()
 
     assert calls == []
+
+
+def test_owned_powerpoint_pid_falls_back_to_new_process_diff(monkeypatch):
+    app = object()
+    observations = iter([set(), {4242}])
+    monkeypatch.setattr(renderer, "_pid_for_app", lambda _app: None)
+    monkeypatch.setattr(
+        renderer,
+        "_powerpoint_process_ids",
+        lambda: next(observations),
+    )
+
+    pid = renderer._discover_owned_powerpoint_pid(
+        app,
+        existing_pids=set(),
+        timeout_sec=0.1,
+    )
+
+    assert pid == 4242
 
 
 def test_render_page_snapshot_opens_temp_copy_not_live_file(tmp_path, monkeypatch):
