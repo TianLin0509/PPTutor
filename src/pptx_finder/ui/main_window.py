@@ -30,7 +30,7 @@ try:
 except Exception:  # noqa: BLE001
     _WIN = False
 
-from .. import actions, db, history, indexer as indexer_mod, renderer as renderer_mod, search as search_mod, updater, __version__
+from .. import actions, db, history, indexer as indexer_mod, renderer as renderer_mod, search as search_mod, thumbnailer, updater, __version__
 from ..config import (
     DOCX_EXT, PDF_EXT, PPTX_EXT, PPT_EXTS, SUPPORTED_EXTS, db_path as cfg_db_path,
     enabled_index_exts as cfg_enabled_index_exts, ext_path,
@@ -683,6 +683,7 @@ class MainWindow(QMainWindow):
         self._results_raw: list[FileResult] = []
         self._render_gen = 0
         self._bg_tasks: list[BackgroundTask] = []
+        self._safe_preview_task: BackgroundTask | None = None
         self._settings_dialogs: list = []
         self._active_heavy_op: str | None = None
         self._closing = False  # 鍏崇獥涓細鍚庡彴浠诲姟鍥炶皟涓嶅啀纰?UI锛堥槻瑙﹁揪宸查攢姣佹帶浠讹級
@@ -763,6 +764,7 @@ class MainWindow(QMainWindow):
         self._req_id = 0
         self._cur_pixmap: QPixmap | None = None
         self._preview_provisional = False  # 褰撳墠棰勮鏄惁涓虹缉鐣ュ浘鍗犱綅锛堥珮娓呮湭鍒帮級
+        self._preview_hd_req_id: int | None = None
         self._sharp_preview_args: tuple[int, str, int, int, int] | None = None
         self._zoom = 1.0  # 棰勮缂╂斁锛?.0=閫傞厤绐楀彛锛?1 鏀惧ぇ鐪嬬粏鑺?
         self._to_tray_on_close = False
@@ -3860,6 +3862,12 @@ class MainWindow(QMainWindow):
                 self._PRIORITY_RIGHT_PREVIEW,
             )
         else:
+            self._request_safe_preview(
+                self._req_id,
+                self._cur.path,
+                page,
+                long_edge=min(preview_edge, 800),
+            )
             self._request_render(
                 self._req_id,
                 self._cur.path,
@@ -3867,6 +3875,46 @@ class MainWindow(QMainWindow):
                 long_edge=preview_edge,
                 priority=self._PRIORITY_RIGHT_PREVIEW,
             )
+
+    def _request_safe_preview(
+        self,
+        req_id: int,
+        path: str,
+        page: int,
+        *,
+        long_edge: int,
+    ) -> None:
+        """Render a latest-only safe first paint outside the serial HD worker."""
+        previous = self._safe_preview_task
+        if previous is not None:
+            try:
+                previous.stop()
+            except RuntimeError:
+                pass
+        task = BackgroundTask(
+            lambda: thumbnailer.find_non_com_page_preview(
+                path,
+                page,
+                long_edge=long_edge,
+            ),
+            "preview-provisional",
+        )
+        self._safe_preview_task = task
+        self._bg_tasks.append(task)
+
+        def _done(result, request_id=req_id):
+            if result:
+                self._on_provisional_rendered(request_id, str(result))
+
+        def _cleanup(task=task):
+            if task in self._bg_tasks:
+                self._bg_tasks.remove(task)
+            if self._safe_preview_task is task:
+                self._safe_preview_task = None
+
+        task.done.connect(_done)
+        task.finished.connect(_cleanup)
+        task.start()
 
     def _preview_long_edge(self) -> int:
         try:
@@ -3953,7 +4001,13 @@ class MainWindow(QMainWindow):
 
     def _on_provisional_rendered(self, req_id: int, png: str) -> None:
         """Keep a safe non-COM page preview visible while HD rendering continues."""
-        if self._closing or req_id != self._req_id or not png or not os.path.exists(png):
+        if (
+            self._closing
+            or req_id != self._req_id
+            or self._preview_hd_req_id == req_id
+            or not png
+            or not os.path.exists(png)
+        ):
             return
         pm = QPixmap(png)
         if pm.isNull():
@@ -3982,6 +4036,7 @@ class MainWindow(QMainWindow):
             return
         self._cur_pixmap = pm
         self._preview_provisional = False  # 楂樻竻宸插埌锛屼笉鍐嶆槸鍗犱綅
+        self._preview_hd_req_id = req_id
         self._preview_hinted = True  # 棣栨棰勮宸叉垚鍔燂紝涔嬪悗涓嶅啀鎻愩€屽敜璧?PowerPoint銆?
         self._update_pixmap()
         self._prefetch_neighbors()  # 鍚庡彴棰勬覆鏌撶浉閭?鍛戒腑椤碉紝缈昏繃鍘绘椂缂撳瓨鍛戒腑=鐬棿

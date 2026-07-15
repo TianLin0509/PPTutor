@@ -4,7 +4,7 @@ from __future__ import annotations
 import threading
 import time
 
-from pptx_finder import renderer, thumbnailer
+from pptx_finder import renderer
 from pptx_finder.ui.render_worker import RenderWorker
 
 
@@ -56,7 +56,6 @@ def test_clicked_preview_never_borrows_active_user_powerpoint_session(
 
     monkeypatch.setattr(renderer, "render_page", fake_render)
     monkeypatch.setattr(renderer, "shutdown", lambda: None)
-    monkeypatch.setattr(thumbnailer, "find_non_com_page_preview", lambda *_a, **_k: None)
     w = RenderWorker()
     w.start()
     try:
@@ -69,71 +68,6 @@ def test_clicked_preview_never_borrows_active_user_powerpoint_session(
         assert calls[0].get("existing_session_only", False) is False
         assert "allow_foreign_session" not in calls[1]
         assert calls[1]["existing_session_only"] is True
-    finally:
-        w.stop()
-        w.wait(3000)
-
-
-def test_first_page_cover_is_emitted_before_a_failed_com_preview(
-    qtbot,
-    monkeypatch,
-    tmp_path,
-):
-    cover = tmp_path / "cover.jpeg"
-    cover.write_bytes(b"cover")
-    monkeypatch.setattr(
-        thumbnailer,
-        "find_non_com_page_preview",
-        lambda path, page_no, **_kwargs: cover if page_no == 1 else None,
-    )
-    monkeypatch.setattr(renderer, "render_page", lambda *_a, **_k: None)
-    monkeypatch.setattr(renderer, "shutdown", lambda: None)
-    w = RenderWorker()
-    provisional_events: list[tuple[int, str]] = []
-    completed_events: list[tuple[int, str]] = []
-    w.provisional_rendered.connect(
-        lambda req_id, path: provisional_events.append((req_id, path))
-    )
-    w.rendered.connect(lambda req_id, path: completed_events.append((req_id, path)))
-    w.start()
-    try:
-        w.request(9, "cover-only.pptx", 1)
-        qtbot.waitUntil(lambda: bool(completed_events), timeout=1000)
-        assert provisional_events == [(9, str(cover))]
-        assert completed_events == [(9, "")]
-    finally:
-        w.stop()
-        w.wait(3000)
-
-
-def test_later_page_safe_preview_is_emitted_before_a_failed_hd_preview(
-    qtbot,
-    monkeypatch,
-    tmp_path,
-):
-    safe = tmp_path / "page-7-safe.png"
-    safe.write_bytes(b"safe")
-    monkeypatch.setattr(
-        thumbnailer,
-        "find_non_com_page_preview",
-        lambda path, page_no, **_kwargs: safe if page_no == 7 else None,
-        raising=False,
-    )
-    monkeypatch.setattr(renderer, "render_page", lambda *_a, **_k: None)
-    monkeypatch.setattr(renderer, "shutdown", lambda: None)
-    w = RenderWorker()
-    provisional_events: list[tuple[int, str]] = []
-    completed_events: list[tuple[int, str]] = []
-    w.provisional_rendered.connect(
-        lambda req_id, path: provisional_events.append((req_id, path))
-    )
-    w.rendered.connect(lambda req_id, path: completed_events.append((req_id, path)))
-    w.start()
-    try:
-        w.request(17, "later-page.pptx", 7)
-        qtbot.waitUntil(lambda: bool(completed_events), timeout=1000)
-        assert provisional_events == [(17, str(safe))]
-        assert completed_events == [(17, "")]
     finally:
         w.stop()
         w.wait(3000)

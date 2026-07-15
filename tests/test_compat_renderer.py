@@ -144,3 +144,39 @@ def test_active_powerpoint_falls_back_to_isolated_compat(
         hi_priority=True,
         use_snapshot=True,
     ) == compat
+
+
+def test_compat_timeout_terminates_only_the_isolated_profile_processes(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "deck.pptx"
+    source.write_bytes(b"pptx")
+    soffice = tmp_path / "soffice.com"
+    soffice.write_bytes(b"exe")
+    terminated: list[str] = []
+    monkeypatch.setattr(renderer, "cache_dir", lambda: tmp_path / "cache")
+    monkeypatch.setattr(renderer, "_find_soffice", lambda: soffice, raising=False)
+    monkeypatch.setattr(
+        renderer.subprocess,
+        "run",
+        lambda command, **_kwargs: (_ for _ in ()).throw(
+            subprocess.TimeoutExpired(command, 30)
+        ),
+    )
+    monkeypatch.setattr(
+        renderer,
+        "_terminate_compat_processes",
+        lambda profile_uri: terminated.append(profile_uri) or 1,
+        raising=False,
+    )
+
+    assert renderer._render_page_compat(
+        str(source),
+        1,
+        "timeout-tree",
+        1000,
+        tmp_path / "timeout.png",
+    ) is None
+    assert len(terminated) == 1
+    assert terminated[0].startswith("file:")

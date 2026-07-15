@@ -547,6 +547,45 @@ def _find_soffice() -> Path | None:
     return None
 
 
+def _terminate_compat_processes(profile_uri: str) -> int:
+    """Terminate only LibreOffice processes carrying our unique profile URI."""
+    if os.name != "nt" or not profile_uri:
+        return 0
+    pythoncom = None
+    initialized = False
+    terminated = 0
+    try:
+        import pythoncom as _pythoncom  # type: ignore
+        import win32com.client  # type: ignore
+
+        pythoncom = _pythoncom
+        pythoncom.CoInitialize()
+        initialized = True
+        service = win32com.client.GetObject(r"winmgmts:\\.\root\cimv2")
+        needle = profile_uri.casefold()
+        for process in service.ExecQuery(
+            "SELECT Name, CommandLine, ProcessId FROM Win32_Process "
+            "WHERE Name LIKE 'soffice%'"
+        ):
+            command_line = str(getattr(process, "CommandLine", "") or "")
+            if needle not in command_line.casefold():
+                continue
+            try:
+                process.Terminate()
+                terminated += 1
+            except Exception:  # noqa: BLE001 one child may already be exiting
+                continue
+    except Exception as exc:  # noqa: BLE001 timeout cleanup stays best-effort
+        log.warning("compat timeout process cleanup failed: %s", exc)
+    finally:
+        if initialized and pythoncom is not None:
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:  # noqa: BLE001
+                pass
+    return terminated
+
+
 def _render_pdf_page(pdf_path: Path, page_no: int, long_edge: int, out: Path) -> Path | None:
     """Render one local PDF page through QtPdf without another long-lived process."""
     from PySide6.QtCore import QSize
@@ -622,6 +661,7 @@ def _render_page_compat(
             profile = work / "profile"
             snapshot = work / f"source{Path(path).suffix or '.pptx'}"
             shutil.copy2(path, snapshot)
+            profile_uri = profile.resolve().as_uri()
             command = [
                 str(soffice),
                 "--headless",
@@ -630,7 +670,7 @@ def _render_page_compat(
                 "--nolockcheck",
                 "--nofirststartwizard",
                 "--norestore",
-                f"-env:UserInstallation={profile.resolve().as_uri()}",
+                f"-env:UserInstallation={profile_uri}",
                 "--convert-to",
                 "pdf:impress_pdf_Export",
                 "--outdir",
@@ -643,14 +683,23 @@ def _render_page_compat(
                 if os.name == "nt"
                 else 0
             )
-            completed = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                timeout=_COMPAT_RENDER_TIMEOUT_SEC,
-                check=False,
-                creationflags=creationflags,
-            )
+            try:
+                completed = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    timeout=_COMPAT_RENDER_TIMEOUT_SEC,
+                    check=False,
+                    creationflags=creationflags,
+                )
+            except subprocess.TimeoutExpired:
+                killed = _terminate_compat_processes(profile_uri)
+                log.warning(
+                    "compat preview timed out path=%s terminated=%s",
+                    path,
+                    killed,
+                )
+                return None
             produced = out_dir / f"{snapshot.stem}.pdf"
             if (
                 completed.returncode != 0
@@ -680,6 +729,11 @@ def _render_page_compat(
                     # atomic and valid; a transient temp cleanup race must never
                     # erase the user's successful first preview.
                     log.info("compat workdir cleanup deferred path=%s: %s", work, exc)
+    else:
+        try:
+            os.utime(pdf_path, None)  # LRU touch: a frequently flipped deck stays cached
+        except OSError:
+            pass
     try:
         return _render_pdf_page(pdf_path, page_no, long_edge, out)
     except Exception as exc:  # noqa: BLE001 malformed PDFs must not kill the worker
@@ -691,15 +745,38 @@ def maintain_render_cache(
     *,
     max_bytes: int = _RENDER_CACHE_MAX_BYTES,
     max_files: int = _RENDER_CACHE_MAX_FILES,
+    compat_work_max_age_sec: float = 10 * 60,
 ) -> dict[str, int]:
-    """Bound only page-render PNGs; leave logos and other app assets untouched."""
+    """Bound page previews/compat PDFs and remove stale isolated workdirs."""
     maximum_bytes = max(1, int(max_bytes))
     maximum_files = max(1, int(max_files))
-    candidates: list[tuple[float, int, Path]] = []
+    workdirs_deleted = 0
+    work_root = cache_dir() / "compat_work"
+    cutoff = time.time() - max(0.0, float(compat_work_max_age_sec))
+    try:
+        workdirs = list(work_root.iterdir())
+    except OSError:
+        workdirs = []
+    for directory in workdirs:
+        try:
+            if not directory.is_dir() or directory.stat().st_mtime >= cutoff:
+                continue
+            shutil.rmtree(directory)
+            workdirs_deleted += 1
+        except OSError:
+            continue
+
+    candidates: list[tuple[float, int, Path, str]] = []
     try:
         entries = list(cache_dir().iterdir())
     except OSError:
-        return {"files": 0, "bytes": 0, "deleted": 0}
+        return {
+            "files": 0,
+            "bytes": 0,
+            "deleted": 0,
+            "compat_pdfs_deleted": 0,
+            "workdirs_deleted": workdirs_deleted,
+        }
     for candidate in entries:
         if not _RENDER_CACHE_PATTERN.fullmatch(candidate.name):
             continue
@@ -709,16 +786,36 @@ def maintain_render_cache(
                 continue
         except OSError:
             continue
-        candidates.append((float(stat.st_mtime), int(stat.st_size), candidate))
-    total_bytes = sum(size for _mtime, size, _path in candidates)
+        candidates.append((float(stat.st_mtime), int(stat.st_size), candidate, "png"))
+    pdf_dir = cache_dir() / "compat_pdf"
+    try:
+        pdf_entries = list(pdf_dir.glob("*.pdf"))
+    except OSError:
+        pdf_entries = []
+    for candidate in pdf_entries:
+        try:
+            stat = candidate.stat()
+            if not candidate.is_file() or stat.st_size <= 0:
+                continue
+        except OSError:
+            continue
+        candidates.append((float(stat.st_mtime), int(stat.st_size), candidate, "compat_pdf"))
+    total_bytes = sum(size for _mtime, size, _path, _kind in candidates)
     if len(candidates) <= maximum_files and total_bytes <= maximum_bytes:
-        return {"files": len(candidates), "bytes": total_bytes, "deleted": 0}
+        return {
+            "files": len(candidates),
+            "bytes": total_bytes,
+            "deleted": 0,
+            "compat_pdfs_deleted": 0,
+            "workdirs_deleted": workdirs_deleted,
+        }
 
     target_bytes = max(1, int(maximum_bytes * _RENDER_CACHE_TRIM_RATIO))
     target_files = max(1, int(maximum_files * _RENDER_CACHE_TRIM_RATIO))
     deleted = 0
+    compat_pdfs_deleted = 0
     remaining = len(candidates)
-    for _mtime, size, candidate in sorted(candidates, key=lambda item: item[0]):
+    for _mtime, size, candidate, kind in sorted(candidates, key=lambda item: item[0]):
         if remaining <= target_files and total_bytes <= target_bytes:
             break
         try:
@@ -726,9 +823,17 @@ def maintain_render_cache(
         except OSError:
             continue
         deleted += 1
+        if kind == "compat_pdf":
+            compat_pdfs_deleted += 1
         remaining -= 1
         total_bytes = max(0, total_bytes - size)
-    return {"files": remaining, "bytes": total_bytes, "deleted": deleted}
+    return {
+        "files": remaining,
+        "bytes": total_bytes,
+        "deleted": deleted,
+        "compat_pdfs_deleted": compat_pdfs_deleted,
+        "workdirs_deleted": workdirs_deleted,
+    }
 
 
 def _snapshot_for_render(path: str, cache_key: str) -> str | None:

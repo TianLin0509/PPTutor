@@ -129,3 +129,16 @@ def test_non_com_page_preview_uses_text_fallback_for_later_pages(tmp_path, monke
 
     assert thumbnailer.find_non_com_page_preview("deck.pptx", 7, long_edge=720) == safe
     assert calls == [("deck.pptx", 7, 720)]
+
+
+def test_text_page_preview_explains_unparseable_or_legacy_files(qapp, tmp_path, monkeypatch):
+    monkeypatch.setattr(thumbnailer, "cache_dir", lambda: tmp_path)
+    monkeypatch.setattr(renderer, "cache_dir", lambda: tmp_path)
+    source = tmp_path / "legacy-or-encrypted.ppt"
+    source.write_bytes(b"not-an-openxml-package")
+
+    out = thumbnailer.text_page_preview(str(source), 1, long_edge=800)
+
+    assert out is not None
+    assert out.exists()
+    assert not QImage(str(out)).isNull()

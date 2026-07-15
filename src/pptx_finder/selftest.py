@@ -33,6 +33,25 @@ CASES = [
 ]
 
 
+def _qtpdf_probe(directory: str | Path) -> dict[str, object]:
+    """Exercise the exact lazy QtPdf path that frozen compat preview needs."""
+    from pypdf import PdfWriter
+
+    from .renderer import _render_pdf_page
+
+    root = Path(directory)
+    root.mkdir(parents=True, exist_ok=True)
+    pdf = root / "qtpdf-probe.pdf"
+    png = root / "qtpdf-probe.png"
+    writer = PdfWriter()
+    writer.add_blank_page(width=1600, height=900)
+    with pdf.open("wb") as stream:
+        writer.write(stream)
+    rendered = _render_pdf_page(pdf, 1, 640, png)
+    size = int(rendered.stat().st_size) if rendered is not None and rendered.exists() else 0
+    return {"ok": size > 0, "bytes": size}
+
+
 def _run(pptx_dir: str) -> dict:
     from . import db, indexer, search
     from .config import CONTENT_EXTS
@@ -61,6 +80,7 @@ def _run(pptx_dir: str) -> dict:
                     "expect": expect, "got": got, "pass": got == expect,
                 })
             stats = db.stats(conn)
+            qtpdf = _qtpdf_probe(td)
             # 每类型索引明细（诊断 pypdf/docx/xlsx 是否真被打包：pdf 这行 files≥1 才算 pypdf 生效）
             by_ext = {
                 (r[0] or ""): {"files": r[1], "pages": r[2]}
@@ -80,9 +100,10 @@ def _run(pptx_dir: str) -> dict:
         "indexed_pages": stats["page_count"],
         "by_ext": by_ext,
         "executor": idx_summary.get("executor"),  # process=ProcessPool 真生效 / thread=回退
+        "qtpdf": qtpdf,
         "passed": passed,
         "total": len(cases),
-        "all_pass": passed == len(cases) and opencc_ok,
+        "all_pass": passed == len(cases) and opencc_ok and bool(qtpdf["ok"]),
         "cases": cases,
     }
 

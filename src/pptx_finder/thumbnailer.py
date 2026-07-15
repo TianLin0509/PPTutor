@@ -224,17 +224,28 @@ def text_page_preview(path: str, page_no: int, *, long_edge: int = 800) -> Path 
         return out
 
     page = parse_pptx_page(path, page_no)
+    preview_label = "文字速览"
     if page is None:
-        return None
-    lines = [value.strip() for value in (page.body, page.smartart) if value and value.strip()]
-    if page.notes and page.notes.strip():
-        lines.append(f"备注\n{page.notes.strip()}")
-    raw = "\n".join(lines).replace("\x00", "").strip()
-    if not raw:
-        raw = "这一页没有可提取的文字；高清原版可用时会自动替换。"
-    raw_lines = [line.strip() for line in raw.splitlines() if line.strip()]
-    headline = (raw_lines[0] if raw_lines else raw)[:120]
-    body = "\n".join(raw_lines[1:]) if len(raw_lines) > 1 else ""
+        preview_label = "安全预览说明"
+        headline = "这一页需要 Office 兼容渲染"
+        body = (
+            "文件可能是旧版 .ppt、已加密、结构异常，或索引页码已经过期。\n"
+            "PPT Doctor 没有读取或改写原文件；高清原版可用时会自动替换。"
+        )
+    else:
+        lines = [
+            value.strip()
+            for value in (page.body, page.smartart)
+            if value and value.strip()
+        ]
+        if page.notes and page.notes.strip():
+            lines.append(f"备注\n{page.notes.strip()}")
+        raw = "\n".join(lines).replace("\x00", "").strip()
+        if not raw:
+            raw = "这一页没有可提取的文字；高清原版可用时会自动替换。"
+        raw_lines = [line.strip() for line in raw.splitlines() if line.strip()]
+        headline = (raw_lines[0] if raw_lines else raw)[:120]
+        body = "\n".join(raw_lines[1:]) if len(raw_lines) > 1 else ""
     if len(body) > 1800:
         body = body[:1799].rstrip() + "…"
 
@@ -257,7 +268,7 @@ def text_page_preview(path: str, page_no: int, *, long_edge: int = 800) -> Path 
         painter.drawText(
             QRect(margin, margin, width - margin * 2, int(height * 0.08)),
             int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
-            f"P{page_no}  ·  文字速览",
+            f"P{page_no}  ·  {preview_label}",
         )
 
         title_top = margin + int(height * 0.09)
