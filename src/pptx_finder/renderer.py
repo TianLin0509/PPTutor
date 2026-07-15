@@ -13,9 +13,6 @@ import logging
 import os
 import re
 import shutil
-import subprocess
-import sys
-import tempfile
 import threading
 import time
 from pathlib import Path
@@ -49,7 +46,7 @@ _RENDER_CACHE_PATTERN = re.compile(
 _RENDER_CACHE_MAX_BYTES = 2 * 1024 * 1024 * 1024
 _RENDER_CACHE_MAX_FILES = 2000
 _RENDER_CACHE_TRIM_RATIO = 0.8
-_COMPAT_RENDER_TIMEOUT_SEC = 30.0
+_RENDER_CACHE_GENERATION = "com-only-v1"
 
 
 class PowerPointSessionBusy(RuntimeError):
@@ -519,254 +516,27 @@ def _cleanup_stale_snapshots(max_age_sec: float = 24 * 60 * 60) -> int:
     return removed
 
 
-def _find_soffice() -> Path | None:
-    """Locate an optional LibreOffice CLI used only when PowerPoint is busy."""
-    configured = str(os.environ.get("PPTUTOR_SOFFICE_PATH", "") or "").strip()
-    candidates = [
-        configured,
-        shutil.which("soffice.com") or "",
-        shutil.which("soffice.exe") or "",
-        shutil.which("soffice") or "",
-    ]
-    if os.name == "nt":
-        candidates.extend([
-            r"C:\Program Files\LibreOffice\program\soffice.com",
-            r"C:\Program Files\LibreOffice\program\soffice.exe",
-            r"C:\Program Files (x86)\LibreOffice\program\soffice.com",
-            str(Path.home() / "AppData/Local/Programs/LibreOffice/program/soffice.com"),
-        ])
-    for raw in candidates:
-        if not raw:
-            continue
-        candidate = Path(raw).expanduser()
-        try:
-            if candidate.is_file():
-                return candidate
-        except OSError:
-            continue
-    return None
-
-
-def _terminate_compat_processes(profile_uri: str) -> int:
-    """Terminate only LibreOffice processes carrying our unique profile URI."""
-    if os.name != "nt" or not profile_uri:
-        return 0
-    pythoncom = None
-    initialized = False
-    terminated = 0
-    try:
-        import pythoncom as _pythoncom  # type: ignore
-        import win32com.client  # type: ignore
-
-        pythoncom = _pythoncom
-        pythoncom.CoInitialize()
-        initialized = True
-        service = win32com.client.GetObject(r"winmgmts:\\.\root\cimv2")
-        needle = profile_uri.casefold()
-        for process in service.ExecQuery(
-            "SELECT Name, CommandLine, ProcessId FROM Win32_Process "
-            "WHERE Name LIKE 'soffice%'"
-        ):
-            command_line = str(getattr(process, "CommandLine", "") or "")
-            if needle not in command_line.casefold():
-                continue
-            try:
-                process.Terminate()
-                terminated += 1
-            except Exception:  # noqa: BLE001 one child may already be exiting
-                continue
-    except Exception as exc:  # noqa: BLE001 timeout cleanup stays best-effort
-        log.warning("compat timeout process cleanup failed: %s", exc)
-    finally:
-        if initialized and pythoncom is not None:
-            try:
-                pythoncom.CoUninitialize()
-            except Exception:  # noqa: BLE001
-                pass
-    return terminated
-
-
-def _render_pdf_page(pdf_path: Path, page_no: int, long_edge: int, out: Path) -> Path | None:
-    """Render one local PDF page through QtPdf without another long-lived process."""
-    from PySide6.QtCore import QSize
-    from PySide6.QtPdf import QPdfDocument
-
-    document = QPdfDocument()
-    try:
-        error = document.load(str(pdf_path))
-        if error != QPdfDocument.Error.None_:
-            return None
-        page_index = int(page_no) - 1
-        if page_index < 0 or page_index >= int(document.pageCount()):
-            return None
-        points = document.pagePointSize(page_index)
-        page_width = max(1.0, float(points.width()))
-        page_height = max(1.0, float(points.height()))
-        edge = max(64, int(long_edge))
-        if page_width >= page_height:
-            width = edge
-            height = max(1, int(round(edge * page_height / page_width)))
-        else:
-            height = edge
-            width = max(1, int(round(edge * page_width / page_height)))
-        image = document.render(page_index, QSize(width, height))
-        if image.isNull():
-            return None
-        out.parent.mkdir(parents=True, exist_ok=True)
-        tmp = out.with_suffix(out.suffix + ".tmp")
-        if not image.save(str(tmp), "PNG"):
-            return None
-        os.replace(tmp, out)
-        return out if out.exists() and out.stat().st_size > 0 else None
-    finally:
-        document.close()
-
-
-def _render_page_compat(
-    path: str,
-    page_no: int,
-    cache_key: str,
-    long_edge: int,
-    out: Path,
-) -> Path | None:
-    """Render without touching a running PowerPoint session.
-
-    LibreOffice is an optional, isolated fallback.  The first clicked page
-    converts a safe copy to a cached PDF; later page turns rasterize that PDF
-    directly and do not keep LibreOffice, PowerPoint, or another worker alive.
-    """
-    soffice = _find_soffice()
-    if soffice is None:
-        log.info("compat preview unavailable: LibreOffice was not found")
-        return None
-    root = cache_dir()
-    pdf_dir = root / "compat_pdf"
-    pdf_dir.mkdir(parents=True, exist_ok=True)
-    pdf_path = pdf_dir / f"{cache_key}.pdf"
-    try:
-        pdf_ready = pdf_path.exists() and pdf_path.stat().st_size > 0
-    except OSError:
-        pdf_ready = False
-    if not pdf_ready:
-        work_root = root / "compat_work"
-        work_root.mkdir(parents=True, exist_ok=True)
-        work: Path | None = None
-        try:
-            work = Path(tempfile.mkdtemp(
-                prefix=f"{cache_key}-",
-                dir=str(work_root),
-            ))
-            out_dir = work / "out"
-            out_dir.mkdir()
-            profile = work / "profile"
-            snapshot = work / f"source{Path(path).suffix or '.pptx'}"
-            shutil.copy2(path, snapshot)
-            profile_uri = profile.resolve().as_uri()
-            command = [
-                str(soffice),
-                "--headless",
-                "--nologo",
-                "--nodefault",
-                "--nolockcheck",
-                "--nofirststartwizard",
-                "--norestore",
-                f"-env:UserInstallation={profile_uri}",
-                "--convert-to",
-                "pdf:impress_pdf_Export",
-                "--outdir",
-                str(out_dir),
-                str(snapshot),
-            ]
-            creationflags = (
-                int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
-                | int(getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0))
-                if os.name == "nt"
-                else 0
-            )
-            try:
-                completed = subprocess.run(
-                    command,
-                    capture_output=True,
-                    text=True,
-                    timeout=_COMPAT_RENDER_TIMEOUT_SEC,
-                    check=False,
-                    creationflags=creationflags,
-                )
-            except subprocess.TimeoutExpired:
-                killed = _terminate_compat_processes(profile_uri)
-                log.warning(
-                    "compat preview timed out path=%s terminated=%s",
-                    path,
-                    killed,
-                )
-                return None
-            produced = out_dir / f"{snapshot.stem}.pdf"
-            if (
-                completed.returncode != 0
-                or not produced.exists()
-                or produced.stat().st_size <= 0
-            ):
-                log.warning(
-                    "compat preview conversion failed rc=%s path=%s stderr=%s",
-                    completed.returncode,
-                    path,
-                    str(completed.stderr or "")[-400:],
-                )
-                return None
-            tmp_pdf = pdf_path.with_suffix(".pdf.tmp")
-            shutil.copy2(produced, tmp_pdf)
-            os.replace(tmp_pdf, pdf_path)
-        except Exception as exc:  # noqa: BLE001 isolated fallback must fail quietly
-            log.warning("compat preview failed path=%s: %s", path, exc)
-            return None
-        finally:
-            if work is not None:
-                try:
-                    shutil.rmtree(work)
-                except OSError as exc:
-                    # soffice.com can return a fraction before soffice.bin has
-                    # released its profile registry.  The cached PDF is already
-                    # atomic and valid; a transient temp cleanup race must never
-                    # erase the user's successful first preview.
-                    log.info("compat workdir cleanup deferred path=%s: %s", work, exc)
-    else:
-        try:
-            os.utime(pdf_path, None)  # LRU touch: a frequently flipped deck stays cached
-        except OSError:
-            pass
-    try:
-        return _render_pdf_page(pdf_path, page_no, long_edge, out)
-    except Exception as exc:  # noqa: BLE001 malformed PDFs must not kill the worker
-        log.warning("compat PDF render failed path=%s page=%s: %s", path, page_no, exc)
-        return None
-
-
 def maintain_render_cache(
     *,
     max_bytes: int = _RENDER_CACHE_MAX_BYTES,
     max_files: int = _RENDER_CACHE_MAX_FILES,
-    compat_work_max_age_sec: float = 10 * 60,
 ) -> dict[str, int]:
-    """Bound page previews/compat PDFs and remove stale isolated workdirs."""
+    """Bound COM PNGs and purge every legacy non-COM preview artifact."""
     maximum_bytes = max(1, int(max_bytes))
     maximum_files = max(1, int(max_files))
-    workdirs_deleted = 0
-    work_root = cache_dir() / "compat_work"
-    cutoff = time.time() - max(0.0, float(compat_work_max_age_sec))
-    try:
-        workdirs = list(work_root.iterdir())
-    except OSError:
-        workdirs = []
-    for directory in workdirs:
+    fallback_dirs_deleted = 0
+    for name in ("compat_pdf", "compat_work", "compat_profile"):
+        directory = cache_dir() / name
         try:
-            if not directory.is_dir() or directory.stat().st_mtime >= cutoff:
+            if not directory.exists():
                 continue
             shutil.rmtree(directory)
-            workdirs_deleted += 1
+            fallback_dirs_deleted += 1
         except OSError:
             continue
 
-    candidates: list[tuple[float, int, Path, str]] = []
+    candidates: list[tuple[float, int, Path]] = []
+    fallback_files_deleted = 0
     try:
         entries = list(cache_dir().iterdir())
     except OSError:
@@ -774,11 +544,18 @@ def maintain_render_cache(
             "files": 0,
             "bytes": 0,
             "deleted": 0,
-            "compat_pdfs_deleted": 0,
-            "workdirs_deleted": workdirs_deleted,
+            "fallback_dirs_deleted": fallback_dirs_deleted,
+            "fallback_files_deleted": fallback_files_deleted,
         }
     for candidate in entries:
         if not _RENDER_CACHE_PATTERN.fullmatch(candidate.name):
+            continue
+        if "_safe_" in candidate.name.casefold():
+            try:
+                candidate.unlink()
+                fallback_files_deleted += 1
+            except OSError:
+                pass
             continue
         try:
             stat = candidate.stat()
@@ -786,36 +563,22 @@ def maintain_render_cache(
                 continue
         except OSError:
             continue
-        candidates.append((float(stat.st_mtime), int(stat.st_size), candidate, "png"))
-    pdf_dir = cache_dir() / "compat_pdf"
-    try:
-        pdf_entries = list(pdf_dir.glob("*.pdf"))
-    except OSError:
-        pdf_entries = []
-    for candidate in pdf_entries:
-        try:
-            stat = candidate.stat()
-            if not candidate.is_file() or stat.st_size <= 0:
-                continue
-        except OSError:
-            continue
-        candidates.append((float(stat.st_mtime), int(stat.st_size), candidate, "compat_pdf"))
-    total_bytes = sum(size for _mtime, size, _path, _kind in candidates)
+        candidates.append((float(stat.st_mtime), int(stat.st_size), candidate))
+    total_bytes = sum(size for _mtime, size, _path in candidates)
     if len(candidates) <= maximum_files and total_bytes <= maximum_bytes:
         return {
             "files": len(candidates),
             "bytes": total_bytes,
             "deleted": 0,
-            "compat_pdfs_deleted": 0,
-            "workdirs_deleted": workdirs_deleted,
+            "fallback_dirs_deleted": fallback_dirs_deleted,
+            "fallback_files_deleted": fallback_files_deleted,
         }
 
     target_bytes = max(1, int(maximum_bytes * _RENDER_CACHE_TRIM_RATIO))
     target_files = max(1, int(maximum_files * _RENDER_CACHE_TRIM_RATIO))
     deleted = 0
-    compat_pdfs_deleted = 0
     remaining = len(candidates)
-    for _mtime, size, candidate, kind in sorted(candidates, key=lambda item: item[0]):
+    for _mtime, size, candidate in sorted(candidates, key=lambda item: item[0]):
         if remaining <= target_files and total_bytes <= target_bytes:
             break
         try:
@@ -823,16 +586,14 @@ def maintain_render_cache(
         except OSError:
             continue
         deleted += 1
-        if kind == "compat_pdf":
-            compat_pdfs_deleted += 1
         remaining -= 1
         total_bytes = max(0, total_bytes - size)
     return {
         "files": remaining,
         "bytes": total_bytes,
         "deleted": deleted,
-        "compat_pdfs_deleted": compat_pdfs_deleted,
-        "workdirs_deleted": workdirs_deleted,
+        "fallback_dirs_deleted": fallback_dirs_deleted,
+        "fallback_files_deleted": fallback_files_deleted,
     }
 
 
@@ -945,7 +706,13 @@ def _close_pres(*, clean_snapshot: bool = True) -> bool:
 
 def cache_key_for_metadata(path: str, mtime: float, size: int) -> str:
     """Pure cache-key calculation safe for the GUI thread."""
-    raw = f"{os.path.abspath(path)}|{float(mtime)}|{int(size)}"
+    # v1.0.14 deliberately invalidates v1.0.13 cache entries because those
+    # PNGs may have come from non-COM fallbacks.  Every readable cache
+    # key from this generation therefore certifies a PowerPoint COM export.
+    raw = (
+        f"{_RENDER_CACHE_GENERATION}|{os.path.abspath(path)}|"
+        f"{float(mtime)}|{int(size)}"
+    )
     return xxhash.xxh64(raw.encode("utf-8")).hexdigest()
 
 
@@ -1057,21 +824,9 @@ def _render_page_direct(
             and getattr(_state, "app", None) is None
             and _powerpoint_active(force=True)
         ):
-            if hi_priority and use_snapshot:
-                # Never open even an owned snapshot inside the user's visible
-                # PowerPoint process.  If COM rejects Close, that snapshot can
-                # remain in their taskbar and recreate the original pollution.
-                rendered = _render_page_compat(
-                    path,
-                    int(page_no),
-                    cache_key,
-                    int(long_edge),
-                    out,
-                )
-                if rendered is not None:
-                    _failed_until.pop(fail_key, None)
-                    return rendered
-            log.info("PowerPoint is active and isolated compatibility preview was unavailable")
+            # Strict COM-only contract: never attach a preview snapshot to the
+            # user's visible PowerPoint and never substitute another renderer.
+            log.info("PowerPoint is active; COM-only preview declined safely")
             return None
         try:
             if existing_session_only:
@@ -1112,18 +867,7 @@ def _render_page_direct(
         except PowerPointSessionBusy as e:
             # This is an expected safety decision, not a broken-file failure;
             # do not poison the page's 90-second retry cache.
-            if hi_priority and use_snapshot:
-                rendered = _render_page_compat(
-                    path,
-                    int(page_no),
-                    cache_key,
-                    int(long_edge),
-                    out,
-                )
-                if rendered is not None:
-                    _failed_until.pop(fail_key, None)
-                    return rendered
-            log.info("preview skipped after isolated fallback: %s", e)
+            log.info("COM-only preview skipped: %s", e)
             return None
         except Exception as e:  # noqa: BLE001
             log.warning("render_page failed path=%s page=%s: %s", path, page_no, e)
@@ -1259,10 +1003,10 @@ def shutdown() -> None:
 
 def diagnostic_lines() -> list[str]:
     if not _ipc_enabled():
-        return [f"renderer_ipc: enabled=False frozen={bool(getattr(sys, 'frozen', False))}"]
+        return ["renderer_ipc: enabled=False mode=com-only"]
     try:
         from . import render_client
 
-        return render_client.diagnostic_lines()
+        return [*render_client.diagnostic_lines(), "renderer_mode: com-only"]
     except Exception as e:  # noqa: BLE001
         return [f"renderer_ipc: enabled=True unavailable ({type(e).__name__}: {e})"]

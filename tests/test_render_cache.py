@@ -55,34 +55,30 @@ def test_stale_snapshot_cleanup_keeps_current_and_recent_files(monkeypatch, tmp_
     assert renderer._cleanup_stale_snapshots(max_age_sec=0) == 0
 
 
-def test_render_cache_maintenance_bounds_compat_pdfs_and_stale_workdirs(
+def test_render_cache_maintenance_purges_every_legacy_fallback_artifact(
     monkeypatch,
     tmp_path,
 ):
     monkeypatch.setattr(renderer, "cache_dir", lambda: tmp_path)
-    now = 20_000.0
-    monkeypatch.setattr(renderer.time, "time", lambda: now)
-
     pdf_dir = tmp_path / "compat_pdf"
     pdf_dir.mkdir()
     old_pdf = pdf_dir / "old-key.pdf"
     old_pdf.write_bytes(b"p" * 400)
-    os.utime(old_pdf, (100, 100))
 
     work_root = tmp_path / "compat_work"
-    stale_work = work_root / "stale"
-    recent_work = work_root / "recent"
-    stale_work.mkdir(parents=True)
-    recent_work.mkdir(parents=True)
-    (stale_work / "source.pptx").write_bytes(b"stale")
-    (recent_work / "source.pptx").write_bytes(b"recent")
-    os.utime(stale_work, (now - 10_000, now - 10_000))
-    os.utime(recent_work, (now - 10, now - 10))
+    (work_root / "recent").mkdir(parents=True)
+    (work_root / "recent" / "source.pptx").write_bytes(b"recent")
+    profile = tmp_path / "compat_profile"
+    profile.mkdir()
+    (profile / "registrymodifications.xcu").write_bytes(b"legacy")
+    safe = tmp_path / "0123456789abcdef_safe_2_800.png"
+    safe.write_bytes(b"legacy text preview")
 
     result = renderer.maintain_render_cache(max_bytes=250, max_files=3)
 
-    assert not old_pdf.exists()
-    assert not stale_work.exists()
-    assert recent_work.exists()
-    assert result["compat_pdfs_deleted"] == 1
-    assert result["workdirs_deleted"] == 1
+    assert not pdf_dir.exists()
+    assert not work_root.exists()
+    assert not profile.exists()
+    assert not safe.exists()
+    assert result["fallback_dirs_deleted"] == 3
+    assert result["fallback_files_deleted"] == 1

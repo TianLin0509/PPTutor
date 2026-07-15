@@ -77,7 +77,8 @@ def test_renderer_ipc_disabled_in_source_by_default(monkeypatch):
     monkeypatch.delattr(render_client.sys, "frozen", raising=False)
 
     assert render_client.should_use_ipc() is False
-    assert renderer.diagnostic_lines() == ["renderer_ipc: enabled=False frozen=False"]
+    lines = renderer.diagnostic_lines()
+    assert lines == ["renderer_ipc: enabled=False mode=com-only"]
 
 
 def test_renderer_ipc_can_be_forced_by_env(monkeypatch):

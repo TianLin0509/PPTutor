@@ -30,7 +30,7 @@ try:
 except Exception:  # noqa: BLE001
     _WIN = False
 
-from .. import actions, db, history, indexer as indexer_mod, renderer as renderer_mod, search as search_mod, thumbnailer, updater, __version__
+from .. import actions, db, history, indexer as indexer_mod, renderer as renderer_mod, search as search_mod, updater, __version__
 from ..config import (
     DOCX_EXT, PDF_EXT, PPTX_EXT, PPT_EXTS, SUPPORTED_EXTS, db_path as cfg_db_path,
     enabled_index_exts as cfg_enabled_index_exts, ext_path,
@@ -623,7 +623,6 @@ class ResultItem(QWidget):
 class MainWindow(QMainWindow):
     _SEARCH_SLOW_HINT_MS = 1000
     _AUTO_PREVIEW_DELAY_MS = 420
-    _SHARP_PREVIEW_DELAY_MS = 160
     _RESIZE_PREVIEW_DELAY_MS = 45
     _HISTORY_HINT_DELAY_MS = 900
     _UI_LOOP_INTERVAL_MS = 1000
@@ -658,7 +657,10 @@ class MainWindow(QMainWindow):
                  smart_grouping_enabled: bool | None = None):
         super().__init__()
         self.setWindowTitle(f"PPT Doctor · PPT 查询助手   v{__version__}")
-        self.setWindowIcon(QIcon(_asset_path("logo.png")))  # 绐楀彛鏍囬/浠诲姟鏍忓浘鏍?
+        app_icon = QApplication.instance().windowIcon()
+        if app_icon.isNull():
+            app_icon = QIcon(_asset_path("app.ico"))
+        self.setWindowIcon(app_icon)
         self.resize(1180, 760)
         self._title_h = 40  # 鑷粯鐜荤拑鏍囬鏍忛珮搴︼紙nativeEvent 鎷栧姩鍖?缂╂斁杈瑰垽瀹氱敤锛?
         self.setWindowFlag(Qt.FramelessWindowHint, True)  # 鏃犺竟妗?鈫?鑷粯鐜荤拑鏍囬鏍?
@@ -683,7 +685,6 @@ class MainWindow(QMainWindow):
         self._results_raw: list[FileResult] = []
         self._render_gen = 0
         self._bg_tasks: list[BackgroundTask] = []
-        self._safe_preview_task: BackgroundTask | None = None
         self._settings_dialogs: list = []
         self._active_heavy_op: str | None = None
         self._closing = False  # 鍏崇獥涓細鍚庡彴浠诲姟鍥炶皟涓嶅啀纰?UI锛堥槻瑙﹁揪宸查攢姣佹帶浠讹級
@@ -763,9 +764,6 @@ class MainWindow(QMainWindow):
         self._preview_direction = 1  # 最近一次翻页方向；邻页预取优先沿该方向
         self._req_id = 0
         self._cur_pixmap: QPixmap | None = None
-        self._preview_provisional = False  # 褰撳墠棰勮鏄惁涓虹缉鐣ュ浘鍗犱綅锛堥珮娓呮湭鍒帮級
-        self._preview_hd_req_id: int | None = None
-        self._sharp_preview_args: tuple[int, str, int, int, int] | None = None
         self._zoom = 1.0  # 棰勮缂╂斁锛?.0=閫傞厤绐楀彛锛?1 鏀惧ぇ鐪嬬粏鑺?
         self._to_tray_on_close = False
         self._thumb_btns: list[QToolButton] = []
@@ -786,9 +784,6 @@ class MainWindow(QMainWindow):
 
         self._render = render_worker or RenderWorker(self)
         self._render.rendered.connect(self._on_rendered)
-        provisional_signal = getattr(self._render, "provisional_rendered", None)
-        if provisional_signal is not None:
-            provisional_signal.connect(self._on_provisional_rendered)
         self._owns_render = render_worker is None
         if self._owns_render:
             self._render.start()
@@ -818,10 +813,6 @@ class MainWindow(QMainWindow):
         self._auto_preview_timer.timeout.connect(
             lambda: self._run_auto_preview(self._auto_preview_token, self._auto_preview_seq)
         )
-        self._sharp_preview_timer = QTimer(self)
-        self._sharp_preview_timer.setSingleShot(True)
-        self._sharp_preview_timer.setInterval(self._SHARP_PREVIEW_DELAY_MS)
-        self._sharp_preview_timer.timeout.connect(self._run_sharp_preview)
         self._resize_preview_timer = QTimer(self)
         self._resize_preview_timer.setSingleShot(True)
         self._resize_preview_timer.setInterval(self._RESIZE_PREVIEW_DELAY_MS)
@@ -2744,16 +2735,17 @@ class MainWindow(QMainWindow):
     _RENDER_CHUNK = 12
     _HIT_NAV_MAX = 12
     _RENDER_YIELD_MS = 1
-    _PREVIEW_MIN_EDGE = 960
-    _PREVIEW_MAX_EDGE = 1280
-    _PREFETCH_EDGE = 960
+    _PREVIEW_MIN_EDGE = 1920
+    _PREVIEW_MAX_EDGE = 2560
+    _PREFETCH_EDGE = 1920
     _PRIORITY_RIGHT_PREVIEW = 0
     _PRIORITY_NEIGHBOR_PREFETCH = 220
     # Render a short contiguous runway while the already-open, proven-owned
-    # PowerPoint session is cheap to reuse.  Three 960px exports normally cost
-    # only a few hundred milliseconds in the background, yet avoid a ~2s COM
-    # cold start on the next several wheel turns.  The worker remains serial and
-    # checks for a real preview between pages, so this does not raise concurrency.
+    # PowerPoint session is cheap to reuse.  Three full-resolution exports avoid
+    # a ~2s COM cold start on the next several wheel turns without ever showing
+    # a lower-resolution placeholder.
+    # The worker remains serial and checks for a real preview between pages, so
+    # this does not raise concurrency.
     _NEIGHBOR_PREFETCH_MAX = 3
 
     def _render_results(self, results: list[FileResult]) -> None:
@@ -3659,9 +3651,9 @@ class MainWindow(QMainWindow):
         accent = self._tok.get("acc", "#0A84FF")
         sub = self._tok.get("ink3", "#888")
         msg = (
-            "\u9996\u6b21\u9884\u89c8\u9700\u8981\u542f\u52a8 PowerPoint\uff0c\u8bf7\u7a0d\u7b49..."
+            "正在启动 PowerPoint COM 并生成原始页面..."
             if not getattr(self, "_preview_hinted", False)
-            else "\u6b63\u5728\u6e32\u67d3\u9884\u89c8..."
+            else "正在等待 PowerPoint COM 原图渲染..."
         )
         self.image_label.setPixmap(QPixmap())
         self.image_label.setText(
@@ -3680,13 +3672,11 @@ class MainWindow(QMainWindow):
         if clear_deferred:
             self._preview_deferred_due_to_busy = False
         self._req_id += 1
-        self._cancel_sharp_preview()
         if hasattr(self, "_spin_timer"):
             self._stop_spinner()
 
     def _show_preview_pending(self) -> None:
         self._cur_pixmap = None
-        self._preview_provisional = False
         self.image_label.setPixmap(QPixmap())
         self.image_label.setText(
             '<div style="font-size:28px">…</div>'
@@ -3694,7 +3684,6 @@ class MainWindow(QMainWindow):
 
     def _clear_preview_empty(self, message: str = "选中左侧结果查看预览") -> None:
         self._cur_pixmap = None
-        self._preview_provisional = False
         self.image_label.setPixmap(QPixmap())
         self.image_label.setText(
             f'<div style="color:#888;font-size:13px">{message}</div>')
@@ -3702,11 +3691,11 @@ class MainWindow(QMainWindow):
     def _show_preview_unavailable(self) -> None:
         self.image_label.setPixmap(QPixmap())
         self.image_label.setText(
-            '<div style="font-size:30px">📫</div>'
-            '<div style="color:#888;font-size:13px;margin-top:12px">此页暂时无法预览<br>'
-            '点“打开文件”直接查看</div>')
+            '<div style="font-size:30px">🖼️</div>'
+            '<div style="color:#666;font-size:13px;margin-top:12px">COM 原图渲染失败<br>'
+            '<span style="color:#999">若 PowerPoint 正在使用，请关闭 PowerPoint 后重新点击此文件；<br>'
+            '也可能是文件加密、损坏或页码已失效。</span></div>')
         self._cur_pixmap = None
-        self._preview_provisional = False
 
     def _show_non_powerpoint_preview(self, ext: str) -> None:
         kind = "Word" if ext == DOCX_EXT else "PDF"
@@ -3719,10 +3708,9 @@ class MainWindow(QMainWindow):
             f'暂不支持页图预览；点“打开文件”查看原文</div>'
         )
         self._cur_pixmap = None
-        self._preview_provisional = False
 
-    def _show_cached_preview_placeholder(self, path: str, page: int, sharp_edge: int) -> str:
-        """Show cached pixels immediately; report whether they are already sharp enough."""
+    def _show_cached_com_preview(self, path: str, page: int, required_edge: int) -> bool:
+        """Show only a COM-only cache entry at the requested display resolution."""
         cached = None
         try:
             # Source paths may be cloud/offline locations where even ``stat`` can
@@ -3739,56 +3727,19 @@ class MainWindow(QMainWindow):
                 path,
                 page,
                 cache_key=cache_key,
-                min_long_edge=1,
+                min_long_edge=required_edge,
             )
         except Exception:  # noqa: BLE001
             cached = None
         if cached is None or not os.path.exists(str(cached)):
-            return ""
+            return False
         pm = QPixmap(str(cached))
         if pm.isNull():
-            return ""
+            return False
         self._cur_pixmap = pm
-        sharp = max(pm.width(), pm.height()) >= sharp_edge
-        self._preview_provisional = not sharp
         self._stop_spinner()
         self._update_pixmap()
-        return "sharp" if sharp else "provisional"
-
-    def _cancel_sharp_preview(self) -> None:
-        self._sharp_preview_args = None
-        timer = getattr(self, "_sharp_preview_timer", None)
-        if timer is not None:
-            timer.stop()
-
-    def _schedule_sharp_preview(
-        self,
-        req_id: int,
-        path: str,
-        page: int,
-        long_edge: int,
-        priority: int,
-    ) -> None:
-        self._sharp_preview_args = (req_id, path, page, long_edge, priority)
-        self._sharp_preview_timer.setInterval(self._SHARP_PREVIEW_DELAY_MS)
-        self._sharp_preview_timer.start()
-
-    def _run_sharp_preview(self) -> None:
-        args = self._sharp_preview_args
-        self._sharp_preview_args = None
-        if args is None or self._closing:
-            return
-        req_id, path, page, long_edge, priority = args
-        if (
-            req_id != self._req_id
-            or self._cur is None
-            or self._cur.path != path
-            or self._view_page != page
-            or self._search_pending_req is not None
-            or self._active_heavy_op is not None
-        ):
-            return
-        self._request_render(req_id, path, page, long_edge=long_edge, priority=priority)
+        return True
 
     def _request_preview(self) -> None:
         if not self._cur:
@@ -3798,7 +3749,6 @@ class MainWindow(QMainWindow):
         if self._defer_preview_if_file_op_active():
             return
         self._preview_deferred_due_to_busy = False
-        self._cancel_sharp_preview()
         self._zoom = 1.0
         page = self._view_page
         hits = self._cur.hits or []
@@ -3839,35 +3789,18 @@ class MainWindow(QMainWindow):
         # 娓愯繘寮忛瑙堬細璇ラ〉缂╃暐鍥惧凡缂撳瓨灏辩珛鍗虫斁澶ф樉绀轰綔鍗犱綅锛堢鍑哄唴瀹广€侀伄浣忔覆鏌撶瓑寰咃級锛岄珮娓呮覆鏌?
         # 濂藉悗鍦?_on_rendered 鏃犵紳鏇挎崲銆傚懡涓〉閫氬父宸叉湁缂╃暐鍥撅紙缁撴灉鍗＄墖宸︿晶閭ｅ紶灏辨槸瀹冿級銆?
         preview_edge = self._preview_long_edge()
-        cache_state = self._show_cached_preview_placeholder(
+        cache_hit = self._show_cached_com_preview(
             self._cur.path,
             page,
             preview_edge,
         )
-        if not cache_state:
-            self._preview_provisional = False
+        if not cache_hit:
             self._start_spinner()
         self._req_id += 1
-        if cache_state == "sharp":
+        if cache_hit:
             self._preview_hinted = True
             self._prefetch_neighbors()
-        elif cache_state == "provisional":
-            # Keep the cached frame visible and sharpen only the page where the
-            # user pauses. Rapid wheel turns cancel unseen COM exports.
-            self._schedule_sharp_preview(
-                self._req_id,
-                self._cur.path,
-                page,
-                preview_edge,
-                self._PRIORITY_RIGHT_PREVIEW,
-            )
         else:
-            self._request_safe_preview(
-                self._req_id,
-                self._cur.path,
-                page,
-                long_edge=min(preview_edge, 800),
-            )
             self._request_render(
                 self._req_id,
                 self._cur.path,
@@ -3876,50 +3809,11 @@ class MainWindow(QMainWindow):
                 priority=self._PRIORITY_RIGHT_PREVIEW,
             )
 
-    def _request_safe_preview(
-        self,
-        req_id: int,
-        path: str,
-        page: int,
-        *,
-        long_edge: int,
-    ) -> None:
-        """Render a latest-only safe first paint outside the serial HD worker."""
-        previous = self._safe_preview_task
-        if previous is not None:
-            try:
-                previous.stop()
-            except RuntimeError:
-                pass
-        task = BackgroundTask(
-            lambda: thumbnailer.find_non_com_page_preview(
-                path,
-                page,
-                long_edge=long_edge,
-            ),
-            "preview-provisional",
-        )
-        self._safe_preview_task = task
-        self._bg_tasks.append(task)
-
-        def _done(result, request_id=req_id):
-            if result:
-                self._on_provisional_rendered(request_id, str(result))
-
-        def _cleanup(task=task):
-            if task in self._bg_tasks:
-                self._bg_tasks.remove(task)
-            if self._safe_preview_task is task:
-                self._safe_preview_task = None
-
-        task.done.connect(_done)
-        task.finished.connect(_cleanup)
-        task.start()
-
     def _preview_long_edge(self) -> int:
         try:
             vp = self.scroll.viewport().size()
-            edge = int(max(vp.width(), vp.height()) * 1.25)
+            pixel_ratio = max(1.0, float(self.devicePixelRatioF()))
+            edge = int(max(vp.width(), vp.height()) * pixel_ratio * 1.5)
         except Exception:  # noqa: BLE001
             edge = self._PREVIEW_MAX_EDGE
         return max(self._PREVIEW_MIN_EDGE, min(self._PREVIEW_MAX_EDGE, edge))
@@ -3999,24 +3893,6 @@ class MainWindow(QMainWindow):
         self._update_pixmap()
         self._toast("原尺寸放大 · 再双击还原" if self._zoom > 1.0 else "已适配窗口")
 
-    def _on_provisional_rendered(self, req_id: int, png: str) -> None:
-        """Keep a safe non-COM page preview visible while HD rendering continues."""
-        if (
-            self._closing
-            or req_id != self._req_id
-            or self._preview_hd_req_id == req_id
-            or not png
-            or not os.path.exists(png)
-        ):
-            return
-        pm = QPixmap(png)
-        if pm.isNull():
-            return
-        self._cur_pixmap = pm
-        self._preview_provisional = True
-        self._stop_spinner()
-        self._update_pixmap()
-
     def _on_rendered(self, req_id: int, png: str) -> None:
         if self._closing:
             return
@@ -4024,19 +3900,13 @@ class MainWindow(QMainWindow):
             return
         self._stop_spinner()
         if not png or not os.path.exists(png):
-            if self._preview_provisional and self._cur_pixmap is not None:
-                return
             self._show_preview_unavailable()
             return
         pm = QPixmap(png)
         if pm.isNull():
-            if self._preview_provisional and self._cur_pixmap is not None:
-                return
             self._show_preview_unavailable()
             return
         self._cur_pixmap = pm
-        self._preview_provisional = False  # 楂樻竻宸插埌锛屼笉鍐嶆槸鍗犱綅
-        self._preview_hd_req_id = req_id
         self._preview_hinted = True  # 棣栨棰勮宸叉垚鍔燂紝涔嬪悗涓嶅啀鎻愩€屽敜璧?PowerPoint銆?
         self._update_pixmap()
         self._prefetch_neighbors()  # 鍚庡彴棰勬覆鏌撶浉閭?鍛戒腑椤碉紝缈昏繃鍘绘椂缂撳瓨鍛戒腑=鐬棿
@@ -4091,8 +3961,6 @@ class MainWindow(QMainWindow):
             self._prefetch_render(
                 self._cur.path,
                 p,
-                # 960px normally is the final size. On a large viewport it is an
-                # instant provisional frame and is sharpened only after a pause.
                 long_edge=self._PREFETCH_EDGE,
                 priority=self._PRIORITY_NEIGHBOR_PREFETCH,
             )

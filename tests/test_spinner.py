@@ -15,7 +15,8 @@ def test_spinner_active_and_text(qtbot, tmp_path):
     assert "PowerPoint" in win.image_label.text()        # 首次预览说明（P2-1）
     win._preview_hinted = True
     win._tick_spinner()
-    assert "正在渲染" in win.image_label.text()            # 之后恢复常规文案
+    assert "正在等待" in win.image_label.text()
+    assert "COM 原图渲染" in win.image_label.text()
 
 
 def test_spinner_stops(qtbot, tmp_path):

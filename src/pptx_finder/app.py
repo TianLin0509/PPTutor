@@ -107,8 +107,12 @@ def _parse_hotkey(spec: str) -> tuple[int, int | None]:
 
 def _make_icon() -> QIcon:
     from .config import resource_path
-    logo = resource_path("assets", "logo.png")
-    if logo.exists():
+    for logo in (
+        resource_path("assets", "app.ico"),
+        resource_path("assets", "logo.png"),
+    ):
+        if not logo.exists():
+            continue
         ic = QIcon(str(logo))
         if not ic.isNull():
             return ic
@@ -554,10 +558,6 @@ def _apply_global_hotkey(app, win, spec: str) -> bool:
 
 def main() -> int:
     multiprocessing.freeze_support()  # PyInstaller 下多进程必需
-    try:  # 任务栏用窗口图标(吉祥物)而非默认 python/exe 图标，需显式 AppUserModelID
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("PPTDoctor")
-    except Exception:  # noqa: BLE001 非 Windows / 旧系统静默跳过
-        pass
     from .logging_setup import configure_logging
     configure_logging()
     log = logging.getLogger(__name__)
