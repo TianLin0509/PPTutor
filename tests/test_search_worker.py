@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import sqlite3
 import threading
 import time
 
@@ -9,6 +10,7 @@ from pptx_finder.ui import search_worker as search_worker_mod
 from test_ui import _index
 
 from pptx_finder.ui.search_worker import SearchWorker
+import pytest
 
 
 class InterruptibleConn:
@@ -338,3 +340,85 @@ def test_search_worker_diagnostics_include_p95_and_max():
     assert "p95=500 ms" in lines
     assert "max=500 ms" in lines
     assert "sensitive term" not in lines
+
+
+def test_search_worker_connection_failure_returns_error_instead_of_dying(
+    monkeypatch, qtbot, tmp_path
+):
+    monkeypatch.setattr(
+        search_worker_mod.db,
+        "connect_readonly",
+        lambda _path, **_kwargs: (_ for _ in ()).throw(
+            OSError("database temporarily unavailable")
+        ),
+    )
+    worker = SearchWorker(db_path=str(tmp_path / "missing.db"))
+    worker.start()
+    try:
+        with qtbot.waitSignal(worker.searched, timeout=1000) as blocker:
+            worker.request(41, "AI SP", "all")
+
+        req_id, query, results, _elapsed_ms, error = blocker.args
+        assert (req_id, query, results) == (41, "AI SP", [])
+        assert "database temporarily unavailable" in str(error)
+        assert worker.isRunning(), "the next search should be able to retry the connection"
+    finally:
+        worker.stop()
+        worker.wait(3000)
+
+
+def test_search_worker_fails_fast_when_database_is_exclusively_locked(qtbot, tmp_path):
+    """A maintenance/schema lock must not leave the UI searching for ~8 seconds."""
+    path = tmp_path / "locked.db"
+    conn = db.connect(path)
+    db.init_db(conn)
+    conn.close()
+
+    locker = sqlite3.connect(path, isolation_level=None, timeout=0.1)
+    locker.execute("PRAGMA journal_mode=WAL")
+    locker.execute("PRAGMA locking_mode=EXCLUSIVE")
+    locker.execute("BEGIN EXCLUSIVE")
+    locker.execute("INSERT INTO meta(key, value) VALUES('held', '1')")
+
+    worker = SearchWorker(db_path=str(path))
+    worker.start()
+    started = time.perf_counter()
+    try:
+        with qtbot.waitSignal(worker.searched, timeout=1500) as blocker:
+            worker.request(42, "AI SP", "all")
+
+        req_id, query, results, elapsed_ms, error = blocker.args
+        assert (req_id, query, results) == (42, "AI SP", [])
+        assert error is not None
+        assert "locked" in str(error).lower()
+        assert elapsed_ms < 1200
+        assert time.perf_counter() - started < 1.4
+        assert worker.isRunning(), "a later query should retry after maintenance releases the lock"
+    finally:
+        locker.rollback()
+        locker.close()
+        worker.stop()
+        worker.wait(3000)
+
+
+def test_readonly_uri_uses_sqlite_unc_path_form_without_resolving_network():
+    uri = db._readonly_uri(r"\\server\share\PPT Doctor\index #1.db")
+
+    assert uri == "file:////server/share/PPT%20Doctor/index%20%231.db?mode=ro"
+    assert not uri.startswith("file://server"), "SQLite rejects non-local URI authorities"
+
+
+def test_connect_readonly_handles_spaces_hashes_and_rejects_writes(tmp_path):
+    path = tmp_path / "PPT Doctor #1" / "index & ready.db"
+    path.parent.mkdir()
+    writer = db.connect(path)
+    db.init_db(writer)
+    writer.close()
+
+    reader = db.connect_readonly(path)
+    try:
+        assert reader.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 0
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            reader.execute("INSERT INTO meta(key, value) VALUES('nope', '1')")
+    finally:
+        reader.close()

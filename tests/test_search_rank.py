@@ -41,19 +41,30 @@ def test_name_with_ext_query_matches_stem(tmp_path):
     assert res[0].name == "b.pptx"
 
 
-def test_scanner_skips_temp(tmp_path):
-    (tmp_path / "Temp").mkdir()
-    fx.make_pptx(tmp_path / "Temp" / "junk.pptx", [{"body": "x"}])
+def test_scanner_includes_user_project_folder_named_temp(tmp_path):
+    (tmp_path / "Projects" / "Temp").mkdir(parents=True)
+    fx.make_pptx(tmp_path / "Projects" / "Temp" / "draft.pptx", [{"body": "x"}])
     (tmp_path / "real").mkdir()
     fx.make_pptx(tmp_path / "real" / "keep.pptx", [{"body": "x"}])
     found = {p.name for p in iter_ppt_files([str(tmp_path)])}
     assert "keep.pptx" in found
-    assert "junk.pptx" not in found      # Temp 目录被排除，临时文件不进索引
+    assert "draft.pptx" in found
+
+
+def test_scanner_skips_actual_appdata_local_temp(tmp_path):
+    temp_dir = tmp_path / "Users" / "me" / "AppData" / "Local" / "Temp"
+    temp_dir.mkdir(parents=True)
+    fx.make_pptx(temp_dir / "office-cache.pptx", [{"body": "x"}])
+
+    found = {p.name for p in iter_ppt_files([str(tmp_path)])}
+
+    assert "office-cache.pptx" not in found
 
 
 def test_exclude_has_temp_dirs():
-    for d in ("temp", "tmp", "local settings"):
-        assert d in EXCLUDE_DIR_NAMES
+    assert "local settings" in EXCLUDE_DIR_NAMES
+    assert "temp" not in EXCLUDE_DIR_NAMES
+    assert "tmp" not in EXCLUDE_DIR_NAMES
 
 
 def test_scanner_includes_company_documents_under_appdata_roaming(tmp_path):
@@ -64,6 +75,25 @@ def test_scanner_includes_company_documents_under_appdata_roaming(tmp_path):
     found = {p.name for p in iter_ppt_files([str(tmp_path)])}
 
     assert "old-project.pptx" in found
+
+
+def test_scanner_reports_inaccessible_directories_instead_of_silently_skipping(monkeypatch, tmp_path):
+    blocked = tmp_path / "blocked"
+    seen = []
+
+    def fake_walk(root, topdown=True, onerror=None):
+        error = PermissionError("access denied")
+        error.filename = str(blocked)
+        assert onerror is not None
+        onerror(error)
+        yield str(root), [], []
+
+    monkeypatch.setattr(scanner.os, "walk", fake_walk)
+
+    list(iter_ppt_files([str(tmp_path)], scan_error_cb=seen.append))
+
+    assert len(seen) == 1
+    assert seen[0].filename == str(blocked)
 
 
 def test_scanner_never_indexes_its_own_appdata_store(tmp_path, monkeypatch):

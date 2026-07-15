@@ -43,6 +43,7 @@ from .text_tokenize import tokenize
 log = logging.getLogger(__name__)
 
 ProgressCb = Callable[[int, int, str], None]
+ThrottleCb = Callable[[], None]
 COMMIT_EVERY = 50
 SCAN_COMMIT_EVERY = 200  # 扫描期每登记这么多就提交一次，让文件名尽快可搜
 PARSE_TIMEOUT_S = 60.0   # 单文件解析超时：超过判定卡住 → 跳过不阻塞整批（子进程隔离的关键保护）
@@ -76,7 +77,34 @@ def _is_cloud_placeholder(path: str | Path, st: os.stat_result | None = None) ->
     return bool(int(getattr(st, "st_file_attributes", 0) or 0) & _CLOUD_PLACEHOLDER_ATTRS)
 
 
-def _index_one(path: str) -> dict[str, Any]:
+def _path_under_any_root(path: str, roots: tuple[str, ...]) -> bool:
+    candidate = os.path.normcase(os.path.abspath(path))
+    for root in roots:
+        try:
+            if os.path.commonpath((candidate, root)) == root:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _path_is_explicitly_missing(path: str) -> bool:
+    """Only confirm deletion on a real not-found result.
+
+    ``os.walk`` silently skips access-denied and transiently unavailable
+    directories. Treating every unseen path as deleted made valid decks vanish
+    from search after a partial full-disk walk.
+    """
+    try:
+        os.stat(ext_path(path))
+    except (FileNotFoundError, NotADirectoryError):
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def _index_one(path: str, compute_content_hash: bool = True) -> dict[str, Any]:
     """worker：解压 + 提取文本 + 逐页分词。返回可 pickle 的紧凑结果。
 
     变更检测交给上层 (size, mtime) 快筛；走到这里说明需要解析，
@@ -102,7 +130,13 @@ def _index_one(path: str) -> dict[str, Any]:
     if st.st_size > cap:
         res["status"] = "too_large"
         return res
-    res["content_hash"] = _file_sha256(ext_path(path))
+    # 精确重复稿折叠属于高阶能力。基础模式不为此把每个 PPT 再完整读一遍，
+    # 直接使用 stat 指纹即可完成增量变更判断。
+    res["content_hash"] = (
+        _file_sha256(ext_path(path))
+        if compute_content_hash
+        else _stat_hash(st.st_size, st.st_mtime)
+    )
     deck = parse_document(path)
     res["status"] = deck.status
     res["error"] = deck.error
@@ -297,6 +331,10 @@ def update_index(
     stop_event: Any = None,
     scan_iter: Iterable[Path] | None = None,
     isolated_worker: bool = False,
+    supported_exts: tuple[str, ...] | set[str] | None = None,
+    compute_content_hash: bool = True,
+    throttle_cb: ThrottleCb | None = None,
+    max_pending_factor: int = 4,
 ) -> dict[str, int]:
     """增量更新：流式扫描 → 即时登记文件名 → 并行解析补全内容。
 
@@ -313,8 +351,53 @@ def update_index(
         "skipped_ppt": 0,
         "skipped_cloud": 0,
         "deleted": 0,
+        "cancelled": 0,
+        "unreadable_dirs": 0,
+        "scan_error_examples": [],
     }
-    source = scan_iter if scan_iter is not None else iter_ppt_files(roots)
+    allowed_exts = {
+        ext.lower()
+        for ext in (supported_exts if supported_exts is not None else (*CONTENT_EXTS, PPT_EXT))
+    }
+    available_roots = tuple(
+        os.path.normcase(os.path.abspath(root))
+        for root in roots
+        if os.path.isdir(ext_path(root))
+    )
+    scan_started_at = time.monotonic()
+
+    def scan_heartbeat(directories_seen: int, _current: str) -> None:
+        if progress_cb is None:
+            return
+        elapsed = max(0, int(time.monotonic() - scan_started_at))
+        if elapsed < 60:
+            elapsed_text = f"{elapsed} 秒"
+        else:
+            minutes, seconds = divmod(elapsed, 60)
+            elapsed_text = f"{minutes} 分 {seconds:02d} 秒"
+        progress_cb(
+            done,
+            -1,
+            f"已检查 {directories_seen:,} 个文件夹 · "
+            f"发现 {len(seen):,} 个文件 · 已用 {elapsed_text}",
+        )
+
+    def scan_error(error: OSError) -> None:
+        summary["unreadable_dirs"] += 1
+        examples = summary["scan_error_examples"]
+        if len(examples) < 5:
+            examples.append(str(getattr(error, "filename", "") or error))
+
+    source = (
+        scan_iter
+        if scan_iter is not None
+        else iter_ppt_files(
+            roots,
+            supported_exts=allowed_exts,
+            scan_progress_cb=scan_heartbeat,
+            scan_error_cb=scan_error,
+        )
+    )
 
     inline = workers == 1 and not isolated_worker
     max_workers = workers or min(os.cpu_count() or 4, 8)
@@ -342,6 +425,10 @@ def update_index(
     def stopped() -> bool:
         return stop_event is not None and stop_event.is_set()
 
+    def yield_to_foreground() -> None:
+        if throttle_cb is not None and not stopped():
+            throttle_cb()
+
     def _emit(p) -> None:
         nonlocal done
         done += 1
@@ -368,7 +455,11 @@ def update_index(
         _emit(p)
 
     def submit(p: Path) -> None:
-        f = ex.submit(_index_one, str(p))
+        f = (
+            ex.submit(_index_one, str(p))
+            if compute_content_hash
+            else ex.submit(_index_one, str(p), False)
+        )
         futs[f] = p
         started[f] = time.monotonic()
 
@@ -397,13 +488,16 @@ def update_index(
 
     def backpressure() -> None:
         """积压超过容量则阻塞收割直到降回容量内（1s 轮询 + 超时清理，绝不永久阻塞）。"""
-        while len(futs) >= max_workers * 4 and not stopped():
+        pending_limit = max(1, max_workers * max(1, int(max_pending_factor)))
+        while len(futs) >= pending_limit and not stopped():
+            yield_to_foreground()
             wait(list(futs), timeout=1.0, return_when=FIRST_COMPLETED)
             harvest_ready()
 
     def drain() -> None:
         """收尾：收割到队列空（1s 轮询 + 超时清理，绝不卡在坏文件上）。"""
         while futs and not stopped():
+            yield_to_foreground()
             wait(list(futs), timeout=1.0, return_when=FIRST_COMPLETED)
             harvest_ready()
 
@@ -412,6 +506,7 @@ def update_index(
         for p in source:
             if stopped():
                 break
+            yield_to_foreground()
             sp = str(p)
             seen.add(sp)
             if len(seen) % SCAN_COMMIT_EVERY == 0:
@@ -441,13 +536,23 @@ def update_index(
                 continue
             # (size, mtime) 快筛。永久解析错误用熔断式退避：同一份字节最多
             # 自动尝试三次；文件 stat 真变化时始终立即重试。
+            ext = p.suffix.lower()
             same_stat = (
                 row is not None
                 and int(st.st_size) == int(row["size"])
                 and abs(st.st_mtime - row["mtime"]) <= 1e-6
             )
             unchanged = same_stat
-            if same_stat and row["status"] in ("pending", "cloud_placeholder"):
+            needs_hash_backfill = bool(
+                same_stat
+                and compute_content_hash
+                and row["status"] == "ok"
+                and ext in CONTENT_EXTS
+                and not str(row["content_hash"] or "").startswith("sha256:")
+            )
+            if needs_hash_backfill:
+                unchanged = False
+            elif same_stat and row["status"] in ("pending", "cloud_placeholder"):
                 unchanged = False
             elif same_stat and row["status"] == "error":
                 failures = int(row["parse_failures"] or 0)
@@ -458,7 +563,6 @@ def update_index(
                 )
             if unchanged:
                 continue
-            ext = p.suffix.lower()
             if ext == PPT_EXT:
                 try:
                     _write_filename_only(conn, p)
@@ -482,7 +586,11 @@ def update_index(
             total += 1
             if inline:
                 try:
-                    _write_result(conn, _index_one(sp))
+                    result = (
+                        _index_one(sp)
+                        if compute_content_hash else _index_one(sp, False)
+                    )
+                    _write_result(conn, result)
                     summary["indexed"] += 1
                 except Exception as e:  # noqa: BLE001
                     log.warning("index failed %s: %s", p, e)
@@ -512,7 +620,12 @@ def update_index(
         for path in list(existing.keys()):
             if stopped():
                 break
-            if path not in seen:
+            if (
+                os.path.splitext(path)[1].lower() in allowed_exts
+                and path not in seen
+                and _path_under_any_root(path, available_roots)
+                and _path_is_explicitly_missing(path)
+            ):
                 db.delete_file(conn, path)
                 summary["deleted"] += 1
         if summary["deleted"]:
@@ -530,7 +643,11 @@ def update_index(
             sp = str(p)
             if inline:
                 try:
-                    _write_result(conn, _index_one(sp))
+                    result = (
+                        _index_one(sp)
+                        if compute_content_hash else _index_one(sp, False)
+                    )
+                    _write_result(conn, result)
                     summary["indexed"] += 1
                 except Exception as e:  # noqa: BLE001
                     log.warning("index failed %s: %s", p, e)
@@ -555,17 +672,35 @@ def update_index(
         if ex is not None:
             _shutdown_executor(ex)
 
-    if progress_cb:
+    was_cancelled = stopped()
+    summary["cancelled"] = int(was_cancelled)
+    if progress_cb and not was_cancelled:
         progress_cb(total, total, "完成")  # 进度走满
-    if scan_iter is None and not stopped():
+    if scan_iter is None and not was_cancelled:
         db.set_meta(conn, db.META_LAST_COMPLETED_SCAN_AT, str(time.time()))
         db.set_meta(conn, db.META_SCAN_POLICY_VERSION, SCAN_POLICY_VERSION)
+        db.set_meta(
+            conn,
+            db.META_LAST_SCAN_UNREADABLE_DIRS,
+            str(int(summary.get("unreadable_dirs", 0) or 0)),
+        )
+        db.set_meta(
+            conn,
+            db.META_LAST_SCAN_ERROR_EXAMPLES,
+            "\n".join(str(path) for path in summary.get("scan_error_examples", [])),
+        )
         conn.commit()
     summary["scanned"] = len(seen)
     return summary
 
 
-def index_single(conn: sqlite3.Connection, path: str) -> bool:
+def index_single(
+    conn: sqlite3.Connection,
+    path: str,
+    *,
+    supported_exts: tuple[str, ...] | set[str] | None = None,
+    compute_content_hash: bool = True,
+) -> bool:
     """实时增量：索引单个文件（watcher 捕获到新建/改存时调用）。
 
     只变更这一个路径：存在则 upsert，已消失则删掉该路径的陈旧索引；绝不影响
@@ -573,6 +708,13 @@ def index_single(conn: sqlite3.Connection, path: str) -> bool:
     """
     p = Path(path)
     try:
+        ext = p.suffix.lower()
+        allowed_exts = {
+            e.lower()
+            for e in (supported_exts if supported_exts is not None else (*CONTENT_EXTS, PPT_EXT))
+        }
+        if ext not in allowed_exts:
+            return False
         if not p.exists():
             if db.get_file_by_path(conn, str(p)) is None:
                 return False
@@ -589,11 +731,14 @@ def index_single(conn: sqlite3.Connection, path: str) -> bool:
             )
             conn.commit()
             return True
-        ext = p.suffix.lower()
         if ext == PPT_EXT:
             _write_filename_only(conn, p)
         elif ext in CONTENT_EXTS:
-            _write_result(conn, _index_one(str(p)))
+            result = (
+                _index_one(str(p))
+                if compute_content_hash else _index_one(str(p), False)
+            )
+            _write_result(conn, result)
         else:
             return False
         conn.commit()

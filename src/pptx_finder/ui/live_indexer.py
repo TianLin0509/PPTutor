@@ -22,10 +22,20 @@ _STOP = object()  # 毒丸：唤醒阻塞中的 queue.get 并退出
 
 class LiveIndexer(QThread):
     indexed = Signal(str)  # 某文件已并入索引（path），主线程据此刷新状态/结果
+    _CONNECT_RETRY_SEC = 1.0
 
-    def __init__(self, db_path: str, parent=None) -> None:
+    def __init__(
+        self,
+        db_path: str,
+        parent=None,
+        *,
+        allowed_exts_provider=None,
+        compute_content_hash_provider=None,
+    ) -> None:
         super().__init__(parent)
         self._db_path = db_path
+        self._allowed_exts_provider = allowed_exts_provider
+        self._compute_content_hash_provider = compute_content_hash_provider
         self._q: queue.Queue = queue.Queue()
         self._stop = threading.Event()
         self._queued: set[str] = set()
@@ -46,7 +56,24 @@ class LiveIndexer(QThread):
         self._q.put(_STOP)
 
     def run(self) -> None:
-        conn = db.connect(self._db_path)  # 自有连接，绝不与主线程共用
+        conn = None
+        connect_attempts = 0
+        while not self._stop.is_set():
+            try:
+                conn = db.connect(self._db_path)  # 自有连接，绝不与主线程共用
+                break
+            except Exception:  # noqa: BLE001 transient lock/path failure is recoverable
+                connect_attempts += 1
+                if connect_attempts == 1 or connect_attempts % 30 == 0:
+                    log.warning(
+                        "live index database connect failed; retrying (attempt %d)",
+                        connect_attempts,
+                        exc_info=True,
+                    )
+                if self._stop.wait(self._CONNECT_RETRY_SEC):
+                    return
+        if conn is None:
+            return
         try:
             while not self._stop.is_set():
                 item = self._q.get()
@@ -55,7 +82,14 @@ class LiveIndexer(QThread):
                 with self._lock:
                     self._queued.discard(item)
                 try:
-                    if indexer.index_single(conn, item):
+                    kwargs = {}
+                    if self._allowed_exts_provider is not None:
+                        kwargs["supported_exts"] = tuple(self._allowed_exts_provider())
+                    if self._compute_content_hash_provider is not None:
+                        kwargs["compute_content_hash"] = bool(
+                            self._compute_content_hash_provider()
+                        )
+                    if indexer.index_single(conn, item, **kwargs):
                         self.indexed.emit(item)
                 except Exception:  # noqa: BLE001 单文件失败不杀线程
                     log.warning("live index failed %s", item, exc_info=True)

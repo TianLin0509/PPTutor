@@ -366,6 +366,7 @@ def test_mainwindow_opens_slim_window(qtbot, tmp_path, monkeypatch):
     win._open_slim_window(str(deck))
     win._open_slim_window(str(deck))
 
+    qtbot.waitUntil(lambda: len(opened) == 1, timeout=1500)
     assert opened == [str(deck)]
     assert len(win._slim_windows) == 1
 
@@ -388,8 +389,32 @@ def test_mainwindow_blocks_slim_window_when_source_missing(qtbot, tmp_path, monk
 
     win._open_slim_window(str(tmp_path / "missing.pptx"))
 
+    qtbot.waitUntil(lambda: bool(toasts), timeout=1500)
     assert opened == []
-    assert toasts and "文件已移动或删除" in toasts[-1]
+    assert "无法瘦身" in toasts[-1]
+
+
+def test_mainwindow_slim_path_probe_never_runs_on_ui_thread(qtbot, tmp_path, monkeypatch):
+    probes = []
+    tasks = []
+
+    def slow_exists(path):
+        probes.append(path)
+        return False
+
+    def fake_run_bg(fn, on_done=None, label=""):
+        tasks.append((fn, on_done, label))
+        return True
+
+    win = MainWindow(conn=_index(tmp_path), render_worker=StubRender(), do_index=False)
+    qtbot.addWidget(win)
+    monkeypatch.setattr(main_window_mod.os.path, "exists", slow_exists)
+    monkeypatch.setattr(win, "_run_bg", fake_run_bg)
+
+    win._open_slim_window("Z:/offline/deck.pptx")
+
+    assert main_window_mod.os.path.abspath("Z:/offline/deck.pptx") not in probes
+    assert tasks and tasks[-1][2] == "ppt-slim-open"
 
 
 def test_mainwindow_blocks_slim_window_during_pending_search(qtbot, tmp_path, monkeypatch):
@@ -496,6 +521,84 @@ def test_mainwindow_version_preview_runs_in_background_and_dedupes(qtbot, tmp_pa
     tasks[0].finished.emit()
     assert calls == ["v1"]
     assert "v1" not in win._version_preview_inflight
+
+
+def test_mainwindow_version_preview_does_not_resolve_lazy_backend_on_ui_thread(
+    qtbot, tmp_path, monkeypatch
+):
+    tasks = []
+    resolved = []
+
+    class FakeSignal:
+        def __init__(self):
+            self.callbacks = []
+
+        def connect(self, callback):
+            self.callbacks.append(callback)
+
+    class FakeTask:
+        def __init__(self, fn, label="", parent=None):
+            self.fn = fn
+            self.label = label
+            self.done = FakeSignal()
+            self.finished = FakeSignal()
+
+        def start(self):
+            tasks.append(self)
+
+    class LazyManager:
+        def supports(self, name):
+            return name == "ensure_version_preview"
+
+        def __getattr__(self, name):
+            resolved.append(name)
+            if name == "ensure_version_preview":
+                return lambda _version_id: None
+            raise AttributeError(name)
+
+    monkeypatch.setattr(main_window_mod, "BackgroundTask", FakeTask, raising=False)
+    manager = LazyManager()
+    win = MainWindow(
+        conn=_index(tmp_path), render_worker=StubRender(), version_mgr=manager, do_index=False
+    )
+    qtbot.addWidget(win)
+    win._cur = _fr(path="C:/deck-a.pptx")
+    win.detail_panel.show()
+
+    win._request_version_preview("v1")
+
+    assert resolved == []
+    task = next(task for task in tasks if task.label == "version-preview")
+    task.fn()
+    assert resolved == ["ensure_version_preview"]
+
+
+def test_history_hint_capability_check_does_not_resolve_lazy_backend_on_ui_thread(
+    qtbot, tmp_path
+):
+    resolved = []
+
+    class LazyManager:
+        def supports(self, name):
+            return name == "search_history_details"
+
+        def __getattr__(self, name):
+            resolved.append(name)
+            if name == "search_history_details":
+                return lambda _query, limit=200: {"total": 0, "rows": []}
+            raise AttributeError(name)
+
+    manager = LazyManager()
+    win = MainWindow(
+        conn=_index(tmp_path), render_worker=StubRender(), version_mgr=manager, do_index=False
+    )
+    qtbot.addWidget(win)
+    win.search_box.setText("AI")
+
+    win._kick_history_search("AI")
+
+    assert resolved == []
+    assert win._history_hint_timer.isActive()
 
 
 def test_mainwindow_detail_update_loads_versions_in_background(qtbot, tmp_path, monkeypatch):

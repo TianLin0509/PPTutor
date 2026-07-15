@@ -5,8 +5,10 @@
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
 from pathlib import Path
+from urllib.parse import quote
 
 from .text_tokenize import normalize, tokenize
 
@@ -26,6 +28,8 @@ META_LAST_COMPLETED_SCAN_AT = "last_completed_scan_at"
 META_LAST_KNOWN_RECONCILE_AT = "last_known_reconcile_at"
 META_KNOWN_RECONCILE_CURSOR = "known_reconcile_cursor"
 META_SCAN_POLICY_VERSION = "scan_policy_version"
+META_LAST_SCAN_UNREADABLE_DIRS = "last_scan_unreadable_dirs"
+META_LAST_SCAN_ERROR_EXAMPLES = "last_scan_error_examples"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS files(
@@ -80,6 +84,53 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA busy_timeout=8000")  # 遇锁等待而非立即失败（多连接/偶发并发）
+    return conn
+
+
+def _readonly_uri(db_path: str | Path) -> str:
+    """Build a SQLite URI without resolving or touching a redirected path."""
+    raw = os.fspath(db_path)
+    # Normalize Win32 extended prefixes before URI encoding. App data normally
+    # uses a local path, but corporate profile redirection can legitimately put
+    # the database on a UNC share.
+    if raw.startswith("\\\\?\\UNC\\"):
+        raw = "\\\\" + raw[8:]
+    elif raw.startswith("\\\\?\\"):
+        raw = raw[4:]
+    normalized = os.path.abspath(raw).replace("\\", "/")
+    if normalized.startswith("//"):
+        # ``file://server/share`` treats ``server`` as a URI authority, which
+        # standard SQLite rejects. Four slashes encode the UNC path itself.
+        encoded = quote(normalized.lstrip("/"), safe="/:")
+        return f"file:////{encoded}?mode=ro"
+    return f"file:{quote(normalized, safe='/:')}?mode=ro"
+
+
+def connect_readonly(
+    db_path: str | Path,
+    *,
+    busy_timeout_ms: int = 400,
+) -> sqlite3.Connection:
+    """Open a fail-fast, truly read-only connection for interactive queries.
+
+    ``connect()`` deliberately waits for writers and executes
+    ``PRAGMA journal_mode=WAL`` because indexing/version maintenance may write.
+    Doing that for the first interactive search can itself wait several seconds
+    behind a schema/VACUUM lock.  A search should instead preserve the current
+    results and ask the user to retry quickly, never hold the spinner for the
+    global eight-second writer timeout.
+    """
+    timeout_ms = max(0, int(busy_timeout_ms))
+    uri = _readonly_uri(db_path)
+    conn = sqlite3.connect(
+        uri,
+        uri=True,
+        check_same_thread=False,
+        timeout=timeout_ms / 1000.0,
+    )
+    conn.row_factory = sqlite3.Row
+    conn.execute(f"PRAGMA busy_timeout={timeout_ms}")
+    conn.execute("PRAGMA query_only=ON")
     return conn
 
 

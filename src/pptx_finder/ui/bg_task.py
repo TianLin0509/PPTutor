@@ -12,7 +12,7 @@ import time
 from collections import deque
 from collections.abc import Callable
 
-from PySide6.QtCore import QThread, Signal
+from PySide6.QtCore import QThread, QTimer, Signal
 
 log = logging.getLogger(__name__)
 _diag_lock = threading.Lock()
@@ -32,7 +32,11 @@ _REGULAR_CONCURRENT = max(1, _MAX_CONCURRENT - 1) if _MAX_CONCURRENT > 1 else 1
 _INTERACTIVE_LABELS = {
     "open", "restore", "export",
     "version-restore", "version-export", "version-recover",
+    "version-restore-prepare",
     "ppt-slim-create",
+    "ppt-slim-open",
+    "copy-page-text",
+    "autostart-toggle", "version-retention-update",
 }
 _gate_cv = threading.Condition()
 _active_slots = 0
@@ -88,6 +92,34 @@ class BackgroundTask(QThread):
         self._fn = fn
         self._label = label
         self._cancelled = threading.Event()
+        # BackgroundTask is deliberately one-shot.  Merely removing a finished
+        # task from a Python tracking list does not destroy its parented QThread;
+        # on Windows each retained QThread keeps a cluster of kernel semaphore
+        # handles alive.  Long-lived windows (notably the film-report entry)
+        # could therefore accumulate thousands of handles over a workday.
+        self._retirement_connected = False
+
+    def start(self, priority=QThread.InheritPriority) -> None:
+        # Callers register their ``done`` / ``finished`` UI cleanup slots before
+        # start().  Register retirement here, deliberately *last*: PySide/Qt 6.11
+        # can crash if a nested event loop handles DeferredDelete before a later
+        # Python finished-slot.  Last connection preserves every callback, then
+        # releases the one-shot QThread and its native handles safely.
+        if not self._retirement_connected:
+            self.finished.connect(self._retire_after_signal_drain)
+            self._retirement_connected = True
+        super().start(priority)
+
+    def _retire_after_signal_drain(self) -> None:
+        # PySide 6.11 can access-violate in QtWidgets when a just-finished Python
+        # QThread is deleted while nested dialog/test event loops still contain
+        # its queued signal deliveries.  A short grace is invisible to users,
+        # bounds retained handles, and lets every done/finished callback drain.
+        # Detach first so closing a parent window during the grace cannot destroy
+        # the task ahead of the timer and leave a callback aimed at an invalid
+        # C++ wrapper.
+        self.setParent(None)
+        QTimer.singleShot(1000, self.deleteLater)
 
     @property
     def label(self) -> str:

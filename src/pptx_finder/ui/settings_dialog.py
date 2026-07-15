@@ -8,7 +8,7 @@ import re
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QSignalBlocker, Qt, QTimer
 from PySide6.QtGui import QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
@@ -37,11 +37,18 @@ from ..config import (
     cache_dir,
     data_dir,
     db_path,
+    enabled_index_exts,
     get_autostart,
+    get_document_search_enabled,
     get_hotkey,
+    get_smart_grouping_enabled,
+    get_version_management_enabled,
     get_version_keep_per_doc,
     set_autostart,
+    set_document_search_enabled,
     set_hotkey,
+    set_smart_grouping_enabled,
+    set_version_management_enabled,
     set_version_keep_per_doc,
 )
 from ..versioning import autostart
@@ -139,12 +146,19 @@ class HotkeyEdit(QLineEdit):
 
 
 class SettingsDialog(QDialog):
-    def __init__(self, manager, parent=None, on_rescan: Callable[[], None] | None = None):
+    def __init__(
+        self,
+        manager,
+        parent=None,
+        on_rescan: Callable[[], None] | None = None,
+        on_feature_change: Callable[[str, bool], None] | None = None,
+    ):
         super().__init__(parent)
         self._mgr = manager
         self._diagnostic_parent = parent
         self._closing_owner = parent
         self._on_rescan = on_rescan
+        self._on_feature_change = on_feature_change
         self._diag_tasks: list[BackgroundTask] = []
         self._parent_bg_tasks = getattr(parent, "_bg_tasks", None)
         if not isinstance(self._parent_bg_tasks, list):
@@ -154,10 +168,14 @@ class SettingsDialog(QDialog):
         self._diag_extra_lines: list[str] = []
         self._powerpoint_inflight = False
         self._vault_audit_inflight = False
+        self._autostart_toggle_token = 0
+        self._autostart_toggle_inflight = False
+        self._retention_update_token = 0
+        self._retention_update_inflight = False
         self._closing = False
         self.setObjectName("settingsWin")
         self.setWindowTitle("设置 · PPT Doctor")
-        self.resize(620, 430)
+        self.resize(700, 600)
         try:
             from ..config import get_theme
             from . import theme as _th
@@ -171,10 +189,11 @@ class SettingsDialog(QDialog):
         lay.setSpacing(12)
 
         self.tabs = QTabWidget()
-        self.tabs.addTab(self._build_guard_tab(), "守护")
+        self.tabs.addTab(self._build_guard_tab(), "功能")
         self.tabs.addTab(self._build_health_tab(), "健康诊断")
         self.tabs.addTab(self._build_powerpoint_tab(), "PowerPoint")
         lay.addWidget(self.tabs, 1)
+        self._sync_feature_controls()
 
     def _ui_alive(self) -> bool:
         if (
@@ -195,16 +214,46 @@ class SettingsDialog(QDialog):
         lay.setContentsMargins(12, 12, 12, 12)
         lay.setSpacing(14)
 
-        title = QLabel("版本管理")
+        title = QLabel("基础模式与高阶功能")
         title.setStyleSheet("font-weight:700;font-size:15px;")
         lay.addWidget(title)
 
         desc = QLabel(
-            "全盘自动守护：你用 PowerPoint 改过、保存过的 PPT 会自动留版本。"
-            "只有之后新建或之后改存过的 PPTX 会进入管理；历史存量不会自动追溯。"
+            "基础模式始终开启：全盘 PPT 检索 + PPT 统计。下面三项默认关闭，"
+            "只在你确实需要时才占用额外 CPU、磁盘和后台线程。"
         )
         desc.setWordWrap(True)
         lay.addWidget(desc)
+
+        self.version_feature = QCheckBox("PPT 版本管理（自动留历史版本）")
+        self.version_feature.setChecked(get_version_management_enabled())
+        self.version_feature.setToolTip("开启后才启动全盘保存监听、离线补拍和版本库维护。")
+        self.version_feature.toggled.connect(
+            lambda on: self._toggle_feature("version_management", on)
+        )
+        lay.addWidget(self.version_feature)
+
+        self.document_feature = QCheckBox("Word / PDF 内容搜索")
+        self.document_feature.setChecked(get_document_search_enabled())
+        self.document_feature.setToolTip("开启后会在低优先级后台补建 Word/PDF 内容索引。")
+        self.document_feature.toggled.connect(
+            lambda on: self._toggle_feature("document_search", on)
+        )
+        lay.addWidget(self.document_feature)
+
+        self.grouping_feature = QCheckBox("相似稿 / 重复稿智能归组")
+        self.grouping_feature.setChecked(get_smart_grouping_enabled())
+        self.grouping_feature.setToolTip(
+            "开启后计算完整文件哈希和 MinHash；大型资料库首次补建会更久。"
+        )
+        self.grouping_feature.toggled.connect(
+            lambda on: self._toggle_feature("smart_grouping", on)
+        )
+        lay.addWidget(self.grouping_feature)
+
+        version_title = QLabel("版本管理设置")
+        version_title.setStyleSheet("font-weight:700;font-size:13px;margin-top:4px;")
+        lay.addWidget(version_title)
 
         self.stat = QLabel("正在读取守护状态…")
         lay.addWidget(self.stat)
@@ -256,6 +305,44 @@ class SettingsDialog(QDialog):
 
         lay.addStretch(1)
         return page
+
+    def _toggle_feature(self, key: str, enabled: bool) -> None:
+        setters = {
+            "version_management": set_version_management_enabled,
+            "document_search": set_document_search_enabled,
+            "smart_grouping": set_smart_grouping_enabled,
+        }
+        setters[key](bool(enabled))
+        self._sync_feature_controls()
+        callback = self._on_feature_change
+        if callable(callback):
+            callback(key, bool(enabled))
+
+    def _sync_feature_controls(self) -> None:
+        version_on = bool(getattr(self, "version_feature", None) and self.version_feature.isChecked())
+        if hasattr(self, "retention"):
+            self.retention.setEnabled(
+                version_on and not self._retention_update_inflight
+            )
+        if hasattr(self, "stat") and not version_on:
+            self.stat.setText("版本管理已关闭；已有历史数据不会删除。")
+
+    def apply_runtime_feature_state(self, key: str, enabled: bool) -> None:
+        """Reflect a backend rollback without emitting another settings change."""
+        controls = {
+            "version_management": getattr(self, "version_feature", None),
+            "document_search": getattr(self, "document_feature", None),
+            "smart_grouping": getattr(self, "grouping_feature", None),
+        }
+        control = controls.get(str(key))
+        if control is None:
+            return
+        blocker = QSignalBlocker(control)
+        try:
+            control.setChecked(bool(enabled))
+        finally:
+            del blocker
+        self._sync_feature_controls()
 
     def _apply_hotkey(self) -> None:
         spec = self._hotkey_edit.spec()
@@ -344,14 +431,67 @@ class SettingsDialog(QDialog):
 
     def _toggle_auto(self, on: bool) -> None:
         set_autostart(on)
-        autostart.set_enabled(on)
+        self._autostart_toggle_token += 1
+        token = self._autostart_toggle_token
+        self._autostart_toggle_inflight = True
+        self.auto.setEnabled(False)
+        task = BackgroundTask(
+            lambda on=bool(on): _set_autostart_enabled_off_ui(on),
+            "autostart-toggle",
+            None,
+        )
+        self._track_diag_task(task)
+        task.done.connect(
+            lambda ok, token=token, on=bool(on):
+                self._on_autostart_toggle_done(token, on, ok)
+        )
+        task.finished.connect(lambda task=task: self._forget_diag_task(task))
+        task.start()
+
+    def _on_autostart_toggle_done(self, token: int, on: bool, ok: object) -> None:
+        if not self._ui_alive() or token != self._autostart_toggle_token:
+            return
+        self._autostart_toggle_inflight = False
+        self.auto.setEnabled(True)
+        state = "on" if on else "off"
+        result = "applied" if ok else "failed; will retry at next startup"
+        self._diag_extra_lines.append(f"autostart_toggle: {state} {result}")
 
     def _apply_retention(self, _index: int) -> None:
         limit = int(self.retention.currentData() or 0)
         set_version_keep_per_doc(limit)
-        fn = getattr(self._mgr, "set_retention_limit", None)
-        if callable(fn):
+        self._retention_update_token += 1
+        token = self._retention_update_token
+        self._retention_update_inflight = True
+        self.retention.setEnabled(False)
+
+        def apply_limit() -> bool:
+            # ``self._mgr`` may be the lazy proxy used by the basic tier.
+            # Resolving this attribute can open/migrate versions.db and must
+            # happen inside the worker, not in the combo-box callback.
+            fn = getattr(self._mgr, "set_retention_limit", None)
+            if not callable(fn):
+                return False
             fn(limit)
+            return True
+
+        task = BackgroundTask(
+            apply_limit,
+            "version-retention-update",
+            None,
+        )
+        self._track_diag_task(task)
+        task.done.connect(
+            lambda _ok, token=token: self._on_retention_update_done(token)
+        )
+        task.finished.connect(lambda task=task: self._forget_diag_task(task))
+        task.start()
+
+    def _on_retention_update_done(self, token: int) -> None:
+        if not self._ui_alive() or token != self._retention_update_token:
+            return
+        self._retention_update_inflight = False
+        self._sync_feature_controls()
 
     def schedule_diagnostics_refresh(self, *, delay_ms: int = 0) -> None:
         if not self._ui_alive():
@@ -396,8 +536,11 @@ class SettingsDialog(QDialog):
             f"db_path: {db_path()}",
             f"cache_dir: {cache_dir()}",
             f"global_hotkey: {get_hotkey()}",
-            f"autostart: preference={'on' if get_autostart() else 'off'} actual={'on' if autostart.is_enabled() else 'off'}",
-            f"autostart_target: {autostart.link_target() or '(missing)'}",
+            "features: "
+            f"version={'on' if get_version_management_enabled() else 'off'} "
+            f"documents={'on' if get_document_search_enabled() else 'off'} "
+            f"smart_grouping={'on' if get_smart_grouping_enabled() else 'off'}",
+            f"autostart_preference: {'on' if get_autostart() else 'off'}",
             f"PPTX_FINDER_ROOTS: {os.environ.get('PPTX_FINDER_ROOTS', '') or '(auto fixed drives)'}",
             f"PPTX_FINDER_DATA_DIR: {os.environ.get('PPTX_FINDER_DATA_DIR', '') or '(default)'}",
             f"exclude_dirs: {len(EXCLUDE_DIR_NAMES)} rules",
@@ -435,10 +578,20 @@ class SettingsDialog(QDialog):
         lines = list(ui_lines)
         guarded_docs: int | None = None
         try:
+            actual, target = _read_autostart_status_off_ui()
+            lines.append(
+                "autostart: "
+                f"preference={'on' if get_autostart() else 'off'} "
+                f"actual={'on' if actual else 'off'}"
+            )
+            lines.append(f"autostart_target: {target or '(missing)'}")
+        except Exception as exc:  # noqa: BLE001 diagnostics must stay available
+            lines.append(f"autostart: unavailable ({type(exc).__name__}: {exc})")
+        try:
             own = db.connect(db_path())
             try:
                 db.init_db(own)
-                s = db.stats(own)
+                s = db.stats(own, exts=enabled_index_exts())
             finally:
                 own.close()
             lines.append(f"index: {s['file_count']} files / {s['page_count']} pages")
@@ -451,11 +604,21 @@ class SettingsDialog(QDialog):
             )
         except Exception as exc:  # noqa: BLE001
             lines.append(f"index: unavailable ({type(exc).__name__}: {exc})")
-        try:
-            guarded_docs = self._version_doc_count_off_ui()
-            lines.append(f"versions: {guarded_docs} guarded docs")
-        except Exception as exc:  # noqa: BLE001
-            lines.append(f"versions: unavailable ({type(exc).__name__}: {exc})")
+        lazy_state = getattr(self._mgr, "is_initialized", None)
+        version_cold = (
+            not get_version_management_enabled()
+            and callable(lazy_state)
+            and not lazy_state()
+        )
+        if version_cold:
+            guarded_docs = 0
+            lines.append("versions: disabled (database not opened)")
+        else:
+            try:
+                guarded_docs = self._version_doc_count_off_ui()
+                lines.append(f"versions: {guarded_docs} guarded docs")
+            except Exception as exc:  # noqa: BLE001
+                lines.append(f"versions: unavailable ({type(exc).__name__}: {exc})")
 
         for p in (data_dir(), cache_dir(), db_path()):
             lines.append(f"exists {Path(p).name}: {Path(p).exists()}")
@@ -477,7 +640,12 @@ class SettingsDialog(QDialog):
             lines.extend(self._diag_extra_lines)
             self._diag_extra_lines.clear()
         self.diagnostic_text.setPlainText("\n".join(lines))
-        self.stat.setText(self._version_stat_text(guarded_docs if isinstance(guarded_docs, int) else None))
+        if get_version_management_enabled():
+            self.stat.setText(
+                self._version_stat_text(guarded_docs if isinstance(guarded_docs, int) else None)
+            )
+        else:
+            self.stat.setText("版本管理已关闭；已有历史数据不会删除。")
 
     def _track_diag_task(self, task) -> None:
         self._diag_tasks.append(task)
@@ -521,16 +689,22 @@ class SettingsDialog(QDialog):
     def _check_vault_repository(self) -> None:
         if not self._ui_alive() or self._vault_audit_inflight:
             return
-        fn = getattr(self._mgr, "audit_repository", None)
-        if not callable(fn):
-            self.diagnostic_text.appendPlainText("\nvault_fsck_manual: unavailable")
-            return
         self._vault_audit_inflight = True
         self.vault_audit_btn.setEnabled(False)
         self.diagnostic_text.appendPlainText(
             "\nvault_fsck_manual: running deep object verification..."
         )
-        task = BackgroundTask(lambda: fn(deep=True), "vault-fsck-deep", None)
+
+        def audit_repository():
+            # Attribute resolution initializes the lazy version backend. A
+            # multi-gigabyte vault may need migration/locks, so even this
+            # lookup belongs off the GUI thread.
+            fn = getattr(self._mgr, "audit_repository", None)
+            if not callable(fn):
+                return {"unavailable": True}
+            return fn(deep=True)
+
+        task = BackgroundTask(audit_repository, "vault-fsck-deep", None)
         self._track_diag_task(task)
         task.done.connect(self._on_vault_audit_done)
         task.finished.connect(lambda task=task: self._finish_vault_audit(task))
@@ -538,6 +712,11 @@ class SettingsDialog(QDialog):
 
     def _on_vault_audit_done(self, result: object) -> None:
         if not self._ui_alive() or not isinstance(result, dict):
+            return
+        if result.get("unavailable"):
+            line = "vault_fsck_manual: unavailable"
+            self._diag_extra_lines.append(line)
+            self.diagnostic_text.appendPlainText("\n" + line)
             return
         line = (
             "vault_fsck_manual: "
@@ -595,7 +774,43 @@ class SettingsDialog(QDialog):
         self._diag_inflight_token = None
         self._powerpoint_inflight = False
         self._vault_audit_inflight = False
+        self._autostart_toggle_token += 1
+        self._autostart_toggle_inflight = False
+        self._retention_update_token += 1
+        self._retention_update_inflight = False
         super().closeEvent(event)
+
+
+def _run_with_com_apartment(fn):
+    """Run shell COM work safely from a QThread, never from the GUI thread."""
+    pythoncom = None
+    initialized = False
+    try:
+        import pythoncom as _pythoncom  # type: ignore
+
+        pythoncom = _pythoncom
+        pythoncom.CoInitialize()
+        initialized = True
+    except Exception:  # noqa: BLE001 COM helper may still work in an existing apartment
+        pass
+    try:
+        return fn()
+    finally:
+        if initialized and pythoncom is not None:
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:  # noqa: BLE001 best-effort apartment cleanup
+                pass
+
+
+def _set_autostart_enabled_off_ui(on: bool) -> bool:
+    return bool(_run_with_com_apartment(lambda: autostart.set_enabled(bool(on))))
+
+
+def _read_autostart_status_off_ui() -> tuple[bool, str]:
+    return _run_with_com_apartment(
+        lambda: (bool(autostart.is_enabled()), str(autostart.link_target() or ""))
+    )
 
 
 def _probe_powerpoint() -> str:

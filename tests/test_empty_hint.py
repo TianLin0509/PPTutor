@@ -104,7 +104,7 @@ def test_index_status_text_reuses_short_stats_cache(qtbot, monkeypatch, tmp_path
     conn = _index(tmp_path)
     calls = 0
 
-    def fake_stats(_conn):
+    def fake_stats(_conn, **_kwargs):
         nonlocal calls
         calls += 1
         return {"file_count": 2, "page_count": 3}
@@ -141,7 +141,7 @@ def test_empty_hint_index_status_loads_in_background(qtbot, monkeypatch, tmp_pat
     tasks = _install_fake_background_task(monkeypatch)
     calls = []
 
-    def fake_stats(_conn):
+    def fake_stats(_conn, **_kwargs):
         calls.append("stats")
         return {"file_count": 2, "page_count": 3}
 
@@ -169,7 +169,7 @@ def test_empty_hint_reuses_inflight_status_refresh(qtbot, monkeypatch, tmp_path)
     tasks = _install_fake_background_task(monkeypatch)
     calls = []
 
-    def fake_stats(_conn):
+    def fake_stats(_conn, **_kwargs):
         calls.append("stats")
         return {"file_count": 2, "page_count": 3}
 
@@ -203,7 +203,7 @@ def test_stale_empty_index_status_does_not_update_hidden_hint(qtbot, monkeypatch
     monkeypatch.setattr(
         main_window_mod.db,
         "stats",
-        lambda _conn: {"file_count": 2, "page_count": 3},
+        lambda _conn, **_kwargs: {"file_count": 2, "page_count": 3},
     )
     win = MainWindow(conn=conn, render_worker=StubRender(), do_index=False)
     qtbot.addWidget(win)

@@ -89,10 +89,48 @@ def test_handler_debounces_word_and_pdf_content_changes():
         timer.cancel()
 
 
+def test_bulk_save_burst_uses_one_shared_debounce_timer(monkeypatch):
+    created = []
+
+    class FakeTimer:
+        def __init__(self, delay, callback, args=()):
+            self.delay = delay
+            self.callback = callback
+            self.args = args
+            self.daemon = False
+            created.append(self)
+
+        def start(self):
+            return None
+
+        def cancel(self):
+            return None
+
+    monkeypatch.setattr("pptx_finder.versioning.watcher.threading.Timer", FakeTimer)
+    h = _Handler(lambda _p: None)
+
+    for index in range(200):
+        h._trigger(f"C:\\docs\\deck-{index}.pptx")
+
+    assert len(h._timers) == 200
+    assert len(created) == 1, "a burst must not create one OS thread per changed file"
+    assert created[0].daemon is True
+
+
+def test_handler_stop_cancels_all_pending_callbacks():
+    h = _Handler(lambda _p: None)
+    h._trigger("C:\\docs\\deck.pptx")
+
+    h.stop()
+
+    assert not h._timers
+
+
 def test_handler_retries_transient_missing_pptx_with_a_hard_limit(monkeypatch):
     """PowerPoint 原子保存的短暂缺口不能直接吞掉，同时重试必须有上限。"""
     callbacks = []
     scheduled = []
+    clock = [100.0]
 
     class FakeTimer:
         def __init__(self, delay, callback, args=()):
@@ -108,12 +146,17 @@ def test_handler_retries_transient_missing_pptx_with_a_hard_limit(monkeypatch):
             return None
 
     monkeypatch.setattr("pptx_finder.versioning.watcher.threading.Timer", FakeTimer)
+    monkeypatch.setattr(
+        "pptx_finder.versioning.watcher.time.monotonic",
+        lambda: clock[0],
+    )
     monkeypatch.setattr("pptx_finder.versioning.watcher.os.path.exists", lambda _p: False)
     h = _Handler(callbacks.append)
 
     h._fire("C:\\docs\\atomic-save.pptx")
     while scheduled:
         timer = scheduled.pop(0)
+        clock[0] += timer.delay
         timer.callback(*timer.args)
 
     assert callbacks == []

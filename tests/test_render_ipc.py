@@ -6,6 +6,8 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
+
 from pptx_finder import render_client, render_service, renderer
 
 
@@ -241,6 +243,151 @@ def test_renderer_client_abort_unblocks_request_without_retry():
         request_thread.join(1)
         server_thread.join(1)
         client.abort()
+
+
+def test_renderer_client_abort_never_terminates_a_ready_com_child():
+    """The Python renderer and POWERPNT.EXE are separate processes.
+
+    Once the renderer handshake completed it may own a COM server.  Aborting
+    must cut the socket so the child unwinds through ``finally``; terminating
+    only the Python process can strand the PowerPoint process and its temporary
+    hash-named presentation.
+    """
+    parent_sock, child_sock = socket.socketpair()
+    events = []
+
+    class FakeProc:
+        def poll(self):
+            return None
+
+        def terminate(self):
+            events.append("terminate")
+
+        def kill(self):
+            events.append("kill")
+
+        def wait(self, timeout=None):
+            events.append(("wait", timeout))
+            return 0
+
+    client = render_client.RendererProcessClient()
+    client._proc = FakeProc()
+    client._sock = parent_sock
+    client._file = parent_sock.makefile("rwb", buffering=0)
+    client._child_ready = True
+    try:
+        assert client.abort() is True
+        assert "terminate" not in events
+        assert "kill" not in events
+    finally:
+        child_sock.close()
+
+
+def test_renderer_client_refuses_a_second_child_while_ready_child_is_cleaning(
+    monkeypatch,
+):
+    """A detached COM owner must finish before another renderer is started.
+
+    Killing the first Python child can strand POWERPNT.EXE; starting a second
+    child while the first is still unwinding can then multiply hidden Office
+    sessions and hash-named snapshot decks.  Fail one preview instead.
+    """
+    client = render_client.RendererProcessClient()
+    client._detached_procs = [type("CleaningProc", (), {"poll": lambda self: None})()]
+    client._detached_alive = 1
+    spawns = []
+    monkeypatch.setattr(
+        render_client.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: spawns.append(True),
+    )
+
+    with pytest.raises(render_client.RendererRequestAborted, match="cleaning up"):
+        client.request({"op": "render", "path": "next.pptx"})
+
+    assert spawns == []
+
+
+def test_renderer_client_recovers_if_detached_reaper_thread_cannot_start(
+    monkeypatch,
+):
+    """Process polling must recover the safety gate without a helper thread."""
+    parent_sock, child_sock = socket.socketpair()
+
+    class FakeProc:
+        def __init__(self, dead=False):
+            self.dead = dead
+
+        def poll(self):
+            return 0 if self.dead else None
+
+        def wait(self, timeout=None):
+            self.dead = True
+            return 0
+
+    detached = FakeProc()
+    client = render_client.RendererProcessClient()
+    client._proc = detached
+    client._sock = parent_sock
+    client._file = parent_sock.makefile("rwb", buffering=0)
+    client._child_ready = True
+    monkeypatch.setattr(
+        render_client.threading.Thread,
+        "start",
+        lambda _self: (_ for _ in ()).throw(RuntimeError("thread quota exhausted")),
+    )
+    try:
+        assert client.abort() is True
+        assert client._detached_alive == 1
+
+        detached.dead = True
+        client._proc = FakeProc()
+        client._sock = object()
+        client._start_locked()
+
+        assert client._detached_alive == 0
+    finally:
+        child_sock.close()
+
+
+def test_graceful_renderer_shutdown_lets_child_finish_com_cleanup(monkeypatch):
+    """Do not terminate the child in the tiny window after its shutdown reply."""
+    events = []
+
+    class FakeProc:
+        def __init__(self):
+            self.dead = False
+
+        def poll(self):
+            return 0 if self.dead else None
+
+        def wait(self, timeout=None):
+            events.append(("wait", timeout))
+            self.dead = True
+            return 0
+
+        def terminate(self):
+            events.append(("terminate", None))
+            self.dead = True
+
+        def kill(self):
+            events.append(("kill", None))
+            self.dead = True
+
+    client = render_client.RendererProcessClient()
+    client._proc = FakeProc()
+    monkeypatch.setattr(
+        client,
+        "_request_locked",
+        lambda payload: events.append(("request", payload["op"]))
+        or {"ok": True, "shutdown": True},
+    )
+
+    client.shutdown()
+
+    assert events[0] == ("request", "shutdown")
+    assert events[1][0] == "wait"
+    assert all(kind != "terminate" for kind, _value in events)
 
 
 def _capture_exception(errors, fn):

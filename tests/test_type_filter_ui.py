@@ -14,22 +14,32 @@ class _StubRender(QObject):
         self.rendered.emit(req_id, "")
 
 
-def _win(qtbot, tmp_path):
+def _win(qtbot, tmp_path, *, document_search_enabled=False):
     conn = db.connect(tmp_path / "i.db")
     db.init_db(conn)
-    win = MainWindow(conn=conn, render_worker=_StubRender(), do_index=False)
+    win = MainWindow(
+        conn=conn,
+        render_worker=_StubRender(),
+        do_index=False,
+        document_search_enabled=document_search_enabled,
+    )
     qtbot.addWidget(win)
     return win
 
 
-def test_type_filter_default_ppt_and_exts_mapping(qtbot, tmp_path):
+def test_type_filter_default_is_ppt_only(qtbot, tmp_path):
     win = _win(qtbot, tmp_path)
 
     assert win.type_filter.currentText() == "PPT"  # 默认 PPT
     assert win._search_exts() == (".pptx", ".ppt")
+    assert [win.type_filter.itemText(i) for i in range(win.type_filter.count())] == ["PPT"]
+
+
+def test_type_filter_advanced_document_mapping(qtbot, tmp_path):
+    win = _win(qtbot, tmp_path, document_search_enabled=True)
 
     win.type_filter.setCurrentIndex(win.type_filter.findText("全部"))
-    assert win._search_exts() is None  # 全部 = 不过滤
+    assert win._search_exts() == (".pptx", ".ppt", ".docx", ".pdf")
 
     win.type_filter.setCurrentIndex(win.type_filter.findText("Word"))
     assert win._search_exts() == (".docx",)
@@ -39,7 +49,7 @@ def test_type_filter_default_ppt_and_exts_mapping(qtbot, tmp_path):
 
 
 def test_type_filter_change_reruns_search(qtbot, tmp_path):
-    win = _win(qtbot, tmp_path)
+    win = _win(qtbot, tmp_path, document_search_enabled=True)
     seen = []
     win._do_search = lambda: seen.append(1)
 
