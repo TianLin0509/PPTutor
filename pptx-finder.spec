@@ -12,11 +12,6 @@ datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 # 读自身版本——必须带上 dist-info 元数据 + 全子模块，否则 frozen 下搜 PDF 静默失效/报错。
 tmp_ret = collect_all('pypdf')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-# PowerPoint 正忙时的隔离预览会把 LibreOffice 生成的缓存 PDF 逐页光栅化。
-# renderer 内为惰性 import，必须显式保留 QtPdf 及 Qt6Pdf.dll。
-hiddenimports += ['PySide6.QtPdf']
-
-
 a = Analysis(
     ['src\\pptx_finder\\__main__.py'],
     pathex=[],
@@ -31,7 +26,7 @@ a = Analysis(
               'PySide6.QtQuick', 'PySide6.QtQml', 'PySide6.QtQuickWidgets', 'PySide6.QtQuick3D',
               'PySide6.QtWebEngineCore', 'PySide6.QtWebEngineWidgets', 'PySide6.QtWebChannel',
               'PySide6.QtMultimedia', 'PySide6.QtMultimediaWidgets',
-              'PySide6.QtPdfWidgets', 'PySide6.QtCharts', 'PySide6.QtDataVisualization',
+              'PySide6.QtPdf', 'PySide6.QtPdfWidgets', 'PySide6.QtCharts', 'PySide6.QtDataVisualization',
               'PySide6.QtDesigner', 'PySide6.QtOpenGL', 'PySide6.QtOpenGLWidgets'],
     noarchive=False,
     optimize=0,
@@ -44,7 +39,7 @@ pyz = PYZ(a.pure)
 _DROP = (
     'opengl32sw', 'd3dcompiler',
     'opencc/clib/lib', 'opencc/clib/include', 'opencc/clib/bin',
-    'qt6quick', 'qt6qml', 'qml', 'qt6webengine', 'qt6webchannel', 'qt6websockets',
+    'qt6quick', 'qt6qml', 'qml', 'qt6pdf', 'qt6webengine', 'qt6webchannel', 'qt6websockets',
     'qt63d', 'qt6quick3d', 'qt6multimedia', 'qt6charts', 'qt6datavisualization', 'qt6designer',
     'qt6opengl', 'qt6virtualkeyboard', 'qt6sensors', 'qt6bluetooth', 'qt6nfc', 'qt6positioning',
     'qt6serialport', 'qt6serialbus', 'qt6sql', 'qt6test', 'qt6help', 'qt6spatialaudio',

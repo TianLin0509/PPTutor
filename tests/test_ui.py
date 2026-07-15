@@ -309,8 +309,8 @@ def test_search_select_preview(qtbot, tmp_path):
     win.result_list.setCurrentRow(0)
     qtbot.waitUntil(lambda: len(stub.calls) >= 1, timeout=2000)
     assert stub.calls[-1][2] == 2
-    # 渲染回空串 → 显示兜底文案
-    assert "无法预览" in win.image_label.text()
+    # 渲染回空串 → 明确报告 COM 原图失败，不展示替代内容
+    assert "COM 原图渲染失败" in win.image_label.text()
 
 
 def test_auto_preview_from_search_is_delayed_and_canceled(qtbot, monkeypatch, tmp_path):
@@ -483,12 +483,7 @@ def test_actions_open_at_page_defensively_bypasses_powerpoint_for_docx(monkeypat
     assert opened == [str(path)]
 
 
-def test_preview_uses_disk_cache_as_provisional_first_paint(qtbot, tmp_path, monkeypatch):
-    image = tmp_path / "cached.png"
-    pm = QPixmap(96, 54)
-    pm.fill(Qt.green)
-    assert pm.save(str(image))
-
+def test_low_resolution_disk_cache_is_not_displayed(qtbot, tmp_path, monkeypatch):
     conn = _index(tmp_path)
     render = PendingRender()
     win = MainWindow(conn=conn, render_worker=render, do_index=False)
@@ -496,23 +491,24 @@ def test_preview_uses_disk_cache_as_provisional_first_paint(qtbot, tmp_path, mon
     qtbot.waitUntil(lambda: win._recent_load_inflight_token is None, timeout=1000)
     win._cur = _fake_results(1)[0]
     win._view_page = 1
-    monkeypatch.setattr(
-        main_window_mod.renderer_mod,
-        "find_cached_render",
-        lambda path, page, min_long_edge=1, cache_key=None: image,
-    )
+    requested_edges = []
 
-    monkeypatch.setattr(MainWindow, "_SHARP_PREVIEW_DELAY_MS", 50, raising=False)
-    win._sharp_preview_timer.setInterval(50)
+    def no_sharp_cache(path, page, min_long_edge=1, cache_key=None):
+        requested_edges.append(min_long_edge)
+        return None
+
+    monkeypatch.setattr(main_window_mod.renderer_mod, "find_cached_render", no_sharp_cache)
+
     win._request_preview()
 
-    assert win._preview_provisional is True
-    assert win._cur_pixmap is not None and not win._cur_pixmap.isNull()
-    assert render.calls == []
-    qtbot.waitUntil(lambda: bool(render.calls), timeout=500)
+    assert requested_edges == [win._preview_long_edge()]
+    assert requested_edges[0] >= MainWindow._PREVIEW_MIN_EDGE
+    assert win._cur_pixmap is None
+    assert render.calls
+    assert win._spin_timer.isActive()
 
 
-def test_worker_cover_fallback_survives_failed_high_resolution_render(qtbot, tmp_path):
+def test_failed_com_render_clears_any_stale_image(qtbot, tmp_path):
     image = tmp_path / "embedded-cover.png"
     pm = QPixmap(320, 180)
     pm.fill(Qt.green)
@@ -524,12 +520,11 @@ def test_worker_cover_fallback_survives_failed_high_resolution_render(qtbot, tmp
     qtbot.addWidget(win)
     win._req_id = 51
 
-    win._on_provisional_rendered(51, str(image))
+    win._cur_pixmap = QPixmap(str(image))
     win._on_rendered(51, "")
 
-    assert win._preview_provisional is True
-    assert win._cur_pixmap is not None and not win._cur_pixmap.isNull()
-    assert "无法预览" not in win.image_label.text()
+    assert win._cur_pixmap is None
+    assert "COM 原图渲染失败" in win.image_label.text()
 
 
 def test_preview_does_not_launch_parallel_text_or_shell_renderer(
@@ -551,15 +546,6 @@ def test_preview_does_not_launch_parallel_text_or_shell_renderer(
         "find_cached_render",
         lambda *_args, **_kwargs: None,
     )
-    monkeypatch.setattr(
-        main_window_mod.thumbnailer,
-        "find_non_com_page_preview",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("selected preview must use one serialized original-image worker")
-        ),
-        raising=False,
-    )
-
     win._request_preview()
 
     assert render.calls
@@ -578,32 +564,9 @@ def test_unavailable_preview_explains_how_original_image_rendering_is_restored(
     win._show_preview_unavailable()
 
     message = win.image_label.text()
-    assert "原始页面无法预览" in message
-    assert "独立预览引擎" in message
+    assert "COM 原图渲染失败" in message
+    assert "独立预览引擎" not in message
     assert "关闭 PowerPoint" in message
-
-
-def test_late_safe_preview_never_overwrites_hd_for_the_same_request(qtbot, tmp_path):
-    hd = tmp_path / "hd.png"
-    safe = tmp_path / "safe.png"
-    hd_pm = QPixmap(64, 36)
-    hd_pm.fill(Qt.red)
-    assert hd_pm.save(str(hd))
-    safe_pm = QPixmap(64, 36)
-    safe_pm.fill(Qt.blue)
-    assert safe_pm.save(str(safe))
-
-    conn = _index(tmp_path)
-    win = MainWindow(conn=conn, render_worker=PendingRender(), do_index=False)
-    qtbot.addWidget(win)
-    win._req_id = 73
-
-    win._on_rendered(73, str(hd))
-    win._on_provisional_rendered(73, str(safe))
-
-    assert win._preview_provisional is False
-    assert win._cur_pixmap is not None
-    assert win._cur_pixmap.toImage().pixelColor(1, 1) == QColor(Qt.red)
 
 
 def test_preview_cache_lookup_uses_index_metadata_without_source_stat(
@@ -632,12 +595,7 @@ def test_preview_cache_lookup_uses_index_metadata_without_source_stat(
     assert seen and seen[0][2]
 
 
-def test_rapid_cached_page_turn_only_renders_latest_sharp_page(qtbot, tmp_path, monkeypatch):
-    image = tmp_path / "cached-low.png"
-    pm = QPixmap(320, 180)
-    pm.fill(Qt.green)
-    assert pm.save(str(image))
-
+def test_rapid_uncached_page_turn_keeps_latest_com_request(qtbot, tmp_path, monkeypatch):
     conn = _index(tmp_path)
     render = PendingRender()
     win = MainWindow(conn=conn, render_worker=render, do_index=False)
@@ -649,24 +607,21 @@ def test_rapid_cached_page_turn_only_renders_latest_sharp_page(qtbot, tmp_path, 
     monkeypatch.setattr(
         main_window_mod.renderer_mod,
         "find_cached_render",
-        lambda path, page, min_long_edge=1, cache_key=None: image,
+        lambda path, page, min_long_edge=1, cache_key=None: None,
     )
-    monkeypatch.setattr(MainWindow, "_SHARP_PREVIEW_DELAY_MS", 70, raising=False)
-    win._sharp_preview_timer.setInterval(70)
 
     win._view_page = 1
     win._request_preview()
     win._view_page = 2
     win._request_preview()
 
-    assert render.calls == []
-    qtbot.waitUntil(lambda: bool(render.calls), timeout=500)
-    assert [call[2] for call in render.calls] == [2]
+    assert [call[2] for call in render.calls] == [1, 2]
+    assert render.calls[-1][2] == 2
 
 
 def test_sharp_disk_cache_skips_redundant_com_render(qtbot, tmp_path, monkeypatch):
     image = tmp_path / "cached-sharp.png"
-    pm = QPixmap(1280, 720)
+    pm = QPixmap(2560, 1440)
     pm.fill(Qt.green)
     assert pm.save(str(image))
 
@@ -685,10 +640,8 @@ def test_sharp_disk_cache_skips_redundant_com_render(qtbot, tmp_path, monkeypatc
 
     win._request_preview()
 
-    assert win._preview_provisional is False
     assert win._cur_pixmap is not None and not win._cur_pixmap.isNull()
     assert render.calls == []
-    assert not win._sharp_preview_timer.isActive()
 
 
 def test_neighbor_prefetch_is_low_priority_and_limited(qtbot, tmp_path):
@@ -854,14 +807,13 @@ def test_invalid_preview_image_shows_failure_instead_of_loading(qtbot, tmp_path)
     broken = tmp_path / "broken-preview.png"
     broken.write_text("not a png", encoding="utf-8")
     win._req_id = 7
-    win._preview_provisional = False
     win.image_label.setText("正在渲染预览…")
     win._start_spinner()
 
     win._on_rendered(7, str(broken))
 
     assert not win._spin_timer.isActive()
-    assert "无法预览" in win.image_label.text()
+    assert "COM 原图渲染失败" in win.image_label.text()
     assert win._cur_pixmap is None
 
 

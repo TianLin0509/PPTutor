@@ -662,7 +662,7 @@ def test_existing_session_only_never_opens_powerpoint_without_owned_snapshot(tmp
     assert get_app_calls == []
 
 
-def test_active_powerpoint_uses_isolated_compat_without_getting_user_app(
+def test_active_powerpoint_fails_closed_without_getting_user_app(
     tmp_path,
     monkeypatch,
 ):
@@ -674,22 +674,11 @@ def test_active_powerpoint_uses_isolated_compat_without_getting_user_app(
     src = tmp_path / "user-session-active.pptx"
     src.write_bytes(b"dummy")
     get_app_calls = []
-    compat_calls = []
-    compat_out = tmp_path / "compat-preview.png"
-
     def forbidden_get_app():
         get_app_calls.append(True)
         raise AssertionError("preview must not reuse the user's PowerPoint process")
 
     monkeypatch.setattr(renderer, "_get_app", forbidden_get_app)
-    monkeypatch.setattr(
-        renderer,
-        "_render_page_compat",
-        lambda path, page_no, cache_key, long_edge, out: compat_calls.append(
-            (path, page_no, cache_key, long_edge, out)
-        )
-        or compat_out,
-    )
 
     out = renderer._render_page_direct(
         str(src),
@@ -700,17 +689,39 @@ def test_active_powerpoint_uses_isolated_compat_without_getting_user_app(
         use_snapshot=True,
     )
 
-    assert out == compat_out
+    assert out is None
     assert get_app_calls == []
-    assert compat_calls == [
-        (
-            str(src.resolve()),
-            1,
-            "user-session-active",
-            961,
-            tmp_path / "user-session-active_1_961.png",
-        )
-    ]
+
+
+def test_powerpoint_session_busy_returns_none_without_poisoning_retry_cache(
+    tmp_path,
+    monkeypatch,
+):
+    renderer.shutdown()
+    renderer._failed_until.clear()
+    monkeypatch.setattr(renderer, "cache_dir", lambda: tmp_path)
+    monkeypatch.setattr(renderer, "_ipc_enabled", lambda: False)
+    monkeypatch.setattr(renderer, "_powerpoint_active", lambda **_kwargs: False)
+    src = tmp_path / "powerpoint-became-busy.pptx"
+    src.write_bytes(b"dummy")
+
+    def busy_get_app():
+        raise renderer.PowerPointSessionBusy("PowerPoint became active")
+
+    monkeypatch.setattr(renderer, "_get_app", busy_get_app)
+
+    out = renderer._render_page_direct(
+        str(src),
+        1,
+        cache_key="became-busy",
+        long_edge=1920,
+        hi_priority=True,
+        use_snapshot=True,
+    )
+
+    assert out is None
+    assert renderer._failed_until == {}
+    assert not list(tmp_path.glob("became-busy_*.png"))
 
 
 def test_existing_session_only_reuses_the_owned_snapshot_without_reopening(tmp_path, monkeypatch):
