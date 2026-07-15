@@ -60,9 +60,10 @@ class RenderWorker(QThread):
         self._session_maybe_open = False
         self._session_last_activity = 0.0
         self._idle_session_releases = 0
-        self._shutdown_failures = 0
+        self._session_release_failures = 0
+        self._final_shutdown_failures = 0
 
-    def _safe_renderer_shutdown(self) -> bool:
+    def _safe_renderer_session_release(self) -> bool:
         """Keep the worker alive when PowerPoint transiently rejects cleanup.
 
         A dead render thread is much worse than one failed cleanup attempt: every
@@ -71,12 +72,11 @@ class RenderWorker(QThread):
         pass; explicit external-open handoff still waits for a successful pass.
         """
         try:
-            renderer.shutdown()
-            return True
+            return bool(renderer.release_session())
         except Exception:  # noqa: BLE001 COM/RPC cleanup may be transient
             with self._cv:
-                self._shutdown_failures += 1
-            log.warning("preview renderer shutdown failed; will retry", exc_info=True)
+                self._session_release_failures += 1
+            log.warning("preview renderer session release failed; will retry", exc_info=True)
             return False
 
     def request(
@@ -236,7 +236,7 @@ class RenderWorker(QThread):
                         self._cv.wait()
                 # —— 锁外执行实际渲染 ——
                 if kind == "idle_release":
-                    released = self._safe_renderer_shutdown()
+                    released = self._safe_renderer_session_release()
                     with self._cv:
                         if released:
                             self._idle_session_releases += 1
@@ -246,7 +246,7 @@ class RenderWorker(QThread):
                             self._session_maybe_open = True
                             self._session_last_activity = time.monotonic()
                 elif kind == "release":
-                    released = self._safe_renderer_shutdown()
+                    released = self._safe_renderer_session_release()
                     with self._cv:
                         if released:
                             # Drop anything that raced with the handoff.  UI file
@@ -287,6 +287,7 @@ class RenderWorker(QThread):
                             hi_priority=True,
                             priority=priority,
                             use_snapshot=True,
+                            allow_borrowed_session=True,
                         )
                     except Exception:  # noqa: BLE001
                         png = None
@@ -322,7 +323,12 @@ class RenderWorker(QThread):
                             self._session_maybe_open = True
                             self._session_last_activity = time.monotonic()
         finally:
-            self._safe_renderer_shutdown()
+            try:
+                renderer.shutdown()
+            except Exception:  # noqa: BLE001 final cleanup is best-effort
+                with self._cv:
+                    self._final_shutdown_failures += 1
+                log.warning("preview renderer final shutdown failed", exc_info=True)
 
     def diagnostic_lines(self) -> list[str]:
         with self._cv:
@@ -343,6 +349,7 @@ class RenderWorker(QThread):
                 f"max_prefetch_queue={self._max_prefetch_queue} "
                 f"warm={self._warm_completed}/{self._warm_requested} "
                 f"session_releases={self._release_count} "
-                f"shutdown_failures={self._shutdown_failures} "
+                f"session_release_failures={self._session_release_failures} "
+                f"final_shutdown_failures={self._final_shutdown_failures} "
                 f"idle_session_releases={self._idle_session_releases}",
             ]

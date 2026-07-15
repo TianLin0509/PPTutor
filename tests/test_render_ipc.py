@@ -22,6 +22,7 @@ def test_render_service_render_request_returns_path(monkeypatch, tmp_path):
         hi_priority=False,
         priority=None,
         use_snapshot=False,
+        allow_borrowed_session=False,
     ):
         assert path == "deck.pptx"
         assert page_no == 2
@@ -30,6 +31,7 @@ def test_render_service_render_request_returns_path(monkeypatch, tmp_path):
         assert hi_priority is True
         assert priority == 0
         assert use_snapshot is True
+        assert allow_borrowed_session is True
         return out
 
     monkeypatch.setattr(renderer, "render_page", fake_render)
@@ -44,9 +46,45 @@ def test_render_service_render_request_returns_path(monkeypatch, tmp_path):
         "hi_priority": True,
         "priority": 0,
         "use_snapshot": True,
+        "allow_borrowed_session": True,
     })
 
     assert resp == {"id": 7, "ok": True, "path": str(out)}
+
+
+def test_render_service_does_not_enable_borrowed_session_implicitly(monkeypatch, tmp_path):
+    out = tmp_path / "strict.png"
+    seen = []
+
+    def fake_render(*_args, allow_borrowed_session=False, **_kwargs):
+        seen.append(bool(allow_borrowed_session))
+        return out
+
+    monkeypatch.setattr(renderer, "render_page", fake_render)
+
+    resp = render_service.handle_request({
+        "id": 71,
+        "op": "render",
+        "path": "deck.pptx",
+        "page_no": 1,
+    })
+
+    assert resp == {"id": 71, "ok": True, "path": str(out)}
+    assert seen == [False]
+
+
+def test_render_service_releases_com_session_without_stopping_service(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        renderer,
+        "release_session",
+        lambda: calls.append("release") or True,
+    )
+
+    resp = render_service.handle_request({"id": 72, "op": "release_session"})
+
+    assert resp == {"id": 72, "ok": True, "released": True}
+    assert calls == ["release"]
 
 
 def test_render_service_propagates_existing_session_only(monkeypatch, tmp_path):
@@ -92,14 +130,81 @@ def test_renderer_wrapper_uses_direct_path_when_ipc_disabled(monkeypatch, tmp_pa
     monkeypatch.setenv("PPTUTOR_RENDERER_IPC", "0")
     called = []
 
-    def fake_direct(path, page_no, cache_key=None, long_edge=2560, hi_priority=False, priority=None, use_snapshot=False):
-        called.append((Path(path).name, page_no, long_edge, hi_priority, priority, use_snapshot))
+    def fake_direct(
+        path,
+        page_no,
+        cache_key=None,
+        long_edge=2560,
+        hi_priority=False,
+        priority=None,
+        use_snapshot=False,
+        allow_borrowed_session=False,
+    ):
+        called.append((
+            Path(path).name,
+            page_no,
+            long_edge,
+            hi_priority,
+            priority,
+            use_snapshot,
+            allow_borrowed_session,
+        ))
         return tmp_path / "direct.png"
 
     monkeypatch.setattr(renderer, "_render_page_direct", fake_direct)
 
-    assert renderer.render_page("deck.pptx", 3, long_edge=480, priority=5) == tmp_path / "direct.png"
-    assert called == [("deck.pptx", 3, 480, False, 5, False)]
+    assert renderer.render_page(
+        "deck.pptx",
+        3,
+        long_edge=480,
+        priority=5,
+        allow_borrowed_session=True,
+    ) == tmp_path / "direct.png"
+    assert called == [("deck.pptx", 3, 480, False, 5, False, True)]
+
+
+def test_renderer_client_propagates_foreground_borrow_permission(tmp_path):
+    client = render_client.RendererProcessClient()
+    payloads = []
+    out = tmp_path / "borrowed.png"
+    client.request = lambda payload: payloads.append(payload) or {
+        "ok": True,
+        "path": str(out),
+    }
+
+    got = client.render_page(
+        "deck.pptx",
+        4,
+        cache_key="borrowed",
+        long_edge=1600,
+        hi_priority=True,
+        priority=0,
+        use_snapshot=True,
+        allow_borrowed_session=True,
+    )
+
+    assert got == out
+    assert payloads[0]["allow_borrowed_session"] is True
+    assert payloads[0]["existing_session_only"] is False
+
+
+def test_renderer_client_release_session_keeps_ready_child_for_reuse(monkeypatch):
+    client = render_client.RendererProcessClient()
+    requests = []
+    stops = []
+    client._proc = type("LiveProc", (), {"poll": lambda self: None})()
+    monkeypatch.setattr(
+        client,
+        "_request_locked",
+        lambda payload: requests.append(payload) or {"ok": True, "released": True},
+    )
+    monkeypatch.setattr(client, "_hard_stop_locked", lambda: stops.append("hard-stop"))
+
+    assert client.release_session() is True
+
+    assert requests == [{"op": "release_session"}]
+    assert stops == []
+    assert client._proc is not None
 
 
 def test_render_service_waits_for_idle_parent_without_timeout(monkeypatch):
