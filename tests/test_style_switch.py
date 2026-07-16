@@ -1,4 +1,4 @@
-"""主界面风格切换：_apply_theme 切到新风格 + 按钮文案显示风格名。"""
+"""主界面风格切换：_apply_theme 切到新风格 + 图标按钮 tooltip 显示风格名。"""
 from __future__ import annotations
 
 from PySide6.QtCore import QObject, Signal
@@ -28,15 +28,15 @@ def test_apply_cinema_theme(qtbot, tmp_path):
     win._apply_theme("cinema")
     assert win._theme == "cinema"
     assert win._tok["acc"] == theme.tok("cinema")["acc"]
-    assert "胶片放映厅" in win.theme_btn.text()
+    assert "胶片放映厅" in win.theme_btn.toolTip()
 
 
 def test_button_shows_each_style_name(qtbot, tmp_path):
     win = _win(qtbot, tmp_path)
     win._apply_theme("ocean")
-    assert "深海极光" in win.theme_btn.text()
+    assert "深海极光" in win.theme_btn.toolTip()
     win._apply_theme("aurora")
-    assert "极光玻璃" in win.theme_btn.text()
+    assert "极光玻璃" in win.theme_btn.toolTip()
 
 
 def test_apply_all_themes_no_crash(qtbot, tmp_path):

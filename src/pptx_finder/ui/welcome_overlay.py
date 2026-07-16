@@ -94,11 +94,11 @@ class WelcomeOverlay(QWidget):
         st.setAlignment(Qt.AlignCenter)
         cl.addSpacing(20)
         cl.addWidget(st)
-        # 10 主题分两行网格（5×2）：单行 HBox 在窄窗口会把 chip 挤到文字重叠
+        # 12 主题分两行网格（6×2）：单行 HBox 在窄窗口会把 chip 挤到文字重叠
         sw = QGridLayout()
         sw.setSpacing(8)
         sw.setContentsMargins(0, 0, 0, 0)
-        per_row = 5
+        per_row = 6
         for c in range(per_row):
             sw.setColumnStretch(c, 1)  # 等宽列，chip 均匀铺满不挤
         self._theme_btns: dict[str, QPushButton] = {}

@@ -176,18 +176,19 @@ def _open_report_sync(mw) -> None:
 
 def install_stats_entry(mw) -> None:
     """给主窗口挂两个入口：顶栏胶片报告按钮 + 状态栏数字可点击。"""
-    # 入口 1：顶栏文字入口（插到主题切换键旁，ghost 风格不抢眼）
-    btn = QPushButton("胶片报告")
-    btn.setObjectName("ghost")
-    btn.setMinimumHeight(42)
+    # 入口 1：合一工具栏图标入口（插到主题键旁，图标色由主窗 _refresh_toolbar_icons 统一刷）
+    btn = QPushButton()
+    btn.setObjectName("iconBtn")
+    btn.setFixedSize(32, 32)
     btn.setToolTip("我的胶片报告")
     btn.setAccessibleName("打开胶片报告")
     btn.setCursor(Qt.PointingHandCursor)
     btn.clicked.connect(lambda: _open_report(mw))
     try:
-        bar = mw.theme_btn.parentWidget().layout().itemAt(0).layout()
-        bar.addWidget(btn)
+        lay = mw.title_actions
+        lay.insertWidget(mw._title_actions_insert_at, btn)
         mw.stats_report_btn = btn
+        mw._refresh_toolbar_icons()
     except Exception:  # noqa: BLE001 顶栏结构变了就降级，不挂顶栏入口
         pass
 

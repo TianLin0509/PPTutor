@@ -16,7 +16,7 @@ def test_spinner_active_and_text(qtbot, tmp_path):
     win._preview_hinted = True
     win._tick_spinner()
     assert "正在等待" in win.image_label.text()
-    assert "COM 原图渲染" in win.image_label.text()
+    assert "渲染原图" in win.image_label.text()
 
 
 def test_spinner_stops(qtbot, tmp_path):

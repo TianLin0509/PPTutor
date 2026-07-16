@@ -154,6 +154,7 @@ def test_primary_ui_text_stays_readable_chinese(qtbot, tmp_path):
     texts = [
         win.windowTitle(),
         win.search_box.placeholderText(),
+        win.search_box.toolTip(),
         win._clear_act.toolTip(),
         *[win.mode.itemText(i) for i in range(win.mode.count())],
         win.facet_btn.text(),
@@ -162,7 +163,7 @@ def test_primary_ui_text_stays_readable_chinese(qtbot, tmp_path):
         win.detail_btn.toolTip(),
         *[win.sort_combo.itemText(i) for i in range(win.sort_combo.count())],
         win.sort_combo.toolTip(),
-        win.theme_btn.text(),
+        win.theme_btn.toolTip(),
         win.path_label.text(),
         win.copy_path_btn.text(),
         win.image_label.text(),
@@ -182,12 +183,13 @@ def test_primary_ui_text_stays_readable_chinese(qtbot, tmp_path):
     assert "PPT Doctor" in joined
 
     assert "PPT 查询助手" in joined
-    assert "输入你记得的文字" in joined
+    assert "搜索 PPT 内容" in joined
+    assert "只搜短语" in joined
     assert "筛选" in joined
     assert "打开文件" in joined
     assert "复制到剪贴板" in joined
     assert "选中左侧结果" in joined
-    assert "云白晨光" in joined
+    assert "切换界面主题" in joined  # 主题按钮 tooltip 固定前缀（与当前持久化主题无关，避免顺序耦合）
     assert "最小化" in joined
     assert "最大化 / 还原" in joined
     assert "关闭" in joined
@@ -267,7 +269,7 @@ def test_detail_button_lives_in_preview_actions(qtbot, tmp_path):
     qtbot.addWidget(win)
 
     assert win.detail_btn.objectName() == "detailAction"
-    assert win.detail_btn.parent().objectName() == "previewActions"
+    assert win.detail_btn.parent().objectName() == "previewHeadBar"
     assert win.detail_btn.isHidden()
 
     win.search_box.setText("\u6607\u817e")
@@ -310,7 +312,7 @@ def test_search_select_preview(qtbot, tmp_path):
     qtbot.waitUntil(lambda: len(stub.calls) >= 1, timeout=2000)
     assert stub.calls[-1][2] == 2
     # 渲染回空串 → 明确报告 COM 原图失败，不展示替代内容
-    assert "COM 原图渲染失败" in win.image_label.text()
+    assert "暂时无法生成原图预览" in win.image_label.text()
 
 
 def test_auto_preview_from_search_is_delayed_and_canceled(qtbot, monkeypatch, tmp_path):
@@ -524,7 +526,7 @@ def test_failed_com_render_clears_any_stale_image(qtbot, tmp_path):
     win._on_rendered(51, "")
 
     assert win._cur_pixmap is None
-    assert "COM 原图渲染失败" in win.image_label.text()
+    assert "暂时无法生成原图预览" in win.image_label.text()
 
 
 def test_preview_does_not_launch_parallel_text_or_shell_renderer(
@@ -564,7 +566,7 @@ def test_unavailable_preview_explains_how_original_image_rendering_is_restored(
     win._show_preview_unavailable()
 
     message = win.image_label.text()
-    assert "COM 原图渲染失败" in message
+    assert "暂时无法生成原图预览" in message
     assert "独立预览引擎" not in message
     assert "无需关闭正在编辑的文稿" in message
     assert "请关闭 PowerPoint" not in message
@@ -814,7 +816,7 @@ def test_invalid_preview_image_shows_failure_instead_of_loading(qtbot, tmp_path)
     win._on_rendered(7, str(broken))
 
     assert not win._spin_timer.isActive()
-    assert "COM 原图渲染失败" in win.image_label.text()
+    assert "暂时无法生成原图预览" in win.image_label.text()
     assert win._cur_pixmap is None
 
 
@@ -3076,7 +3078,7 @@ def test_theme_toggle(qtbot, tmp_path):
     qtbot.addWidget(win)
     win._apply_theme("cloud")
     win._toggle_theme()
-    assert win._theme == "aurora"   # 循环切到下一个风格（cloud → raycast）
+    assert win._theme == "atelier"   # cloud 是列表末位，循环回绕到静白（列表首位）
 
 
 def test_show_recent_loads_uncached_files_in_background(qtbot, monkeypatch, tmp_path):

@@ -12,7 +12,8 @@ REQUIRED = {
     # 阶段2：氛围背景 + 面板透出 + 圆角
     "base", "appbg", "panel", "panel2", "radius",
 }
-EXPECTED = ["aurora", "cinema", "cyber", "ocean", "magma", "forest", "sakura", "midnight", "graphite", "cloud"]
+EXPECTED = ["atelier", "atelier_dark",
+            "aurora", "cinema", "cyber", "ocean", "magma", "forest", "sakura", "midnight", "graphite", "cloud"]
 
 
 def test_all_themes_registered():

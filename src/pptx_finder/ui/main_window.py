@@ -121,6 +121,47 @@ def _icon_theme(color: str = "#8A8A8A", size: int = 18) -> QIcon:
     )
 
 
+def _icon_filter(color: str = "#8A8A8A", size: int = 18) -> QIcon:
+    """漏斗式三横线（长/中/短）：筛选。"""
+    scale = size / 18
+    return _make_icon(
+        lambda p: (
+            p.drawLine(round(3 * scale), round(5 * scale), round(15 * scale), round(5 * scale)),
+            p.drawLine(round(6 * scale), round(9 * scale), round(12 * scale), round(9 * scale)),
+            p.drawLine(round(8 * scale), round(13 * scale), round(10 * scale), round(13 * scale)),
+        ),
+        color,
+        size,
+    )
+
+
+def _icon_settings(color: str = "#8A8A8A", size: int = 18) -> QIcon:
+    """齿轮简化：圆心 + 四向短齿。"""
+    scale = size / 18
+
+    def _draw(p):
+        p.drawEllipse(round(5.5 * scale), round(5.5 * scale), round(7 * scale), round(7 * scale))
+        for dx, dy in ((0, -1), (0, 1), (-1, 0), (1, 0)):
+            p.drawLine(round((9 + dx * 5.2) * scale), round((9 + dy * 5.2) * scale),
+                       round((9 + dx * 7.3) * scale), round((9 + dy * 7.3) * scale))
+
+    return _make_icon(_draw, color, size)
+
+
+def _icon_film(color: str = "#8A8A8A", size: int = 18) -> QIcon:
+    """胶片框：外框 + 两侧齿孔轨。"""
+    scale = size / 18
+    return _make_icon(
+        lambda p: (
+            p.drawRect(round(2 * scale), round(4 * scale), round(14 * scale), round(10 * scale)),
+            p.drawLine(round(5.5 * scale), round(4 * scale), round(5.5 * scale), round(14 * scale)),
+            p.drawLine(round(12.5 * scale), round(4 * scale), round(12.5 * scale), round(14 * scale)),
+        ),
+        color,
+        size,
+    )
+
+
 def _icon_clear() -> QIcon:
     return _make_icon(lambda p: (p.drawLine(5, 5, 13, 13), p.drawLine(13, 5, 5, 13)))
 
@@ -336,7 +377,7 @@ def _app_logo() -> QPixmap:
 
 def _load_theme() -> str:
     # 主题持久化集中在 config.ui.json（与热键等共用一个文件，合并写不互相清键）
-    return get_theme("cloud")
+    return get_theme()
 
 
 def _save_theme(name: str) -> None:
@@ -486,6 +527,7 @@ class ResultItem(QWidget):
         _fn_color = tok['ink2'] if is_member else tok['ink1']
         fn.setStyleSheet(f"font-size:14px;font-weight:600;color:{_fn_color};background:transparent;")
         fn.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        fn.setToolTip(r.name)  # 长文件名被裁时悬停可看全名
         row.addWidget(fn, 1)
 
         match_kind = getattr(r, "match_kind", "partial")
@@ -495,24 +537,29 @@ class ResultItem(QWidget):
             exact = QLabel("文件名全字" if match_kind.startswith("filename_") else "内容全字")
             exact.setObjectName("exactMatchBadge")
             exact.setStyleSheet(
-                f"font-size:10px;font-weight:700;color:{tok['grn']};"
-                f"border:1px solid {tok['bd2']};border-radius:5px;padding:1px 6px;background:transparent;"
+                f"font-size:10px;font-weight:600;color:{tok['ink3']};"
+                f"background:{tok['field']};border:none;border-radius:5px;padding:2px 7px;"
             )
             row.addWidget(exact, 0)
 
         if r.hits:
-            for h in r.hits[:3]:
-                pg = QLabel(f"P{h.page_no}")
-                pg.setStyleSheet(
-                    f"font-size:11px;font-weight:700;color:{tok['acc']};"
-                    f"background:rgba({tok['hl_r']},{tok['hl_g']},{tok['hl_b']},0.15);"
-                    "border-radius:6px;padding:1px 7px;")
-                row.addWidget(pg, 0)
+            # \u547d\u4e2d\u9875\u7801\u5408\u5e76\u4e3a\u4e00\u679a\u7b49\u5bbd\u7070\u6807\u7b7e\uff08\u84dd\u8272\u9884\u7b97\u8ba9\u4f4d\u7ed9\u9009\u4e2d\u6001\u4e0e\u4e3b\u6309\u94ae\uff09\uff1b
+            # \u53d6\u76f8\u5173\u5ea6\u524d\u4e09\uff0c\u518d\u6309\u9875\u7801\u5347\u5e8f\u5c55\u793a\uff08\u9875\u7801\u5373\u4f4d\u7f6e\uff0c\u6392\u5e8f\u66f4\u76f4\u89c9\uff09
+            pages = " \u00b7 ".join(
+                f"P{h.page_no}" for h in sorted(r.hits[:3], key=lambda h: h.page_no))
+            if len(r.hits) > 3:
+                pages += " \u2026"
+            pg = QLabel(pages)
+            pg.setStyleSheet(
+                f"font-size:11px;font-weight:600;color:{tok['ink3']};"
+                'font-family:"Consolas","Microsoft YaHei UI";background:transparent;padding:1px 2px;')
+            pg.setToolTip("\u547d\u4e2d\u9875\u7801")
+            row.addWidget(pg, 0)
         elif r.name_hit:
             nh = QLabel("\u6587\u4ef6\u540d\u547d\u4e2d")
             nh.setStyleSheet(
-                f"font-size:10.5px;font-weight:700;color:{tok['grn']};"
-                f"border:1px solid {tok['bd2']};border-radius:6px;padding:1px 7px;background:transparent;")
+                f"font-size:10.5px;font-weight:600;color:{tok['ink3']};"
+                f"background:{tok['field']};border:none;border-radius:5px;padding:2px 7px;")
             row.addWidget(nh, 0)
         if r.status == "filename_only":
             ext = QLabel(".ppt")
@@ -566,7 +613,9 @@ class ResultItem(QWidget):
             if len(dup_paths) > 1:
                 tm = f"{tm} · 同一文件 · {len(dup_paths)} 个位置"
             t = QLabel(tm)
-            t.setStyleSheet(f"font-size:11px;color:{tok['ink3']};background:transparent;")
+            t.setStyleSheet(
+                f"font-size:11px;color:{tok['ink4']};background:transparent;"
+                'font-family:"Consolas","Microsoft YaHei UI";')
             t.setToolTip("\n".join(dup_paths) if len(dup_paths) > 1 else "")
             lay.addWidget(t)
         if len(dup_paths) > 1:
@@ -696,7 +745,7 @@ class MainWindow(QMainWindow):
             app_icon = QIcon(_asset_path("app.ico"))
         self.setWindowIcon(app_icon)
         self.resize(1180, 760)
-        self._title_h = 40  # 鑷粯鐜荤拑鏍囬鏍忛珮搴︼紙nativeEvent 鎷栧姩鍖?缂╂斁杈瑰垽瀹氱敤锛?
+        self._title_h = 52  # 鑷粯鐜荤拑鏍囬鏍忛珮搴︼紙nativeEvent 鎷栧姩鍖?缂╂斁杈瑰垽瀹氱敤锛?
         self.setWindowFlag(Qt.FramelessWindowHint, True)  # 鏃犺竟妗?鈫?鑷粯鐜荤拑鏍囬鏍?
 
         self._theme = _load_theme()
@@ -1059,78 +1108,12 @@ class MainWindow(QMainWindow):
 
         root.addWidget(self._build_glass_title())  # 鏃犺竟妗嗙獥鍙ｇ殑鑷粯鐜荤拑鏍囬鏍?
 
+        # 合一工具栏后，topBar 仅承载搜索语法提示行（hint 隐藏时高度为 0）
         top = QWidget()
         top.setObjectName("topBar")
         tl = QVBoxLayout(top)
-        tl.setContentsMargins(13, 12, 13, 11)
+        tl.setContentsMargins(2, 0, 2, 0)
         tl.setSpacing(0)
-        bar = QHBoxLayout()
-        bar.setSpacing(10)
-        logo = QLabel()
-        logo.setObjectName("appLogo")
-        logo.setPixmap(_app_logo())
-        logo.setToolTip("PPT Doctor")
-        bar.addWidget(logo)
-        self.search_box = QLineEdit()
-        self.search_box.setObjectName("searchBox")
-        self.search_box.setPlaceholderText(
-            '输入你记得的文字 / 文件名…（多词完整短语优先；空格=同时含，"引号"=只搜短语）'
-        )
-        self.search_box.setMinimumHeight(42)
-        self.search_box.addAction(_icon_search(), QLineEdit.LeadingPosition)
-        self._clear_act = self.search_box.addAction(_icon_clear(), QLineEdit.TrailingPosition)
-        self._clear_act.setVisible(False)
-        self._clear_act.setToolTip("清空")
-        self._clear_act.triggered.connect(self._clear_search_now)
-        self.search_box.textChanged.connect(lambda: self._debounce.start())
-        self.search_box.textChanged.connect(lambda t: self._clear_act.setVisible(bool(t)))
-        self.search_box.installEventFilter(self)
-        self._history_model = QStringListModel(self)
-        self._completer = QCompleter(self._history_model, self)
-        self._completer.setCompletionMode(QCompleter.UnfilteredPopupCompletion)
-        self._completer.setCaseSensitivity(Qt.CaseInsensitive)
-        self.search_box.setCompleter(self._completer)
-        self._completer.popup().setObjectName("historyPopup")
-        bar.addWidget(self.search_box, 1)
-        self.type_filter = QComboBox()
-        self.type_filter.setObjectName("typeFilter")
-        self.type_filter.setToolTip("选择要搜索的文件类型（默认 PPT）")
-        type_options = [("PPT", (".pptx", ".ppt"))]
-        if self._document_search_enabled:
-            type_options.extend((
-                ("Word", (".docx",)),
-                ("PDF", (".pdf",)),
-                ("全部", self._enabled_index_exts()),
-            ))
-        for _label, _exts in type_options:
-            self.type_filter.addItem(_label, _exts)
-        self.type_filter.setCurrentIndex(0)  # 默认 PPT，保住产品焦点
-        self.type_filter.currentIndexChanged.connect(lambda _=0: self._do_search())
-        bar.addWidget(self.type_filter)
-        self.mode = QComboBox()
-        self.mode.addItems(["全部", "仅文件名", "仅内容"])
-        self.mode.setMinimumHeight(42)
-        self.mode.currentIndexChanged.connect(self._do_search)
-        bar.addWidget(self.mode)
-        self.facet_btn = QPushButton("筛选")
-        self.facet_btn.setObjectName("ghost")
-        self.facet_btn.setMinimumHeight(42)
-        self.facet_btn.setCheckable(True)
-        self.facet_btn.setToolTip("按时间 / 类型 / 页数 / 文件夹筛选")
-        self.facet_btn.clicked.connect(self._toggle_facet)
-        bar.addWidget(self.facet_btn)
-        self.settings_btn = QPushButton("设置")
-        self.settings_btn.setObjectName("ghost")
-        self.settings_btn.setMinimumHeight(42)
-        self.settings_btn.setToolTip("打开设置")
-        self.settings_btn.clicked.connect(self._open_settings_from_button)
-        bar.addWidget(self.settings_btn)
-        self.theme_btn = QPushButton()
-        self.theme_btn.setObjectName("ghost")
-        self.theme_btn.setMinimumHeight(42)
-        self.theme_btn.clicked.connect(self._show_theme_menu)
-        bar.addWidget(self.theme_btn)
-        tl.addLayout(bar)
         self.query_hint = QLabel("")
         self.query_hint.setObjectName("queryHint")
         self.query_hint.setWordWrap(True)
@@ -1390,30 +1373,20 @@ class MainWindow(QMainWindow):
         self.copy_path_btn.setObjectName("linkBtn")
         self.copy_path_btn.clicked.connect(self._act_copy_path)
         self.copy_path_btn.hide()
-        action_box = QWidget()
-        action_box.setObjectName("previewActions")
-        action_lay = QVBoxLayout(action_box)
-        action_lay.setContentsMargins(0, 0, 0, 0)
-        action_lay.setSpacing(6)
-        action_row = QHBoxLayout()
-        action_row.setContentsMargins(0, 0, 0, 0)
-        action_row.setSpacing(6)
-        action_row.addWidget(self.copy_text_btn, 0)
-        action_row.addWidget(self.copy_path_btn, 0)
-        action_lay.addLayout(action_row)
-        self.detail_btn = QPushButton("查看详情")
+        # 头部动作收敛为一行：两枚文字链 + 一枚描边「详情」，高度还给预览画布
+        self.detail_btn = QPushButton("详情")
         self.detail_btn.setObjectName("detailAction")
-        self.detail_btn.setMinimumHeight(32)
         self.detail_btn.setCheckable(True)
         self.detail_btn.setToolTip("显示/隐藏版本时间线、大纲和文件信息")
         self.detail_btn.clicked.connect(self._toggle_detail)
         self.detail_btn.hide()
-        action_lay.addWidget(self.detail_btn)
         self._detail_dot = QLabel("●", self.detail_btn)
         self._detail_dot.setObjectName("navDot")
         self._detail_dot.setAttribute(Qt.WA_TransparentForMouseEvents)
         self._detail_dot.hide()
-        pr.addWidget(action_box, 0, Qt.AlignTop)
+        pr.addWidget(self.copy_text_btn, 0)
+        pr.addWidget(self.copy_path_btn, 0)
+        pr.addWidget(self.detail_btn, 0)
         hv.addLayout(pr)
         self.meta_label = QLabel("")
         self.meta_label.setObjectName("metaLabel")
@@ -1424,8 +1397,8 @@ class MainWindow(QMainWindow):
         self.scroll.setWidgetResizable(True)
         self.scroll.setFrameShape(QFrame.NoFrame)
         self.image_label = QLabel(
-            '<div style="font-size:15px;font-weight:600">选择一个搜索结果</div>'
-            '<div style="color:#888;font-size:12px;margin-top:8px">这里会显示命中页的 PowerPoint 原图</div>')
+            f'<div style="font-size:15px;font-weight:600;color:{self._tok["ink2"]}">选择一个搜索结果</div>'
+            f'<div style="color:{self._tok["ink4"]};font-size:12px;margin-top:8px">这里会显示命中页的 PowerPoint 原图</div>')
         self.image_label.setObjectName("previewImage")
         self.image_label.setAlignment(Qt.AlignCenter)
         self.scroll.setWidget(self.image_label)
@@ -1443,13 +1416,14 @@ class MainWindow(QMainWindow):
         lay.addWidget(thumb_wrap)
 
         nav = QHBoxLayout()
-        self.prev_btn = QPushButton("◀ 上一命中页")
+        self.prev_btn = QPushButton("‹ 上一命中页")
         self.prev_btn.setObjectName("navBtn")
         self.prev_btn.setToolTip("上一处命中页　(Ctrl+↑)")
         self.prev_btn.clicked.connect(lambda: self._step_hit(-1))
         self.page_label = QLabel("—")
+        self.page_label.setObjectName("pageLabel")
         self.page_label.setAlignment(Qt.AlignCenter)
-        self.next_btn = QPushButton("下一命中页 ▶")
+        self.next_btn = QPushButton("下一命中页 ›")
         self.next_btn.setObjectName("navBtn")
         self.next_btn.setToolTip("下一处命中页　(Ctrl+↓)")
         self.next_btn.clicked.connect(lambda: self._step_hit(1))
@@ -1477,6 +1451,17 @@ class MainWindow(QMainWindow):
         return panel
 
     # ---------- 鐜荤拑鏍囬鏍忥紙鏃犺竟妗嗙獥鍙ｈ嚜缁橈級 ----------
+    def _mk_title_icon_btn(self, tip: str, checkable: bool = False) -> QPushButton:
+        """合一工具栏的 32px 方形图标按钮：图标色由 _apply_theme 统一刷新。"""
+        b = QPushButton()
+        b.setObjectName("iconBtn")
+        b.setFixedSize(32, 32)
+        b.setIconSize(QSize(16, 16))
+        b.setCursor(Qt.PointingHandCursor)
+        b.setToolTip(tip)
+        b.setCheckable(checkable)
+        return b
+
     def _build_glass_title(self) -> QWidget:
         tb = QWidget()
         tb.setObjectName("glassTitle")
@@ -1502,7 +1487,72 @@ class MainWindow(QMainWindow):
         lay.addWidget(ver)
         lay.addWidget(self.gt_theme)
         lay.addWidget(self.update_chip)
-        lay.addStretch(1)
+        lay.addSpacing(2)
+
+        # —— 合一工具栏中部：搜索框是窗口的物理中心 ——
+        self.search_box = QLineEdit()
+        self.search_box.setObjectName("searchBox")
+        self.search_box.setPlaceholderText("搜索 PPT 内容 / 文件名…")
+        self.search_box.setToolTip(
+            '多词完整短语优先；空格 = 同时含；"引号" = 只搜短语'
+        )
+        self.search_box.setFixedHeight(34)
+        self.search_box.setMaximumWidth(680)
+        self.search_box.addAction(_icon_search(), QLineEdit.LeadingPosition)
+        self._clear_act = self.search_box.addAction(_icon_clear(), QLineEdit.TrailingPosition)
+        self._clear_act.setVisible(False)
+        self._clear_act.setToolTip("清空")
+        self._clear_act.triggered.connect(self._clear_search_now)
+        self.search_box.textChanged.connect(lambda: self._debounce.start())
+        self.search_box.textChanged.connect(lambda t: self._clear_act.setVisible(bool(t)))
+        self.search_box.installEventFilter(self)
+        self._history_model = QStringListModel(self)
+        self._completer = QCompleter(self._history_model, self)
+        self._completer.setCompletionMode(QCompleter.UnfilteredPopupCompletion)
+        self._completer.setCaseSensitivity(Qt.CaseInsensitive)
+        self.search_box.setCompleter(self._completer)
+        self._completer.popup().setObjectName("historyPopup")
+        lay.addWidget(self.search_box, 1)
+
+        self.type_filter = QComboBox()
+        self.type_filter.setObjectName("typeFilter")
+        self.type_filter.setToolTip("选择要搜索的文件类型（默认 PPT）")
+        type_options = [("PPT", (".pptx", ".ppt"))]
+        if self._document_search_enabled:
+            type_options.extend((
+                ("Word", (".docx",)),
+                ("PDF", (".pdf",)),
+                ("全部", self._enabled_index_exts()),
+            ))
+        for _label, _exts in type_options:
+            self.type_filter.addItem(_label, _exts)
+        self.type_filter.setCurrentIndex(0)  # 默认 PPT，保住产品焦点
+        self.type_filter.currentIndexChanged.connect(lambda _=0: self._do_search())
+        self.type_filter.setFixedHeight(30)
+        lay.addWidget(self.type_filter)
+        self.mode = QComboBox()
+        self.mode.addItems(["全部", "仅文件名", "仅内容"])
+        self.mode.setFixedHeight(30)
+        self.mode.currentIndexChanged.connect(self._do_search)
+        lay.addWidget(self.mode)
+        lay.addSpacing(2)
+
+        # —— 右侧：低频功能一律图标化（悬停出说明），视觉主次让位给搜索 ——
+        self.facet_btn = self._mk_title_icon_btn("按时间 / 类型 / 页数 / 文件夹筛选", checkable=True)
+        self.facet_btn.setAccessibleName("筛选")
+        self.facet_btn.clicked.connect(self._toggle_facet)
+        lay.addWidget(self.facet_btn)
+        self.settings_btn = self._mk_title_icon_btn("打开设置")
+        self.settings_btn.setAccessibleName("设置")
+        self.settings_btn.clicked.connect(self._open_settings_from_button)
+        lay.addWidget(self.settings_btn)
+        self.theme_btn = self._mk_title_icon_btn("切换界面主题")
+        self.theme_btn.setAccessibleName("主题")
+        self.theme_btn.clicked.connect(self._show_theme_menu)
+        lay.addWidget(self.theme_btn)
+        self.title_actions = lay  # stats_entry 等外部入口在窗口控制键前插入图标按钮
+        self._title_actions_insert_at = lay.count()
+        lay.addSpacing(2)
         for txt, slot, oid, tip in (("—", self.showMinimized, "winMin", "最小化"),
                                     ("□", self._win_toggle_max, "winMax", "最大化 / 还原"),
                                     ("×", self.close, "winClose", "关闭")):
@@ -1575,6 +1625,14 @@ class MainWindow(QMainWindow):
                         return True, 15   # HTBOTTOM
                 # 鏍囬鏍忔嫋鍔ㄥ尯锛氶伩寮€椤堕儴 b 缂╂斁杈?+ 鍙充晶 146px 绐楀彛鎸夐挳鍖?
                 if b <= y < self._title_h and x < w - 146:
+                    # 合一工具栏：搜索框/下拉/按钮等交互控件区域必须回 HTCLIENT，
+                    # 否则点击会被系统当成标题栏拖拽，控件收不到鼠标事件。
+                    child = self.childAt(pos)
+                    wgt = child
+                    while wgt is not None and wgt is not self:
+                        if isinstance(wgt, (QLineEdit, QComboBox, QPushButton, QToolButton)):
+                            return super().nativeEvent(et, message)
+                        wgt = wgt.parentWidget()
                     return True, 2        # HTCAPTION
         return super().nativeEvent(et, message)
 
@@ -1652,7 +1710,12 @@ class MainWindow(QMainWindow):
             self.copy_text_btn.hide()
             self.detail_btn.hide()
             return
-        self.path_label.setText(_elide_middle(r.path))
+        # 面包屑式路径：目录弱化、文件名加粗——一眼先看到「哪份 PPT」，再看「在哪」
+        d, f = os.path.split(r.path)
+        self.path_label.setText(
+            f'<span style="color:{self._tok["ink4"]}">{html.escape(_elide_middle(d, 56))}{os.sep}</span>'
+            f'<span style="color:{self._tok["ink1"]};font-weight:600">{html.escape(f)}</span>'
+        )
         self.path_label.setToolTip(r.path)
         self.copy_path_btn.show()
         self.copy_text_btn.show()
@@ -1713,10 +1776,8 @@ class MainWindow(QMainWindow):
         if getattr(self, "index_bar", None) is not None:
             self.index_bar.set_accent_color(self._tok["acc"])
         theme_label = dict(theme.THEMES).get(name, name)
-        self.theme_btn.setText(theme_label)
-        self.theme_btn.setIcon(_icon_theme(self._tok["ink2"], 16))
-        self.theme_btn.setIconSize(QSize(16, 16))
         self.theme_btn.setToolTip(f"切换界面主题 · 当前：{theme_label}")
+        self._refresh_toolbar_icons()
         if persist:
             _save_theme(name)
         if self._results_raw:
@@ -1732,6 +1793,19 @@ class MainWindow(QMainWindow):
             self.dashboard.set_theme()
         if getattr(self, "_empty_icon", None) is not None:
             self._set_empty_icon(getattr(self, "_empty_icon_kind", "search"))
+
+    def _refresh_toolbar_icons(self) -> None:
+        """合一工具栏图标色跟随主题（ink3 静默灰），checked/hover 色由 QSS 承担。"""
+        c = self._tok["ink3"]
+        for btn, factory in (
+            (getattr(self, "facet_btn", None), _icon_filter),
+            (getattr(self, "settings_btn", None), _icon_settings),
+            (getattr(self, "theme_btn", None), _icon_theme),
+            (getattr(self, "stats_report_btn", None), _icon_film),
+        ):
+            if btn is not None:
+                btn.setIcon(factory(c, 16))
+                btn.setIconSize(QSize(16, 16))
 
     def _show_theme_menu(self) -> None:
         """椤舵爮椋庢牸鎸夐挳 鈫?寮瑰嚭椋庢牸鑿滃崟锛堝綋鍓嶉鏍兼墦鍕撅級銆?"""
@@ -3659,7 +3733,10 @@ class MainWindow(QMainWindow):
             return
         hits = self._cur.hits
         unit = "段" if (self._cur.ext or "").lower() == DOCX_EXT else "页"
-        for i, h in enumerate(hits[:self._HIT_NAV_MAX]):
+        # 分段控件按页码升序显示（空间直觉：页码即位置）；导航仍按 hits 的相关度顺序
+        shown = sorted(range(min(len(hits), self._HIT_NAV_MAX)), key=lambda i: hits[i].page_no)
+        for i in shown:
+            h = hits[i]
             b = QToolButton()
             b.setObjectName("thumb")
             b.setText(f"第{h.page_no}{unit}")
@@ -3667,6 +3744,7 @@ class MainWindow(QMainWindow):
             b.setChecked(i == self._hit_idx)
             b.setEnabled(self._active_heavy_op is None and self._search_pending_req is None)
             b.setFixedSize(64, 34)
+            b.setProperty("hit_index", i)
             b.clicked.connect(lambda _=False, i=i: self._goto_hit(i))
             self.thumb_row.addWidget(b)
             self._thumb_btns.append(b)
@@ -3711,9 +3789,9 @@ class MainWindow(QMainWindow):
         accent = self._tok.get("acc", "#0A84FF")
         sub = self._tok.get("ink3", "#888")
         msg = (
-            "正在连接 PowerPoint COM 并生成原始页面..."
+            "正在连接 PowerPoint 生成原图…"
             if not getattr(self, "_preview_hinted", False)
-            else "正在等待 PowerPoint COM 原图渲染..."
+            else "正在等待 PowerPoint 渲染原图…"
         )
         self.image_label.setPixmap(QPixmap())
         self.image_label.setText(
@@ -3739,22 +3817,22 @@ class MainWindow(QMainWindow):
         self._cur_pixmap = None
         self.image_label.setPixmap(QPixmap())
         self.image_label.setText(
-            '<div style="font-size:28px">…</div>'
-            '<div style="color:#888;font-size:13px;margin-top:12px">正在准备预览</div>')
+            f'<div style="font-size:28px;color:{self._tok["ink4"]}">…</div>'
+            f'<div style="color:{self._tok["ink3"]};font-size:13px;margin-top:12px">正在准备预览</div>')
 
     def _clear_preview_empty(self, message: str = "选中左侧结果查看预览") -> None:
         self._cur_pixmap = None
         self.image_label.setPixmap(QPixmap())
         self.image_label.setText(
-            f'<div style="color:#888;font-size:13px">{message}</div>')
+            f'<div style="color:{self._tok["ink3"]};font-size:13px">{message}</div>')
 
     def _show_preview_unavailable(self) -> None:
         self.image_label.setPixmap(QPixmap())
         self.image_label.setText(
-            '<div style="font-size:15px;font-weight:600">COM 原图渲染失败</div>'
-            '<div style="color:#777;font-size:12px;margin-top:8px">'
-            '<span style="color:#999">若 PowerPoint 正忙或有弹窗，请完成当前操作后重试；<br>'
-            '无需关闭正在编辑的文稿。也可能是文件加密、损坏或页码已失效。</span></div>')
+            f'<div style="font-size:15px;font-weight:600;color:{self._tok["ink2"]}">暂时无法生成原图预览</div>'
+            f'<div style="color:{self._tok["ink3"]};font-size:12px;margin-top:10px;line-height:1.7">'
+            '若 PowerPoint 正忙或有弹窗，完成当前操作后切换页码即可重试；<br>'
+            '无需关闭正在编辑的文稿。也可能是文件加密、损坏或页码已失效。</div>')
         self._cur_pixmap = None
 
     def _show_non_powerpoint_preview(self, ext: str) -> None:
@@ -3843,8 +3921,9 @@ class MainWindow(QMainWindow):
         self.prev_btn.setEnabled(nav_enabled and n > 0 and self._hit_idx > 0)
         self.next_btn.setEnabled(nav_enabled and n > 0 and self._hit_idx < n - 1)
         # 缂╃暐鍥鹃珮浜細褰撳墠椤垫濂芥槸鏌愬懡涓〉灏辩偣浜畠
-        for i, b in enumerate(self._thumb_btns):
-            b.setChecked(i < n and hits[i].page_no == page)
+        for b in self._thumb_btns:
+            i = b.property("hit_index")
+            b.setChecked(i is not None and i < n and hits[i].page_no == page)
         # 娓愯繘寮忛瑙堬細璇ラ〉缂╃暐鍥惧凡缂撳瓨灏辩珛鍗虫斁澶ф樉绀轰綔鍗犱綅锛堢鍑哄唴瀹广€侀伄浣忔覆鏌撶瓑寰咃級锛岄珮娓呮覆鏌?
         # 濂藉悗鍦?_on_rendered 鏃犵紳鏇挎崲銆傚懡涓〉閫氬父宸叉湁缂╃暐鍥撅紙缁撴灉鍗＄墖宸︿晶閭ｅ紶灏辨槸瀹冿級銆?
         preview_edge = self._preview_long_edge()

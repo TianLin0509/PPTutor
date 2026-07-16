@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 APP_NAME = "pptx-finder"
-DEFAULT_THEME = "cloud"
+DEFAULT_THEME = "atelier"
 DEFAULT_AUTOSTART = True
 DEFAULT_VERSION_KEEP_PER_DOC = 100
 # 高阶功能默认关闭：基础模式只承担全盘 PPT 搜索与 PPT 统计。

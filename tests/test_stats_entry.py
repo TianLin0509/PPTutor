@@ -31,9 +31,11 @@ def _win(qtbot, tmp_path):
 
 def test_report_entry_button_in_topbar(qtbot, tmp_path):
     win = _win(qtbot, tmp_path)
-    btns = [b for b in win.findChildren(QPushButton) if b.text() == "胶片报告"]
+    # 合一工具栏后报告入口是图标按钮（无文字），按 accessibleName / tooltip 识别
+    btns = [b for b in win.findChildren(QPushButton) if b.accessibleName() == "打开胶片报告"]
     assert len(btns) == 1
-    assert btns[0].accessibleName() == "打开胶片报告"
+    assert "胶片报告" in btns[0].toolTip()
+    assert not btns[0].icon().isNull()
 
 
 def test_status_label_clickable(qtbot, tmp_path):
