@@ -5,6 +5,7 @@ from PySide6.QtCore import QObject
 from pptx_finder import db, search
 from pptx_finder.text_tokenize import tokenize
 from pptx_finder.ui.main_window import MainWindow
+from pptx_finder.ui.result_utils import sort_results
 
 from test_ui import StubRender
 
@@ -61,7 +62,7 @@ def test_full_phrase_does_not_match_an_ascii_word_prefix(tmp_path):
     assert by_name["prefix.pptx"].match_kind == "partial"
 
 
-def test_full_phrase_beats_separator_compacted_filename_match(tmp_path):
+def test_filename_full_query_match_beats_content_full_phrase(tmp_path):
     conn = db.connect(tmp_path / "phrase-vs-name.db")
     db.init_db(conn)
     _add_file(conn, name="AI-SP.pptx", text="unrelated", mtime=300)
@@ -70,8 +71,9 @@ def test_full_phrase_beats_separator_compacted_filename_match(tmp_path):
 
     rows = search.search(conn, "AI SP")
 
-    assert [row.name for row in rows[:2]] == ["notes.pptx", "AI-SP.pptx"]
-    assert rows[0].match_kind == "content_phrase"
+    assert [row.name for row in rows[:2]] == ["AI-SP.pptx", "notes.pptx"]
+    assert rows[0].match_kind == "filename_exact"
+    assert rows[1].match_kind == "content_phrase"
 
 
 def test_case_sensitive_search_filters_content_and_filename_but_default_does_not(tmp_path):
@@ -108,6 +110,79 @@ def test_case_sensitive_exact_filename_keeps_the_exact_ranking_tier(tmp_path):
     assert len(rows) == 1
     assert rows[0].name == "AIReport.pptx"
     assert rows[0].match_kind == "filename_exact"
+
+
+def test_default_relevance_prefers_recent_same_case_filename_token_over_old_content(tmp_path):
+    """用户搜 FINAL 时，近期文件名全词命中必须压过旧正文命中。"""
+    conn = db.connect(tmp_path / "filename-before-content.db")
+    db.init_db(conn)
+    _add_file(
+        conn,
+        name="梦想的一天-FINAL.pptx",
+        text="梦想记录",
+        mtime=1_725_000_000,  # 约一个月内
+    )
+    _add_file(
+        conn,
+        name="一年前的项目总结.pptx",
+        text="final final final delivery notes",
+        mtime=1_695_000_000,
+    )
+    conn.commit()
+
+    rows = search.search(conn, "FINAL")
+
+    assert [row.name for row in rows[:2]] == [
+        "梦想的一天-FINAL.pptx",
+        "一年前的项目总结.pptx",
+    ]
+    assert rows[0].name_hit is True
+    assert rows[0].match_kind == "filename_phrase"
+    assert rows[0].case_exact is True
+    assert rows[1].case_exact is False
+    # UI 的“相关度”二次排序也必须保留同一规则，不能把搜索层的正确顺序打乱。
+    assert sort_results(list(reversed(rows)), "relevance")[0].name == "梦想的一天-FINAL.pptx"
+
+
+def test_default_relevance_uses_case_as_a_ranking_signal_without_filtering(tmp_path):
+    """默认仍召回大小写不同的结果，但与查询大小写一致者排在前面。"""
+    conn = db.connect(tmp_path / "case-rank.db")
+    db.init_db(conn)
+    _add_file(conn, name="Alpha-FINAL.pptx", text="unrelated", mtime=100)
+    _add_file(conn, name="Beta-final.pptx", text="unrelated", mtime=300)
+    conn.commit()
+
+    rows = search.search(conn, "FINAL")
+
+    assert [row.name for row in rows] == ["Alpha-FINAL.pptx", "Beta-final.pptx"]
+    assert [row.case_exact for row in rows] == [True, False]
+
+
+def test_same_case_filename_phrase_beats_case_folded_exact_filename(tmp_path):
+    """来源相同时，大小写一致优先于仅 casefold 后的完整文件名。"""
+    conn = db.connect(tmp_path / "case-before-quality.db")
+    db.init_db(conn)
+    _add_file(conn, name="final.pptx", text="unrelated", mtime=400)
+    _add_file(conn, name="梦想的一天-FINAL.pptx", text="unrelated", mtime=100)
+    conn.commit()
+
+    rows = search.search(conn, "FINAL")
+
+    assert [row.name for row in rows] == ["梦想的一天-FINAL.pptx", "final.pptx"]
+    assert [row.case_exact for row in rows] == [True, False]
+    assert rows[1].match_kind == "filename_exact"
+
+
+def test_default_relevance_uses_recency_within_same_source_quality_and_case(tmp_path):
+    conn = db.connect(tmp_path / "recent-rank.db")
+    db.init_db(conn)
+    _add_file(conn, name="Old-FINAL.pptx", text="unrelated", mtime=100)
+    _add_file(conn, name="New-FINAL.pptx", text="unrelated", mtime=300)
+    conn.commit()
+
+    rows = search.search(conn, "FINAL")
+
+    assert [row.name for row in rows] == ["New-FINAL.pptx", "Old-FINAL.pptx"]
 
 
 class _CaptureSearchWorker(QObject):

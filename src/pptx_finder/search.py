@@ -4,12 +4,14 @@ from __future__ import annotations
 import logging
 import re
 import sqlite3
+import unicodedata
 from collections import defaultdict
 from difflib import SequenceMatcher
 from functools import lru_cache
 
 from . import cluster
 from .models import FileResult, SearchHit
+from .ranking import relevance_components
 from .text_tokenize import char_match, normalize, parse_query
 
 log = logging.getLogger(__name__)
@@ -25,17 +27,26 @@ _CAND_SPLIT_RE = re.compile(r"[^0-9A-Za-z\u4e00-\u9fff]+")
 _TEXT_CAND_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]{2,40}|[0-9A-Za-z]{3,40}|[\u4e00-\u9fff]{2,12}")
 _COMPACT_RE = re.compile(r"[^0-9a-z\u4e00-\u9fff]+", re.IGNORECASE)
 _WS_RE = re.compile(r"\s+")
-_MATCH_KIND_ORDER = {
-    "filename_phrase": 0,
-    "content_phrase": 1,
-    "filename_exact": 2,
-    "content_exact": 3,
-    "partial": 4,
-}
-
-
+_ASCII_CASE_TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
 def _stem_name(name: str) -> str:
     return _EXT_RE.sub("", name or "").strip()
+
+
+def _case_rank_needles(query: str) -> list[str]:
+    """Extract cheap case-bearing tokens used only as a ranking signal.
+
+    Recall and strict case-sensitive filtering keep using the full normalized
+    pipeline. Default relevance merely needs to distinguish ``FINAL`` from
+    ``final``; doing a second OpenCC pass over up to 3000 slide bodies would add
+    needless CPU. NFKC handles full-width Latin text, and uncased Chinese does
+    not affect a case comparison.
+    """
+    normalized = unicodedata.normalize("NFKC", query or "")
+    return [
+        token
+        for token in _ASCII_CASE_TOKEN_RE.findall(normalized)
+        if any(ch.isalpha() for ch in token)
+    ]
 
 
 def _candidate_parts(text: str) -> list[str]:
@@ -177,14 +188,14 @@ def _full_query_phrase(
     *,
     case_sensitive: bool,
 ) -> str:
-    """Return the user's whole multi-word phrase for priority classification.
+    """Return the user's whole single- or multi-word query for classification.
 
     Unquoted ``AI SP`` remains an AND query for recall, but the contiguous phrase
     receives a harder ranking tier. A single explicit quoted phrase gets the same
     treatment. Mixed quoted/unquoted clauses keep their existing AND semantics.
     """
     value = ""
-    if not phrases and len(terms) >= 2:
+    if not phrases and terms:
         value = " ".join(terms)
     elif not terms and len(phrases) == 1:
         value = phrases[0]
@@ -367,6 +378,8 @@ def search(conn: sqlite3.Connection, query: str, scope: str | None = None,
         for x in (phrases + terms)
         if x.strip()
     ]
+    case_needles = _case_rank_needles(query)
+    has_case_signal = bool(case_needles)
     full_phrase = _full_query_phrase(
         terms, phrases, case_sensitive=case_sensitive)
     # 文件名搜索意图：整个 query 去扩展名，用于「完全/前缀匹配」加权（如搜 b.pptx → b）
@@ -496,6 +509,7 @@ def search(conn: sqlite3.Connection, query: str, scope: str | None = None,
             if case_sensitive
             else (row["name_norm"] or normalize(row["name"]))
         )
+        case_preserved_name = unicodedata.normalize("NFKC", row["name"] or "")
         filename_phrase = bool(
             name_hit
             and _contains_full_phrase(_stem_name(normalized_name), full_phrase)
@@ -516,13 +530,33 @@ def search(conn: sqlite3.Connection, query: str, scope: str | None = None,
             query_exact
             and any(_contains_compact_exact(raw_norm, query_exact) for *_head, raw_norm in pages)
         )
-        match_kind = (
-            "filename_phrase" if filename_phrase
-            else "content_phrase" if content_phrase
-            else "filename_exact" if filename_exact
-            else "content_exact" if content_exact
-            else "partial"
-        )
+        if name_hit:
+            match_kind = (
+                "filename_exact" if filename_exact
+                else "filename_phrase" if filename_phrase
+                else "partial"
+            )
+        else:
+            match_kind = (
+                "content_phrase" if content_phrase
+                else "content_exact" if content_exact
+                else "partial"
+            )
+        if not has_case_signal:
+            case_exact = True
+        elif name_hit:
+            case_exact = bool(
+                case_needles
+                and all(needle in case_preserved_name for needle in case_needles)
+            )
+        else:
+            case_exact = any(
+                all(
+                    needle in unicodedata.normalize("NFKC", raw)
+                    for needle in case_needles
+                )
+                for _page_no, _rank, raw, _raw_norm in pages
+            )
         score = (
             W_REL * rel_norm(best_rank)
             + W_RECENCY * rec_norm(row["mtime"])
@@ -532,14 +566,15 @@ def search(conn: sqlite3.Connection, query: str, scope: str | None = None,
             file_id=row["id"], path=row["path"], name=row["name"], ext=row["ext"],
             mtime=row["mtime"], size=row["size"], page_count=row["page_count"],
             status=row["status"], score=score, name_hit=name_hit, hits=hits,
-            match_kind=match_kind,
+            match_kind=match_kind, case_exact=case_exact,
             content_hash=row["content_hash"] or "", group_id=gmap.get(row["id"]),
         ))
 
-    # 相关度硬分层：完整短语（文件名 > 内容）> 分隔符压缩后的全字 > 拆词部分命中。
+    # 相关度硬分层：文件名来源 > 内容来源；同来源内大小写一致 > 折叠命中，
+    # 然后比较连续全字/分隔符压缩/部分命中的质量。
+    # 修改时间仍进入 score，并作为最终 tie-breaker。这里与 UI 二次排序共用同一组件。
     results.sort(key=lambda r: (
-        _MATCH_KIND_ORDER.get(r.match_kind, _MATCH_KIND_ORDER["partial"]),
-        -r.score,
+        *relevance_components(r),
         -r.mtime,
         r.name.casefold(),
     ))

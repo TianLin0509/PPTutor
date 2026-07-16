@@ -47,7 +47,7 @@ def _result(name: str, *, mtime: float, score: float = 1.0) -> FileResult:
     )
 
 
-def test_relevance_tiers_exact_filename_then_exact_content_then_partial(tmp_path):
+def test_relevance_tiers_put_all_filename_hits_before_content(tmp_path):
     conn = db.connect(tmp_path / "rank.db")
     db.init_db(conn)
     _add_file(conn, file_id=1, name="AI算力.pptx", text="封面", mtime=10)
@@ -55,18 +55,19 @@ def test_relevance_tiers_exact_filename_then_exact_content_then_partial(tmp_path
     _add_file(conn, file_id=3, name="AI算力规划扩展.pptx", text="其它内容", mtime=30)
     conn.commit()
 
-    # Separators in the query do not demote an otherwise exact filename/content match.
+    # Separators do not demote exact matches, but the source tier remains absolute:
+    # even a partial filename hit precedes an exact slide-content hit.
     rows = search.search(conn, "AI 算力")
 
     assert [r.name for r in rows[:3]] == [
         "AI算力.pptx",
-        "项目说明.pptx",
         "AI算力规划扩展.pptx",
+        "项目说明.pptx",
     ]
     assert [r.match_kind for r in rows[:3]] == [
         "filename_exact",
-        "content_exact",
         "partial",
+        "content_exact",
     ]
 
 
