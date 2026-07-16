@@ -5,6 +5,7 @@ import datetime
 import os
 
 from ..query_explain import suggestion_keys
+from ..ranking import relevance_components
 
 
 def mode_key_from_text(mode: str) -> str:
@@ -19,15 +20,6 @@ def empty_suggestions(query: str, mode: str) -> list[str]:
     return suggestion_keys(query, mode_key_from_text(mode))
 
 
-_MATCH_KIND_ORDER = {
-    "filename_phrase": 0,
-    "content_phrase": 1,
-    "filename_exact": 2,
-    "content_exact": 3,
-    "partial": 4,
-}
-
-
 def _sort_key_for(r, keys: tuple[str, ...]) -> tuple:
     out: list = []
     for key in keys:
@@ -36,13 +28,10 @@ def _sort_key_for(r, keys: tuple[str, ...]) -> tuple:
         elif key == "name":
             out.append(str(r.name or "").casefold())
         else:  # relevance
-            out.extend((
-                _MATCH_KIND_ORDER.get(
-                    getattr(r, "match_kind", "partial"),
-                    _MATCH_KIND_ORDER["partial"],
-                ),
-                -float(r.score or 0.0),
-            ))
+            out.extend(relevance_components(r))
+    # Deterministic fallback. Recency is already a soft part of score, while an
+    # explicitly selected secondary key above still takes precedence here.
+    out.extend((-float(r.mtime or 0.0), str(r.name or "").casefold()))
     return tuple(out)
 
 

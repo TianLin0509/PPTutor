@@ -70,11 +70,14 @@ class FileResult:
     score: float
     name_hit: bool
     hits: list[SearchHit] = field(default_factory=list)
-    # 相关度硬分层：完整短语（文件名 > 内容）> 紧凑全字 > 部分命中。
-    # phrase 类用于未加引号的多词查询（如 AI SP），旧调用方不传时按部分命中处理。
+    # 相关度硬分层的命中质量；命中来源由 name_hit 单独表达。
+    # phrase 类既适用于单词全字匹配（FINAL），也适用于多词短语（AI SP）。
     match_kind: str = "partial"
     # P1 版本归组
     group_id: int | None = None
     is_latest: bool = False
     content_hash: str = ""
     duplicate_paths: list[str] = field(default_factory=list)
+    # 放在 dataclass 末尾，兼容潜在外部位置参数构造；内部调用全部使用关键字。
+    # 默认搜索仍不区分大小写地召回，但排序优先与用户输入大小写一致的命中。
+    case_exact: bool = False
