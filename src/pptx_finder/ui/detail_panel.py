@@ -121,7 +121,7 @@ class DetailPanel(QWidget):
         action_row.addWidget(self._slim_btn)
         lay.addLayout(action_row)
         lay.addSpacing(2)
-        lay.addWidget(self._sec_title("📍 版本时间线"))
+        lay.addWidget(self._sec_title("版本时间线"))
         ver_c = QWidget()
         self._version_box = QVBoxLayout(ver_c)
         self._version_box.setContentsMargins(0, 0, 0, 0)

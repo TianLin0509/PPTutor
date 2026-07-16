@@ -31,8 +31,9 @@ def _win(qtbot, tmp_path):
 
 def test_report_entry_button_in_topbar(qtbot, tmp_path):
     win = _win(qtbot, tmp_path)
-    btns = [b for b in win.findChildren(QPushButton) if b.text() == "🎞️"]
+    btns = [b for b in win.findChildren(QPushButton) if b.text() == "胶片报告"]
     assert len(btns) == 1
+    assert btns[0].accessibleName() == "打开胶片报告"
 
 
 def test_status_label_clickable(qtbot, tmp_path):

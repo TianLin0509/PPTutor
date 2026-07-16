@@ -187,7 +187,7 @@ def test_primary_ui_text_stays_readable_chinese(qtbot, tmp_path):
     assert "打开文件" in joined
     assert "复制到剪贴板" in joined
     assert "选中左侧结果" in joined
-    assert "🎨" in joined
+    assert "云白晨光" in joined
     assert "最小化" in joined
     assert "最大化 / 还原" in joined
     assert "关闭" in joined

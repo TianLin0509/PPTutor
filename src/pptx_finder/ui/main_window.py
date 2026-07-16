@@ -74,7 +74,7 @@ def _make_icon(draw, color: str = "#8A8A8A", size: int = 18) -> QIcon:
     pm.fill(Qt.transparent)
     p = QPainter(pm)
     p.setRenderHint(QPainter.Antialiasing)
-    pen = QPen(QColor(color), 1.7)
+    pen = QPen(QColor(color), max(1.7, size * 0.075))
     pen.setCapStyle(Qt.RoundCap)
     p.setPen(pen)
     p.setBrush(Qt.NoBrush)
@@ -83,8 +83,42 @@ def _make_icon(draw, color: str = "#8A8A8A", size: int = 18) -> QIcon:
     return QIcon(pm)
 
 
-def _icon_search() -> QIcon:
-    return _make_icon(lambda p: (p.drawEllipse(3, 3, 8, 8), p.drawLine(10, 10, 15, 15)))
+def _icon_search(color: str = "#8A8A8A", size: int = 18) -> QIcon:
+    scale = size / 18
+    return _make_icon(
+        lambda p: (
+            p.drawEllipse(round(3 * scale), round(3 * scale), round(8 * scale), round(8 * scale)),
+            p.drawLine(round(10 * scale), round(10 * scale), round(15 * scale), round(15 * scale)),
+        ),
+        color,
+        size,
+    )
+
+
+def _icon_folder(color: str = "#8A8A8A", size: int = 18) -> QIcon:
+    scale = size / 18
+    return _make_icon(
+        lambda p: (
+            p.drawLine(round(2 * scale), round(6 * scale), round(7 * scale), round(6 * scale)),
+            p.drawLine(round(7 * scale), round(6 * scale), round(9 * scale), round(8 * scale)),
+            p.drawLine(round(9 * scale), round(8 * scale), round(16 * scale), round(8 * scale)),
+            p.drawRect(round(2 * scale), round(8 * scale), round(14 * scale), round(8 * scale)),
+        ),
+        color,
+        size,
+    )
+
+
+def _icon_theme(color: str = "#8A8A8A", size: int = 18) -> QIcon:
+    scale = size / 18
+    return _make_icon(
+        lambda p: (
+            p.drawEllipse(round(3 * scale), round(3 * scale), round(12 * scale), round(12 * scale)),
+            p.drawLine(round(9 * scale), round(3 * scale), round(9 * scale), round(15 * scale)),
+        ),
+        color,
+        size,
+    )
 
 
 def _icon_clear() -> QIcon:
@@ -1390,8 +1424,8 @@ class MainWindow(QMainWindow):
         self.scroll.setWidgetResizable(True)
         self.scroll.setFrameShape(QFrame.NoFrame)
         self.image_label = QLabel(
-            '<div style="font-size:30px">🔎</div>'
-            '<div style="color:#888;font-size:13px;margin-top:12px">选中左侧结果，预览命中页</div>')
+            '<div style="font-size:15px;font-weight:600">选择一个搜索结果</div>'
+            '<div style="color:#888;font-size:12px;margin-top:8px">这里会显示命中页的 PowerPoint 原图</div>')
         self.image_label.setObjectName("previewImage")
         self.image_label.setAlignment(Qt.AlignCenter)
         self.scroll.setWidget(self.image_label)
@@ -1425,7 +1459,7 @@ class MainWindow(QMainWindow):
         lay.addLayout(nav)
 
         ops = QHBoxLayout()
-        self.goto_btn = QPushButton("↵ 打开并跳到此页")
+        self.goto_btn = QPushButton("打开并跳到此页")
         self.goto_btn.setObjectName("primary")
         self.goto_btn.clicked.connect(self._act_goto)
         self.open_btn = QPushButton("打开文件")
@@ -1458,6 +1492,7 @@ class MainWindow(QMainWindow):
         ver.setObjectName("gtVer")
         self.gt_theme = QLabel(dict(theme.THEMES).get(self._theme, self._theme))
         self.gt_theme.setObjectName("gtTheme")
+        self.gt_theme.hide()  # 当前主题已由工具栏按钮显示，标题栏不重复占位
         self.update_chip = QPushButton("")  # 澧為噺鏇存柊 chip锛氬彂鐜版柊鐗堟墠鏄剧ず锛岄潪妯℃€併€佷笉鎵撴柇鎼滅储
         self.update_chip.setObjectName("updateChip")
         self.update_chip.setCursor(Qt.PointingHandCursor)
@@ -1606,6 +1641,13 @@ class MainWindow(QMainWindow):
             self.path_label.setText("← 选中左侧结果查看预览")
             self.path_label.setToolTip("")
             self.meta_label.setText("")
+            self._hit_idx = 0
+            self._view_page = 1
+            self._zoom = 1.0
+            if getattr(self, "thumb_row", None) is not None:
+                self._populate_thumbs()
+            if getattr(self, "page_label", None) is not None:
+                self.page_label.setText("—")
             self.copy_path_btn.hide()
             self.copy_text_btn.hide()
             self.detail_btn.hide()
@@ -1670,7 +1712,11 @@ class MainWindow(QMainWindow):
             app.setStyleSheet(theme.build_qss(name))
         if getattr(self, "index_bar", None) is not None:
             self.index_bar.set_accent_color(self._tok["acc"])
-        self.theme_btn.setText(f"🎨 {dict(theme.THEMES).get(name, name)}")
+        theme_label = dict(theme.THEMES).get(name, name)
+        self.theme_btn.setText(theme_label)
+        self.theme_btn.setIcon(_icon_theme(self._tok["ink2"], 16))
+        self.theme_btn.setIconSize(QSize(16, 16))
+        self.theme_btn.setToolTip(f"切换界面主题 · 当前：{theme_label}")
         if persist:
             _save_theme(name)
         if self._results_raw:
@@ -1684,6 +1730,8 @@ class MainWindow(QMainWindow):
             self.gt_theme.setText(dict(theme.THEMES).get(name, name))
         if getattr(self, "dashboard", None) is not None:
             self.dashboard.set_theme()
+        if getattr(self, "_empty_icon", None) is not None:
+            self._set_empty_icon(getattr(self, "_empty_icon_kind", "search"))
 
     def _show_theme_menu(self) -> None:
         """椤舵爮椋庢牸鎸夐挳 鈫?寮瑰嚭椋庢牸鑿滃崟锛堝綋鍓嶉鏍兼墦鍕撅級銆?"""
@@ -1953,6 +2001,7 @@ class MainWindow(QMainWindow):
             else:
                 self.list_head.hide()
                 self._invalidate_preview_request()
+                self._clear_preview_empty()
                 self._update_preview_header(None)
                 self._set_ops_enabled(False)
                 self._show_empty_hint(query)
@@ -1986,6 +2035,7 @@ class MainWindow(QMainWindow):
             self._clear_detail_load_inflight()
             self._clear_detail_panel_selection()
             self._invalidate_preview_request()
+            self._clear_preview_empty()
             self._update_preview_header(None)
             self._set_ops_enabled(False)
             self._show_empty_hint(query)
@@ -2136,9 +2186,11 @@ class MainWindow(QMainWindow):
         v = QVBoxLayout(self.empty_hint)
         v.setAlignment(Qt.AlignCenter)
         v.setSpacing(11)
-        self._empty_icon = QLabel("🔍")
+        self._empty_icon = QLabel()
         self._empty_icon.setObjectName("emptyIcon")
         self._empty_icon.setAlignment(Qt.AlignCenter)
+        self._empty_icon_kind = "search"
+        self._set_empty_icon("search")
         v.addWidget(self._empty_icon)
         self._empty_query_label = QLabel("没找到")
         self._empty_query_label.setObjectName("emptyTitle")
@@ -2172,13 +2224,21 @@ class MainWindow(QMainWindow):
         self._diagnose_btn.setToolTip("查看索引库、扫描范围、数据目录和 PowerPoint 状态")
         self._diagnose_btn.clicked.connect(self._open_health_diagnostics)
         v.addWidget(self._diagnose_btn, 0, Qt.AlignCenter)
-        self._health_center_btn = QPushButton("🩺 给整个库做次体检")
+        self._health_center_btn = QPushButton("给整个库做次体检")
         self._health_center_btn.setObjectName("suggBtn")
         self._health_center_btn.setToolTip("扫描重复 / 僵尸冷文件 / 终版诅咒 / 解析失败，并一键回收重复占用")
         self._health_center_btn.clicked.connect(self._open_health_center)
         v.addWidget(self._health_center_btn, 0, Qt.AlignCenter)
         self.empty_hint.hide()
         parent_layout.addWidget(self.empty_hint, 1)
+
+    def _set_empty_icon(self, kind: str) -> None:
+        """Use font-independent vector icons for empty and indexing states."""
+        self._empty_icon_kind = "folder" if kind == "folder" else "search"
+        factory = _icon_folder if self._empty_icon_kind == "folder" else _icon_search
+        icon = factory(self._tok["accd"], 34)
+        self._empty_icon.setText("")
+        self._empty_icon.setPixmap(icon.pixmap(34, 34))
 
     def _index_status_text(self) -> str:
         try:
@@ -2287,7 +2347,7 @@ class MainWindow(QMainWindow):
     def _show_empty_hint(self, query: str) -> None:
         """闆剁粨鏋滃紩瀵硷細鍒楄〃璁╀綅锛岀粰銆屾病鎵惧埌 + 鍙偣寤鸿銆嶃€?"""
         self.result_list.hide()
-        self._empty_icon.setText("🔍")
+        self._set_empty_icon("search")
         self._empty_tip.setText("换个说法试试")
         self._empty_query_label.setText(f"\u6ca1\u627e\u5230\u300c{query}\u300d")
         self._set_empty_index_status_async()
@@ -2301,7 +2361,7 @@ class MainWindow(QMainWindow):
     def _show_start_hint(self) -> None:
         """鏃犳渶杩戞枃浠讹紙鍒氳 / 杩樺湪绱㈠紩锛夋椂鐨勮捣姝ュ紩瀵硷紝澶嶇敤 emptyHint 瀹瑰櫒锛堥殣钘忓缓璁寜閽級銆?"""
         self.result_list.hide()
-        self._empty_icon.setText("📂")
+        self._set_empty_icon("folder")
         self._empty_query_label.setText("\u8fd8\u5728\u6574\u7406\u4f60\u7684 PPT...")
         self._empty_tip.setText("索引好后这里会列出最近文件；现在就能在上方搜索框直接搜你写过的字")
         self._set_empty_index_status_async()
@@ -3118,7 +3178,7 @@ class MainWindow(QMainWindow):
     def _show_facet_empty(self) -> None:
         """facet 鎶婄粨鏋滅瓫绌烘椂鐨勬彁绀衡€斺€旀槸绛涢€夊お绐勶紝涓嶆槸娌℃悳鍒般€?"""
         self.result_list.hide()
-        self._empty_icon.setText("🔎")
+        self._set_empty_icon("search")
         self._empty_query_label.setText("筛选后没有结果")
         self._empty_tip.setText("筛选条件太窄，放宽或清掉筛选再看看")
         self._set_empty_index_status_async()
@@ -3691,8 +3751,8 @@ class MainWindow(QMainWindow):
     def _show_preview_unavailable(self) -> None:
         self.image_label.setPixmap(QPixmap())
         self.image_label.setText(
-            '<div style="font-size:30px">🖼️</div>'
-            '<div style="color:#666;font-size:13px;margin-top:12px">COM 原图渲染失败<br>'
+            '<div style="font-size:15px;font-weight:600">COM 原图渲染失败</div>'
+            '<div style="color:#777;font-size:12px;margin-top:8px">'
             '<span style="color:#999">若 PowerPoint 正忙或有弹窗，请完成当前操作后重试；<br>'
             '无需关闭正在编辑的文稿。也可能是文件加密、损坏或页码已失效。</span></div>')
         self._cur_pixmap = None
@@ -3702,9 +3762,8 @@ class MainWindow(QMainWindow):
         unit = "段落" if ext == DOCX_EXT else "页面"
         self.image_label.setPixmap(QPixmap())
         self.image_label.setText(
-            f'<div style="font-size:30px">📄</div>'
-            f'<div style="color:#888;font-size:13px;margin-top:12px">'
-            f'{kind} 内容已全文索引，可定位命中{unit}<br>'
+            f'<div style="font-size:15px;font-weight:600">{kind} 内容已全文索引</div>'
+            f'<div style="color:#888;font-size:12px;margin-top:8px">可定位命中{unit}<br>'
             f'暂不支持页图预览；点“打开文件”查看原文</div>'
         )
         self._cur_pixmap = None

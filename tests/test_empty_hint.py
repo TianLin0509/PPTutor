@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QToolButton
 
 from test_ui import StubRender, _finish_fake_task, _index, _install_fake_background_task
 
@@ -68,9 +69,31 @@ def test_zero_result_shows_hint(qtbot, tmp_path):
     assert "2 个文件" in txt
     assert "3 页" in txt
     assert "当前范围：全部范围" in txt
-    assert win._empty_icon.text() == "🔍"
+    assert win._empty_icon_kind == "search"
+    assert not win._empty_icon.pixmap().isNull()
     assert win._empty_tip.text() == "换个说法试试"
     assert not any(token in win._empty_tip.text() for token in ("鏁", "鍚", "绱", "锛", "鈥", "鈫", "馃", "\ufffd"))
+
+
+def test_zero_result_clears_stale_preview_body(qtbot, tmp_path):
+    conn = _index(tmp_path)
+    win = MainWindow(conn=conn, render_worker=StubRender(), do_index=False)
+    qtbot.addWidget(win)
+    win.image_label.setText("上一份文件的旧预览错误")
+    stale_thumb = QToolButton()
+    stale_thumb.setText("第1页")
+    win.thumb_row.addWidget(stale_thumb)
+    win._thumb_btns = [stale_thumb]
+    win.page_label.setText("第 1 / 2 页")
+
+    win.search_box.setText("绝对不存在的词xyz123")
+    win._do_search()
+
+    assert "上一份文件的旧预览错误" not in win.image_label.text()
+    assert "选中左侧结果查看预览" in win.image_label.text()
+    assert win.thumb_row.count() == 0
+    assert win._thumb_btns == []
+    assert win.page_label.text() == "—"
 
 
 def test_zero_result_scope_status_reflects_content_mode(qtbot, tmp_path):
@@ -94,7 +117,8 @@ def test_start_hint_explains_empty_index(qtbot, tmp_path):
     win._do_search()
     qtbot.waitUntil(lambda: "索引库为空" in win._empty_index_status.text(), timeout=2000)
     assert "索引库为空" in win._empty_index_status.text()
-    assert win._empty_icon.text() == "📂"
+    assert win._empty_icon_kind == "folder"
+    assert not win._empty_icon.pixmap().isNull()
     assert "索引好后这里会列出最近文件" in win._empty_tip.text()
     assert "直接搜你写过的字" in win._empty_tip.text()
     assert not any(token in win._empty_tip.text() for token in ("鏁", "鍚", "绱", "锛", "鈥", "鈫", "馃", "\ufffd"))

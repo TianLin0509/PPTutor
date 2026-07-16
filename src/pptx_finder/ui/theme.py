@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from string import Template
 
+from ..config import resource_path
+
 
 def _rgb(hx: str):
     h = hx.lstrip("#")
@@ -21,19 +23,19 @@ def _mk(bg, blobs, acc, acc2, ink, light=False):
     ar, ag, ab = _rgb(acc)
     A = f"{ar},{ag},{ab}"
     if light:
-        d = dict(panel="rgba(255,255,255,0.82)", panel2="rgba(255,255,255,0.66)", field="rgba(255,255,255,0.72)",
-                 hover="rgba(0,0,0,0.05)", sel=f"rgba({A},0.16)", selblur="rgba(0,0,0,0.06)",
-                 bd="rgba(0,0,0,0.12)", bd2="rgba(0,0,0,0.06)", scroll="rgba(0,0,0,0.18)", scrollh="rgba(0,0,0,0.30)",
+        d = dict(panel="rgba(255,255,255,0.96)", panel2="rgba(255,255,255,0.88)", field="rgba(255,255,255,0.94)",
+                 hover=f"rgba({A},0.08)", sel=f"rgba({A},0.14)", selblur="rgba(44,55,72,0.07)",
+                 bd="rgba(43,55,72,0.16)", bd2="rgba(43,55,72,0.10)", scroll="rgba(67,78,94,0.34)", scrollh="rgba(43,54,70,0.56)",
                  acctext="#FFFFFF", base=bg)
     else:
-        d = dict(panel="rgba(255,255,255,0.07)", panel2="rgba(255,255,255,0.045)", field="rgba(255,255,255,0.06)",
-                 hover="rgba(255,255,255,0.10)", sel=f"rgba({A},0.22)", selblur="rgba(255,255,255,0.07)",
-                 bd="rgba(255,255,255,0.16)", bd2="rgba(255,255,255,0.09)", scroll="rgba(255,255,255,0.16)", scrollh="rgba(255,255,255,0.30)",
+        d = dict(panel="rgba(255,255,255,0.10)", panel2="rgba(255,255,255,0.07)", field="rgba(255,255,255,0.09)",
+                 hover="rgba(255,255,255,0.13)", sel=f"rgba({A},0.24)", selblur="rgba(255,255,255,0.08)",
+                 bd="rgba(255,255,255,0.18)", bd2="rgba(255,255,255,0.11)", scroll="rgba(255,255,255,0.27)", scrollh="rgba(255,255,255,0.48)",
                  acctext="#0B1020", base="transparent")
     d.update(win=bg, appbg=bg, blobs=blobs, ink1=ink[0], ink2=ink[1], ink3=ink[2], ink4=ink[3],
-             acc=acc, accd=acc2, grn="#34D399", hl_r=str(ar), hl_g=str(ag), hl_b=str(ab), hl_a="0.26", radius="13",
+             acc=acc, accd=acc2, grn="#34D399", hl_r=str(ar), hl_g=str(ag), hl_b=str(ab), hl_a="0.26", radius="12",
              is_light=light,  # 主题明暗标志：系统标题栏深浅、对比度判定用（替代旧的硬编码主题名清单）
-             canvas=("#F7F8FA" if light else "#17171F"))  # report_overlay 浮层卡片背景（不透明）依赖 canvas
+             canvas=("#F8FAFD" if light else "#17171F"))  # report_overlay 浮层卡片背景（不透明）依赖 canvas
     return d
 
 
@@ -75,7 +77,7 @@ TOKENS: dict[str, dict] = {
         [(0.18, 0.12, 0.58, (150, 160, 185, 90)), (0.85, 0.20, 0.60, (110, 125, 150, 80)),
          (0.60, 0.90, 0.64, (90, 100, 125, 70)), (0.34, 0.60, 0.50, (180, 190, 210, 58))],
         "#AEB6C6", "#E2E8F0", ("#F0F2F6", "#CDD2DC", "#8E95A4", "#5E6472")),
-    "cloud": _mk("#EDF1F7",
+    "cloud": _mk("#F2F5FA",
         [(0.16, 0.10, 0.60, (120, 170, 255, 95)), (0.85, 0.18, 0.60, (255, 180, 210, 85)),
          (0.60, 0.92, 0.66, (150, 230, 210, 80)), (0.34, 0.60, 0.55, (200, 180, 255, 75))],
         "#0A84FF", "#0A66D6", ("#1D1D1F", "#494B50", "#6E6E73", "#A0A4AB"), light=True),
@@ -92,7 +94,7 @@ _QSS = Template("""
 QWidget { background: $base; color: $ink1; font-size: 13px; }
 QMainWindow { background: $win; }
 QWidget#central { background: transparent; }
-QToolTip { background: $win; color: $ink1; border: 1px solid $bd; }
+QToolTip { background: $win; color: $ink1; border: 1px solid $bd; border-radius: 7px; padding: 6px 9px; }
 
 /* 玻璃标题栏（无边框窗口的自绘标题栏） */
 QWidget#glassTitle { background: $panel; border-bottom: 1px solid $bd; }
@@ -108,48 +110,53 @@ QPushButton#winMin:hover, QPushButton#winMax:hover { background: rgba($hl_r,$hl_
 QPushButton#winClose:hover { background: #E81123; color: #FFFFFF; }
 
 /* 顶栏 */
-QWidget#topBar { background: $panel; }
+QWidget#topBar { background: $panel; border-bottom: 1px solid $bd2; }
 QLabel#appLogo { background: transparent; border: none; }
 
 /* 搜索框 */
 QLineEdit#searchBox {
-  background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 rgba($hl_r,$hl_g,$hl_b,0.12), stop:0.18 $field, stop:0.82 $field, stop:1 rgba(52,199,89,0.10));
-  border: 1.5px solid rgba($hl_r,$hl_g,$hl_b,0.34); border-radius: ${radius}px;
+  background: $field; border: 1px solid $bd; border-radius: 11px;
   padding: 0 14px; font-size: 15px; color: $ink1; selection-background-color: $acc;
 }
 QLineEdit#searchBox:hover {
-  border-color: $bd2;
-  background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 rgba($hl_r,$hl_g,$hl_b,0.16), stop:0.5 $field, stop:1 rgba(52,199,89,0.12));
+  border-color: rgba($hl_r,$hl_g,$hl_b,0.48);
 }
 QLineEdit#searchBox:focus {
-  border-color: $acc;
-  background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 rgba($hl_r,$hl_g,$hl_b,0.22), stop:0.26 $field, stop:0.74 $field, stop:1 rgba($hl_r,$hl_g,$hl_b,0.16));
+  border: 1.5px solid $acc; background: $field;
 }
 QLabel#queryHint { color: $ink3; font-size: 11.5px; background: transparent; padding: 5px 4px 0 40px; }
 
 /* 模式下拉 */
 QComboBox {
-  background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 rgba($hl_r,$hl_g,$hl_b,0.10), stop:0.42 $field, stop:1 rgba($hl_r,$hl_g,$hl_b,0.06));
-  border: 1px solid rgba($hl_r,$hl_g,$hl_b,0.26); border-radius: 8px; padding: 4px 11px; color: $ink2;
+  background: $field; border: 1px solid $bd; border-radius: 8px;
+  padding: 6px 30px 6px 11px; color: $ink2;
 }
-QComboBox:hover { border-color: $bd2; }
-QComboBox::drop-down { border: none; width: 18px; }
+QComboBox:hover { border-color: rgba($hl_r,$hl_g,$hl_b,0.48); color: $ink1; }
+QComboBox:on { border-color: $acc; background: $field; }
+QComboBox:disabled { color: $ink4; background: $selblur; }
+QComboBox::drop-down { border: none; width: 28px; subcontrol-origin: padding; subcontrol-position: top right; }
+QComboBox::down-arrow { image: url("$combo_arrow"); width: 12px; height: 8px; }
 QComboBox QAbstractItemView {
-  background: $win; border: 1px solid $bd; border-radius: 8px; padding: 4px;
+  background: $win; border: 1px solid $bd; border-radius: 9px; padding: 5px;
   selection-background-color: $sel; selection-color: $ink1; outline: 0;
 }
+QComboBox QAbstractItemView::item { min-height: 28px; padding: 4px 9px; border-radius: 6px; }
+QComboBox QAbstractItemView::item:hover { background: $hover; color: $ink1; }
+QComboBox QAbstractItemView::item:selected { background: $sel; color: $ink1; }
 
 /* 按钮 */
 QPushButton {
-  background: $field; border: 1px solid $bd; border-radius: 7px; padding: 7px 14px; color: $ink1;
+  background: $field; border: 1px solid $bd; border-radius: 8px; padding: 7px 13px; color: $ink1;
 }
-QPushButton:hover { background: $hover; }
-QPushButton:disabled { color: $ink4; }
+QPushButton:hover { background: $hover; border-color: rgba($hl_r,$hl_g,$hl_b,0.42); }
+QPushButton:pressed { background: $sel; border-color: rgba($hl_r,$hl_g,$hl_b,0.58); }
+QPushButton:disabled { color: $ink4; background: $selblur; border-color: $bd2; }
 QPushButton#primary { background: $acc; border: 1px solid $acc; color: $acctext; font-weight: 600; }
 QPushButton#primary:hover { background: $accd; }
-QPushButton#primary:pressed { background: $accd; padding-top: 8px; padding-bottom: 6px; }
-QPushButton#ghost { background: transparent; border: none; color: $ink3; padding: 5px 8px; }
+QPushButton#primary:pressed { background: $accd; border-color: $accd; }
+QPushButton#ghost { background: transparent; border: none; color: $ink2; padding: 5px 8px; }
 QPushButton#ghost:hover { background: $hover; color: $ink1; }
+QPushButton#ghost:pressed, QPushButton#ghost:checked { background: $sel; color: $acc; }
 
 /* 键盘焦点环（Tab/方向键可见焦点）：边框类描强调色，无边框类给底色 */
 QPushButton:focus, QComboBox:focus { border-color: $acc; }
@@ -170,14 +177,14 @@ QListWidget#resultList::item:selected { background: transparent; }
 QWidget#previewPanel { background: $panel; border: 1px solid $bd; border-radius: ${radius}px; }
 QWidget#previewHeadBar { background: transparent; }
 QWidget#previewActions { background: transparent; }
-QLabel#previewImage { background: $field; border: 1px solid $bd; border-radius: ${radius}px; }
+QLabel#previewImage { background: $field; border: 1px solid $bd2; border-radius: 10px; }
 QLabel#pathLabel { color: $ink2; font-size: 12px; }
 QLabel#metaLabel { color: $ink3; font-size: 11.5px; }
-QPushButton#linkBtn { background: transparent; border: 1px solid $bd2; border-radius: 7px; padding: 2px 10px; color: $acc; font-size: 11.5px; font-weight: 600; }
-QPushButton#linkBtn:hover { border-color: $acc; }
+QPushButton#linkBtn { background: transparent; border: 1px solid $bd2; border-radius: 7px; padding: 2px 10px; color: $accd; font-size: 11.5px; font-weight: 600; }
+QPushButton#linkBtn:hover { border-color: $acc; color: $accd; }
 QPushButton#detailAction {
   background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 rgba($hl_r,$hl_g,$hl_b,0.20), stop:1 rgba($hl_r,$hl_g,$hl_b,0.08));
-  border: 1px solid $acc; border-radius: 8px; padding: 5px 13px; color: $acc; font-size: 12px; font-weight: 700;
+  border: 1px solid $acc; border-radius: 8px; padding: 5px 13px; color: $accd; font-size: 12px; font-weight: 700;
 }
 QPushButton#detailAction:hover { background: rgba($hl_r,$hl_g,$hl_b,0.20); }
 QPushButton#detailAction:checked { background: $acc; color: $acctext; }
@@ -204,10 +211,22 @@ QLabel#dtDot { color: $acc; font-size: 11px; background: transparent; }
 QLabel#dtTitle { color: $ink1; font-size: 13px; font-weight: 700; background: transparent; }
 QPushButton#dtClose { background: transparent; border: none; color: $ink3; font-size: 21px; font-weight: 600; border-radius: 8px; padding: 0; }
 QPushButton#dtClose:hover { background: rgba(255,69,58,0.9); color: #ffffff; }
-QTabWidget#detailTabs::pane { border: none; border-top: 1px solid $bd; background: transparent; }
-QTabBar::tab { background: transparent; color: $ink3; padding: 7px 18px; font-size: 12.5px; font-weight: 600; border: none; border-bottom: 2px solid transparent; }
-QTabBar::tab:selected { color: $acc; border-bottom: 2px solid $acc; }
-QTabBar::tab:hover:!selected { color: $ink1; }
+/* 次级窗口统一使用卡片化 Tab；主界面 detailTabs 在下方保留紧凑下划线特例。 */
+QTabWidget::pane { background: $panel2; border: 1px solid $bd; border-radius: 10px; top: -1px; }
+QTabBar::tab {
+  background: transparent; color: $ink3; padding: 8px 14px; margin: 0 3px 4px 0;
+  font-size: 12.5px; font-weight: 600; border: 1px solid transparent; border-radius: 7px;
+}
+QTabBar::tab:selected { color: $acc; background: $sel; border-color: rgba($hl_r,$hl_g,$hl_b,0.20); }
+QTabBar::tab:hover:!selected { color: $ink1; background: $hover; }
+QTabBar::tab:focus { border-color: $acc; }
+QTabWidget#detailTabs::pane { border: none; border-top: 1px solid $bd2; border-radius: 0; background: transparent; }
+QTabWidget#detailTabs QTabBar::tab {
+  background: transparent; margin: 0; padding: 8px 18px; border: none;
+  border-radius: 0; border-bottom: 2px solid transparent;
+}
+QTabWidget#detailTabs QTabBar::tab:selected { color: $acc; border-bottom: 2px solid $acc; }
+QTabWidget#detailTabs QTabBar::tab:hover:!selected { color: $ink1; background: $hover; }
 QLabel#verChanged { color: $ink3; font-size: 11px; background: transparent; }
 QLabel#detailSecT { color: $ink3; font-size: 11px; font-weight: 700; background: transparent; }
 QLabel#detailMeta { color: $ink3; font-size: 11.5px; background: transparent; }
@@ -228,8 +247,8 @@ QPushButton#verPreviewBtn:hover { border-color: $acc; color: $acc; }
 QPushButton#outlineItem { background: transparent; border: none; text-align: left; padding: 4px 6px; color: $ink2; font-size: 11.5px; border-radius: 5px; }
 QPushButton#outlineItem:hover { background: $hover; color: $acc; }
 QLabel#listHead { color: $ink3; font-size: 11.5px; font-weight: 600; background: transparent; }
-QComboBox#sortCombo { background: transparent; border: 1px solid $bd; border-radius: 6px; padding: 2px 8px; color: $ink3; font-size: 11.5px; }
-QComboBox#sortCombo:hover { border-color: $bd2; color: $ink2; }
+QComboBox#sortCombo, QComboBox#sortSecondary { background: $field; border: 1px solid $bd2; border-radius: 7px; padding: 3px 26px 3px 9px; color: $ink3; font-size: 11.5px; }
+QComboBox#sortCombo:hover, QComboBox#sortSecondary:hover { border-color: rgba($hl_r,$hl_g,$hl_b,0.45); color: $ink2; }
 QComboBox#sortCombo QAbstractItemView { background: $win; border: 1px solid $bd; border-radius: 8px; selection-background-color: $sel; selection-color: $ink1; }
 
 /* 搜索历史下拉 */
@@ -302,20 +321,31 @@ QLabel#recVer { color: $acc; font-size: 11px; font-weight: 700; background: tran
 
 /* 分隔条 — 加宽透明，玻璃卡之间透出极光当间隙 */
 QSplitter::handle { background: transparent; }
-QSplitter::handle:horizontal { width: 12px; }
-QSplitter::handle:hover { background: rgba($hl_r,$hl_g,$hl_b,0.20); border-radius: 3px; }
+QSplitter::handle:horizontal { width: 8px; }
+QSplitter::handle:vertical { height: 8px; }
+QSplitter::handle:hover { background: rgba($hl_r,$hl_g,$hl_b,0.12); border-radius: 3px; }
 
-/* 滚动条 */
-QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
-QScrollBar::handle:vertical { background: $scroll; border-radius: 4px; min-height: 28px; }
-QScrollBar::handle:vertical:hover { background: $scrollh; }
-QScrollBar::add-line, QScrollBar::sub-line { height: 0; }
-QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
+/* 滚动条：双轴统一的细轨道，不显示系统箭头，hover/拖动仍有清晰反馈 */
+QScrollBar:vertical { background: transparent; width: 9px; margin: 2px 1px; }
+QScrollBar:horizontal { background: transparent; height: 9px; margin: 1px 2px; }
+QScrollBar::handle:vertical { background: $scroll; border-radius: 4px; min-height: 32px; }
+QScrollBar::handle:horizontal { background: $scroll; border-radius: 4px; min-width: 32px; }
+QScrollBar::handle:vertical:hover, QScrollBar::handle:horizontal:hover { background: $scrollh; }
+QScrollBar::handle:vertical:pressed, QScrollBar::handle:horizontal:pressed { background: $acc; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; background: transparent; }
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; background: transparent; }
+QScrollBar::up-arrow:vertical, QScrollBar::down-arrow:vertical,
+QScrollBar::left-arrow:horizontal, QScrollBar::right-arrow:horizontal { width: 0; height: 0; }
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical,
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background: transparent; }
+QAbstractScrollArea::corner { background: transparent; border: none; }
 
 /* 右键菜单 */
 QMenu { background: $win; border: 1px solid $bd2; border-radius: 11px; padding: 6px; }
 QMenu::item { padding: 7px 24px 7px 14px; border-radius: 7px; color: $ink1; font-size: 12.5px; }
 QMenu::item:selected { background: $hover; }
+QMenu::item:disabled { color: $ink4; }
+QMenu::indicator { width: 14px; height: 14px; }
 QMenu::separator { height: 1px; background: $bd; margin: 4px 6px; }
 
 /* 次级窗口通用控件 */
@@ -323,9 +353,17 @@ QLineEdit {
   background: $field; border: 1.5px solid $bd; border-radius: 7px;
   padding: 5px 10px; color: $ink1; selection-background-color: $acc;
 }
+QLineEdit:hover { border-color: rgba($hl_r,$hl_g,$hl_b,0.40); }
 QLineEdit:focus { border-color: $acc; }
+QLineEdit:disabled, QLineEdit:read-only { color: $ink3; background: $selblur; border-color: $bd2; }
+QPlainTextEdit, QTextEdit {
+  background: $field; color: $ink1; border: 1px solid $bd; border-radius: 9px;
+  padding: 8px; selection-background-color: $acc; selection-color: $acctext;
+}
+QPlainTextEdit:focus, QTextEdit:focus { border-color: $acc; }
+QPlainTextEdit:read-only, QTextEdit:read-only { background: $panel2; color: $ink2; }
 QListWidget {
-  background: $field; border: 1px solid $bd; border-radius: ${radius}px;
+  background: $field; border: 1px solid $bd; border-radius: 10px;
   outline: 0; padding: 4px;
 }
 QListWidget::item { color: $ink1; padding: 7px 9px; border-radius: 6px; }
@@ -333,7 +371,17 @@ QListWidget::item:hover { background: $hover; }
 QListWidget::item:selected { background: $sel; color: $ink1; }
 QCheckBox { color: $ink1; spacing: 7px; background: transparent; }
 QCheckBox::indicator { width: 16px; height: 16px; border: 1.5px solid $bd2; border-radius: 5px; background: $field; }
-QCheckBox::indicator:checked { background: $acc; border-color: $acc; }
+QCheckBox::indicator:hover { border-color: rgba($hl_r,$hl_g,$hl_b,0.58); }
+QCheckBox::indicator:checked { background: $acc; border-color: $acc; image: url("$check_icon"); }
+QCheckBox::indicator:disabled { background: $selblur; border-color: $bd2; }
+QCheckBox:focus { color: $acc; }
+
+QToolButton { background: transparent; color: $ink2; border: 1px solid transparent; border-radius: 7px; padding: 5px; }
+QToolButton:hover { background: $hover; border-color: $bd2; color: $ink1; }
+QToolButton:pressed, QToolButton:checked { background: $sel; border-color: rgba($hl_r,$hl_g,$hl_b,0.45); color: $acc; }
+
+QProgressBar { background: $selblur; border: none; border-radius: 4px; text-align: center; color: $ink2; }
+QProgressBar::chunk { background: $acc; border-radius: 4px; }
 
 /* 浮层 Toast */
 QLabel#toast {
@@ -349,9 +397,21 @@ _QSS_KEYS = ("win", "base", "appbg", "panel", "panel2", "field", "hover", "sel",
              "scroll", "scrollh", "hl_r", "hl_g", "hl_b", "radius")
 
 
+def _qss_asset(name: str) -> str:
+    """Return a Qt-style URL that works from source and a PyInstaller bundle."""
+    return resource_path("assets", name).resolve().as_posix()
+
+
 def build_qss(theme: str) -> str:
     t = TOKENS.get(theme, TOKENS["aurora"])
-    return _QSS.substitute({k: t[k] for k in _QSS_KEYS})
+    values = {k: t[k] for k in _QSS_KEYS}
+    values.update(
+        combo_arrow=_qss_asset(
+            "ui-chevron-dark.svg" if t.get("is_light", False) else "ui-chevron-light.svg"
+        ),
+        check_icon=_qss_asset("ui-check.svg"),
+    )
+    return _QSS.substitute(values)
 
 
 def tok(theme: str) -> dict:
