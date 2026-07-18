@@ -151,7 +151,7 @@ def test_empty_mode_change_does_not_refresh_dashboard_stats(qtbot, monkeypatch, 
     qtbot.addWidget(win)
     win.search_box.setText("")
     win._showing_recent = True
-    win._list_stack.setCurrentWidget(win.dashboard)
+    win._page_stack.setCurrentWidget(win.dashboard)
     refreshes = []
     monkeypatch.setattr(win.dashboard, "schedule_refresh", lambda *, force=False: refreshes.append(force))
 

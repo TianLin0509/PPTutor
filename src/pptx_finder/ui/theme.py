@@ -149,6 +149,16 @@ QPushButton#winMin, QPushButton#winMax, QPushButton#winClose { background: trans
 QPushButton#winMin:hover, QPushButton#winMax:hover { background: $hover; color: $ink1; }
 QPushButton#winClose:hover { background: #E81123; color: #FFFFFF; }
 
+/* 左侧导航轨：页面切换（搜索/概览/版本/健康）+ 低频动作（报告/设置） */
+QWidget#navRail { background: $panel; border-right: 1px solid $bd2; }
+QLabel#railLogo { color: $acc; font-size: 13px; background: transparent; }
+QToolButton#railBtn {
+  background: transparent; border: 1px solid transparent; border-radius: 9px;
+  color: $ink3; font-size: 9px; padding: 2px 0;
+}
+QToolButton#railBtn:hover { background: $hover; }
+QToolButton#railBtn:checked { background: $sel; color: $acc; }
+
 /* 顶栏（合一后仅承载搜索语法提示行，默认隐藏） */
 QWidget#topBar { background: $panel; border: none; }
 

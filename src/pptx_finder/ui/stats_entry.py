@@ -1,12 +1,10 @@
-"""非侵入式入口注入：给主窗口挂「我的胶片报告」入口。
+"""胶片报告：报告生成 + 浮层弹出逻辑。
 
-只通过 mw 的稳定 self 属性（theme_btn / status_label / _conn / _theme）附加入口，
-不改 main_window 既有逻辑。main_window 仅需在 _build_ui 末尾调用 install_stats_entry(self)。
+入口已收编到主窗左侧导航轨「报告」按钮（main_window 直接调 ``_open_report(mw)``）；
+顶栏图标按钮与状态栏数字点击彩蛋已随导航轨改造退役。
 """
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QPushButton
 try:
     from shiboken6 import isValid as _qt_is_valid
 except Exception:  # noqa: BLE001
@@ -173,29 +171,3 @@ def _open_report_sync(mw) -> None:
     ov.raise_()
     mw._stats_overlay = ov  # 持引用，避免被 GC 回收
 
-
-def install_stats_entry(mw) -> None:
-    """给主窗口挂两个入口：顶栏胶片报告按钮 + 状态栏数字可点击。"""
-    # 入口 1：合一工具栏图标入口（插到主题键旁，图标色由主窗 _refresh_toolbar_icons 统一刷）
-    btn = QPushButton()
-    btn.setObjectName("iconBtn")
-    btn.setFixedSize(32, 32)
-    btn.setToolTip("我的胶片报告")
-    btn.setAccessibleName("打开胶片报告")
-    btn.setCursor(Qt.PointingHandCursor)
-    btn.clicked.connect(lambda: _open_report(mw))
-    try:
-        lay = mw.title_actions
-        lay.insertWidget(mw._title_actions_insert_at, btn)
-        mw.stats_report_btn = btn
-        mw._refresh_toolbar_icons()
-    except Exception:  # noqa: BLE001 顶栏结构变了就降级，不挂顶栏入口
-        pass
-
-    # 入口 2：状态栏数字可点击（彩蛋）
-    try:
-        mw.status_label.setCursor(Qt.PointingHandCursor)
-        mw.status_label.setToolTip("点我看胶片报告")
-        mw.status_label.mousePressEvent = lambda e: _open_report(mw)
-    except Exception:  # noqa: BLE001
-        pass

@@ -148,6 +148,47 @@ def _icon_film(color: str = "#8A8A8A", size: int = 18) -> QIcon:
     )
 
 
+def _icon_dash(color: str = "#8A8A8A", size: int = 18) -> QIcon:
+    """四宫格：库概览。"""
+    scale = size / 18
+    return _make_icon(
+        lambda p: (
+            p.drawRect(round(3 * scale), round(3 * scale), round(5 * scale), round(5 * scale)),
+            p.drawRect(round(10 * scale), round(3 * scale), round(5 * scale), round(5 * scale)),
+            p.drawRect(round(3 * scale), round(10 * scale), round(5 * scale), round(5 * scale)),
+            p.drawRect(round(10 * scale), round(10 * scale), round(5 * scale), round(5 * scale)),
+        ),
+        color,
+        size,
+    )
+
+
+def _icon_history(color: str = "#8A8A8A", size: int = 18) -> QIcon:
+    """时钟：版本历史。"""
+    scale = size / 18
+
+    def _draw(p):
+        p.drawEllipse(round(3 * scale), round(3 * scale), round(12 * scale), round(12 * scale))
+        p.drawLine(round(9 * scale), round(5.5 * scale), round(9 * scale), round(9.5 * scale))
+        p.drawLine(round(9 * scale), round(9.5 * scale), round(12 * scale), round(11 * scale))
+
+    return _make_icon(_draw, color, size)
+
+
+def _icon_health(color: str = "#8A8A8A", size: int = 18) -> QIcon:
+    """心电脉冲：库体检。"""
+    scale = size / 18
+
+    def _draw(p):
+        p.drawLine(round(2 * scale), round(9 * scale), round(5.5 * scale), round(9 * scale))
+        p.drawLine(round(5.5 * scale), round(9 * scale), round(7.5 * scale), round(4 * scale))
+        p.drawLine(round(7.5 * scale), round(4 * scale), round(10.5 * scale), round(14 * scale))
+        p.drawLine(round(10.5 * scale), round(14 * scale), round(12.5 * scale), round(9 * scale))
+        p.drawLine(round(12.5 * scale), round(9 * scale), round(16 * scale), round(9 * scale))
+
+    return _make_icon(_draw, color, size)
+
+
 def _icon_clear() -> QIcon:
     return _make_icon(lambda p: (p.drawLine(5, 5, 13, 13), p.drawLine(13, 5, 5, 13)))
 
@@ -1181,13 +1222,9 @@ class MainWindow(QMainWindow):
         self._history_hint.mousePressEvent = lambda _e: self._open_history_hint()
         ll.addWidget(self._history_hint)
         self._build_empty_hint(ll)
-        # 鍒楄〃鍖虹敤 QStackedWidget 鍖呫€岀粨鏋滃垪琛?left銆嶄笌銆屼华琛ㄧ洏棣栧睆銆嶄簩閫変竴鍒囨崲锛?
-        # left锛堝惈 result_list 鍙婂叏閮ㄤ俊鍙风粦瀹氾級鍘熸牱淇濈暀锛屼粎澶氫竴灞?stack 瀹瑰櫒銆?
-        self._list_stack = QStackedWidget()
-        self._list_stack.setObjectName("listStack")
-        self._list_stack.addWidget(left)                  # index 0锛氱粨鏋滃垪琛ㄥ尯
-        self.dashboard = DashboardView(self)
-        self._list_stack.addWidget(self.dashboard)        # index 1锛氫华琛ㄧ洏棣栧睆
+        # 主区页面化后，列表区 left（含 result_list 及全部信号绑定）直接做 splitter 左栏；
+        # 原 listStack 二选一容器退役，仪表盘提升为顶层页。
+        self._list_pane = left
         # facet 不再占 splitter 栏位：改为「+ 筛选」chip 呼出的非模态浮层（点外面自动关闭）
         self.facet_panel = FacetPanel(self._tok, parent=self)
         self.facet_panel.setWindowFlags(Qt.Popup | Qt.FramelessWindowHint)
@@ -1196,7 +1233,7 @@ class MainWindow(QMainWindow):
         self.facet_panel.filters_changed.connect(self._apply_facet)
         self.facet_panel.filters_changed.connect(self._refresh_facet_chips)
         self.facet_panel.hide()
-        split.addWidget(self._list_stack)
+        split.addWidget(left)
         split.addWidget(self._build_preview())
         # 详情区嵌入预览卡（四 Tab：预览/大纲/版本/详情，在 _build_preview 内构造）；信号接线不变
         self.detail_panel.restore_requested.connect(self._act_restore_version)
@@ -1208,12 +1245,43 @@ class MainWindow(QMainWindow):
         split.setStretchFactor(1, 6)
         split.setSizes([520, 660])
         self._split = split
+
+        # 主区四页一个栈：搜索（splitter 原样）/ 概览（DashboardView 全宽）/
+        # 版本 + 健康（懒加载容器，首次切入才构造嵌入窗口）
+        self.dashboard = DashboardView(self)
+        self._version_page_win = None
+        self._health_page_win = None
+        self._page_stack = QStackedWidget()
+        self._page_stack.setObjectName("pageStack")
+        self._pages: dict[str, QWidget] = {"search": split, "dashboard": self.dashboard}
+        for key in ("version", "health"):
+            container = QWidget()
+            container.setObjectName(f"page_{key}")
+            cl = QVBoxLayout(container)
+            cl.setContentsMargins(0, 0, 0, 0)
+            cl.setSpacing(0)
+            self._pages[key] = container
+        self._version_page_lay = self._pages["version"].layout()
+        self._health_page_lay = self._pages["health"].layout()
+        for key in ("search", "dashboard", "version", "health"):
+            self._page_stack.addWidget(self._pages[key])
+        self._page_stack.setCurrentWidget(self.dashboard)  # 启动默认页 = 概览
+
         wrap = QWidget()
         wrap.setObjectName("contentWrap")
         wl = QVBoxLayout(wrap)
         wl.setContentsMargins(16, 6, 16, 10)  # 涓棿鍐呭鍖哄洓鍛ㄧ暀鐧斤紝涓嶈创绐楀彛杈?
-        wl.addWidget(split)
-        root.addWidget(wrap, 1)
+        wl.addWidget(self._page_stack)
+
+        # 身体行：最左 56px 导航轨 + 页面区
+        body = QWidget()
+        body.setObjectName("bodyRow")
+        bl = QHBoxLayout(body)
+        bl.setContentsMargins(0, 0, 0, 0)
+        bl.setSpacing(0)
+        bl.addWidget(self._build_nav_rail())
+        bl.addWidget(wrap, 1)
+        root.addWidget(body, 1)
 
         self.setCentralWidget(central)
 
@@ -1263,13 +1331,105 @@ class MainWindow(QMainWindow):
         self.hotkey_label.installEventFilter(self)  # 点击 → 打开设置（#2 热键可改）
         self.status.addPermanentWidget(self.hotkey_label)
 
-        # 瓒ｅ懗缁熻銆屾垜鐨勮兌鐗囨姤鍛娿€嶅叆鍙ｏ紙闈炰镜鍏ユ敞鍏ワ紝閫昏緫鍏ㄥ湪 stats_entry锛?
-        from .stats_entry import install_stats_entry
-        install_stats_entry(self)
-
         self._init_toast()
         self._init_spinner()
         self._install_shortcuts()
+
+    # ---------- 左侧导航轨（页面切换 + 报告/设置入口） ----------
+    def _build_nav_rail(self) -> QWidget:
+        """56px 导航轨：顶部 logo，中部页面按钮（搜索/概览/版本/健康），底部动作（报告/设置）。"""
+        rail = QWidget()
+        rail.setObjectName("navRail")
+        rail.setFixedWidth(56)
+        lay = QVBoxLayout(rail)
+        lay.setContentsMargins(0, 10, 0, 10)
+        lay.setSpacing(6)
+        logo = QLabel("◆")
+        logo.setObjectName("railLogo")
+        logo.setAlignment(Qt.AlignCenter)
+        lay.addWidget(logo)
+        lay.addSpacing(6)
+        self._rail_page_btns: dict[str, QToolButton] = {}
+        for key, label, tip in (("search", "搜索", "搜索"),
+                                ("dashboard", "概览", "库概览"),
+                                ("version", "版本", "版本管理"),
+                                ("health", "健康", "库健康体检")):
+            btn = self._mk_rail_btn(label, tip)
+            btn.setCheckable(True)
+            btn.clicked.connect(lambda _checked=False, k=key: self._switch_page(k))
+            lay.addWidget(btn, 0, Qt.AlignHCenter)
+            self._rail_page_btns[key] = btn
+        lay.addStretch(1)
+        self.rail_report_btn = self._mk_rail_btn("报告", "我的胶片报告")
+        self.rail_report_btn.setAccessibleName("打开胶片报告")
+        self.rail_report_btn.clicked.connect(self._open_report_from_rail)
+        lay.addWidget(self.rail_report_btn, 0, Qt.AlignHCenter)
+        self.rail_settings_btn = self._mk_rail_btn("设置", "打开设置")
+        self.rail_settings_btn.setAccessibleName("设置")
+        self.rail_settings_btn.clicked.connect(self._open_settings_from_button)
+        lay.addWidget(self.rail_settings_btn, 0, Qt.AlignHCenter)
+        cur = self._current_page_key()
+        for k, btn in self._rail_page_btns.items():
+            btn.setChecked(k == cur)
+        self._sync_version_rail_btn()
+        self._refresh_rail_icons()
+        return rail
+
+    def _mk_rail_btn(self, label: str, tip: str) -> QToolButton:
+        """导航轨 40×40 按钮：图标在上 + 9px 小字（QSS #railBtn 承担底色/checked 态）。"""
+        b = QToolButton()
+        b.setObjectName("railBtn")
+        b.setFixedSize(40, 40)
+        b.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+        b.setText(label)
+        b.setToolTip(tip)
+        b.setCursor(Qt.PointingHandCursor)
+        return b
+
+    def _refresh_rail_icons(self) -> None:
+        """rail 图标色跟随主题与 checked 态：checked 用 acc，其余 ink3（QSS 只管底色与文字色）。"""
+        btns = getattr(self, "_rail_page_btns", None)
+        if not btns:
+            return
+        acc = self._tok["acc"]
+        ink = self._tok["ink3"]
+        for key, factory in (("search", _icon_search), ("dashboard", _icon_dash),
+                             ("version", _icon_history), ("health", _icon_health)):
+            btn = btns.get(key)
+            if btn is not None:
+                btn.setIcon(factory(acc if btn.isChecked() else ink, 16))
+                btn.setIconSize(QSize(16, 16))
+        report = getattr(self, "rail_report_btn", None)
+        if report is not None:
+            report.setIcon(_icon_film(ink, 16))
+            report.setIconSize(QSize(16, 16))
+        settings = getattr(self, "rail_settings_btn", None)
+        if settings is not None:
+            settings.setIcon(_icon_settings(ink, 16))
+            settings.setIconSize(QSize(16, 16))
+
+    def _open_report_from_rail(self) -> None:
+        """rail「报告」：打开胶片报告浮层（逻辑全在 stats_entry，盖主窗语义不变）。"""
+        from . import stats_entry
+        stats_entry._open_report(self)
+
+    def _version_feature_enabled(self) -> bool:
+        """版本功能开关：生产经 app.py 注入 _feature_runtime；测试直造主窗时看 _version_mgr。"""
+        runtime = getattr(self, "_feature_runtime", None)
+        if runtime is not None:
+            return bool(getattr(runtime, "version_enabled", False))
+        return getattr(self, "_version_mgr", None) is not None
+
+    def _sync_version_rail_btn(self) -> None:
+        """rail「版本」跟随版本功能开关：关掉即隐藏（实现成本最低）；设置里改 flag 后
+        经 set_version_manager 回到主窗即反映。当前正停在版本页时回落概览页。"""
+        btn = getattr(self, "_rail_page_btns", {}).get("version")
+        if btn is None:
+            return
+        enabled = self._version_feature_enabled()
+        btn.setVisible(enabled)
+        if not enabled and self._current_page_key() == "version":
+            self._switch_page("dashboard")
 
     # —— 分类型索引进度迷你条（设计 D）——
     def _build_type_rail(self) -> QFrame:
@@ -1548,16 +1708,11 @@ class MainWindow(QMainWindow):
         lay.addSpacing(2)
 
         # —— 右侧：低频功能一律图标化（悬停出说明），视觉主次让位给搜索 ——
-        self.settings_btn = self._mk_title_icon_btn("打开设置")
-        self.settings_btn.setAccessibleName("设置")
-        self.settings_btn.clicked.connect(self._open_settings_from_button)
-        lay.addWidget(self.settings_btn)
+        # 设置/报告入口已收编到左侧导航轨，工具栏只留主题键 + 窗口控制键
         self.theme_btn = self._mk_title_icon_btn("切换界面主题")
         self.theme_btn.setAccessibleName("主题")
         self.theme_btn.clicked.connect(self._show_theme_menu)
         lay.addWidget(self.theme_btn)
-        self.title_actions = lay  # stats_entry 等外部入口在窗口控制键前插入图标按钮
-        self._title_actions_insert_at = lay.count()
         lay.addSpacing(2)
         for txt, slot, oid, tip in (("—", self.showMinimized, "winMin", "最小化"),
                                     ("□", self._win_toggle_max, "winMax", "最大化 / 还原"),
@@ -1642,19 +1797,85 @@ class MainWindow(QMainWindow):
                     return True, 2        # HTCAPTION
         return super().nativeEvent(et, message)
 
+    # ---------- 主区页面切换（导航轨 + _show_* 统一入口） ----------
+    def _switch_page(self, key: str) -> None:
+        """顶层页切换唯一入口：rail 点击与内部 _show_* 都经此，保证 checked 态一致。
+        版本/健康页首次切入时懒加载构造；版本功能未开时版本页不可进。"""
+        stack = getattr(self, "_page_stack", None)
+        page = getattr(self, "_pages", {}).get(key)
+        if stack is None or page is None:
+            return
+        if key == "version" and not self._ensure_version_page():
+            self._toast("版本管理未启用，可在设置中开启")
+            return
+        if key == "health":
+            self._ensure_health_page()
+        stack.setCurrentWidget(page)
+        for k, btn in getattr(self, "_rail_page_btns", {}).items():
+            btn.setChecked(k == key)
+        self._refresh_rail_icons()
+        if key == "health":
+            win = self._health_page_win
+            if win is not None:
+                win.refresh()  # 进入健康页即重新体检（构造内的首次扫描有 _scan_inflight 挡重）
+
+    def _current_page_key(self) -> str:
+        stack = getattr(self, "_page_stack", None)
+        if stack is None:
+            return ""
+        cur = stack.currentWidget()
+        for key, page in getattr(self, "_pages", {}).items():
+            if page is cur:
+                return key
+        return ""
+
+    def _ensure_version_page(self) -> bool:
+        """版本页懒加载：首次进入才构造嵌入的 VersionWindow（parent=主窗，随主窗关闭）。"""
+        if self._version_page_win is not None:
+            return True
+        mgr = getattr(self, "_version_mgr", None)
+        if mgr is None:
+            return False
+        from .version_window import VersionWindow
+        win = VersionWindow(mgr, self, embedded=True)
+        self._version_page_lay.addWidget(win)
+        self._version_page_win = win
+        return True
+
+    def _ensure_health_page(self):
+        """健康页懒加载：首次进入才构造嵌入的 HealthWindow（构造即 refresh 的语义保留）。"""
+        if self._health_page_win is not None:
+            return self._health_page_win
+        from .. import health
+        from .health_window import HealthWindow
+
+        db_path = self._health_db_path()
+
+        def _scan():
+            conn = db.connect(db_path)
+            try:
+                return health.scan_health(conn)
+            finally:
+                conn.close()
+
+        win = HealthWindow(
+            self._tok, _scan, self._recycle_health_paths_and_sync_index, self,
+            embedded=True,
+        )
+        self._health_page_lay.addWidget(win)
+        self._health_page_win = win
+        return win
+
     # ---------- 鍒楄〃 / 浠〃鐩?棣栧睆鍒囨崲 ----------
     def _show_dashboard(self, *, force_refresh: bool = False) -> None:
         """鍒囧埌浠〃鐩橀灞忥紙绌烘悳绱㈤粯璁よ鍥撅級銆備笉鍔?result_list 鏈韩銆?"""
         if getattr(self, "dashboard", None) is not None:
-            self._list_stack.setCurrentWidget(self.dashboard)
+            self._switch_page("dashboard")
             self.dashboard.schedule_refresh(force=force_refresh)
 
     def _show_list(self) -> None:
         """鍒囧埌缁撴灉鍒楄〃鍖猴紙鏈夋悳绱㈣瘝 / 鏈夌粨鏋滄椂锛夈€?"""
-        stack = getattr(self, "_list_stack", None)
-        left = stack.widget(0) if stack is not None else None
-        if stack is not None and left is not None:
-            stack.setCurrentWidget(left)
+        self._switch_page("search")
 
     def _set_ops_enabled(self, on: bool) -> None:
         on = on and self._active_heavy_op is None and self._search_pending_req is None
@@ -1799,16 +2020,15 @@ class MainWindow(QMainWindow):
             self._set_empty_icon(getattr(self, "_empty_icon_kind", "search"))
 
     def _refresh_toolbar_icons(self) -> None:
-        """合一工具栏图标色跟随主题（ink3 静默灰），checked/hover 色由 QSS 承担。"""
+        """合一工具栏与导航轨图标色跟随主题（ink3 静默灰），checked/hover 色由 QSS 承担。"""
         c = self._tok["ink3"]
         for btn, factory in (
-            (getattr(self, "settings_btn", None), _icon_settings),
             (getattr(self, "theme_btn", None), _icon_theme),
-            (getattr(self, "stats_report_btn", None), _icon_film),
         ):
             if btn is not None:
                 btn.setIcon(factory(c, 16))
                 btn.setIconSize(QSize(16, 16))
+        self._refresh_rail_icons()
 
     def _show_theme_menu(self) -> None:
         """椤舵爮椋庢牸鎸夐挳 鈫?寮瑰嚭椋庢牸鑿滃崟锛堝綋鍓嶉鏍兼墦鍕撅級銆?"""
@@ -1922,6 +2142,7 @@ class MainWindow(QMainWindow):
             self.refresh_version_shield()
         if self._cur is not None:
             self._schedule_detail_update(force=True)
+        self._sync_version_rail_btn()  # 设置里改版本开关后，rail「版本」入口即反映
 
     def _note_user_activity(self) -> None:
         worker = getattr(self, "_indexer", None)
@@ -2132,21 +2353,21 @@ class MainWindow(QMainWindow):
                     old.stop()  # 停掉上一次（防 <140ms 连续搜索时旧 finished 清掉新 effect）
                 except Exception:  # noqa: BLE001
                     pass
-            eff = QGraphicsOpacityEffect(self._list_stack)
-            self._list_stack.setGraphicsEffect(eff)
+            eff = QGraphicsOpacityEffect(self._list_pane)
+            self._list_pane.setGraphicsEffect(eff)
             anim = QPropertyAnimation(eff, b"opacity", self)
             anim.setDuration(140)
             anim.setStartValue(0.55)
             anim.setEndValue(1.0)
             # 仅当 effect 仍是本次设置的那个才移除，避免旧回调误清新动画的 effect
             anim.finished.connect(
-                lambda e=eff: self._list_stack.setGraphicsEffect(None)
-                if self._list_stack.graphicsEffect() is e else None)
+                lambda e=eff: self._list_pane.setGraphicsEffect(None)
+                if self._list_pane.graphicsEffect() is e else None)
             anim.start()
             self._list_fade_anim = anim  # 防 GC
         except Exception:  # noqa: BLE001 动效失败绝不影响结果展示
             try:
-                self._list_stack.setGraphicsEffect(None)
+                self._list_pane.setGraphicsEffect(None)
             except Exception:  # noqa: BLE001
                 pass
 
@@ -2218,11 +2439,16 @@ class MainWindow(QMainWindow):
         already_on_recent_dashboard = (
             self._showing_recent
             and getattr(self, "dashboard", None) is not None
-            and self._list_stack.currentWidget() is self.dashboard
+            and self._current_page_key() == "dashboard"
         )
         self._showing_recent = True
         if dashboard_force_refresh or not already_on_recent_dashboard:
-            self._show_dashboard(force_refresh=dashboard_force_refresh)
+            if self._current_page_key() in ("", "search", "dashboard"):
+                # 清空搜索词回落概览：仅当当前在搜索页/概览页时切页
+                self._show_dashboard(force_refresh=dashboard_force_refresh)
+            elif getattr(self, "dashboard", None) is not None:
+                # 停在版本/健康页：只后台刷新概览数据，不把用户切走
+                self.dashboard.schedule_refresh(force=dashboard_force_refresh)
         recents = self._recent_files_cached(force=recent_force_refresh)
         if recents is not None:
             self._recent_load_token += 1
@@ -2634,43 +2860,9 @@ class MainWindow(QMainWindow):
                 schedule(force=True)
 
     def _open_health_center(self) -> None:
-        """打开「库体检中心」：扫描重复 / 僵尸 / 诅咒 / 解析失败 + 一键回收重复占用。"""
-        from .. import health
-        from .health_window import HealthWindow
-
-        wins = getattr(self, "_health_windows", None)
-        if wins is None:
-            wins = []
-            self._health_windows = wins
-        for w in list(wins):
-            try:
-                if getattr(w, "_closing", False) or not w.isVisible():
-                    wins.remove(w)
-                    continue
-                w.refresh()
-                w.raise_()
-                w.activateWindow()
-                return
-            except RuntimeError:
-                if w in wins:
-                    wins.remove(w)
-
-        db_path = self._health_db_path()
-
-        def _scan():
-            conn = db.connect(db_path)
-            try:
-                return health.scan_health(conn)
-            finally:
-                conn.close()
-
-        win = HealthWindow(self._tok, _scan, self._recycle_health_paths_and_sync_index, self)
-        wins.append(win)
-        win.destroyed.connect(
-            lambda _=None, w=win: wins.remove(w) if w in wins else None)
-        win.show()
-        win.raise_()
-        win.activateWindow()
+        """打开「库体检中心」：切到健康页（懒加载嵌入 HealthWindow；进入即重新体检）。
+        原 _health_windows 独立窗管理随主区页面化退役。"""
+        self._switch_page("health")
 
     def _open_slim_window(self, path: str | None = None) -> None:
         if self._block_if_search_pending():
@@ -2751,18 +2943,14 @@ class MainWindow(QMainWindow):
             self._toast(f"已生成瘦身副本：{os.path.basename(output_path)}")
 
     def _open_version_window_for(self, *, path: str | None = None, query: str | None = None):
-        """打开版本管理窗口，并按需定位到某文件 / 直接跨版本搜某词（D3 / D6）。"""
+        """切到版本页，并按需对嵌入实例定位到某文件 / 直接跨版本搜某词（D3 / D6）。
+        托盘「版本管理…」仍开独立 VersionWindow，与此页并存。"""
         if self._version_mgr is None:
             return
-        cb = getattr(self, "_open_version_cb", None)
-        if not callable(cb):
+        if not self._ensure_version_page():
             return
-        try:
-            win = cb()
-        except Exception:  # noqa: BLE001
-            return
-        if win is None:
-            return
+        win = self._version_page_win
+        self._switch_page("version")
         if query:
             fn = getattr(win, "search_history", None)
             if callable(fn):

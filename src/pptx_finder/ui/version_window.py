@@ -63,8 +63,9 @@ class VersionWindow(QWidget):
     _FILE_OP_BUSY_NOTICE = "已有文件操作正在进行，请稍候…"
     _DOC_POPULATE_BATCH = 160
 
-    def __init__(self, manager, parent=None):
+    def __init__(self, manager, parent=None, *, embedded: bool = False):
         super().__init__(parent)
+        self._embedded = embedded  # 嵌入主窗页面时跳过顶层窗语义（标题/尺寸/纯色窗底）
         self._mgr = manager
         self._cur_doc = None  # (doc_id, path, status)
         self._docs_load_token = 0
@@ -94,8 +95,9 @@ class VersionWindow(QWidget):
         self._doc_filter_token = 0
         self._doc_population_token = 0
         self.setObjectName("versionWin")
-        self.setWindowTitle("版本管理 · PPT 版 git")
-        self.resize(940, 580)
+        if not self._embedded:
+            self.setWindowTitle("版本管理 · PPT 版 git")
+            self.resize(940, 580)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(14, 12, 14, 12)
@@ -183,7 +185,10 @@ class VersionWindow(QWidget):
         self.schedule_reload_docs()
 
     def _apply_glass(self) -> None:
-        """玻璃质感：给独立窗口套当前主题的纯色窗底（默认透明底在深色主题下显得「挫」）。"""
+        """玻璃质感：给独立窗口套当前主题的纯色窗底（默认透明底在深色主题下显得「挫」）。
+        嵌入主窗页面时跳过：透明底随主窗 central，与其它页一致。"""
+        if self._embedded:
+            return
         try:
             from ..config import get_theme
             from . import theme as _th

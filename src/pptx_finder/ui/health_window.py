@@ -37,8 +37,9 @@ _DUP_SHOW_LIMIT = 40  # 极端库下避免一次塞太多行卡 UI
 class HealthWindow(QWidget):
     """库体检窗口。scan_fn() -> HealthReport（后台调）；recycle_fn(paths) -> dict（后台调）。"""
 
-    def __init__(self, tok: dict, scan_fn, recycle_fn, parent=None):
+    def __init__(self, tok: dict, scan_fn, recycle_fn, parent=None, *, embedded: bool = False):
         super().__init__(parent)
+        self._embedded = embedded  # 嵌入主窗健康页时跳过顶层窗语义（Window flag/标题/尺寸/纯色窗底）
         self._tok = tok or {}
         self._scan_fn = scan_fn
         self._recycle_fn = recycle_fn
@@ -56,9 +57,10 @@ class HealthWindow(QWidget):
             self._parent_bg_tasks = None
 
         self.setObjectName("healthWin")
-        self.setWindowFlag(Qt.Window, True)   # 独立顶层窗口（即便有 parent）
-        self.setWindowTitle("库体检 · PPT Doctor")
-        self.resize(720, 760)
+        if not self._embedded:
+            self.setWindowFlag(Qt.Window, True)   # 独立顶层窗口（即便有 parent）
+            self.setWindowTitle("库体检 · PPT Doctor")
+            self.resize(720, 760)
         self._build()
         self._apply_window_bg()
         self.refresh()
@@ -102,6 +104,8 @@ class HealthWindow(QWidget):
         root.addWidget(scroll, 1)
 
     def _apply_window_bg(self) -> None:
+        if self._embedded:
+            return  # 嵌入主窗页面：透明底随主窗 central，不套纯色窗底
         win = self._tok.get("win", "#1d1d1f")
         self.setStyleSheet(f"QWidget#healthWin {{ background: {win}; }}")
 

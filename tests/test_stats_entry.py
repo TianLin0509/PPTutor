@@ -1,8 +1,8 @@
-"""入口注入单测：主窗口非侵入装上「胶片报告」入口 + 能弹出浮层。"""
+"""入口注入单测：报告逻辑（生成/浮层）与导航轨报告入口。"""
 from __future__ import annotations
 
-from PySide6.QtCore import QObject, Qt, Signal
-from PySide6.QtWidgets import QPushButton
+from PySide6.QtCore import QObject, Signal
+from PySide6.QtWidgets import QToolButton, QWidget
 
 from pptx_finder import db
 from pptx_finder import stats
@@ -29,18 +29,15 @@ def _win(qtbot, tmp_path):
     return win
 
 
-def test_report_entry_button_in_topbar(qtbot, tmp_path):
+def test_report_entry_button_in_nav_rail(qtbot, tmp_path):
     win = _win(qtbot, tmp_path)
-    # 合一工具栏后报告入口是图标按钮（无文字），按 accessibleName / tooltip 识别
-    btns = [b for b in win.findChildren(QPushButton) if b.accessibleName() == "打开胶片报告"]
+    # 报告入口统一收编到左侧导航轨（顶栏图标按钮已随 A6 工具栏瘦身移除）
+    rail = win.findChild(QWidget, "navRail")
+    assert rail is not None
+    btns = [b for b in rail.findChildren(QToolButton) if b.accessibleName() == "打开胶片报告"]
     assert len(btns) == 1
     assert "胶片报告" in btns[0].toolTip()
     assert not btns[0].icon().isNull()
-
-
-def test_status_label_clickable(qtbot, tmp_path):
-    win = _win(qtbot, tmp_path)
-    assert win.status_label.cursor().shape() == Qt.PointingHandCursor
 
 
 def test_open_report_shows_overlay(qtbot, tmp_path):

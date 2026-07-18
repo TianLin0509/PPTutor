@@ -258,7 +258,8 @@ def test_settings_button_opens_settings_callback(qtbot, tmp_path):
     calls = []
     win._open_settings_cb = lambda: calls.append("open")
 
-    qtbot.mouseClick(win.settings_btn, Qt.LeftButton)
+    # 设置入口已收编到左侧导航轨（工具栏 settings_btn 退役），仍触发同一回调
+    qtbot.mouseClick(win.rail_settings_btn, Qt.LeftButton)
 
     assert calls == ["open"]
 
@@ -3269,7 +3270,7 @@ def test_show_dashboard_schedules_refresh_after_switch(qtbot, monkeypatch, tmp_p
     monkeypatch.setattr(
         win.dashboard,
         "schedule_refresh",
-        lambda *, force=False: calls.append((force, win._list_stack.currentWidget() is win.dashboard)),
+        lambda *, force=False: calls.append((force, win._page_stack.currentWidget() is win.dashboard)),
     )
 
     win._show_list()
