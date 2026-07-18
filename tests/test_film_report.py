@@ -4,6 +4,8 @@ from __future__ import annotations
 from datetime import datetime
 from types import SimpleNamespace
 
+from PySide6.QtWidgets import QFrame
+
 from pptx_finder import db, stats
 from pptx_finder.ui import heatmap as hm
 from pptx_finder.ui import report_overlay as ro
@@ -104,7 +106,7 @@ def test_rollnumber_starts_at_zero(qtbot):
 
 
 # ---------- 改版浮层构造 smoke ----------
-def test_overlay_is_fixed_dark_and_has_copy(qtbot, tmp_path):
+def test_overlay_follows_theme_and_has_copy(qtbot, tmp_path):
     conn = db.connect(tmp_path / "i.db")
     db.init_db(conn)
     mt = datetime(2026, 6, 1, 2).timestamp()
@@ -113,14 +115,48 @@ def test_overlay_is_fixed_dark_and_has_copy(qtbot, tmp_path):
     db.replace_pages(conn, fid, [(1, "算力" * 100, "t")])
     conn.commit()
     report = stats.build_report(conn, year=None)
-    ov = ro.ReportOverlay(report, theme.tok("cloud"))   # 传 cloud 也固定走 FILM 暗黑
+    light = theme.tok("atelier")
+    ov = ro.ReportOverlay(report, light)            # 浮层配色跟随传入主题
     qtbot.addWidget(ov)
-    assert ov._tok is ro.FILM                            # 忽略传入主题，固定暗黑胶片质感
-    assert hasattr(ov, "copy_btn")                       # 复制按钮存在
-    assert len(ov._rolls) == 2                           # 英雄区两个滚动数字（份数 / 字数）
+    assert ov._tok is not ro.FILM                   # 不再强制固定 FILM 深色
+    assert ov._tok["card0"] == light["panel"]       # 卡片底 ← 主题 panel 派生
+    assert ov._tok["card1"] == light["panel2"]
+    assert ov._tok["roast"] == light["acc"]         # 吐槽色 ← 主题强调色派生
+    assert light["panel"] in ov._card.styleSheet()  # 卡片 stylesheet 实含主题色
+    assert ro.FILM["card0"] not in ov._card.styleSheet()
+    assert hasattr(ov, "copy_btn")                  # 复制按钮存在
+    assert len(ov._rolls) == 2                      # 英雄区两个滚动数字（份数 / 字数）
     out = tmp_path / "r.png"
-    assert ov.export_png(str(out)) is True               # 仍能导出 PNG
+    assert ov.export_png(str(out)) is True          # 仍能导出 PNG（导出=所见即所得）
     assert out.exists() and out.stat().st_size > 0
+
+
+def test_overlay_stylesheet_differs_between_light_and_dark_theme(qtbot, tmp_path):
+    """静白 / 静黑分别构造：关键 stylesheet 色值不同且各自匹配对应主题 token。"""
+    conn = db.connect(tmp_path / "i.db")
+    db.init_db(conn)
+    mt = datetime(2026, 6, 1, 2).timestamp()
+    db.upsert_file(conn, path="/a.pptx", name="a.pptx", ext=".pptx", size=1000, mtime=mt,
+                   content_hash="h", page_count=5, status="ok", error="", indexed_at=0)
+    conn.commit()
+    report = stats.build_report(conn, year=None)
+    light, dark = theme.tok("atelier"), theme.tok("atelier_dark")
+    ov_light = ro.ReportOverlay(report, light)
+    qtbot.addWidget(ov_light)
+    ov_dark = ro.ReportOverlay(report, dark)
+    qtbot.addWidget(ov_dark)
+    # 卡片渐变底 ← 主题 panel 派生，两主题互不串色
+    assert light["panel"] in ov_light._card.styleSheet()
+    assert dark["panel"] in ov_dark._card.styleSheet()
+    assert ov_light._card.styleSheet() != ov_dark._card.styleSheet()
+    # 卡片边框 ← 主题 bd
+    assert light["bd"] in ov_light._card.styleSheet()
+    assert dark["bd"] in ov_dark._card.styleSheet()
+    # 区块卡背景 ← 主题 canvas
+    assert light["canvas"] in ov_light.findChild(QFrame, "activityCard").styleSheet()
+    assert dark["canvas"] in ov_dark.findChild(QFrame, "activityCard").styleSheet()
+    # 遮罩压暗与主题无关，保持一致
+    assert ov_light.styleSheet() == ov_dark.styleSheet()
 
 
 def test_copy_blocked_during_year_switch(qtbot, tmp_path, monkeypatch):

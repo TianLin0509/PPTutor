@@ -149,7 +149,7 @@ def _build_report_off_ui(
     return stats.build_report(conn, **kwargs)
 
 
-# ---------- 固定暗黑胶片质感（不跟随 app 主题，保证报告/导出图始终高级一致） ----------
+# ---------- 胶片配色回退源（浮层跟随 app 主题；仅当传入 token 缺键时用这里兜底） ----------
 FILM = {
     "win": "#16131f", "card0": "#1d1a2a", "card1": "#15121e",
     "bd": "rgba(255,255,255,0.09)",
@@ -159,6 +159,20 @@ FILM = {
     "hl_r": "255", "hl_g": "140", "hl_b": "66",
     "roast": "#ff9f6b",
 }
+
+
+def _remap_tok(tok: dict | None) -> dict:
+    """主题 token → 报告浮层键集：同名键直接采用，缺键回退 FILM。
+
+    theme.tok() 没有 card0/card1/roast，按 panel/panel2/acc 派生；显式传入优先。
+    """
+    merged = dict(FILM)
+    if isinstance(tok, dict):
+        merged.update({k: v for k, v in tok.items() if v is not None})
+        merged["card0"] = tok.get("card0") or tok.get("panel") or FILM["card0"]
+        merged["card1"] = tok.get("card1") or tok.get("panel2") or FILM["card1"]
+        merged["roast"] = tok.get("roast") or tok.get("acc") or FILM["roast"]
+    return merged
 
 
 # ---------- 嘴替吐槽文案（纯函数，按阈值切档，可测） ----------
@@ -251,8 +265,8 @@ class ReportOverlay(QWidget):
 
     def __init__(self, report, tok, parent=None, *, conn=None, version_db_path=None):
         super().__init__(parent)
-        tok = FILM  # 固定暗黑胶片质感，忽略传入主题（报告自成一套，导出图也始终高级一致）
-        self._tok = tok
+        self._tok = _remap_tok(tok)  # 跟随打开时的 app 主题（导出图=所见即所得），缺键回退 FILM
+        tok = self._tok
         self._rolls: list[RollNumber] = []
         self._conn = conn
         self._version_db_path = version_db_path
@@ -364,9 +378,9 @@ class ReportOverlay(QWidget):
             self._month_btn = QPushButton("本月")
             self._week_btn = QPushButton("本周")
             chip_css = (
-                f"QPushButton{{background:{tok['field']};color:{tok['ink3']};border:1px solid #343041;"
+                f"QPushButton{{background:{tok['field']};color:{tok['ink3']};border:1px solid {tok['bd']};"
                 f"border-radius:9px;padding:3px 11px;font-size:12px;}}"
-                f"QPushButton:checked{{background:#3a2830;"
+                f"QPushButton:checked{{background:{tok['sel']};"
                 f"color:{tok['acc']};border-color:{tok['acc']};}}")
             for b, scope in (
                 (self._all_btn, _SCOPE_ALL),
@@ -385,7 +399,7 @@ class ReportOverlay(QWidget):
         self.copy_btn.setToolTip("复制当前 Tab 的完整报告图片，可直接粘贴到微信 / 钉钉")
         self.copy_btn.setCursor(Qt.PointingHandCursor)
         self.copy_btn.setStyleSheet(
-            f"QPushButton{{background:{tok['field']};color:{tok['ink2']};border:1px solid #343041;"
+            f"QPushButton{{background:{tok['field']};color:{tok['ink2']};border:1px solid {tok['bd']};"
             f"border-radius:7px;padding:5px 11px;font-weight:600;}}"
             f"QPushButton:hover{{border-color:{tok['acc']};color:{tok['acc']};}}")
         self.copy_btn.clicked.connect(self._copy_clicked)
@@ -424,11 +438,11 @@ class ReportOverlay(QWidget):
         self._tab_bar.setStyleSheet(
             "QTabBar{background:transparent;border:none;}"
             f"QTabBar::tab{{background:{tok['field']};color:{tok['ink3']};"
-            "border:1px solid #343041;border-radius:9px;padding:7px 14px;margin-right:6px;"
+            f"border:1px solid {tok['bd']};border-radius:9px;padding:7px 14px;margin-right:6px;"
             "font-size:12px;font-weight:600;min-width:64px;}"
-            f"QTabBar::tab:selected{{background:#3a2830;color:{tok['acc']};"
+            f"QTabBar::tab:selected{{background:{tok['sel']};color:{tok['acc']};"
             f"border-color:{tok['acc']};}}"
-            f"QTabBar::tab:hover{{color:{tok['ink1']};border-color:#5b5368;}}"
+            f"QTabBar::tab:hover{{color:{tok['ink1']};border-color:{tok['ink4']};}}"
             f"QTabBar::tab:focus{{border:2px solid {tok['acc']};padding:6px 13px;}}"
         )
         self._tab_bar.currentChanged.connect(self._on_tab_changed)
@@ -667,7 +681,7 @@ class ReportOverlay(QWidget):
             self._scale_card(report.scale),
         )
 
-    # ---- 卡片构建（暗黑胶片质感） ----
+    # ---- 卡片构建（配色经 self._tok 跟随主题） ----
     def _stat_box(self, value_widget, label: str) -> QFrame:
         tok = self._tok
         box = QFrame()
@@ -920,7 +934,7 @@ class ReportOverlay(QWidget):
                 locate.setCursor(Qt.PointingHandCursor)
                 locate.setStyleSheet(
                     f"QPushButton{{background:{tok['field']};color:{tok['ink3']};"
-                    "border:1px solid #3b3548;border-radius:7px;padding:3px 9px;}"
+                    f"border:1px solid {tok['bd']};border-radius:7px;padding:3px 9px;}}"
                     f"QPushButton:hover{{color:{tok['acc']};border-color:{tok['acc']};}}"
                 )
                 locate.clicked.connect(lambda _=False, p=str(path): actions.open_folder(p))
