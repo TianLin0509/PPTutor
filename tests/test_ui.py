@@ -1365,6 +1365,52 @@ def test_index_done_status_refresh_does_not_override_search_pending(qtbot, monke
     assert "正在搜索" in win.status_label.text()
 
 
+def test_last_index_label_shows_last_completed_scan_time(qtbot, monkeypatch, tmp_path):
+    tasks = _install_fake_background_task(monkeypatch)
+    monkeypatch.setattr(
+        main_window_mod.db,
+        "stats",
+        lambda _conn, **_kwargs: {"file_count": 7, "page_count": 11},
+    )
+    conn = _index(tmp_path)
+    db.set_meta(conn, db.META_LAST_COMPLETED_SCAN_AT, str(time.time()))
+    conn.commit()
+    win = MainWindow(conn=conn, render_worker=StubRender(), do_index=False)
+    qtbot.addWidget(win)
+    for task in list(tasks):
+        _finish_fake_task(task)
+    tasks.clear()
+
+    win._refresh_status()
+    _finish_fake_task(tasks[-1])
+
+    assert not win.last_index_label.isHidden()
+    assert win.last_index_label.text().startswith("上次索引 ")
+    assert "全量索引" in win.last_index_label.toolTip()
+
+
+def test_last_index_label_hidden_without_completed_scan(qtbot, monkeypatch, tmp_path):
+    tasks = _install_fake_background_task(monkeypatch)
+    monkeypatch.setattr(
+        main_window_mod.db,
+        "stats",
+        lambda _conn, **_kwargs: {"file_count": 7, "page_count": 11},
+    )
+    conn = _index(tmp_path)
+    db.delete_meta(conn, db.META_LAST_COMPLETED_SCAN_AT)
+    conn.commit()
+    win = MainWindow(conn=conn, render_worker=StubRender(), do_index=False)
+    qtbot.addWidget(win)
+    for task in list(tasks):
+        _finish_fake_task(task)
+    tasks.clear()
+
+    win._refresh_status()
+    _finish_fake_task(tasks[-1])
+
+    assert win.last_index_label.isHidden()
+
+
 def test_index_progress_does_not_override_search_pending(qtbot, monkeypatch, tmp_path):
     tasks = _install_fake_background_task(monkeypatch)
     win = MainWindow(conn=_index(tmp_path), render_worker=StubRender(), do_index=False)

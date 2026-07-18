@@ -1247,6 +1247,11 @@ class MainWindow(QMainWindow):
         self.status.addWidget(self.status_dot)
         self.status_label = QLabel("准备中…")
         self.status.addWidget(self.status_label)
+        self.last_index_label = QLabel("")
+        self.last_index_label.setObjectName("lastIndexLabel")
+        self.last_index_label.setToolTip("上次全量索引完成时间；实时增量索引持续进行中")
+        self.last_index_label.hide()  # 首次全量索引完成后才显示
+        self.status.addWidget(self.last_index_label)
         self.version_shield = QLabel("")
         self.version_shield.setObjectName("verShield")
         self.version_shield.hide()  # 鏈夌増鏈悗鎵嶆樉绀?
@@ -5400,6 +5405,18 @@ class MainWindow(QMainWindow):
             "以下目录本轮无法读取：\n" + examples
             if unreadable and examples else ""
         )
+        # 常驻「上次索引 HH:mm」：上次全量索引完成时间，提示数据新鲜度
+        try:
+            last_scan_at = float(stats.get("last_completed_scan_at", 0) or 0)
+        except (TypeError, ValueError):
+            last_scan_at = 0.0
+        if last_scan_at > 0:
+            last_dt = datetime.datetime.fromtimestamp(last_scan_at)
+            fmt = "%H:%M" if last_dt.date() == datetime.datetime.now().date() else "%m-%d %H:%M"
+            self.last_index_label.setText(f"上次索引 {last_dt.strftime(fmt)}")
+            self.last_index_label.show()
+        else:
+            self.last_index_label.hide()
 
     def _apply_status_error(self, token: int, error: Exception) -> None:
         if self._closing or token != self._status_refresh_token:

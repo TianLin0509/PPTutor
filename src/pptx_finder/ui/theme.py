@@ -346,6 +346,7 @@ QLabel#pctLabel {
   border-radius: 6px; font-size: 11px; font-weight: 700; padding: 1px 5px; font-family: "Consolas", "Microsoft YaHei UI";
 }
 QLabel#statusDot { color: $grn; font-size: 13px; padding: 0 2px 0 4px; background: transparent; }
+QStatusBar#statusBar QLabel#lastIndexLabel { color: $ink4; font-size: 12px; background: transparent; }
 QFrame#typeRail { background: transparent; }
 
 /* 仪表盘首屏（零搜索默认视图） */
