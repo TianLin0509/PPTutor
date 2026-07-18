@@ -6,7 +6,7 @@ import time
 import pytest
 from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtGui import QColor, QPixmap
-from PySide6.QtWidgets import QLabel, QPushButton
+from PySide6.QtWidgets import QLabel, QPushButton, QTabWidget, QWidget
 
 import fixtures_gen as fx
 
@@ -159,8 +159,7 @@ def test_primary_ui_text_stays_readable_chinese(qtbot, tmp_path):
         *[win.mode.itemText(i) for i in range(win.mode.count())],
         win.facet_add_chip.text(),
         win.facet_add_chip.toolTip(),
-        win.detail_btn.text(),
-        win.detail_btn.toolTip(),
+        *[win.detail_panel.tabs.tabText(i) for i in range(win.detail_panel.tabs.count())],
         *[win.sort_combo.itemText(i) for i in range(win.sort_combo.count())],
         win.sort_combo.toolTip(),
         win.theme_btn.toolTip(),
@@ -264,19 +263,22 @@ def test_settings_button_opens_settings_callback(qtbot, tmp_path):
     assert calls == ["open"]
 
 
-def test_detail_button_lives_in_preview_actions(qtbot, tmp_path):
+def test_detail_tabs_live_in_preview_card(qtbot, tmp_path):
     win = MainWindow(conn=_index(tmp_path), render_worker=StubRender(), do_index=False)
     qtbot.addWidget(win)
 
-    assert win.detail_btn.objectName() == "detailAction"
-    assert win.detail_btn.parent().objectName() == "previewHeadBar"
-    assert win.detail_btn.isHidden()
+    tabs = win.detail_panel.tabs
+    assert tabs.objectName() == "detailTabs"
+    # 四 Tab 顺序固定：预览/大纲/版本/详情；整个详情区嵌在预览卡里
+    assert [tabs.tabText(i) for i in range(tabs.count())] == ["预览", "大纲", "版本", "详情"]
+    panel = win.findChild(QWidget, "previewPanel")
+    assert panel is not None and panel.findChild(QTabWidget, "detailTabs") is tabs
+    assert tabs.widget(0).findChild(QLabel, "previewImage") is win.image_label
 
     win.search_box.setText("\u6607\u817e")
     win._do_search()
     win.result_list.setCurrentRow(0)
 
-    assert not win.detail_btn.isHidden()
     assert not win.copy_path_btn.isHidden()
 
 
@@ -2301,8 +2303,6 @@ def test_detail_update_is_debounced_during_fast_selection(qtbot, monkeypatch, tm
     conn = _index(tmp_path)
     win = MainWindow(conn=conn, render_worker=StubRender(), do_index=False)
     qtbot.addWidget(win)
-    win.detail_panel.show()
-    monkeypatch.setattr(win.detail_panel, "isHidden", lambda: False)
     calls: list[str | None] = []
     monkeypatch.setattr(win, "_update_detail", lambda: calls.append(win._cur.name if win._cur else None))
 
@@ -2325,8 +2325,7 @@ def test_detail_update_uses_restartable_timer(qtbot, monkeypatch, tmp_path):
     conn = _index(tmp_path)
     win = MainWindow(conn=conn, render_worker=StubRender(), do_index=False)
     qtbot.addWidget(win)
-    win.detail_panel.show()
-    monkeypatch.setattr(win.detail_panel, "isHidden", lambda: False)
+    win._cur = _fake_results(1)[0]  # 门控改为「有选中文件即加载」：直接调度也需要选中项
     calls: list[int] = []
     monkeypatch.setattr(win, "_run_detail_update", lambda token: calls.append(token))
 
@@ -2428,7 +2427,6 @@ def test_detail_dot_refresh_checks_versions_in_background(qtbot, monkeypatch, tm
     qtbot.addWidget(win)
     win._cur = FileResult(file_id=1, path="C:/deck-a.pptx", name="deck-a.pptx", ext=".pptx",
                           mtime=0, size=1, page_count=1, status="ok", score=1, name_hit=False)
-    win.detail_panel.hide()
 
     win._refresh_detail_dot()
 
@@ -2457,7 +2455,6 @@ def test_detail_dot_refresh_reuses_inflight_check(qtbot, monkeypatch, tmp_path):
     qtbot.addWidget(win)
     win._cur = FileResult(file_id=1, path="C:/deck-a.pptx", name="deck-a.pptx", ext=".pptx",
                           mtime=0, size=1, page_count=1, status="ok", score=1, name_hit=False)
-    win.detail_panel.hide()
     tasks.clear()
 
     win._refresh_detail_dot()
@@ -2489,7 +2486,6 @@ def test_detail_dot_refresh_new_token_allows_new_check(qtbot, monkeypatch, tmp_p
     conn = _index(tmp_path)
     win = MainWindow(conn=conn, render_worker=StubRender(), version_mgr=CountingVersions(), do_index=False)
     qtbot.addWidget(win)
-    win.detail_panel.hide()
     win._cur = FileResult(file_id=1, path="C:/deck-a.pptx", name="deck-a.pptx", ext=".pptx",
                           mtime=0, size=1, page_count=1, status="ok", score=1, name_hit=False)
 
@@ -2542,8 +2538,6 @@ def test_late_detail_payload_does_not_override_newer_payload(qtbot, monkeypatch,
     conn = _index(tmp_path)
     win = MainWindow(conn=conn, render_worker=StubRender(), do_index=False)
     qtbot.addWidget(win)
-    win.detail_panel.show()
-    monkeypatch.setattr(win.detail_panel, "isHidden", lambda: False)
     result = FileResult(file_id=1, path="C:/same.pptx", name="same.pptx", ext=".pptx",
                         mtime=0, size=1, page_count=1, status="ok", score=1, name_hit=False)
     win._cur = result

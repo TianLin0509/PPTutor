@@ -252,13 +252,8 @@ QPushButton#facetChip { background: transparent; border: 1px solid $bd2; border-
 QPushButton#facetChip:hover { background: $hover; }
 QPushButton#facetChip:checked { background: rgba($hl_r,$hl_g,$hl_b,0.14); border-color: $acc; color: $acc; font-weight: 600; }
 
-/* 详情抽屉 */
-QWidget#detailPanel { background: $panel2; border: 1px solid $bd; border-radius: ${radius}px; }
-#detailHead { background: $panel; border-bottom: 1px solid $bd2; border-top-left-radius: ${radius}px; border-top-right-radius: ${radius}px; }
-QLabel#dtDot { color: $acc; font-size: 11px; background: transparent; }
-QLabel#dtTitle { color: $ink1; font-size: 13px; font-weight: 700; background: transparent; }
-QPushButton#dtClose { background: transparent; border: none; color: $ink3; font-size: 21px; font-weight: 600; border-radius: 8px; padding: 0; }
-QPushButton#dtClose:hover { background: rgba(255,69,58,0.9); color: #ffffff; }
+/* 详情区（内嵌预览卡的四 Tab 容器：透明底，卡片样式由外层 previewPanel 提供） */
+QWidget#detailPanel { background: transparent; border: none; }
 /* 次级窗口统一卡片化 Tab；主界面 detailTabs 保留紧凑下划线特例 */
 QTabWidget::pane { background: $panel2; border: 1px solid $bd; border-radius: 10px; top: -1px; }
 QTabBar::tab {
@@ -278,6 +273,7 @@ QTabWidget#detailTabs QTabBar::tab:hover:!selected { color: $ink1; background: $
 QLabel#verChanged { color: $ink3; font-size: 11px; background: transparent; }
 QLabel#detailSecT { color: $ink3; font-size: 11px; font-weight: 700; background: transparent; }
 QLabel#detailMeta { color: $ink3; font-size: 11.5px; background: transparent; }
+QLabel#detailPath { color: $ink3; font-size: 11.5px; background: transparent; }
 QLabel#detailMuted { color: $ink4; font-size: 11.5px; background: transparent; }
 QWidget#verNode { border-left: 2px solid $bd2; }
 QLabel#verLatest { color: $acc; font-size: 12px; font-weight: 700; background: transparent; }

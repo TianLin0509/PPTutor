@@ -232,8 +232,6 @@ def test_current_file_snapshot_refreshes_detail_debounced(qtbot, monkeypatch, tm
     monkeypatch.setattr(win, "_index_file_live", lambda _path: None)
     monkeypatch.setattr(win, "_maybe_show_version_intro", lambda: None)
     monkeypatch.setattr(win, "_schedule_version_shield_refresh", lambda: None)
-    win.detail_panel.show()
-    monkeypatch.setattr(win.detail_panel, "isHidden", lambda: False)
     win._cur = FileResult(
         file_id=1,
         path="C:/current.pptx",
@@ -289,8 +287,8 @@ def test_detail_dot_shows_on_versions(qtbot, tmp_path):
     win.search_box.setText("昇腾")
     win._do_search()
     win.result_list.setCurrentRow(0)
-    qtbot.waitUntil(lambda: not win._detail_dot.isHidden(), timeout=1000)  # 有版本 + 详情关 → 红点
-    win._toggle_detail()                          # 打开详情
+    qtbot.waitUntil(lambda: not win._detail_dot.isHidden(), timeout=1000)  # 有版本 + 未看版本 Tab → 红点
+    win.detail_panel.tabs.setCurrentIndex(win.detail_panel.version_tab_index())  # 切到「版本」Tab
     assert win._detail_dot.isHidden()             # 已在看版本 → 红点隐藏
 
 
@@ -327,9 +325,10 @@ def test_show_spotlight_replaces_old(qtbot, tmp_path):
     qtbot.wait(20)
     win._show_spotlight(win.search_box, "a")
     first = win._spotlight
-    win._show_spotlight(win.detail_btn, "b")      # 弹新的应替换旧的
+    tab_bar = win.detail_panel.tabs.tabBar()
+    win._show_spotlight(tab_bar, "b")             # 弹新的应替换旧的
     assert win._spotlight is not first
-    assert win._spotlight._target is win.detail_btn
+    assert win._spotlight._target is tab_bar
 
 
 # ---------- P1-1 索引完成庆祝 ----------
@@ -452,7 +451,7 @@ def test_detail_first_open_hint(qtbot, tmp_path):
     win.search_box.setText("昇腾")
     win._do_search()
     win.result_list.setCurrentRow(0)
-    win._toggle_detail()                          # 首次展开 + 有版本 → 提示
+    win.detail_panel.tabs.setCurrentIndex(win.detail_panel.version_tab_index())  # 首次切到版本 Tab + 有版本 → 提示
     qtbot.waitUntil(lambda: "历史版本" in win._toast_label.text(), timeout=1000)
 
 
@@ -495,7 +494,7 @@ def test_detail_first_open_hint_checks_versions_in_background(qtbot, tmp_path, m
     qtbot.addWidget(win)
     win._cur = FileResult(file_id=1, path="C:/deck-a.pptx", name="deck-a.pptx", ext=".pptx",
                           mtime=0, size=1, page_count=1, status="ok", score=1, name_hit=False)
-    win.detail_panel.show()
+    win.detail_panel.tabs.setCurrentIndex(win.detail_panel.version_tab_index())  # 「打开方式」= 切到版本 Tab
 
     win._maybe_hint_detail_versions()
 
@@ -522,7 +521,7 @@ def test_detail_first_open_hint_reuses_inflight_check(qtbot, tmp_path, monkeypat
     win = MainWindow(conn=_index(tmp_path), render_worker=StubRender(),
                      version_mgr=CountingVersions(), do_index=False)
     qtbot.addWidget(win)
-    win.detail_panel.show()
+    win.detail_panel.tabs.setCurrentIndex(win.detail_panel.version_tab_index())  # 「打开方式」= 切到版本 Tab
     win._cur = FileResult(file_id=1, path="C:/deck-a.pptx", name="deck-a.pptx", ext=".pptx",
                           mtime=0, size=1, page_count=1, status="ok", score=1, name_hit=False)
     tasks.clear()
@@ -556,7 +555,7 @@ def test_detail_first_open_hint_new_path_allows_new_check(qtbot, tmp_path, monke
     win = MainWindow(conn=_index(tmp_path), render_worker=StubRender(),
                      version_mgr=VersionsByPath(), do_index=False)
     qtbot.addWidget(win)
-    win.detail_panel.show()
+    win.detail_panel.tabs.setCurrentIndex(win.detail_panel.version_tab_index())  # 「打开方式」= 切到版本 Tab
     win._cur = FileResult(file_id=1, path="C:/deck-a.pptx", name="deck-a.pptx", ext=".pptx",
                           mtime=0, size=1, page_count=1, status="ok", score=1, name_hit=False)
     tasks.clear()
@@ -592,7 +591,7 @@ def test_detail_first_open_without_versions_does_not_consume_hint(qtbot, tmp_pat
     win = MainWindow(conn=_index(tmp_path), render_worker=StubRender(),
                      version_mgr=VersionsByPath(), do_index=False)
     qtbot.addWidget(win)
-    win.detail_panel.show()
+    win.detail_panel.tabs.setCurrentIndex(win.detail_panel.version_tab_index())  # 「打开方式」= 切到版本 Tab
     win._cur = FileResult(file_id=1, path="C:/deck-a.pptx", name="deck-a.pptx", ext=".pptx",
                           mtime=0, size=1, page_count=1, status="ok", score=1, name_hit=False)
     tasks.clear()

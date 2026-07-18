@@ -94,16 +94,6 @@ def test_detail_slim_button_follows_file_action_enabled(qtbot):
     assert dp._slim_btn.isEnabled() is False
 
 
-def test_detail_close_button_has_large_click_target(qtbot):
-    dp = DetailPanel(theme.tok("raycast"))
-    qtbot.addWidget(dp)
-    btn = dp.findChild(QPushButton, "dtClose")
-
-    assert btn.text() == "×"
-    assert btn.width() >= 32
-    assert btn.height() >= 32
-
-
 def test_detail_version_nodes(qtbot):
     dp = DetailPanel(theme.tok("raycast"))
     qtbot.addWidget(dp)
@@ -290,7 +280,6 @@ def test_detail_version_actions_disabled_during_search_pending(qtbot, tmp_path):
     vm = StubVerMgr(versions=[{"version_id": "v1", "ts": 1000, "page_count": 5}], managed=True)
     win = MainWindow(conn=_index(tmp_path), render_worker=StubRender(), version_mgr=vm, do_index=False)
     qtbot.addWidget(win)
-    win._toggle_detail()
     win.search_box.setText("昇腾")
     win._do_search()
     win.result_list.setCurrentRow(0)
@@ -325,12 +314,21 @@ def test_detail_outline_click_emits_page(qtbot):
     assert fired == [2]
 
 
-def test_mainwindow_detail_toggle(qtbot, tmp_path):
+def test_mainwindow_detail_embedded_tabs_load_on_select(qtbot, tmp_path):
+    """详情区常驻预览卡：四 Tab 顺序固定 预览/大纲/版本/详情，选中文件即加载，无需打开动作。"""
     win = MainWindow(conn=_index(tmp_path), render_worker=StubRender(), do_index=False)
     qtbot.addWidget(win)
-    assert win.detail_panel.isHidden()
-    win._toggle_detail()
-    assert not win.detail_panel.isHidden()
+    tabs = win.detail_panel.tabs
+    assert tabs.objectName() == "detailTabs"
+    assert [tabs.tabText(i) for i in range(tabs.count())] == ["预览", "大纲", "版本", "详情"]
+    # 预览内容平移进 Tab1，objectName 与行为不变
+    assert tabs.widget(0).findChild(QLabel, "previewImage") is win.image_label
+
+    win.search_box.setText("昇腾")
+    win._do_search()
+    win.result_list.setCurrentRow(0)
+
+    qtbot.waitUntil(lambda: "页" in win.detail_panel._meta_label.text(), timeout=1000)
 
 
 def test_mainwindow_opens_slim_window(qtbot, tmp_path, monkeypatch):
@@ -456,7 +454,6 @@ def test_mainwindow_select_updates_detail(qtbot, tmp_path):
     vm = StubVerMgr(versions=[{"version_id": "v1", "ts": 1000, "page_count": 5}], managed=True)
     win = MainWindow(conn=_index(tmp_path), render_worker=StubRender(), version_mgr=vm, do_index=False)
     qtbot.addWidget(win)
-    win._toggle_detail()
     win.search_box.setText("昇腾")
     win._do_search()
     win.result_list.setCurrentRow(0)
@@ -505,7 +502,6 @@ def test_mainwindow_version_preview_runs_in_background_and_dedupes(qtbot, tmp_pa
     win = MainWindow(conn=_index(tmp_path), render_worker=StubRender(), version_mgr=PreviewMgr(), do_index=False)
     qtbot.addWidget(win)
     win._cur = _fr(path="C:/deck-a.pptx")
-    win.detail_panel.show()
     win.detail_panel.update_for(win._cur, [{"version_id": "v1", "ts": 1000, "page_count": 5}])
     tasks.clear()
 
@@ -563,7 +559,6 @@ def test_mainwindow_version_preview_does_not_resolve_lazy_backend_on_ui_thread(
     )
     qtbot.addWidget(win)
     win._cur = _fr(path="C:/deck-a.pptx")
-    win.detail_panel.show()
 
     win._request_version_preview("v1")
 
@@ -644,7 +639,6 @@ def test_mainwindow_detail_update_loads_versions_in_background(qtbot, tmp_path, 
     win = MainWindow(conn=_index(tmp_path), render_worker=StubRender(), version_mgr=CountingVersions(), do_index=False)
     qtbot.addWidget(win)
     win._cur = _fr(path="C:/deck-a.pptx")
-    win.detail_panel.show()
 
     win._update_detail()
 
@@ -702,7 +696,6 @@ def test_mainwindow_detail_update_reuses_inflight_same_file(qtbot, tmp_path, mon
     win = MainWindow(conn=_index(tmp_path), render_worker=StubRender(), version_mgr=CountingVersions(), do_index=False)
     qtbot.addWidget(win)
     win._cur = _fr(path="C:/deck-a.pptx")
-    win.detail_panel.show()
 
     win._update_detail()
     win._update_detail()
@@ -721,51 +714,6 @@ def test_mainwindow_detail_update_reuses_inflight_same_file(qtbot, tmp_path, mon
 
     detail_tasks = [task for task in tasks if task.label == "detail-load"]
     assert [task.label for task in detail_tasks] == ["detail-load", "detail-load"]
-
-
-def test_detail_reopen_same_file_starts_fresh_load_after_hidden(qtbot, tmp_path, monkeypatch):
-    tasks = []
-
-    class FakeSignal:
-        def __init__(self):
-            self.callbacks = []
-
-        def connect(self, callback):
-            self.callbacks.append(callback)
-
-        def emit(self, value=None):
-            for callback in list(self.callbacks):
-                if value is None:
-                    callback()
-                else:
-                    callback(value)
-
-    class FakeTask:
-        def __init__(self, fn, label="", parent=None):
-            self.fn = fn
-            self.label = label
-            self.done = FakeSignal()
-            self.finished = FakeSignal()
-
-        def start(self):
-            tasks.append(self)
-
-    monkeypatch.setattr(main_window_mod, "BackgroundTask", FakeTask, raising=False)
-
-    win = MainWindow(conn=_index(tmp_path), render_worker=StubRender(), version_mgr=StubVerMgr(), do_index=False)
-    qtbot.addWidget(win)
-    win._cur = _fr(path="C:/deck-a.pptx")
-    win.detail_panel.show()
-
-    win._update_detail()
-    first_task = tasks[-1]
-    win._toggle_detail()
-    win._toggle_detail()
-
-    detail_tasks = [task for task in tasks if task.label == "detail-load"]
-    assert len(detail_tasks) == 2
-    assert detail_tasks[0] is first_task
-    assert detail_tasks[1] is not first_task
 
 
 def test_detail_reselect_same_file_starts_fresh_load_after_selection_cleared(qtbot, tmp_path, monkeypatch):
@@ -801,7 +749,6 @@ def test_detail_reselect_same_file_starts_fresh_load_after_selection_cleared(qtb
     qtbot.addWidget(win)
     current = _fr(path="C:/deck-a.pptx")
     win._cur = current
-    win.detail_panel.show()
 
     win._update_detail()
     first_task = tasks[-1]
@@ -820,7 +767,6 @@ def test_mainwindow_selection_clear_resets_detail_panel(qtbot, tmp_path):
     qtbot.addWidget(win)
     current = _fr(path="C:/deck-a.pptx", page_count=12)
     win._cur = current
-    win.detail_panel.show()
     win.detail_panel.update_for(
         current,
         [{"version_id": "v1", "ts": 1000, "page_count": 12}],
@@ -866,7 +812,6 @@ def test_mainwindow_detail_update_allows_new_file_during_inflight(qtbot, tmp_pat
 
     win = MainWindow(conn=_index(tmp_path), render_worker=StubRender(), version_mgr=StubVerMgr(), do_index=False)
     qtbot.addWidget(win)
-    win.detail_panel.show()
 
     win._cur = _fr(path="C:/deck-a.pptx")
     win._update_detail()
@@ -908,7 +853,6 @@ def test_mainwindow_detail_update_force_supersedes_same_file_inflight(qtbot, tmp
 
     win = MainWindow(conn=_index(tmp_path), render_worker=StubRender(), version_mgr=StubVerMgr(), do_index=False)
     qtbot.addWidget(win)
-    win.detail_panel.show()
     win._cur = _fr(path="C:/deck-a.pptx")
 
     win._update_detail()
@@ -917,3 +861,38 @@ def test_mainwindow_detail_update_force_supersedes_same_file_inflight(qtbot, tmp
 
     detail_tasks = [task for task in tasks if task.label == "detail-load"]
     assert [task.label for task in detail_tasks] == ["detail-load", "detail-load"]
+
+
+def test_version_tab_dot_matches_detail_has_versions(qtbot, tmp_path):
+    """红点语义迁到「版本」Tab 标题：出现规则与 _detail_has_versions 一致；
+    已在看「版本」Tab 时红点隐去（对应原"面板已开则不显点"）。"""
+    vm = StubVerMgr(versions=[{"version_id": "v1", "ts": 1000, "page_count": 5}])
+    win = MainWindow(conn=_index(tmp_path), render_worker=StubRender(), version_mgr=vm, do_index=False)
+    qtbot.addWidget(win)
+    win.search_box.setText("昇腾")
+    win._do_search()
+    win.result_list.setCurrentRow(0)
+
+    assert win._detail_has_versions(win._cur.path, vm) is True
+    qtbot.waitUntil(lambda: not win._detail_dot.isHidden(), timeout=1000)  # 有版本 → 版本 Tab 红点
+    # 红点挂在 Tab 条上，指向「版本」Tab
+    assert win._detail_dot.parentWidget() is win.detail_panel.tabs.tabBar()
+
+    win.detail_panel.tabs.setCurrentIndex(win.detail_panel.version_tab_index())
+    assert win._detail_dot.isHidden()            # 已在看版本 → 红点隐去
+
+    win.detail_panel.tabs.setCurrentIndex(0)
+    assert not win._detail_dot.isHidden()        # 离开版本 Tab → 红点回来（复用缓存，不重复查库）
+
+
+def test_version_tab_dot_hidden_without_versions(qtbot, tmp_path):
+    vm = StubVerMgr(versions=[])
+    win = MainWindow(conn=_index(tmp_path), render_worker=StubRender(), version_mgr=vm, do_index=False)
+    qtbot.addWidget(win)
+    win.search_box.setText("昇腾")
+    win._do_search()
+    win.result_list.setCurrentRow(0)
+
+    assert win._detail_has_versions(win._cur.path, vm) is False
+    qtbot.wait(2 * win._DETAIL_DOT_DELAY_MS + 120)  # 给红点后台检查足够时间
+    assert win._detail_dot.isHidden()            # 无版本 → 无红点

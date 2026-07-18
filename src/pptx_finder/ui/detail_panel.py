@@ -1,5 +1,7 @@
-"""选中文件详情弹窗：两个 Tab —— 版本管理（文件信息 + 版本时间线，恢复/导出/改动简述）+
-大纲（点击跳页）。无边框玻璃弹窗，可拖动。版本数据经 version_mgr.list_versions(path)（只读）。
+"""预览卡内嵌详情区：四个 Tab —— 预览（内容由主窗注入）/ 大纲 / 版本 / 详情。
+大纲点击跳页；版本 Tab 含版本时间线（恢复/导出/改动简述/缩略图预览）与 PPT 瘦身入口；
+详情 Tab 为文件元信息（大小/页数/修改时间/版本数 + 完整路径）。
+版本数据经 version_mgr.list_versions(path)（只读）。
 """
 from __future__ import annotations
 
@@ -50,7 +52,6 @@ class DetailPanel(QWidget):
         self.setObjectName("detailPanel")
         self._tok = tok
         self._path = None
-        self._drag_off = None
         self._file_actions_enabled = True
         self._version_nodes: list[QWidget] = []
         self._version_preview_labels: dict[str, QLabel] = {}
@@ -58,40 +59,26 @@ class DetailPanel(QWidget):
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
-        root.addWidget(self._build_head())   # 玻璃标题栏（拖动 + 关闭）
-
-        tabs = QTabWidget()
-        tabs.setObjectName("detailTabs")
-        tabs.addTab(self._build_version_tab(), "版本管理")
-        tabs.addTab(self._build_outline_tab(), "大纲")
-        root.addWidget(tabs, 1)
+        self.tabs = QTabWidget()
+        self.tabs.setObjectName("detailTabs")
+        self._outline_page = self._build_outline_tab()
+        self._version_page = self._build_version_tab()
+        self._info_page = self._build_info_tab()
+        # 预览 Tab 由主窗注入（set_preview_widget 插到 index 0）；此处先按 大纲/版本/详情 排
+        self.tabs.addTab(self._outline_page, "大纲")
+        self.tabs.addTab(self._version_page, "版本")
+        self.tabs.addTab(self._info_page, "详情")
+        root.addWidget(self.tabs, 1)
 
     # ---------- 结构 ----------
-    def _build_head(self) -> QWidget:
-        head = QWidget()
-        head.setObjectName("detailHead")
-        head.setFixedHeight(40)
-        hl = QHBoxLayout(head)
-        hl.setContentsMargins(15, 0, 7, 0)
-        hl.setSpacing(8)
-        dot = QLabel("◆")
-        dot.setObjectName("dtDot")
-        title = QLabel("详情")
-        title.setObjectName("dtTitle")
-        hl.addWidget(dot)
-        hl.addWidget(title)
-        hl.addStretch(1)
-        close_btn = QPushButton("✕")
-        close_btn.setObjectName("dtClose")
-        close_btn.setText("×")
-        close_btn.setFixedSize(34, 32)
-        close_btn.setCursor(Qt.PointingHandCursor)
-        close_btn.setToolTip("关闭")
-        close_btn.clicked.connect(self.hide)
-        hl.addWidget(close_btn)
-        head.mousePressEvent = self._drag_press   # 标题栏拖动整窗
-        head.mouseMoveEvent = self._drag_move
-        return head
+    def set_preview_widget(self, w: QWidget) -> None:
+        """主窗把预览内容作为第一个 Tab 注入，最终顺序固定 预览/大纲/版本/详情。"""
+        self.tabs.insertTab(0, w, "预览")
+        self.tabs.setCurrentIndex(0)
+
+    def version_tab_index(self) -> int:
+        """「版本」Tab 的当前下标（预览 Tab 注入后为 2）；红点定位与门控判断用。"""
+        return self.tabs.indexOf(self._version_page)
 
     def _scroll(self) -> tuple[QScrollArea, QVBoxLayout]:
         scroll = QScrollArea()
@@ -106,10 +93,6 @@ class DetailPanel(QWidget):
     def _build_version_tab(self) -> QWidget:
         scroll, lay = self._scroll()
         lay.setSpacing(8)
-        self._meta_label = QLabel("← 选中左侧文件查看详情")  # 文件信息（紧凑，置顶）
-        self._meta_label.setObjectName("detailMeta")
-        self._meta_label.setWordWrap(True)
-        lay.addWidget(self._meta_label)
         action_row = QHBoxLayout()
         action_row.setContentsMargins(0, 0, 0, 0)
         action_row.addStretch(1)
@@ -141,18 +124,23 @@ class DetailPanel(QWidget):
         lay.addStretch(1)
         return scroll
 
+    def _build_info_tab(self) -> QWidget:
+        scroll, lay = self._scroll()
+        lay.setSpacing(8)
+        self._meta_label = QLabel("← 选中左侧文件查看详情")  # 文件信息（紧凑，置顶）
+        self._meta_label.setObjectName("detailMeta")
+        self._meta_label.setWordWrap(True)
+        lay.addWidget(self._meta_label)
+        lay.addWidget(self._sec_title("文件"))
+        self._path_label = QLabel("")
+        self._path_label.setObjectName("detailPath")
+        self._path_label.setWordWrap(True)
+        self._path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        lay.addWidget(self._path_label)
+        lay.addStretch(1)
+        return scroll
+
     # ---------- 交互 ----------
-    def _drag_press(self, e):  # noqa: N802
-        if e.button() == Qt.LeftButton:
-            self._drag_off = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
-        else:
-            self._drag_off = None
-
-    def _drag_move(self, e):  # noqa: N802
-        off = self._drag_off
-        if off is not None and (e.buttons() & Qt.LeftButton):
-            self.move(e.globalPosition().toPoint() - off)
-
     def _sec_title(self, text: str) -> QLabel:
         lbl = QLabel(text)
         lbl.setObjectName("detailSecT")
@@ -169,6 +157,7 @@ class DetailPanel(QWidget):
     def clear_selection(self) -> None:
         self._path = None
         self._meta_label.setText("← 选中左侧文件查看详情")
+        self._path_label.setText("")
         self._sync_slim_button()
         self._clear(self._version_box)
         self._version_nodes = []
@@ -195,11 +184,18 @@ class DetailPanel(QWidget):
             parts.append(f"大小 {sz}")
         if r.page_count:
             parts.append(f"{r.page_count} 页")
+        mtime = getattr(r, "mtime", 0) or 0
+        if mtime > 0:
+            tm = _fmt_ts(mtime)
+            if tm:
+                parts.append(f"修改于 {tm}")
         if versioning_enabled:
             parts.append(f"{len(versions)} 个版本" if versions else "暂无版本")
         else:
             parts.append("版本管理未开启")
         self._meta_label.setText("　·　".join(parts))
+        self._path_label.setText(str(r.path))
+        self._path_label.setToolTip(str(r.path))
 
         self._clear(self._version_box)
         self._version_nodes = []

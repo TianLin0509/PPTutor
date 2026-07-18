@@ -788,6 +788,7 @@ class MainWindow(QMainWindow):
         self._detail_dot_token = 0
         self._detail_dot_inflight_token: int | None = None
         self._detail_dot_inflight_path: str | None = None
+        self._detail_dot_has = False  # 最近一次红点检查结果（切 Tab 时复用，不重复查库）
         self._detail_hint_token = 0
         self._detail_hint_inflight_token: int | None = None
         self._detail_hint_inflight_path: str | None = None
@@ -1197,17 +1198,12 @@ class MainWindow(QMainWindow):
         self.facet_panel.hide()
         split.addWidget(self._list_stack)
         split.addWidget(self._build_preview())
-        # 璇︽儏鏀逛负娴姩寮圭獥锛堜笉鍐嶅崰绗洓鍒楋紝鑺傜害妯悜绌洪棿锛夛細闈炴ā鎬?Tool 绐楋紝娴湪涓荤獥涔嬩笂銆?
-        # 璺熼殢閫変腑瀹炴椂鍒锋柊锛屽叧鎺変笉褰卞搷鎼滅储/棰勮涓诲尯锛涗俊鍙蜂笌 _update_detail 閫昏緫鍧囦笉鍙樸€?
-        self.detail_panel = DetailPanel(self._tok, parent=self)
-        # 鏃犺竟妗嗙幓鐠冨脊绐楋紙鑷粯鐜荤拑鏍囬鏍忓彲鎷栧姩 + 鍏抽棴锛夛紝show 鍚庡姞 Win11 DWM 鍦嗚锛屽拰涓荤獥缁熶竴
-        self.detail_panel.setWindowFlags(Qt.Tool | Qt.FramelessWindowHint)
+        # 详情区嵌入预览卡（四 Tab：预览/大纲/版本/详情，在 _build_preview 内构造）；信号接线不变
         self.detail_panel.restore_requested.connect(self._act_restore_version)
         self.detail_panel.export_requested.connect(self._act_export_version)
         self.detail_panel.preview_requested.connect(self._request_version_preview)
         self.detail_panel.page_requested.connect(self._act_goto_page)
         self.detail_panel.slim_requested.connect(self._open_slim_window)
-        self.detail_panel.hide()
         split.setStretchFactor(0, 5)
         split.setStretchFactor(1, 6)
         split.setSizes([520, 660])
@@ -1382,25 +1378,20 @@ class MainWindow(QMainWindow):
         self.copy_path_btn.setObjectName("linkBtn")
         self.copy_path_btn.clicked.connect(self._act_copy_path)
         self.copy_path_btn.hide()
-        # 头部动作收敛为一行：两枚文字链 + 一枚描边「详情」，高度还给预览画布
-        self.detail_btn = QPushButton("详情")
-        self.detail_btn.setObjectName("detailAction")
-        self.detail_btn.setCheckable(True)
-        self.detail_btn.setToolTip("显示/隐藏版本时间线、大纲和文件信息")
-        self.detail_btn.clicked.connect(self._toggle_detail)
-        self.detail_btn.hide()
-        self._detail_dot = QLabel("●", self.detail_btn)
-        self._detail_dot.setObjectName("navDot")
-        self._detail_dot.setAttribute(Qt.WA_TransparentForMouseEvents)
-        self._detail_dot.hide()
+        # 头部动作收敛为一行：两枚文字链；详情/大纲/版本入口已并入下方 Tab 条
         pr.addWidget(self.copy_text_btn, 0)
         pr.addWidget(self.copy_path_btn, 0)
-        pr.addWidget(self.detail_btn, 0)
         hv.addLayout(pr)
+        lay.addWidget(head)
+
+        # Tab1「预览」内容体：metaLabel + 原图画布 + 命中页分段缩略图 + 命中导航 + 操作行
+        body = QWidget()
+        bl = QVBoxLayout(body)
+        bl.setContentsMargins(0, 0, 0, 0)
+        bl.setSpacing(8)
         self.meta_label = QLabel("")
         self.meta_label.setObjectName("metaLabel")
-        hv.addWidget(self.meta_label)
-        lay.addWidget(head)
+        bl.addWidget(self.meta_label)
 
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
@@ -1414,7 +1405,7 @@ class MainWindow(QMainWindow):
         # 棰勮鍖烘粴杞?= 鎸夊師濮嬮〉搴忕炕椤碉紙鐪嬪墠鍑犻〉鍒ゆ柇鏄笉鏄鎵剧殑 PPT锛?
         self.scroll.viewport().installEventFilter(self)
         self.image_label.installEventFilter(self)
-        lay.addWidget(self.scroll, 1)
+        bl.addWidget(self.scroll, 1)
 
         # 鍛戒腑椤电缉鐣ュ浘鏉?
         self.thumb_row = QHBoxLayout()
@@ -1422,7 +1413,7 @@ class MainWindow(QMainWindow):
         self.thumb_row.setAlignment(Qt.AlignCenter)
         thumb_wrap = QWidget()
         thumb_wrap.setLayout(self.thumb_row)
-        lay.addWidget(thumb_wrap)
+        bl.addWidget(thumb_wrap)
 
         nav = QHBoxLayout()
         self.prev_btn = QPushButton("‹ 上一命中页")
@@ -1439,7 +1430,7 @@ class MainWindow(QMainWindow):
         nav.addWidget(self.prev_btn)
         nav.addWidget(self.page_label, 1)
         nav.addWidget(self.next_btn)
-        lay.addLayout(nav)
+        bl.addLayout(nav)
 
         ops = QHBoxLayout()
         self.goto_btn = QPushButton("打开并跳到此页")
@@ -1455,7 +1446,17 @@ class MainWindow(QMainWindow):
         for b in (self.goto_btn, self.open_btn, self.folder_btn, self.clip_btn):
             b.setMinimumHeight(38)
             ops.addWidget(b)
-        lay.addLayout(ops)
+        bl.addLayout(ops)
+        # 预览卡 = 头部 + 四 Tab（预览/大纲/版本/详情）；详情数据管线沿用 _update_detail
+        self.detail_panel = DetailPanel(self._tok)
+        self.detail_panel.set_preview_widget(body)
+        self.detail_panel.tabs.currentChanged.connect(self._on_detail_tab_changed)
+        # 红点挂在 Tab 条上：选中文件有历史版本时指向「版本」Tab
+        self._detail_dot = QLabel("●", self.detail_panel.tabs.tabBar())
+        self._detail_dot.setObjectName("navDot")
+        self._detail_dot.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self._detail_dot.hide()
+        lay.addWidget(self.detail_panel, 1)
         self._set_ops_enabled(False)
         return panel
 
@@ -1658,7 +1659,7 @@ class MainWindow(QMainWindow):
     def _set_ops_enabled(self, on: bool) -> None:
         on = on and self._active_heavy_op is None and self._search_pending_req is None
         for w in (self.open_btn, self.folder_btn, self.clip_btn,
-                  self.copy_path_btn, self.copy_text_btn, self.detail_btn,
+                  self.copy_path_btn, self.copy_text_btn,
                   self.prev_btn, self.next_btn):
             w.setEnabled(on)
         can_goto = on and self._cur is not None and (self._cur.ext or "").lower() in PPT_EXTS
@@ -1691,7 +1692,7 @@ class MainWindow(QMainWindow):
         self._cur_item_widget = None
         self._preview_deferred_due_to_busy = False
         self._clear_detail_load_inflight()
-        self._clear_detail_panel_selection()
+        self.detail_panel.clear_selection()
         self._invalidate_preview_request()
         self._update_preview_header(None)
         self._clear_preview_empty()
@@ -1713,7 +1714,6 @@ class MainWindow(QMainWindow):
                 self.page_label.setText("—")
             self.copy_path_btn.hide()
             self.copy_text_btn.hide()
-            self.detail_btn.hide()
             return
         # 面包屑式路径：目录弱化、文件名加粗——一眼先看到「哪份 PPT」，再看「在哪」
         d, f = os.path.split(r.path)
@@ -1724,7 +1724,6 @@ class MainWindow(QMainWindow):
         self.path_label.setToolTip(r.path)
         self.copy_path_btn.show()
         self.copy_text_btn.show()
-        self.detail_btn.show()
         parts = []
         sz = _fmt_size(r.size)
         if sz:
@@ -1921,7 +1920,7 @@ class MainWindow(QMainWindow):
                 self._history_hint.hide()
         else:
             self.refresh_version_shield()
-        if not self.detail_panel.isHidden() and self._cur is not None:
+        if self._cur is not None:
             self._schedule_detail_update(force=True)
 
     def _note_user_activity(self) -> None:
@@ -2009,7 +2008,7 @@ class MainWindow(QMainWindow):
             self._results = []
             self._cur = None
             self._clear_detail_load_inflight()
-            self._clear_detail_panel_selection()
+            self.detail_panel.clear_selection()
             self.result_list.clear()
             self._hide_empty_hint()
             self.result_count.setText("搜索中…")
@@ -2111,7 +2110,7 @@ class MainWindow(QMainWindow):
             self.list_head.hide()
             self._cur = None
             self._clear_detail_load_inflight()
-            self._clear_detail_panel_selection()
+            self.detail_panel.clear_selection()
             self._invalidate_preview_request()
             self._clear_preview_empty()
             self._update_preview_header(None)
@@ -2177,7 +2176,7 @@ class MainWindow(QMainWindow):
         self._results_raw = list(recents)
         self._cur = None
         self._clear_detail_load_inflight()
-        self._clear_detail_panel_selection()
+        self.detail_panel.clear_selection()
         self._invalidate_preview_request()
         self._showing_recent = True
         if recents:
@@ -3184,7 +3183,7 @@ class MainWindow(QMainWindow):
             self._cur = None
             self._cur_item_widget = None
             self._clear_detail_load_inflight()
-            self._clear_detail_panel_selection()
+            self.detail_panel.clear_selection()
             self._invalidate_preview_request()
             self._update_preview_header(None)
             self._set_ops_enabled(False)
@@ -3269,7 +3268,7 @@ class MainWindow(QMainWindow):
             self.result_count.setText("筛选后无结果")
             self._cur = None
             self._clear_detail_load_inflight()
-            self._clear_detail_panel_selection()
+            self.detail_panel.clear_selection()
             self._invalidate_preview_request()
             self._clear_preview_empty("筛选后没有可预览结果")
             self._update_preview_header(None)
@@ -3294,45 +3293,11 @@ class MainWindow(QMainWindow):
             facet_counts(self._results_raw, datetime.datetime.now().timestamp()), keep=False)
         self._refresh_facet_chips()
 
-    def _toggle_detail(self) -> None:
-        if self.detail_panel.isHidden():
-            self._position_detail_popup()
-            self.detail_panel.show()
-            self._round_detail_corners()   # 鏃犺竟妗嗙獥 show 鍚庢墠鑳芥嬁 winId 鍔?Win11 鍦嗚
-            self.detail_panel.raise_()
-            self._detail_update_token += 1
-            self._update_detail()
+    def _on_detail_tab_changed(self, index: int) -> None:
+        """切到「版本」Tab 视同首次展开详情：触发一次性版本提示；红点随所在 Tab 显隐。"""
+        if index == self.detail_panel.version_tab_index():
             self._maybe_hint_detail_versions()
-        else:
-            self.detail_panel.hide()
-            self._detail_update_token += 1
-            self._detail_update_force = False
-            self._detail_update_timer.stop()
-            self._clear_detail_load_inflight()
-        self.detail_btn.setChecked(not self.detail_panel.isHidden())
-        self._detail_dot_token += 1
-        self._detail_dot_timer.stop()
-        self._refresh_detail_dot()
-
-    def _position_detail_popup(self) -> None:
-        """璇︽儏寮圭獥娴湪涓荤獥鍙充晶鍐呬晶锛岃窡闅忎富绐楀綋鍓嶄綅缃?澶у皬銆?"""
-        g = self.frameGeometry()
-        w = 360
-        h = min(640, max(420, g.height() - 120))
-        self.detail_panel.resize(w, h)
-        self.detail_panel.move(max(0, g.right() - w - 30), g.top() + self._title_h + 60)
-
-    def _round_detail_corners(self) -> None:
-        """缁欐棤杈规璇︽儏寮圭獥鍔?Win11 DWM 鍦嗚锛堟棫绯荤粺闈欓粯澶辫触锛岄€€鍖栦负鐩磋锛夈€?"""
-        if not _WIN:
-            return
-        try:
-            hwnd = int(self.detail_panel.winId())
-            # DWMWA_WINDOW_CORNER_PREFERENCE=33, value 2=ROUND
-            ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                hwnd, 33, ctypes.byref(ctypes.c_int(2)), 4)
-        except Exception:  # noqa: BLE001
-            pass
+        self._apply_detail_dot(getattr(self, "_detail_dot_has", False))
 
     def _maybe_hint_detail_versions(self) -> None:
         """棣栨灞曞紑璇︽儏涓斿綋鍓嶆枃浠舵湁鍘嗗彶鐗堟湰鏃讹紝鎻愮ず銆岃繖閲岃兘涓€閿洖鍒板巻鍙茬増鏈€嶃€?"""
@@ -3375,12 +3340,12 @@ class MainWindow(QMainWindow):
         cur = getattr(self, "_cur", None)
         if self._closing or token != self._detail_hint_token or cur is None or cur.path != path:
             return
-        if bool(has) and not self.detail_panel.isHidden():
+        if bool(has) and self.detail_panel.tabs.currentIndex() == self.detail_panel.version_tab_index():
             self._detail_opened_once = True
             self._toast("💡 这里能一键回到任意历史版本")
 
     def _schedule_detail_update(self, *, force: bool = False) -> None:
-        if self.detail_panel.isHidden():
+        if self._cur is None:  # 内容常驻：有选中文件即加载，无选中不调度
             return
         self._detail_update_token += 1
         self._detail_update_force = self._detail_update_force or force
@@ -3402,17 +3367,10 @@ class MainWindow(QMainWindow):
         self._detail_load_inflight_path = None
         self._detail_load_inflight_file_id = None
 
-    def _clear_detail_panel_selection(self) -> None:
-        panel = getattr(self, "detail_panel", None)
-        clear = getattr(panel, "clear_selection", None)
-        if callable(clear):
-            clear()
-
     def _update_detail(self, *, force: bool = False) -> None:
-        if self.detail_panel.isHidden() or self._cur is None:
+        if self._cur is None:
             self._clear_detail_load_inflight()
-            if self._cur is None:
-                self._clear_detail_panel_selection()
+            self.detail_panel.clear_selection()
             return
         r = self._cur
         if (
@@ -3482,7 +3440,7 @@ class MainWindow(QMainWindow):
     def _on_detail_payload(self, token: int, path: str, file_id: int, payload: object) -> None:
         if self._closing or token != self._detail_update_token:
             return
-        if self.detail_panel.isHidden() or self._cur is None:
+        if self._cur is None:
             return
         if self._cur.path != path or self._cur.file_id != file_id:
             return
@@ -3512,7 +3470,7 @@ class MainWindow(QMainWindow):
         if version_id in self._version_preview_inflight:
             return
         cur = self._cur
-        if cur is None or self.detail_panel.isHidden():
+        if cur is None:
             return
 
         token = self._detail_update_token
@@ -3546,7 +3504,7 @@ class MainWindow(QMainWindow):
         cur = self._cur
         if self._closing or token != self._detail_update_token:
             return
-        if self.detail_panel.isHidden() or cur is None:
+        if cur is None:
             return
         if cur.path != path or cur.file_id != file_id:
             return
@@ -4701,7 +4659,7 @@ class MainWindow(QMainWindow):
     def _refresh_detail_dot(self) -> None:
         """閫変腑鏂囦欢鏈夊巻鍙茬増鏈椂锛岃鎯呮寜閽寒绾㈢偣锛涙湰 session 棣栨鍙戠幇鏃跺懠鍚镐竴娆″紩瀵笺€?"""
         cur = getattr(self, "_cur", None)
-        if self._version_mgr is None or cur is None or not self.detail_panel.isHidden():
+        if self._version_mgr is None or cur is None:
             self._detail_dot_inflight_token = None
             self._detail_dot_inflight_path = None
             self._apply_detail_dot(False)
@@ -4749,15 +4707,19 @@ class MainWindow(QMainWindow):
         self._apply_detail_dot(bool(has))
 
     def _apply_detail_dot(self, has: bool) -> None:
-        if has and self.detail_panel.isHidden():  # 璇︽儏宸叉墦寮€灏变笉鐢ㄧ孩鐐瑰啀鎻愮ず
-            self._detail_dot.move(self.detail_btn.width() - 14, 5)
+        self._detail_dot_has = bool(has)
+        bar = self.detail_panel.tabs.tabBar()
+        ver_idx = self.detail_panel.version_tab_index()
+        if has and self.detail_panel.tabs.currentIndex() != ver_idx:  # 璇︽儏宸叉墦寮€灏变笉鐢ㄧ孩鐐瑰啀鎻愮ず
+            rect = bar.tabRect(ver_idx)
+            self._detail_dot.move(rect.right() - 14, rect.top() + 3)
             self._detail_dot.show()
             self._detail_dot.raise_()
             # 棣栨鍙戠幇 + 绐楀彛鍙鏃舵墠鍛煎惛寮曞锛堥殣钘忓埌鎵樼洏鏃朵笉娴垂鍔ㄧ敾锛岀暀鍒颁笅娆″啀璇曪級
             if not getattr(self, "_detail_hint_done", False) and self.isVisible():
                 self._detail_hint_done = True
                 from .spotlight import attention_pulse
-                attention_pulse(self.detail_btn,
+                attention_pulse(bar,
                                 color=self._tok.get("acc", "#0A84FF"), cycles=2)
         else:
             self._detail_dot.hide()
@@ -4789,9 +4751,9 @@ class MainWindow(QMainWindow):
                 or getattr(self, "_welcome", None) is not None):
             return  # 绐楀彛娌￠湶鑴?/ 娆㈣繋椤佃繕鍦?鈫?绛変笅娆?showEvent 琛ュ脊
         self._show_spotlight(
-            self.detail_btn,
+            self.detail_panel.tabs.tabBar(),
             "已自动给你改过的 PPT 留了底 🛡️\n"
-            "改崩了、想找回旧版，点这里「详情」就能一键回到任意历史版本。")
+            "改崩了、想找回旧版，点这里「版本」就能一键回到任意历史版本。")
         mark_version_intro_done()
         self._pending_version_intro = False
 
