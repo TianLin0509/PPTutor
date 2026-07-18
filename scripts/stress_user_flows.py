@@ -201,9 +201,9 @@ def main() -> int:
         win.sort_combo.setCurrentIndex(idx)
         pump(120)
 
-    win.facet_btn.click()
+    win._toggle_facet()
     pump(120)
-    win.facet_btn.click()
+    win._toggle_facet()
     pump(120)
 
     rows = min(24, win.result_list.count())

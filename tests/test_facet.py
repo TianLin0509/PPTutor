@@ -1,7 +1,9 @@
-"""08 facet 筛选：聚合 count + 多维过滤 + 抽屉。"""
+"""08 facet 筛选：聚合 count + 多维过滤 + 条件行/浮层。"""
 from __future__ import annotations
 
 import datetime
+
+from PySide6.QtWidgets import QPushButton
 
 from test_ui import StubRender, _index
 
@@ -73,6 +75,8 @@ def test_mainwindow_facet_toggle(qtbot, tmp_path):
     assert win.facet_panel.isHidden()
     win._toggle_facet()
     assert not win.facet_panel.isHidden()
+    win._toggle_facet()
+    assert win.facet_panel.isHidden()
 
 
 def test_mainwindow_facet_filters_results(qtbot, tmp_path):
@@ -93,3 +97,36 @@ def test_mainwindow_facet_filters_results(qtbot, tmp_path):
     # 只看 10-30 页 → 只剩 big.pptx
     win._apply_facet({"page": {"10-30"}})
     assert [r.name for r in win._results] == ["big.pptx"]
+
+
+def test_facet_condition_chip_shows_selected_bucket(qtbot, tmp_path):
+    """选中 facet 后，结果顶栏条件行出现带桶名的条件 chip；未选时只有「+ 筛选」。"""
+    win = MainWindow(conn=_index(tmp_path), render_worker=StubRender(), do_index=False)
+    qtbot.addWidget(win)
+    win.search_box.setText("算力")
+    win._do_search()
+    assert win._results
+    assert win.findChildren(QPushButton, "facetActiveChip") == []
+    win.facet_panel._chip_btns[("page", "1-10")].click()
+    chips = win.findChildren(QPushButton, "facetActiveChip")
+    assert len(chips) == 1
+    assert "1-10" in chips[0].text()
+
+
+def test_facet_condition_chip_click_removes_filter(qtbot, tmp_path):
+    """点条件 chip ✕ 走 FacetPanel 状态机移除条件，filters_changed 语义不变。"""
+    win = MainWindow(conn=_index(tmp_path), render_worker=StubRender(), do_index=False)
+    qtbot.addWidget(win)
+    win.search_box.setText("算力")
+    win._do_search()
+    win.facet_panel._chip_btns[("page", "1-10")].click()
+    assert win._facet_filters == {"page": {"1-10"}}
+    fired = []
+    win.facet_panel.filters_changed.connect(lambda f: fired.append(f))
+    chip = win.findChildren(QPushButton, "facetActiveChip")[0]
+    chip.click()
+    assert fired and fired[-1] == {}
+    assert win._facet_filters == {}
+    assert win.facet_panel.active_filters() == {}
+    assert win.findChildren(QPushButton, "facetActiveChip") == []
+    assert len(win._results) == 1  # 条件移除后恢复未过滤全集

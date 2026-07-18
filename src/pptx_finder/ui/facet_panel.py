@@ -92,6 +92,23 @@ class FacetPanel(QWidget):
             self._filters.pop(dim, None)
         self.filters_changed.emit({k: set(v) for k, v in self._filters.items()})
 
+    def active_filters(self) -> dict:
+        """当前选中条件的只读副本 {dim: set(buckets)}，供结果顶栏条件行渲染。"""
+        return {k: set(v) for k, v in self._filters.items()}
+
+    def remove_filter(self, dim: str, bucket: str) -> None:
+        """取消选中某个桶并重发 filters_changed——与在面板里点掉 chip 走同一条状态机。"""
+        s = self._filters.get(dim)
+        if not s or bucket not in s:
+            return
+        s.discard(bucket)
+        if not s:
+            self._filters.pop(dim, None)
+        btn = self._chip_btns.get((dim, bucket))
+        if btn is not None:
+            btn.setChecked(False)
+        self.filters_changed.emit({k: set(v) for k, v in self._filters.items()})
+
     def _clear_all(self) -> None:
         self._filters = {}
         for b in self._chip_btns.values():

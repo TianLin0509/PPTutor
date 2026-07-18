@@ -121,20 +121,6 @@ def _icon_theme(color: str = "#8A8A8A", size: int = 18) -> QIcon:
     )
 
 
-def _icon_filter(color: str = "#8A8A8A", size: int = 18) -> QIcon:
-    """漏斗式三横线（长/中/短）：筛选。"""
-    scale = size / 18
-    return _make_icon(
-        lambda p: (
-            p.drawLine(round(3 * scale), round(5 * scale), round(15 * scale), round(5 * scale)),
-            p.drawLine(round(6 * scale), round(9 * scale), round(12 * scale), round(9 * scale)),
-            p.drawLine(round(8 * scale), round(13 * scale), round(10 * scale), round(13 * scale)),
-        ),
-        color,
-        size,
-    )
-
-
 def _icon_settings(color: str = "#8A8A8A", size: int = 18) -> QIcon:
     """齿轮简化：圆心 + 四向短齿。"""
     scale = size / 18
@@ -1132,6 +1118,21 @@ class MainWindow(QMainWindow):
         hr = QHBoxLayout(self.list_head)
         hr.setContentsMargins(12, 6, 8, 4)
         hr.setSpacing(8)
+        # 左侧条件行：已选 facet 条件 chip（点 ✕ 移除）+ 虚线「+ 筛选」浮层入口，
+        # 随 listHeadBar 一起显隐；零选中时只剩「+ 筛选」
+        self.facet_bar = QWidget()
+        self.facet_bar.setObjectName("facetBar")
+        fb = QHBoxLayout(self.facet_bar)
+        fb.setContentsMargins(0, 0, 0, 0)
+        fb.setSpacing(6)
+        self.facet_add_chip = QPushButton("+ 筛选")
+        self.facet_add_chip.setObjectName("facetAdd")
+        self.facet_add_chip.setCursor(Qt.PointingHandCursor)
+        self.facet_add_chip.setAccessibleName("筛选")
+        self.facet_add_chip.setToolTip("按时间 / 类型 / 页数 / 文件夹筛选")
+        self.facet_add_chip.clicked.connect(self._toggle_facet)
+        fb.addWidget(self.facet_add_chip)
+        hr.addWidget(self.facet_bar, 0)
         self.result_count = QLabel("")
         self.result_count.setObjectName("listHead")
         hr.addWidget(self.result_count, 1)
@@ -1186,10 +1187,14 @@ class MainWindow(QMainWindow):
         self._list_stack.addWidget(left)                  # index 0锛氱粨鏋滃垪琛ㄥ尯
         self.dashboard = DashboardView(self)
         self._list_stack.addWidget(self.dashboard)        # index 1锛氫华琛ㄧ洏棣栧睆
-        self.facet_panel = FacetPanel(self._tok)
+        # facet 不再占 splitter 栏位：改为「+ 筛选」chip 呼出的非模态浮层（点外面自动关闭）
+        self.facet_panel = FacetPanel(self._tok, parent=self)
+        self.facet_panel.setWindowFlags(Qt.Popup | Qt.FramelessWindowHint)
+        self.facet_panel.setMinimumWidth(240)
+        self.facet_panel.setMaximumHeight(460)
         self.facet_panel.filters_changed.connect(self._apply_facet)
+        self.facet_panel.filters_changed.connect(self._refresh_facet_chips)
         self.facet_panel.hide()
-        split.addWidget(self.facet_panel)
         split.addWidget(self._list_stack)
         split.addWidget(self._build_preview())
         # 璇︽儏鏀逛负娴姩寮圭獥锛堜笉鍐嶅崰绗洓鍒楋紝鑺傜害妯悜绌洪棿锛夛細闈炴ā鎬?Tool 绐楋紝娴湪涓荤獥涔嬩笂銆?
@@ -1203,10 +1208,9 @@ class MainWindow(QMainWindow):
         self.detail_panel.page_requested.connect(self._act_goto_page)
         self.detail_panel.slim_requested.connect(self._open_slim_window)
         self.detail_panel.hide()
-        split.setStretchFactor(0, 0)
-        split.setStretchFactor(1, 5)
-        split.setStretchFactor(2, 6)
-        split.setSizes([0, 520, 660])
+        split.setStretchFactor(0, 5)
+        split.setStretchFactor(1, 6)
+        split.setSizes([520, 660])
         self._split = split
         wrap = QWidget()
         wrap.setObjectName("contentWrap")
@@ -1543,10 +1547,6 @@ class MainWindow(QMainWindow):
         lay.addSpacing(2)
 
         # —— 右侧：低频功能一律图标化（悬停出说明），视觉主次让位给搜索 ——
-        self.facet_btn = self._mk_title_icon_btn("按时间 / 类型 / 页数 / 文件夹筛选", checkable=True)
-        self.facet_btn.setAccessibleName("筛选")
-        self.facet_btn.clicked.connect(self._toggle_facet)
-        lay.addWidget(self.facet_btn)
         self.settings_btn = self._mk_title_icon_btn("打开设置")
         self.settings_btn.setAccessibleName("设置")
         self.settings_btn.clicked.connect(self._open_settings_from_button)
@@ -1679,7 +1679,7 @@ class MainWindow(QMainWindow):
             self.sort_combo,
             self.sort_secondary,
             self.case_sensitive_btn,
-            self.facet_btn,
+            self.facet_bar,
             self.facet_panel,
         ):
             w.setEnabled(enabled)
@@ -1803,7 +1803,6 @@ class MainWindow(QMainWindow):
         """合一工具栏图标色跟随主题（ink3 静默灰），checked/hover 色由 QSS 承担。"""
         c = self._tok["ink3"]
         for btn, factory in (
-            (getattr(self, "facet_btn", None), _icon_filter),
             (getattr(self, "settings_btn", None), _icon_settings),
             (getattr(self, "theme_btn", None), _icon_theme),
             (getattr(self, "stats_report_btn", None), _icon_film),
@@ -3219,16 +3218,39 @@ class MainWindow(QMainWindow):
         self._schedule_detail_dot_refresh()
 
     def _relayout_split(self) -> None:
-        f = 180 if not self.facet_panel.isHidden() else 0
-        avail = max(560, self.width() - f - 24)
-        self._split.setSizes([f, int(avail * 0.44), int(avail * 0.56)])
+        avail = max(560, self.width() - 24)
+        self._split.setSizes([int(avail * 0.44), int(avail * 0.56)])
 
     def _toggle_facet(self) -> None:
+        """「+ 筛选」chip 呼出/收起 facet 浮层（Qt.Popup：点外面自动关闭）。"""
         if self._search_pending_req is not None:
             return
-        self.facet_panel.setHidden(not self.facet_panel.isHidden())
-        self.facet_btn.setChecked(not self.facet_panel.isHidden())
-        self._relayout_split()
+        if self.facet_panel.isHidden():
+            pos = self.facet_add_chip.mapToGlobal(self.facet_add_chip.rect().bottomLeft())
+            self.facet_panel.move(pos + QPoint(0, 4))
+            self.facet_panel.show()
+            self.facet_panel.raise_()
+        else:
+            self.facet_panel.hide()
+
+    def _refresh_facet_chips(self, _filters: dict | None = None) -> None:
+        """按 FacetPanel 当前选中重建结果顶栏的条件 chip 行（零选中时只剩「+ 筛选」）。"""
+        lay = self.facet_bar.layout()
+        while lay.count() > 1:  # 末尾固定是「+ 筛选」chip
+            it = lay.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+        for dim, buckets in self.facet_panel.active_filters().items():
+            for bucket in sorted(buckets):
+                chip = QPushButton(f"{bucket} ✕")
+                chip.setObjectName("facetActiveChip")
+                chip.setCursor(Qt.PointingHandCursor)
+                chip.setToolTip("点击移除该筛选条件")
+                chip.clicked.connect(
+                    lambda _=False, d=dim, b=bucket: self.facet_panel.remove_filter(d, b))
+                lay.insertWidget(lay.count() - 1, chip)
 
     def _apply_facet(self, filters: dict) -> None:
         if self._search_pending_req is not None:
@@ -3270,6 +3292,7 @@ class MainWindow(QMainWindow):
         self._facet_filters = {}
         self.facet_panel.update_counts(
             facet_counts(self._results_raw, datetime.datetime.now().timestamp()), keep=False)
+        self._refresh_facet_chips()
 
     def _toggle_detail(self) -> None:
         if self.detail_panel.isHidden():

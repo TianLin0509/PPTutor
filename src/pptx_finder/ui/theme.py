@@ -210,6 +210,13 @@ QPushButton#chip { background: transparent; border: 1px solid $bd; border-radius
 QPushButton#chip:hover { background: $hover; color: $ink2; }
 QPushButton#chip:checked { background: rgba($hl_r,$hl_g,$hl_b,0.14); border-color: $acc; color: $acc; }
 
+/* 结果顶栏条件行：已选条件 chip（点 ✕ 移除，淡蓝选中态）+ 虚线「+ 筛选」入口 */
+QWidget#facetBar { background: transparent; }
+QPushButton#facetActiveChip { background: rgba($hl_r,$hl_g,$hl_b,0.14); border: 1px solid $acc; border-radius: 980px; padding: 4px 12px; color: $acc; font-size: 12px; }
+QPushButton#facetActiveChip:hover { background: rgba($hl_r,$hl_g,$hl_b,0.22); }
+QPushButton#facetAdd { background: transparent; border: 1px dashed $bd; border-radius: 980px; padding: 4px 12px; color: $ink3; font-size: 12px; }
+QPushButton#facetAdd:hover { background: $hover; color: $ink2; }
+
 /* 结果列表（在 listPane 卡内，透明） */
 QListWidget#resultList { background: transparent; border: none; outline: 0; padding: 6px 4px; }
 QListWidget#resultList::item { border: none; margin: 0; padding: 0; background: transparent; }
