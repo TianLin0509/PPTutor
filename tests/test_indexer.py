@@ -215,3 +215,58 @@ def test_index_single_sanitizes_surrogate_text_before_sqlite(tmp_path, monkeypat
     assert "Keyword" in raw
     assert not any(0xD800 <= ord(ch) <= 0xDFFF for ch in raw)
     assert _fts_files(conn, "Keyword")
+
+
+def test_scan_error_paths_collected_and_persisted(tmp_path, monkeypatch):
+    """scan_error 时全量路径列表进 summary 并持久化到 db meta。"""
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    _mk(docs / "a.pptx", ["算力"])
+    conn = db.connect(tmp_path / "i.db")
+    db.init_db(conn)
+
+    def fake_iter(_roots, **kwargs):
+        for name in ("locked_a", "locked_b", "locked_c"):
+            err = PermissionError("denied")
+            err.filename = str(tmp_path / name)
+            kwargs["scan_error_cb"](err)
+        yield docs / "a.pptx"
+
+    monkeypatch.setattr("pptx_finder.scanner.iter_ppt_files", fake_iter)
+    summary = indexer.update_index(conn, [str(docs)], workers=1)
+
+    assert summary["unreadable_dirs"] == 3
+    assert summary["scan_error_paths"] == [
+        str(tmp_path / "locked_a"),
+        str(tmp_path / "locked_b"),
+        str(tmp_path / "locked_c"),
+    ]
+    assert len(summary["scan_error_examples"]) == 3
+    persisted = db.meta_value(conn, db.META_LAST_SCAN_ERROR_PATHS, "")
+    assert persisted.splitlines() == summary["scan_error_paths"]
+
+
+def test_scan_error_paths_capped_at_500(tmp_path, monkeypatch):
+    """计数 unreadable_dirs 不受 cap 影响，全量列表最多保留 500 条防爆。"""
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    _mk(docs / "a.pptx", ["算力"])
+    conn = db.connect(tmp_path / "i.db")
+    db.init_db(conn)
+
+    def fake_iter(_roots, **kwargs):
+        for i in range(505):
+            err = PermissionError("denied")
+            err.filename = str(tmp_path / f"locked_{i}")
+            kwargs["scan_error_cb"](err)
+        yield docs / "a.pptx"
+
+    monkeypatch.setattr("pptx_finder.scanner.iter_ppt_files", fake_iter)
+    summary = indexer.update_index(conn, [str(docs)], workers=1)
+
+    assert summary["unreadable_dirs"] == 505
+    assert len(summary["scan_error_paths"]) == 500
+    assert summary["scan_error_paths"][-1] == str(tmp_path / "locked_499")
+    assert len(summary["scan_error_examples"]) == 5
+    persisted = db.meta_value(conn, db.META_LAST_SCAN_ERROR_PATHS, "")
+    assert len(persisted.splitlines()) == 500

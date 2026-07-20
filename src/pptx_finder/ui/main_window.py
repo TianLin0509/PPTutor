@@ -18,7 +18,7 @@ import time
 from PySide6.QtCore import QEvent, QMimeData, QPoint, QPropertyAnimation, QSize, Qt, QStringListModel, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QCursor, QDrag, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap, QShortcut
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QCompleter, QFrame, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+    QApplication, QComboBox, QCompleter, QDialog, QFrame, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMainWindow, QMenu, QProgressBar, QPushButton, QScrollArea,
     QSizePolicy, QSplitter, QStackedWidget, QToolButton, QVBoxLayout, QWidget,
 )
@@ -1318,6 +1318,17 @@ class MainWindow(QMainWindow):
         self.status.addWidget(self.status_dot)
         self.status_label = QLabel("准备中…")
         self.status.addWidget(self.status_label)
+        # 无权限文件夹警示：仅上轮扫描有无权限目录时显示，点击弹出完整清单
+        self.status_warn_label = QLabel("")
+        self.status_warn_label.setObjectName("statusWarnLabel")
+        self.status_warn_label.setCursor(Qt.PointingHandCursor)
+        self.status_warn_label.installEventFilter(self)  # 点击 → 无权限文件夹详情
+        self.status_warn_label.hide()
+        self.status.addWidget(self.status_warn_label)
+        self._scan_error_paths: list[str] = []
+        self._scan_error_examples: list[str] = []
+        self._scan_unreadable_dirs = 0
+        self._unreadable_dirs_dialog = None
         self.last_index_label = QLabel("")
         self.last_index_label.setObjectName("lastIndexLabel")
         self.last_index_label.setToolTip("上次全量索引完成时间；实时增量索引持续进行中")
@@ -2832,6 +2843,81 @@ class MainWindow(QMainWindow):
         dlg.show()
         dlg.raise_()
         dlg.activateWindow()
+
+    def _open_unreadable_dirs_dialog(self) -> None:
+        """状态栏警示点击 → 列出扫描时无权限读取的文件夹完整清单。
+
+        数据直接用 _apply_status_stats 已解析的暂存值，不再查库。
+        """
+        existing = self._unreadable_dirs_dialog
+        if existing is not None:
+            try:
+                if existing.isVisible():
+                    existing.raise_()
+                    existing.activateWindow()
+                    return
+            except RuntimeError:
+                self._unreadable_dirs_dialog = None
+        unreadable = int(getattr(self, "_scan_unreadable_dirs", 0) or 0)
+        paths = list(getattr(self, "_scan_error_paths", []) or [])
+        only_examples = not paths
+        if only_examples:
+            # 旧数据没有全量列表，退化为示例（仅前 5 条）
+            paths = list(getattr(self, "_scan_error_examples", []) or [])
+        dlg = QDialog(self)
+        dlg.setObjectName("unreadableDirsDialog")
+        dlg.setWindowTitle("无权限文件夹")
+        dlg.setMinimumWidth(560)
+        dlg.setMinimumHeight(360)
+        try:
+            _t = theme.tok(get_theme())
+            dlg.setStyleSheet(f"QDialog#unreadableDirsDialog {{ background: {_t['win']}; }}")
+        except Exception:  # noqa: BLE001 样式失败不影响功能
+            pass
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(18, 16, 18, 16)
+        lay.setSpacing(10)
+        count = unreadable or len(paths)
+        desc = QLabel(
+            f"以下 {count} 个文件夹扫描时无权限读取，内容可能有遗漏。"
+            "可在系统层面检查权限，或在设置中排除。"
+        )
+        desc.setWordWrap(True)
+        lay.addWidget(desc)
+        if only_examples:
+            note = QLabel("（仅示例：旧版本数据只保留了部分目录）")
+            note.setObjectName("unreadableDirsNote")
+            lay.addWidget(note)
+        lst = QListWidget()
+        lst.setObjectName("unreadableDirsList")
+        lst.addItems(paths)
+        lay.addWidget(lst, 1)
+        btns = QHBoxLayout()
+        copy_btn = QPushButton("复制全部路径")
+        copy_btn.clicked.connect(lambda: self._copy_unreadable_dirs(paths))
+        btns.addWidget(copy_btn)
+        health_btn = QPushButton("打开健康诊断")
+        health_btn.clicked.connect(lambda: (dlg.accept(), self._open_health_diagnostics()))
+        btns.addWidget(health_btn)
+        btns.addStretch(1)
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(dlg.accept)
+        btns.addWidget(close_btn)
+        lay.addLayout(btns)
+        self._unreadable_dirs_dialog = dlg
+        dlg.destroyed.connect(
+            lambda _=None, d=dlg: setattr(self, "_unreadable_dirs_dialog", None)
+            if self._unreadable_dirs_dialog is d else None
+        )
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _copy_unreadable_dirs(self, paths: list[str]) -> None:
+        if not paths:
+            return
+        QApplication.clipboard().setText("\n".join(str(p) for p in paths))
+        self._toast(f"已复制 {len(paths)} 个路径")
 
     def _health_db_path(self) -> str:
         return _sqlite_file_path(self._conn) or self._db_path
@@ -4447,6 +4533,9 @@ class MainWindow(QMainWindow):
             if callable(cb):
                 cb()
             return True
+        if obj is getattr(self, "status_warn_label", None) and et == QEvent.MouseButtonPress:
+            self._open_unreadable_dirs_dialog()  # 状态栏警示点击 → 无权限文件夹详情
+            return True
         if et in (QEvent.Wheel, QEvent.MouseButtonDblClick) and obj in (self.image_label, self.scroll.viewport()):
             if et == QEvent.Wheel:
                 if ev.modifiers() & Qt.ControlModifier:
@@ -5426,6 +5515,7 @@ class MainWindow(QMainWindow):
         self._index_progress_last_ui_at = now
         self._index_progress_last_phase = phase
         self.status_dot.hide()
+        self.status_warn_label.hide()  # 扫描进行中先收起警示，完成后由 _apply_status_stats 恢复
         self.type_rail.hide()
         self.index_phase_label.show()
         self.index_count_label.show()
@@ -5484,6 +5574,7 @@ class MainWindow(QMainWindow):
             self.pct_label.clear()
             self.pct_label.hide()
             self.status_dot.hide()
+            self.status_warn_label.hide()
             self.status_label.setToolTip("")
             if error:
                 self.status_label.setText(
@@ -5535,6 +5626,8 @@ class MainWindow(QMainWindow):
                     own, db.META_LAST_SCAN_UNREADABLE_DIRS, "0")
                 stats["last_scan_error_examples"] = db.meta_value(
                     own, db.META_LAST_SCAN_ERROR_EXAMPLES, "")
+                stats["last_scan_error_paths"] = db.meta_value(
+                    own, db.META_LAST_SCAN_ERROR_PATHS, "")
                 stats["type_counts"] = db.type_counts(own)
                 stats["completed_feature_signature"] = (
                     get_completed_index_feature_signature()
@@ -5553,6 +5646,8 @@ class MainWindow(QMainWindow):
             self._conn, db.META_LAST_SCAN_UNREADABLE_DIRS, "0")
         stats["last_scan_error_examples"] = db.meta_value(
             self._conn, db.META_LAST_SCAN_ERROR_EXAMPLES, "")
+        stats["last_scan_error_paths"] = db.meta_value(
+            self._conn, db.META_LAST_SCAN_ERROR_PATHS, "")
         stats["type_counts"] = db.type_counts(self._conn)
         stats["completed_feature_signature"] = get_completed_index_feature_signature()
         return stats
@@ -5641,13 +5736,18 @@ class MainWindow(QMainWindow):
             )
         except (TypeError, ValueError):
             unreadable = 0
-        coverage_warning = (
-            f" · ⚠ {unreadable} 个文件夹无权限，可能有遗漏"
-            if unreadable else ""
+        coverage_paths = (summary or {}).get(
+            "scan_error_paths",
+            stats.get("last_scan_error_paths", ""),
         )
+        if isinstance(coverage_paths, (list, tuple)):
+            coverage_paths = [str(path) for path in coverage_paths]
+        else:
+            coverage_paths = str(coverage_paths or "").splitlines()
+        coverage_paths = [path for path in coverage_paths if path]
         self.status_dot.show()
         self.status_label.setText(
-            f"\u7d22\u5f15\u5c31\u7eea\uff1a{stats.get('file_count', 0)} \u4e2a\u6587\u4ef6 \u00b7 {stats.get('page_count', 0)} \u9875{dist}{coverage_warning}"
+            f"\u7d22\u5f15\u5c31\u7eea\uff1a{stats.get('file_count', 0)} \u4e2a\u6587\u4ef6 \u00b7 {stats.get('page_count', 0)} \u9875{dist}"
        )
         examples = (summary or {}).get(
             "scan_error_examples",
@@ -5657,10 +5757,21 @@ class MainWindow(QMainWindow):
             examples = "\n".join(str(path) for path in examples)
         else:
             examples = str(examples or "")
-        self.status_label.setToolTip(
-            "以下目录本轮无法读取：\n" + examples
-            if unreadable and examples else ""
-        )
+        # 暂存已解析数据供详情对话框使用，避免对话框再查库
+        self._scan_error_paths = coverage_paths
+        self._scan_error_examples = [p for p in examples.splitlines() if p]
+        self._scan_unreadable_dirs = unreadable
+        self.status_label.setToolTip("")
+        if unreadable:
+            self.status_warn_label.setText(f"⚠ {unreadable} 个文件夹无权限，可能有遗漏")
+            self.status_warn_label.setToolTip(
+                "以下目录本轮无法读取：\n" + examples
+                if examples else ""
+            )
+            self.status_warn_label.show()
+        else:
+            self.status_warn_label.hide()
+            self.status_warn_label.setToolTip("")
         # 常驻「上次索引 HH:mm」：上次全量索引完成时间，提示数据新鲜度
         try:
             last_scan_at = float(stats.get("last_completed_scan_at", 0) or 0)

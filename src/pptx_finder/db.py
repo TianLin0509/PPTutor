@@ -30,6 +30,7 @@ META_KNOWN_RECONCILE_CURSOR = "known_reconcile_cursor"
 META_SCAN_POLICY_VERSION = "scan_policy_version"
 META_LAST_SCAN_UNREADABLE_DIRS = "last_scan_unreadable_dirs"
 META_LAST_SCAN_ERROR_EXAMPLES = "last_scan_error_examples"
+META_LAST_SCAN_ERROR_PATHS = "last_scan_error_paths"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS files(

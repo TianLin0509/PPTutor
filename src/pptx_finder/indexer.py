@@ -354,6 +354,7 @@ def update_index(
         "cancelled": 0,
         "unreadable_dirs": 0,
         "scan_error_examples": [],
+        "scan_error_paths": [],
     }
     allowed_exts = {
         ext.lower()
@@ -384,9 +385,13 @@ def update_index(
 
     def scan_error(error: OSError) -> None:
         summary["unreadable_dirs"] += 1
+        path = str(getattr(error, "filename", "") or error)
         examples = summary["scan_error_examples"]
         if len(examples) < 5:
-            examples.append(str(getattr(error, "filename", "") or error))
+            examples.append(path)
+        paths = summary["scan_error_paths"]
+        if len(paths) < 500:  # 全量列表，cap 防爆
+            paths.append(path)
 
     source = (
         scan_iter
@@ -688,6 +693,11 @@ def update_index(
             conn,
             db.META_LAST_SCAN_ERROR_EXAMPLES,
             "\n".join(str(path) for path in summary.get("scan_error_examples", [])),
+        )
+        db.set_meta(
+            conn,
+            db.META_LAST_SCAN_ERROR_PATHS,
+            "\n".join(str(path) for path in summary.get("scan_error_paths", [])),
         )
         conn.commit()
     summary["scanned"] = len(seen)

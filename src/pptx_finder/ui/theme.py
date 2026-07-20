@@ -360,6 +360,7 @@ QLabel#pctLabel {
 }
 QLabel#statusDot { color: $grn; font-size: 13px; padding: 0 2px 0 4px; background: transparent; }
 QStatusBar#statusBar QLabel#lastIndexLabel { color: $ink4; font-size: 12px; background: transparent; }
+QStatusBar#statusBar QLabel#statusWarnLabel { color: #D97706; font-size: 12px; background: transparent; }
 QFrame#typeRail { background: transparent; }
 
 /* 仪表盘首屏（零搜索默认视图） */
