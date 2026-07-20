@@ -2884,6 +2884,19 @@ class MainWindow(QMainWindow):
             if callable(schedule):
                 schedule(force=True)
 
+    def _locate_health_item(self, path: str, name: str) -> None:
+        """体检条目点击定位：切搜索页 + 仅文件名模式 + 按去扩展名的文件名搜索
+        （走正常搜索链，结果首条自动选中即预览）。健康页 embedded 时由 HealthWindow 鸭子类型回调。"""
+        base = os.path.splitext((name or os.path.basename(path or "")).strip())[0].strip()
+        if not base:
+            return
+        self._switch_page("search")
+        self.search_box.setText(base)
+        if self.mode.currentIndex() != 1:
+            self.mode.setCurrentIndex(1)  # currentIndexChanged → _do_search（此时文本已就位）
+        else:
+            self._do_search()
+
     def _open_health_center(self) -> None:
         """打开「库体检中心」：切到健康页（懒加载嵌入 HealthWindow；进入即重新体检）。
         原 _health_windows 独立窗管理随主区页面化退役。"""

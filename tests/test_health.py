@@ -106,9 +106,37 @@ def test_scan_health_counts_all_ailments(tmp_path):
     assert rep.curse_count == 1
     assert rep.parse_failed == 1
     assert rep.parse_failed_by_status == {"encrypted": 1}
-    assert rep.bloat_biggest == ("巨无霸.pptx", 99999)
-    assert rep.bloat_longest == ("巨无霸.pptx", 180)
+    assert rep.bloat_biggest == ("巨无霸.pptx", 99999, "/big.pptx")
+    assert rep.bloat_longest == ("巨无霸.pptx", 180, "/big.pptx")
+    assert rep.zombie_examples == [health.AilmentExample("老古董.pptx", "/z.pptx")]
+    assert rep.curse_examples == [health.AilmentExample("最终版方案.pptx", "/c.pptx")]
+    assert rep.parse_failed_examples == [health.AilmentExample("坏文件.pptx", "/e.pptx")]
     assert 0 <= rep.score < 100
+
+
+def test_scan_health_examples_carry_name_and_path(tmp_path):
+    conn = _conn(tmp_path)
+    now = _ts(2026, 6, 26)
+    _put(conn, "老古董.pptx", path="/docs/z.pptx", mtime=_ts(2023, 1, 1))
+    conn.commit()
+    rep = health.scan_health(conn, now=now)
+    assert rep.zombie_count == 1
+    ex = rep.zombie_examples[0]
+    assert ex.name == "老古董.pptx"
+    assert ex.path == "/docs/z.pptx"
+
+
+def test_scan_health_examples_capped_at_10(tmp_path):
+    conn = _conn(tmp_path)
+    now = _ts(2026, 6, 26)
+    for i in range(12):
+        _put(conn, f"最终版{i}.pptx", path=f"/c{i}.pptx", mtime=_ts(2023, 1, 1), status="encrypted")
+    conn.commit()
+    rep = health.scan_health(conn, now=now)
+    assert rep.zombie_count == 12 and rep.curse_count == 12 and rep.parse_failed == 12
+    assert len(rep.zombie_examples) == 10
+    assert len(rep.curse_examples) == 10
+    assert len(rep.parse_failed_examples) == 10
 
 
 def test_scan_health_exts_filters_to_ppt(tmp_path):

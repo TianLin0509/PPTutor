@@ -124,3 +124,15 @@ def test_version_rail_button_follows_feature_flag(qtbot, tmp_path):
     # 再关掉 → 入口隐藏
     win.set_version_manager(None)
     assert btn.isHidden()
+
+
+def test_locate_health_item_switches_to_search_filename_mode(qtbot, tmp_path):
+    """体检条目点击定位：切搜索页 + 仅文件名模式 + 去扩展名的文件名作为查询文本。"""
+    win = _win(qtbot, tmp_path)
+
+    win._locate_health_item("/docs/昇腾 汇报.pptx", "昇腾 汇报.pptx")
+
+    assert win._current_page_key() == "search"
+    assert win._rail_page_btns["search"].isChecked()
+    assert win.mode.currentIndex() == 1
+    assert win.search_box.text() == "昇腾 汇报"

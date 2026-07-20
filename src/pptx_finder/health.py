@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from . import stats  # 复用 stats._CURSE（终版诅咒命名梗，与胶片报告同一口径）
 
 _YEAR_SEC = 365 * 24 * 3600
+_EXAMPLE_LIMIT = 10  # 各病灶示例条目上限：够点击跳转定位，又不至于塞爆卡片
 
 
 def human_bytes(n: int | float) -> str:
@@ -101,6 +102,14 @@ def find_duplicate_groups(conn: sqlite3.Connection, exts: tuple[str, ...] | None
 # ---------- 体检总报告 ----------
 
 @dataclass
+class AilmentExample:
+    """单条病灶示例：name 用于展示，path 用于点击跳转定位。"""
+
+    name: str
+    path: str
+
+
+@dataclass
 class HealthReport:
     deck_count: int
     score: int                                   # 0-100 健康分
@@ -110,10 +119,13 @@ class HealthReport:
     zombie_count: int = 0
     zombie_bytes: int = 0
     curse_count: int = 0
-    bloat_biggest: tuple[str, int] | None = None  # (name, size)
-    bloat_longest: tuple[str, int] | None = None  # (name, page_count)
+    bloat_biggest: tuple[str, int, str] | None = None  # (name, size, path)
+    bloat_longest: tuple[str, int, str] | None = None  # (name, page_count, path)
     parse_failed: int = 0
     parse_failed_by_status: dict[str, int] = field(default_factory=dict)
+    zombie_examples: list[AilmentExample] = field(default_factory=list)        # ≤_EXAMPLE_LIMIT 条
+    curse_examples: list[AilmentExample] = field(default_factory=list)
+    parse_failed_examples: list[AilmentExample] = field(default_factory=list)
 
     @property
     def duplicate_groups_count(self) -> int:
@@ -158,11 +170,16 @@ def scan_health(conn: sqlite3.Connection, *, now: float | None = None,
 
     biggest = max(rows, key=lambda r: int(r["size"] or 0), default=None)
     longest = max(rows, key=lambda r: int(r["page_count"] or 0), default=None)
-    bloat_biggest = (biggest["name"], int(biggest["size"] or 0)) if biggest and (biggest["size"] or 0) > 0 else None
-    bloat_longest = (longest["name"], int(longest["page_count"] or 0)) if longest and (longest["page_count"] or 0) > 0 else None
+    bloat_biggest = (biggest["name"], int(biggest["size"] or 0), biggest["path"]) if biggest and (biggest["size"] or 0) > 0 else None
+    bloat_longest = (longest["name"], int(longest["page_count"] or 0), longest["path"]) if longest and (longest["page_count"] or 0) > 0 else None
 
     failed = [r for r in rows if (r["status"] or "ok") != "ok"]
     by_status = dict(Counter((r["status"] or "ok") for r in failed))
+
+    def _examples(src) -> list[AilmentExample]:
+        # 数据内部本是全量行列表，以前只留计数；取前几条给 UI 做可点跳转
+        return [AilmentExample(name=r["name"] or "", path=r["path"] or "")
+                for r in src[:_EXAMPLE_LIMIT]]
 
     score = _health_score(deck_count, dup_redundant, len(zombies), len(curse), len(failed))
     return HealthReport(
@@ -178,6 +195,9 @@ def scan_health(conn: sqlite3.Connection, *, now: float | None = None,
         bloat_longest=bloat_longest,
         parse_failed=len(failed),
         parse_failed_by_status=by_status,
+        zombie_examples=_examples(zombies),
+        curse_examples=_examples(curse),
+        parse_failed_examples=_examples(failed),
     )
 
 

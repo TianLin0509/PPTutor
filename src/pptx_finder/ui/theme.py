@@ -377,6 +377,7 @@ QFrame#dashRec { background: $field; border: 1px solid $bd2; border-radius: 9px;
 QLabel#recName { color: $ink1; font-size: 12px; font-weight: 600; background: transparent; }
 QLabel#recTime { color: $ink4; font-size: 11px; background: transparent; }
 QLabel#recVer { color: $acc; font-size: 11px; font-weight: 700; background: transparent; }
+QLabel#healthLink { background: transparent; }  /* 库体检可点病灶条目：颜色由内联 acc token 控制，hover 下划线走 eventFilter */
 
 /* 分隔条 */
 QSplitter::handle { background: transparent; }
