@@ -809,6 +809,8 @@ class MainWindow(QMainWindow):
         self._cur_item_widget: ResultItem | None = None
         self._search_seq = 0
         self._search_pending_req: int | None = None
+        self._last_query_text = ""            # 上次 _do_search 入口的查询文本（识别后台重搜）
+        self._search_keep_selection = False   # 本次搜索是否「文本未变的后台重搜」（保留选中用）
         self._search_worker: SearchWorker | None = None
         self._async_search = conn is None and do_index
         self._live_refresh_after_search = False
@@ -874,6 +876,7 @@ class MainWindow(QMainWindow):
         self._view_page = 1  # 褰撳墠棰勮椤碉紙鍘熷椤靛簭锛屾粴杞彲鑴辩鍛戒腑椤佃嚜鐢辩炕锛?
         self._preview_direction = 1  # 最近一次翻页方向；邻页预取优先沿该方向
         self._req_id = 0
+        self._req_path: str | None = None  # 当前 req_id 渲染请求的源文件 path（迟到渲染校验用）
         self._cur_pixmap: QPixmap | None = None
         self._zoom = 1.0  # 棰勮缂╂斁锛?.0=閫傞厤绐楀彛锛?1 鏀惧ぇ鐪嬬粏鑺?
         self._to_tray_on_close = False
@@ -1496,8 +1499,14 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+L"), self, activated=self._focus_search)
 
     def _focus_search(self) -> None:
+        self.focus_search()
+
+    def focus_search(self) -> None:
+        """显式唤起搜索框（Ctrl+L / 全局热键）：聚焦 + 全选，空文本时补弹历史下拉。
+        setFocus 产生的 FocusIn 不再自动弹历史（见 eventFilter），这里显式补一次。"""
         self.search_box.setFocus()
         self.search_box.selectAll()
+        self.show_history_popup()
 
     def set_hotkey_status(self, spec: str, ok: bool) -> None:
         """状态栏全局热键标签（#2）：成功显示热键；失败标黄「点此改」。app.py 注册后回调。"""
@@ -2050,6 +2059,15 @@ class MainWindow(QMainWindow):
     def _refresh_history_model(self) -> None:
         self._history_model.setStringList(history.load_history(limit=10))
 
+    def show_history_popup(self) -> None:
+        """空搜索框时刷新并弹出历史下拉。供显式唤起路径调用：鼠标点入（eventFilter
+        按 MouseFocusReason 触发）、Ctrl+L、全局热键；其余 FocusIn 一律不弹。"""
+        if self.search_box.text():
+            return
+        self._refresh_history_model()
+        if self._history_model.stringList():
+            self._completer.complete()
+
     def _mode_key(self) -> str:
         return {1: "filename", 2: "content"}.get(self.mode.currentIndex(), "all")
 
@@ -2164,6 +2182,10 @@ class MainWindow(QMainWindow):
         if hasattr(self, "_history_hint"):
             self._history_hint.hide()
         query = self.search_box.text().strip()
+        # 区分「用户改词」与「后台重搜」（live 刷新等文本未变的重搜）：
+        # 后者在结果重建后按 path 恢复选中，而不是拽回首行
+        self._search_keep_selection = bool(query) and query == self._last_query_text
+        self._last_query_text = query
         self._search_seq += 1
         self._cancel_render_work_for_new_search()
         self._cancel_auto_preview()
@@ -2315,6 +2337,8 @@ class MainWindow(QMainWindow):
         self._clear_search_pending()
         self._results_raw = results
         self._refresh_facets()
+        # 后台重搜（查询文本未变）时记住当前选中文件，重建后按 path 恢复选中
+        keep_path = self._cur.path if (self._search_keep_selection and self._cur is not None) else None
         suffix = f" \u00b7 {elapsed_ms:.0f} ms" if elapsed_ms is not None else ""
         if results:
             self.result_count.setText(f"\u547d\u4e2d {len(results)} \u4e2a\u6587\u4ef6{suffix}")
@@ -2324,7 +2348,8 @@ class MainWindow(QMainWindow):
         self._apply_sort_render()
         if results:
             self.list_head.show()
-            self._select_first(delayed_preview=True)
+            if not (keep_path and self._select_path(keep_path)):
+                self._select_first(delayed_preview=True)
             self._animate_list_in()
             self._kick_history_search(query)
         else:
@@ -3050,9 +3075,11 @@ class MainWindow(QMainWindow):
             return
         if self._results_raw:
             self._cancel_auto_preview()
+            keep_path = self._cur.path if self._cur is not None else None  # 排序变化按 path 保留选中
             self._apply_sort_render()
             if self._results:
-                self._select_first(delayed_preview=True)
+                if not (keep_path and self._select_path(keep_path, delayed_preview=True)):
+                    self._select_first(delayed_preview=True)
 
     # 只同步创建首屏结果卡片；其余结果在滚到底部或点击“继续显示”时分批物化。
     # 这样排序/筛选不再销毁并重建数百个 QWidget；结果卡保持纯文本，不派发图片任务。
@@ -3337,6 +3364,39 @@ class MainWindow(QMainWindow):
                 self._schedule_auto_preview(self._search_seq)
                 QTimer.singleShot(0, lambda: setattr(self, "_suppress_select_preview", False))
 
+    def _row_for_result_index(self, target: int) -> int:
+        for row in range(self.result_list.count()):
+            item = self.result_list.item(row)
+            if item is not None and item.data(Qt.UserRole) == target:
+                return row
+        return -1
+
+    def _select_path(self, path: str, *, delayed_preview: bool = False) -> bool:
+        """结果重建后按 path 恢复选中（后台刷新/排序/筛选时选中不跳回首行）。
+        目标结果尚未物化成卡片时按需分批加载；找不到返回 False，调用方回退 _select_first。"""
+        target = next((i for i, r in enumerate(self._results) if r.path == path), None)
+        if target is None:
+            return False
+        # 目标不在渲染计划里（如版本组重新折叠的历史版本）→ 直接回退，不全量物化
+        if not any(e[0] == "i" and e[1] == target for e in self._render_plan):
+            return False
+        row = self._row_for_result_index(target)
+        while row < 0 and self._render_plan_pos < len(self._render_plan):
+            pos_before = self._render_plan_pos
+            self._load_more_results()  # 结果卡分批物化：翻到目标所在批
+            row = self._row_for_result_index(target)
+            if self._render_plan_pos == pos_before:
+                break
+        if row < 0:
+            return False
+        if delayed_preview:
+            self._suppress_select_preview = True
+        self.result_list.setCurrentRow(row)
+        if delayed_preview:
+            self._schedule_auto_preview(self._search_seq)
+            QTimer.singleShot(0, lambda: setattr(self, "_suppress_select_preview", False))
+        return True
+
     # ---------- 閫夋嫨 / 棰勮 ----------
     def _cancel_auto_preview(self) -> None:
         self._auto_preview_token += 1
@@ -3383,6 +3443,8 @@ class MainWindow(QMainWindow):
         if idx is None or idx >= len(self._results):
             return
         self._cur = self._results[idx]
+        # 选中已变：在途旧渲染即刻作废，不等新请求派发（早退分支不 bump req_id 的漏洞）
+        self._invalidate_preview_request(clear_deferred=False)
         self._hit_idx = 0
         self._preview_direction = 1
         self._view_page = self._current_page()  # 鍒濆瀹氫綅棣栦釜鍛戒腑椤碉紙鏃犲懡涓?绗?椤碉級
@@ -3445,11 +3507,13 @@ class MainWindow(QMainWindow):
         self._facet_filters = filters
         self._cancel_auto_preview()
         self._suppress_select_preview = True
+        keep_path = self._cur.path if self._cur is not None else None  # 筛选变化按 path 保留选中
         self._apply_sort_render()
         if self._results:
             self.result_count.setText(f"命中 {len(self._results)} 个文件")
             self.list_head.show()
-            self._select_first(delayed_preview=True)
+            if not (keep_path and self._select_path(keep_path, delayed_preview=True)):
+                self._select_first(delayed_preview=True)
         else:
             QTimer.singleShot(0, lambda: setattr(self, "_suppress_select_preview", False))
             # 绛涢€夊悗鏃犵粨鏋滐細鍒暀銆屽懡涓?N 涓€嶉檲鏃ц鏁?+ 缁欑┖鐘舵€佹彁绀猴紙鍖哄埆浜庛€屾病鎼滃埌銆嶏級
@@ -3984,6 +4048,7 @@ class MainWindow(QMainWindow):
         if clear_deferred:
             self._preview_deferred_due_to_busy = False
         self._req_id += 1
+        self._req_path = None
         if hasattr(self, "_spin_timer"):
             self._stop_spinner()
 
@@ -4109,6 +4174,7 @@ class MainWindow(QMainWindow):
         if not cache_hit:
             self._start_spinner()
         self._req_id += 1
+        self._req_path = self._cur.path  # 记录本次渲染的源文件：迟到回包按 path 复核
         if cache_hit:
             self._preview_hinted = True
             self._prefetch_neighbors()
@@ -4209,6 +4275,9 @@ class MainWindow(QMainWindow):
         if self._closing:
             return
         if req_id != self._req_id:
+            return
+        # 双保险：派发时记录过源 path 的渲染，选中文件已不同则丢弃（迟到渲染不回屏）
+        if self._req_path is not None and (self._cur is None or self._cur.path != self._req_path):
             return
         self._stop_spinner()
         if not png or not os.path.exists(png):
@@ -4375,9 +4444,10 @@ class MainWindow(QMainWindow):
                 self._toggle_zoom()
             return True
         if obj is self.search_box and ev.type() == QEvent.FocusIn and not self.search_box.text():
-            self._refresh_history_model()
-            if self._history_model.stringList():
-                self._completer.complete()
+            # 仅真正点进框里才自动弹历史；窗口激活/浮层归还焦点不弹——
+            # 焦点长期粘在搜索框上，点导航按钮不抢焦点，那些 FocusIn 会让历史「自动展开」
+            if ev.reason() == Qt.MouseFocusReason:
+                self.show_history_popup()
         if obj is self.search_box and ev.type() == QEvent.KeyPress:
             k = ev.key()
             if k in (Qt.Key_Down, Qt.Key_Up):

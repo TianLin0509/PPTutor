@@ -728,6 +728,48 @@ def test_completed_right_preview_stays_in_selected_preview_only(qtbot, tmp_path)
     assert card.findChild(QLabel, "cardThumb") is None
 
 
+def test_late_render_from_previous_selection_is_dropped(qtbot, tmp_path):
+    """A 渲染在途时选中切到 B：选中即作废旧请求；A 迟到的渲染不上屏。"""
+    image = tmp_path / "late.png"
+    pm = QPixmap(160, 90)
+    pm.fill(Qt.red)
+    assert pm.save(str(image), "PNG")
+
+    conn = _index(tmp_path)
+    render = PendingRender()
+    win = MainWindow(conn=conn, render_worker=render, do_index=False)
+    qtbot.addWidget(win)
+    results = _fake_results(2)
+    win._showing_recent = False
+    win._results_raw = results
+    win._results = results
+    win._render_results(results)
+
+    win.result_list.setCurrentRow(0)   # 选中 A → 派发 A 的渲染（PendingRender 不回包）
+    qtbot.waitUntil(lambda: len(render.calls) == 1, timeout=1000)
+    a_req, a_path, _page = render.calls[-1]
+    assert a_path == results[0].path
+    assert win._req_path == a_path
+
+    win.result_list.setCurrentRow(1)   # 选中 B → _on_select 立刻作废旧请求 + 派发 B
+    assert win._req_id != a_req
+    qtbot.waitUntil(lambda: len(render.calls) == 2, timeout=1000)
+
+    render.rendered.emit(a_req, str(image))   # A 的迟到渲染：req_id 已作废
+    assert win._cur_pixmap is None
+
+    # 双保险之二：req_id 碰巧仍匹配时按源 path 复核（直接构造早退留下的残留状态）
+    win._req_id = a_req
+    win._req_path = a_path
+    assert win._cur.path == results[1].path   # 当前选中已是 B
+    win._on_rendered(a_req, str(image))
+    assert win._cur_pixmap is None            # path 不一致 → 丢弃
+
+    win._req_path = results[1].path           # 对照：path 一致才正常上屏
+    win._on_rendered(a_req, str(image))
+    assert win._cur_pixmap is not None and not win._cur_pixmap.isNull()
+
+
 def test_facet_change_auto_preview_is_delayed(qtbot, monkeypatch, tmp_path):
     monkeypatch.setattr(MainWindow, "_AUTO_PREVIEW_DELAY_MS", 80)
     conn = _index_multi(

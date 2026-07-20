@@ -5,7 +5,7 @@ import threading
 import time
 
 import fixtures_gen as fx
-from test_ui import StubRender, StubThumb, _finish_fake_task, _index, _install_fake_background_task
+from test_ui import StubRender, StubThumb, _finish_fake_task, _index, _index_multi, _install_fake_background_task
 
 from pptx_finder import db, indexer, search
 from pptx_finder.ui.index_worker import IndexWorker
@@ -986,3 +986,44 @@ def test_thumb_worker_coalesces_duplicate_requests():
     tw.request("a.pptx", 2)
     assert tw._q.qsize() == 2
     tw.clear()
+
+
+def test_live_refresh_keeps_selection_by_path(qtbot, tmp_path):
+    """live 后台重搜（查询文本未变）：选中按 path 保留，不被拽回首行。"""
+    conn = _index_multi(tmp_path, {f"deck-{i}.pptx": [f"共同词 保留选中 变体{i}"] for i in range(3)})
+    win = MainWindow(conn=conn, render_worker=StubRender(), do_index=False,
+                     smart_grouping_enabled=False)
+    qtbot.addWidget(win)
+    win.search_box.setText("共同词")
+    win._do_search()
+    assert win.result_list.count() == 3
+
+    win.result_list.setCurrentRow(1)   # 用户选中第二个文件
+    keep_path = win._results[1].path
+    assert win._cur is not None and win._cur.path == keep_path
+
+    win._do_live_refresh()             # watcher 触发的后台重搜：结果集不变
+
+    assert win.result_list.count() == 3
+    assert win._cur is not None
+    assert win._cur.path == keep_path  # 选中不跳回首行
+    assert win.result_list.currentRow() == 1
+
+
+def test_user_requery_still_selects_first(qtbot, tmp_path):
+    """用户主动改词的重搜保持原行为：选中回第一行。"""
+    conn = _index_multi(tmp_path, {f"deck-{i}.pptx": [f"共同词 保留选中 变体{i}"] for i in range(3)})
+    win = MainWindow(conn=conn, render_worker=StubRender(), do_index=False,
+                     smart_grouping_enabled=False)
+    qtbot.addWidget(win)
+    win.search_box.setText("共同词")
+    win._do_search()
+    win.result_list.setCurrentRow(2)
+
+    win.search_box.setText("保留选中")
+    win._do_search()
+
+    assert win.result_list.count() == 3
+    assert win.result_list.currentRow() == win._first_selectable_row()
+    assert win._cur is not None
+    assert win._cur.path == win._results[0].path

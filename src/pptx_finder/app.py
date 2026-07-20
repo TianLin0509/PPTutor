@@ -517,8 +517,7 @@ def _toggle_window(win: MainWindow) -> None:
         win.showNormal()
         win.raise_()
         win.activateWindow()
-        win.search_box.setFocus()
-        win.search_box.selectAll()
+        win.focus_search()
 
 
 def _apply_global_hotkey(app, win, spec: str) -> bool:
