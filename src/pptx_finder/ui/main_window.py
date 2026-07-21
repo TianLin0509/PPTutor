@@ -748,6 +748,10 @@ class MainWindow(QMainWindow):
     _INDEX_PROGRESS_UI_MS = 100
     _INDEX_STATUS_CACHE_MS = 1000
     _KNOWN_RECONCILE_INTERVAL_SEC = 24 * 60 * 60
+    # F1 后台重搜节流：live 刷新驱动的重搜最小间隔；用户手动搜索不经过此节流
+    _BG_RESEARCH_MIN_INTERVAL_SEC = 15.0
+    # 用户刚改过查询词的宽限期，期间后台重搜不抢跑（用户主动操作永不节流）
+    _USER_INPUT_GRACE_SEC = 5.0
     _FULL_COVERAGE_INTERVAL_SEC = 7 * 24 * 60 * 60
     _FULL_COVERAGE_DELAY_MS = 30_000
     _FULL_COVERAGE_RETRY_MS = 5_000
@@ -814,6 +818,8 @@ class MainWindow(QMainWindow):
         self._search_worker: SearchWorker | None = None
         self._async_search = conn is None and do_index
         self._live_refresh_after_search = False
+        self._last_bg_research_ts = 0.0   # 上次后台重搜时刻（monotonic，F1）
+        self._last_user_input_ts = 0.0    # 用户最近一次改查询词时刻（monotonic，F1）
         self._live_deferred_paths: set[str] = set()
         self._search_slow_hint_req_id = 0
         self._search_slow_hint_query = ""
@@ -826,6 +832,11 @@ class MainWindow(QMainWindow):
         self._detail_load_inflight_token: int | None = None
         self._detail_load_inflight_path: str | None = None
         self._detail_load_inflight_file_id: int | None = None
+        # F3：detail 面板当前数据对应的文件/mtime 与版本+大纲缓存；
+        # 后台重搜按原 path 恢复选中时免重载，面板被重建清空则用缓存同步回填
+        self._detail_loaded_path: str | None = None
+        self._detail_loaded_mtime: float = 0.0
+        self._detail_loaded_payload: dict | None = None
         self._version_preview_inflight: set[str] = set()
         self._restore_diff_inflight: set[tuple[str, str]] = set()
         self._detail_dot_token = 0
@@ -877,6 +888,8 @@ class MainWindow(QMainWindow):
         self._preview_direction = 1  # 最近一次翻页方向；邻页预取优先沿该方向
         self._req_id = 0
         self._req_path: str | None = None  # 当前 req_id 渲染请求的源文件 path（迟到渲染校验用）
+        # F2 预览去重：当前已显示/在途预览的 (path, page, mtime, size)；同 key 重发直接 no-op
+        self._last_preview_key: tuple | None = None
         self._cur_pixmap: QPixmap | None = None
         self._zoom = 1.0  # 棰勮缂╂斁锛?.0=閫傞厤绐楀彛锛?1 鏀惧ぇ鐪嬬粏鑺?
         self._to_tray_on_close = False
@@ -1695,6 +1708,7 @@ class MainWindow(QMainWindow):
         self._clear_act.triggered.connect(self._clear_search_now)
         self.search_box.textChanged.connect(lambda: self._debounce.start())
         self.search_box.textChanged.connect(lambda t: self._clear_act.setVisible(bool(t)))
+        self.search_box.textChanged.connect(self._note_user_query_input)
         self.search_box.installEventFilter(self)
         self._history_model = QStringListModel(self)
         self._completer = QCompleter(self._history_model, self)
@@ -2183,6 +2197,10 @@ class MainWindow(QMainWindow):
         """当前文件类型过滤；即使选“全部”也只覆盖用户已开启的类型。"""
         tf = getattr(self, "type_filter", None)
         return tf.currentData() if tf is not None else self._enabled_index_exts()
+
+    def _note_user_query_input(self) -> None:
+        """查询词变化打点（F1）：后台重搜据此避开用户正在输入的窗口。"""
+        self._last_user_input_ts = time.monotonic()
 
     def _do_search(self) -> None:
         if self._closing:
@@ -3698,6 +3716,28 @@ class MainWindow(QMainWindow):
     def _schedule_detail_update(self, *, force: bool = False) -> None:
         if self._cur is None:  # 内容常驻：有选中文件即加载，无选中不调度
             return
+        cur = self._cur
+        if (
+            not force
+            and self._detail_loaded_payload is not None
+            and self._detail_loaded_path == cur.path
+            and self._detail_loaded_mtime == float(getattr(cur, "mtime", 0) or 0)
+        ):
+            # F3：同 path 且内容未变（典型：后台重搜按原选中恢复）→ 不再重查版本+大纲；
+            # 面板若在结果重建的瞬时被清空，用缓存 payload 同步回填，不起后台任务
+            if getattr(self.detail_panel, "_path", None) != cur.path:
+                payload = self._detail_loaded_payload
+                self.detail_panel.update_for(
+                    payload["result"],
+                    list(payload["versions"]),
+                    versioning_enabled=self._version_mgr is not None,
+                )
+                try:
+                    self.detail_panel.set_outline(list(payload["titles"]))
+                except Exception:  # noqa: BLE001
+                    self.detail_panel.set_outline([])
+                self._set_ops_enabled(True)
+            return
         self._detail_update_token += 1
         self._detail_update_force = self._detail_update_force or force
         self._detail_update_timer.setInterval(self._DETAIL_UPDATE_DELAY_MS)
@@ -3810,6 +3850,10 @@ class MainWindow(QMainWindow):
         except Exception:  # noqa: BLE001
             self.detail_panel.set_outline([])
         self._set_ops_enabled(self._cur is not None)
+        # F3：记录已加载的 path/mtime 与 payload，供 _schedule_detail_update 去重
+        self._detail_loaded_path = path
+        self._detail_loaded_mtime = float(getattr(r, "mtime", 0) or 0)
+        self._detail_loaded_payload = {"result": r, "versions": versions, "titles": titles}
 
     def _request_version_preview(self, version_id: str) -> None:
         if not version_id or self._version_mgr is None:
@@ -4153,6 +4197,7 @@ class MainWindow(QMainWindow):
 
     def _show_preview_pending(self) -> None:
         self._cur_pixmap = None
+        self._last_preview_key = None  # 画面被占位文本替换，F2 去重 key 一并失效
         self.image_label.setPixmap(QPixmap())
         self.image_label.setText(
             f'<div style="font-size:28px;color:{self._tok["ink4"]}">…</div>'
@@ -4160,6 +4205,7 @@ class MainWindow(QMainWindow):
 
     def _clear_preview_empty(self, message: str = "选中左侧结果查看预览") -> None:
         self._cur_pixmap = None
+        self._last_preview_key = None  # F2
         self.image_label.setPixmap(QPixmap())
         self.image_label.setText(
             f'<div style="color:{self._tok["ink3"]};font-size:13px">{message}</div>')
@@ -4174,6 +4220,7 @@ class MainWindow(QMainWindow):
         self._cur_pixmap = None
 
     def _show_non_powerpoint_preview(self, ext: str) -> None:
+        self._last_preview_key = None  # F2：非 PPT 文本占位替换画面，去重 key 失效
         kind = "Word" if ext == DOCX_EXT else "PDF"
         unit = "段落" if ext == DOCX_EXT else "页面"
         self.image_label.setPixmap(QPixmap())
@@ -4218,6 +4265,10 @@ class MainWindow(QMainWindow):
 
     def _request_preview(self) -> None:
         if not self._cur:
+            return
+        # F2 去重：同文件同页同内容的预览已显示/在途时不重发（挡住后台重搜恢复选中后的
+        # 连带 COM 渲染）；翻页/换文件/文件内容已变（mtime/size 变）时 key 不同照常
+        if self._last_preview_key == (self._cur.path, self._view_page, self._cur.mtime, self._cur.size):
             return
         if self._search_pending_req is not None:
             return
@@ -4274,6 +4325,7 @@ class MainWindow(QMainWindow):
             self._start_spinner()
         self._req_id += 1
         self._req_path = self._cur.path  # 记录本次渲染的源文件：迟到回包按 path 复核
+        self._last_preview_key = (self._cur.path, page, self._cur.mtime, self._cur.size)  # F2
         if cache_hit:
             self._preview_hinted = True
             self._prefetch_neighbors()
@@ -5397,7 +5449,16 @@ class MainWindow(QMainWindow):
         if self._search_pending_req is not None and self.search_box.text().strip():
             self._live_refresh_after_search = True
             return
-        if self.search_box.text().strip():
+        query = self.search_box.text().strip()
+        if query:
+            # F1 后台重搜节流：距上次后台重搜 <15s、或用户 <5s 前刚改过词，
+            # 本次 tick 直接放弃（不 reschedule；下一个 live 事件会再启动 2.5s 去抖）
+            now = time.monotonic()
+            if now - self._last_bg_research_ts < self._BG_RESEARCH_MIN_INTERVAL_SEC:
+                return
+            if now - self._last_user_input_ts < self._USER_INPUT_GRACE_SEC:
+                return
+            self._last_bg_research_ts = now
             self._do_search()
         elif getattr(self, "dashboard", None) is not None and self._showing_recent:
             self._show_recent(dashboard_force_refresh=True, recent_force_refresh=True)  # 绌烘悳绱㈠仠鍦ㄤ华琛ㄧ洏 鈫?鏂版枃浠跺苟鍏ュ悗鍒锋柊缁熻

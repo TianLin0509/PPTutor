@@ -1283,6 +1283,7 @@ def test_live_refresh_waits_for_pending_search(qtbot, tmp_path):
     # Production uses a multi-second quiet period.  Shorten only this test's
     # timer while preserving the wait-until-the-current-search-finishes rule.
     win._live_refresh.setInterval(20)
+    win._last_user_input_ts = 0.0  # F1 用户输入宽限：本测试验证 deferred 重搜，拨到宽限期外
     win._on_search_done(first_req, "昇腾", [], 1.0, None)
 
     qtbot.waitUntil(lambda: len(pending.requests) == 2, timeout=1000)

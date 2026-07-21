@@ -1002,6 +1002,7 @@ def test_live_refresh_keeps_selection_by_path(qtbot, tmp_path):
     keep_path = win._results[1].path
     assert win._cur is not None and win._cur.path == keep_path
 
+    win._last_user_input_ts = 0.0      # F1 用户输入宽限：拨到宽限期外，让后台重搜真实发生
     win._do_live_refresh()             # watcher 触发的后台重搜：结果集不变
 
     assert win.result_list.count() == 3
@@ -1027,3 +1028,141 @@ def test_user_requery_still_selects_first(qtbot, tmp_path):
     assert win.result_list.currentRow() == win._first_selectable_row()
     assert win._cur is not None
     assert win._cur.path == win._results[0].path
+
+
+# ---------- 后台刷新节流（F1 重搜间隔/输入宽限、F2 预览去重、F3 detail 免重载） ----------
+
+def test_live_refresh_throttles_background_research(qtbot, monkeypatch, tmp_path):
+    """F1：后台重搜最小间隔 15s——间隔内的第二次 tick 直接放弃，不 reschedule。"""
+    win = MainWindow(conn=_index(tmp_path), render_worker=StubRender(), thumb_worker=StubThumb(), do_index=False)
+    qtbot.addWidget(win)
+    win.search_box.setText("昇腾")
+    searches = []
+    monkeypatch.setattr(win, "_do_search", lambda: searches.append(1))
+    win._last_user_input_ts = 0.0  # 越过用户输入宽限，单测 15s 间隔
+
+    win._do_live_refresh()
+    assert searches == [1]           # 首次后台重搜放行
+
+    win._do_live_refresh()
+    assert searches == [1]           # 15s 内第二次被跳过
+
+    win._last_bg_research_ts -= MainWindow._BG_RESEARCH_MIN_INTERVAL_SEC + 1
+    win._do_live_refresh()
+    assert searches == [1, 1]        # 间隔推进后放行
+
+
+def test_live_refresh_waits_for_user_input_grace(qtbot, monkeypatch, tmp_path):
+    """F1：用户 5s 内刚改过查询词时后台重搜不抢跑；宽限过后放行。"""
+    win = MainWindow(conn=_index(tmp_path), render_worker=StubRender(), thumb_worker=StubThumb(), do_index=False)
+    qtbot.addWidget(win)
+    searches = []
+    monkeypatch.setattr(win, "_do_search", lambda: searches.append(1))
+    win.search_box.setText("昇腾")   # textChanged 打点 _last_user_input_ts = now
+
+    win._do_live_refresh()
+    assert searches == []            # 宽限 5s 内不放行
+
+    win._last_user_input_ts = time.monotonic() - MainWindow._USER_INPUT_GRACE_SEC - 1
+    win._do_live_refresh()
+    assert searches == [1]           # 宽限过后放行
+
+
+def test_live_refresh_manual_search_bypasses_throttle(qtbot, tmp_path):
+    """F1：用户手动 _do_search 不经过节流，也不占用后台重搜的 15s 时钟。"""
+    win = MainWindow(conn=_index(tmp_path), render_worker=StubRender(), thumb_worker=StubThumb(), do_index=False)
+    qtbot.addWidget(win)
+    win.search_box.setText("昇腾")
+
+    win._do_search()                 # 手动搜索：立即执行
+    assert win._results
+    assert win._last_bg_research_ts == 0.0  # 手动搜索不占用后台时钟
+
+    win._last_user_input_ts = 0.0
+    win._do_live_refresh()           # 首次后台 tick 仍立即放行并打点
+    assert win._last_bg_research_ts > 0.0
+
+
+def test_preview_request_dedupes_same_file_same_page(qtbot, tmp_path):
+    """F2：同文件同页的预览重发被去重；翻页/文件内容变化照常发出。"""
+    render = StubRender()
+    win = MainWindow(conn=_index(tmp_path), render_worker=render, thumb_worker=StubThumb(), do_index=False)
+    qtbot.addWidget(win)
+    win.search_box.setText("昇腾")
+    win._do_search()
+    assert win._cur is not None
+
+    win._request_preview()
+    assert len(render.calls) == 1
+    win._request_preview()           # 同 key：后台重搜恢复选中后的连带重发被去重
+    assert len(render.calls) == 1
+
+    win._view_page += 1              # 翻页 → key 不同，照常发出
+    win._request_preview()
+    assert len(render.calls) == 2
+
+    win._cur.mtime += 1000           # 文件内容已变（编辑后重索引）→ 照常重渲染
+    win._request_preview()
+    assert len(render.calls) == 3
+
+
+def _drive_detail_load_once(win, tasks):
+    """调度一次 detail 加载并同步跑完（等价于 80ms timer 到点 + 后台任务完成）。"""
+    win._schedule_detail_update()
+    win._detail_update_timer.stop()
+    win._run_detail_update(win._detail_update_token)
+    detail_tasks = [t for t in tasks if t.label == "detail-load"]
+    _finish_fake_task(detail_tasks[-1])
+    return detail_tasks
+
+
+def test_detail_schedule_skips_reload_for_same_path(qtbot, monkeypatch, tmp_path):
+    """F3：同 path 且内容未变时 _schedule_detail_update 不重查版本+大纲；
+    面板若在结果重建瞬时被清空，用缓存 payload 同步回填。"""
+    tasks = _install_fake_background_task(monkeypatch)
+    win = MainWindow(conn=_index(tmp_path), render_worker=StubRender(), thumb_worker=StubThumb(), do_index=False)
+    qtbot.addWidget(win)
+    win.search_box.setText("昇腾")
+    win._do_search()
+    cur = win._results[0]
+    win._cur = cur
+
+    detail_tasks = _drive_detail_load_once(win, tasks)
+    assert len(detail_tasks) == 1
+    assert win._detail_loaded_path == cur.path
+    assert win.detail_panel._path == cur.path
+
+    win.detail_panel.clear_selection()       # 模拟结果重建瞬时清空面板
+    win._schedule_detail_update()
+    detail_tasks = [t for t in tasks if t.label == "detail-load"]
+    assert len(detail_tasks) == 1            # 没有再起后台加载
+    assert not win._detail_update_timer.isActive()
+    assert win.detail_panel._path == cur.path  # 缓存 payload 同步回填
+
+
+def test_detail_schedule_reloads_on_path_change_and_force(qtbot, monkeypatch, tmp_path):
+    """F3：force（留版/恢复版本后）与换 path 照常重载。"""
+    tasks = _install_fake_background_task(monkeypatch)
+    win = MainWindow(conn=_index(tmp_path), render_worker=StubRender(), thumb_worker=StubThumb(), do_index=False)
+    qtbot.addWidget(win)
+    win.search_box.setText("昇腾")
+    win._do_search()
+    cur = win._results[0]
+    win._cur = cur
+    _drive_detail_load_once(win, tasks)
+
+    win._schedule_detail_update(force=True)  # 同 path 但 force → 重载
+    win._detail_update_timer.stop()
+    win._run_detail_update(win._detail_update_token)
+    detail_tasks = [t for t in tasks if t.label == "detail-load"]
+    assert len(detail_tasks) == 2
+    _finish_fake_task(detail_tasks[-1])
+
+    others = [r for r in db.recent_files(win._conn, limit=20) if r.path != cur.path]
+    assert others
+    win._cur = others[0]                     # 换 path → 重载
+    win._schedule_detail_update()
+    win._detail_update_timer.stop()
+    win._run_detail_update(win._detail_update_token)
+    detail_tasks = [t for t in tasks if t.label == "detail-load"]
+    assert len(detail_tasks) == 3
