@@ -12,6 +12,7 @@ import os
 import queue
 import sys
 import threading
+import time
 
 from PySide6.QtCore import QAbstractNativeEventFilter, Qt
 from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPixmap
@@ -504,19 +505,58 @@ def _singleton_name() -> str:
     return os.environ.get("PPTX_FINDER_SINGLETON_NAME", "").strip() or SINGLETON_NAME
 
 
-def _show_window(win: MainWindow) -> None:
+def _force_foreground(win: MainWindow) -> None:
+    """把主窗稳定带到前台。
+
+    Windows 前台锁定下 SetForegroundWindow 常被拒（表现为任务栏闪一下、窗口不弹）。
+    按托盘应用惯例绕开：AttachThreadInput 借用前台线程权限 + 短暂 TOPMOST 脉冲；
+    非 Windows / 任何一步失败都退化为 Qt 三件套，不致命。
+    """
     win.showNormal()
+    try:
+        u32 = ctypes.windll.user32
+        k32 = ctypes.windll.kernel32
+        hwnd = int(win.winId())
+        if u32.IsIconic(hwnd):
+            u32.ShowWindow(hwnd, 9)  # SW_RESTORE
+        fore = u32.GetForegroundWindow()
+        fore_tid = u32.GetWindowThreadProcessId(fore, None)
+        cur_tid = k32.GetCurrentThreadId()
+        attached = False
+        if fore_tid and fore_tid != cur_tid:
+            attached = bool(u32.AttachThreadInput(cur_tid, fore_tid, True))
+        try:
+            u32.BringWindowToTop(hwnd)
+            u32.SetForegroundWindow(hwnd)
+        finally:
+            if attached:
+                u32.AttachThreadInput(cur_tid, fore_tid, False)
+        # 短暂 TOPMOST 脉冲强制刷新 Z 序（不抢激活态）
+        swp = 0x0001 | 0x0002 | 0x0010 | 0x0040  # NOMOVE|NOSIZE|NOACTIVATE|SHOWWINDOW
+        u32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, swp)
+        u32.SetWindowPos(hwnd, -2, 0, 0, 0, 0, swp)
+    except Exception:  # noqa: BLE001
+        pass
     win.raise_()
     win.activateWindow()
 
 
+_TOGGLE_DEBOUNCE_SEC = 0.4  # 同一次按压可能投递多条 WM_HOTKEY（含长按自动重复），合并为一次切换
+
+
+def _show_window(win: MainWindow) -> None:
+    _force_foreground(win)
+
+
 def _toggle_window(win: MainWindow) -> None:
+    now = time.monotonic()
+    if now - getattr(win, "_last_toggle_ts", 0.0) < _TOGGLE_DEBOUNCE_SEC:
+        return
+    win._last_toggle_ts = now
     if win.isVisible() and not win.isMinimized() and win.isActiveWindow():
         win.hide()
     else:
-        win.showNormal()
-        win.raise_()
-        win.activateWindow()
+        _force_foreground(win)
         win.focus_search()
 
 
