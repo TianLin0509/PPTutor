@@ -10,6 +10,7 @@ from pathlib import Path
 
 from .. import renderer
 from ..config import PPTX_EXT, get_version_keep_per_doc
+from ..path_policy import explicit_project_output_roots, is_project_output_path
 from ..scanner import iter_ppt_files
 from ..text_tokenize import build_fts_match_exact
 from . import store, vault
@@ -125,7 +126,14 @@ def _diff_summary(version, previous, text_diff: dict, package_diff: dict) -> lis
 
 
 class VersionManager:
-    def __init__(self, conn=None, on_snapshot=None, on_content_saved=None):
+    def __init__(
+        self,
+        conn=None,
+        on_snapshot=None,
+        on_content_saved=None,
+        *,
+        index_roots: list[str] | tuple[str, ...] | None = None,
+    ):
         self._db_path = vault.db_path() if conn is None else None
         self._conn = conn or store.connect(self._db_path)
         store.init_db(self._conn)
@@ -136,6 +144,8 @@ class VersionManager:
             self._read_conn = conn
         self._lock = threading.RLock()
         self._watcher = None
+        self._index_roots = tuple(index_roots or ())
+        self._explicit_output_roots = explicit_project_output_roots(self._index_roots)
         self._on_snapshot = on_snapshot
         self._on_content_saved = on_content_saved
         self._reconcile_stop = threading.Event()
@@ -199,10 +209,17 @@ class VersionManager:
         notify: bool = True,
         *,
         preserve_version_ids: set[str] | None = None,
+        explicit_output_roots: tuple[str, ...] | list[str] | None = None,
     ) -> str | None:
         if not _is_pptx(path):
             return None
         path = os.path.abspath(path)
+        allowed_outputs = (
+            self._explicit_output_roots
+            if explicit_output_roots is None else tuple(explicit_output_roots)
+        )
+        if is_project_output_path(path, explicit_output_roots=allowed_outputs):
+            return None
         if not os.path.exists(path):
             return None
         try:
@@ -246,6 +263,11 @@ class VersionManager:
             return False
         src_path = os.path.abspath(src_path)
         dest_path = os.path.abspath(dest_path)
+        if is_project_output_path(
+            dest_path,
+            explicit_output_roots=self._explicit_output_roots,
+        ):
+            return False
         if os.path.exists(src_path):
             return False
         with self._lock:
@@ -359,8 +381,12 @@ class VersionManager:
     # ---------- Catch-up ----------
     def catch_up_root(self, root: str) -> int:
         n = 0
+        selected_output_roots = explicit_project_output_roots([root])
         for p in iter_ppt_files([root]):
-            if p.suffix.lower() == PPTX_EXT and self.snapshot_now(str(p)):
+            if p.suffix.lower() == PPTX_EXT and self.snapshot_now(
+                str(p),
+                explicit_output_roots=selected_output_roots,
+            ):
                 n += 1
         return n
 
@@ -391,6 +417,11 @@ class VersionManager:
             for doc in docs:
                 path = str(doc["path"] or "")
                 if not path or not _is_pptx(path):
+                    continue
+                if is_project_output_path(
+                    path,
+                    explicit_output_roots=self._explicit_output_roots,
+                ):
                     continue
                 if not os.path.exists(path):
                     with self._lock:
@@ -479,6 +510,11 @@ class VersionManager:
                         if not entry.is_file():
                             continue
                         if not _is_pptx(entry.path):
+                            continue
+                        if is_project_output_path(
+                            entry.path,
+                            explicit_output_roots=self._explicit_output_roots,
+                        ):
                             continue
                         if os.path.basename(entry.path).startswith("~$"):
                             continue
@@ -1039,7 +1075,7 @@ class VersionManager:
         self._stop_watcher()
         from .watcher import VaultWatcher, default_watch_paths
         self._watcher = VaultWatcher(
-            default_watch_paths(),
+            list(self._index_roots) or default_watch_paths(),
             self.snapshot_now,
             self.move_path,
             self._on_content_saved,

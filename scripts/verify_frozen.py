@@ -1,7 +1,7 @@
-"""frozen exe 端到端验证：启动打包 exe → 不崩 → 改存 Desktop 下 pptx → 全盘 watcher 自动留版本。
+"""frozen exe 端到端验证：包清单、单实例 IPC、实时索引和版本快照。
 
-证明新架构（全盘监听、谁变管谁）在 PyInstaller frozen 下完整工作。
-DECKS 放 Desktop（被 default_watch_paths 监听）——不能放 AppData/Temp（被排除）。
+证明 root-scoped watcher、Qt 本地 IPC 和版本守护在 PyInstaller frozen 下完整工作。
+DECKS 放 Desktop（显式配置为库根）——不能放 AppData/Temp（被排除）。
 DATA(vault) 隔离在临时目录，不碰生产。
 """
 from __future__ import annotations
@@ -43,14 +43,14 @@ DATA.mkdir(parents=True)
     }),
     encoding="utf-8",
 )
-# DECKS 必须在被全盘 watcher 监听的位置（Desktop），不能放 AppData/Temp（被排除）
+# DECKS 放在 Desktop 并显式配置为唯一库根；不碰用户其它目录。
 DECKS = Path(os.path.expanduser("~")) / "Desktop" / f"_pptxverify_decks_{_run_id}"
 DECKS.mkdir(parents=True, exist_ok=True)
 PPTX = DECKS / "测试方案.pptx"
 
 ENV = dict(os.environ)
 ENV["PPTX_FINDER_DATA_DIR"] = str(DATA)
-ENV["PPTX_FINDER_ROOTS"] = str(DECKS)  # 限搜索索引范围（版本 watcher 走全盘 default_watch_paths）
+ENV["PPTX_FINDER_ROOTS"] = str(DECKS)  # 扫描、watcher、live index、版本共享同一根
 ENV["PPTX_FINDER_SINGLETON_NAME"] = f"ppt-doctor-frozen-verify-{_run_id}"
 
 
@@ -68,11 +68,29 @@ def count_versions() -> int:
     return n
 
 
+def package_runtime_files_ok() -> bool:
+    names = {path.name.casefold() for path in EXE.parent.rglob("*") if path.is_file()}
+    required = {
+        "_ssl.pyd",
+        "libssl-3.dll",
+        "libcrypto-3.dll",
+        "qt6network.dll",
+        "qschannelbackend.dll",
+    }
+    forbidden = {"libssl-3-x64.dll", "libcrypto-3-x64.dll"}
+    missing = sorted(required - names)
+    unexpected = sorted(forbidden & names)
+    ok = not missing and not unexpected
+    print(f"层0 · TLS/QtNetwork 包清单 = {ok} missing={missing} unexpected={unexpected}")
+    return ok
+
+
 def main() -> int:
     if not EXE.exists():
         print("FAIL: exe 不存在", EXE)
         _cleanup()
         return 1
+    package_ok = package_runtime_files_ok()
 
     # 预置：造 pptx + 源码建 v1
     fx.make_pptx(PPTX, [{"body": "封面 frozen 测试"}, {"body": "第二页 量子计算 章节"}])
@@ -94,10 +112,21 @@ def main() -> int:
         _cleanup()
         return 1
 
-    # 层2：改存 Desktop 下 pptx → 全盘 watcher 应自动留版本
+    # 层2：同 singleton 名的第二实例应通过 QLocalSocket 激活首实例后快速退出。
+    ipc_started = time.monotonic()
+    try:
+        second = subprocess.run([str(EXE)], env=ENV, timeout=5, check=False)
+        ipc_elapsed = time.monotonic() - ipc_started
+        ipc_ok = second.returncode == 0 and ipc_elapsed < 5 and proc.poll() is None
+    except subprocess.TimeoutExpired:
+        ipc_elapsed = time.monotonic() - ipc_started
+        ipc_ok = False
+    print(f"层2 · Qt 本地单实例 IPC = {ipc_ok} ({ipc_elapsed:.2f}s，首实例仍存活={proc.poll() is None})")
+
+    # 层3：改存显式库根下 pptx → root-scoped watcher 应自动留版本
     time.sleep(1)
     fx.make_pptx(PPTX, [{"body": "封面 改稿"}, {"body": "第二页 经典计算"}, {"body": "新增第三页"}])
-    print("已改存 pptx（Desktop 下），等全盘 watcher 防抖(1.5s)+快照 ...")
+    print("已改存 pptx（显式库根内），等 watcher 防抖(1.5s)+快照 ...")
     time.sleep(6)
 
     proc.terminate()
@@ -109,10 +138,10 @@ def main() -> int:
     time.sleep(0.5)
 
     n2 = count_versions()
-    print(f"层2 · 改存后版本数 = {n2}（期望 2 = 全盘 watcher 在 frozen 下端到端工作）")
+    print(f"层3 · 改存后版本数 = {n2}（期望 2 = root-scoped watcher 端到端工作）")
 
-    ok = alive and n1 == 1 and n2 == 2
-    print(f"\n=== frozen 全盘监听验证：{'PASS' if ok else 'FAIL'} ===")
+    ok = package_ok and alive and ipc_ok and n1 == 1 and n2 == 2
+    print(f"\n=== frozen 发布候选验证：{'PASS' if ok else 'FAIL'} ===")
     _cleanup()
     return 0 if ok else 1
 

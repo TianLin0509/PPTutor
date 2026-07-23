@@ -272,8 +272,13 @@ class _FeatureRuntime:
             self._started = True
             self._transition_thread.start()
         try:
+            roots_provider = getattr(self._win, "index_roots", None)
+            watch_roots = (
+                list(roots_provider())
+                if callable(roots_provider) else default_watch_paths()
+            )
             watcher = VaultWatcher(
-                default_watch_paths(),
+                watch_roots,
                 self._on_ppt_saved,
                 self._on_moved,
                 self._on_content_saved,
@@ -631,6 +636,7 @@ def main() -> int:
         lambda: VersionManager(
             on_snapshot=bridge.emit_snapshot,
             on_content_saved=bridge.emit_content_changed,
+            index_roots=win.index_roots(),
         )
     )
     app._version_manager = version_mgr  # 防 GC

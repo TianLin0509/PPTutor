@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import ssl
 import tempfile
 from pathlib import Path
 
@@ -36,6 +37,7 @@ CASES = [
 def _run(pptx_dir: str) -> dict:
     from . import db, indexer, search
     from .config import CONTENT_EXTS
+    from .report_insights import _terms as report_terms
     from .text_tokenize import normalize
 
     src = Path(pptx_dir)
@@ -51,6 +53,14 @@ def _run(pptx_dir: str) -> dict:
 
             # OpenCC 繁简是否在 frozen 真实生效（词典打包成功的硬证据）
             opencc_ok = "软件" in normalize("軟件開發")
+            # Packaging prunes jieba's LAC/POS/analyse models. Basic cut must
+            # still load the core dictionary in the frozen application.
+            jieba_terms = list(report_terms("人工智能平台"))
+            jieba_ok = "人工智能" in jieba_terms and "平台" in jieba_terms
+            # The frozen updater relies on stdlib HTTPS.  Creating a context
+            # loads _ssl plus its real OpenSSL DLL pair without making a
+            # network request, guarding the size-pruning allowlist.
+            ssl_ok = bool(ssl.create_default_context().get_ciphers())
 
             cases = []
             for label, query, fname, expect in CASES:
@@ -76,13 +86,16 @@ def _run(pptx_dir: str) -> dict:
     passed = sum(1 for c in cases if c["pass"])
     return {
         "opencc_ok": opencc_ok,
+        "jieba_ok": jieba_ok,
+        "jieba_terms": jieba_terms,
+        "ssl_ok": ssl_ok,
         "indexed_files": stats["file_count"],
         "indexed_pages": stats["page_count"],
         "by_ext": by_ext,
         "executor": idx_summary.get("executor"),  # process=ProcessPool 真生效 / thread=回退
         "passed": passed,
         "total": len(cases),
-        "all_pass": passed == len(cases) and opencc_ok,
+        "all_pass": passed == len(cases) and opencc_ok and jieba_ok and ssl_ok,
         "cases": cases,
     }
 

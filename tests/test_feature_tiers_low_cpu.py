@@ -555,6 +555,49 @@ def test_feature_runtime_keeps_live_indexing_but_does_not_start_versions_by_defa
     assert manager.stops == 1
 
 
+def test_feature_runtime_watcher_uses_the_window_index_root_contract(monkeypatch, tmp_path):
+    selected = tmp_path / "selected-library"
+    selected.mkdir()
+    seen_roots = []
+
+    class _Watcher:
+        def __init__(self, roots, *_args, **_kwargs):
+            seen_roots.append(list(roots))
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+    class _Manager:
+        def stop(self):
+            pass
+
+    class _Bridge:
+        def emit_content_changed(self, _path):
+            pass
+
+    class _Win:
+        def index_roots(self):
+            return [str(selected)]
+
+        def set_version_manager(self, _manager):
+            pass
+
+    monkeypatch.setattr(app_mod, "VaultWatcher", _Watcher)
+    monkeypatch.setattr(
+        app_mod,
+        "default_watch_paths",
+        lambda: [str(tmp_path / "must-not-be-used")],
+    )
+    runtime = app_mod._FeatureRuntime(_Win(), _Manager(), _Bridge())
+    runtime.start()
+    runtime.stop()
+
+    assert seen_roots == [[str(selected)]]
+
+
 def test_feature_runtime_snapshot_failure_reaches_watcher_retry(tmp_path):
     deck = tmp_path / "deck.pptx"
     deck.write_bytes(b"ppt")

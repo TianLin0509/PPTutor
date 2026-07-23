@@ -165,12 +165,14 @@ def download_delta(base_url: str, info: UpdateInfo, staging: Path,
 # ---------- 应用（Windows 原地替换） ----------
 # helper 纯 ASCII（PS5.1 无 BOM 文件按 ANSI 读，纯 ASCII 不会乱码）。日志用英文。
 _HELPER_PS1 = r'''param([int]$MainPid, [string]$Plan)
-function Log($m){ try { Add-Content -LiteralPath ($env:LOCALAPPDATA + '\pptx-finder\update.log') -Value ((Get-Date -Format o) + '  ' + $m) } catch {} }
+$script:LogPath = ($env:LOCALAPPDATA + '\pptx-finder\update.log')
+function Log($m){ try { Add-Content -LiteralPath $script:LogPath -Value ((Get-Date -Format o) + '  ' + $m) } catch {} }
 try {
+  $p = Get-Content -Raw -LiteralPath $Plan | ConvertFrom-Json
+  if ($p.log_path) { $script:LogPath = [string]$p.log_path }
   Log "helper start pid=$MainPid"
   if ($MainPid -gt 0) { try { Wait-Process -Id $MainPid -Timeout 60 -ErrorAction Stop } catch { Log "wait: $_" } }
   Start-Sleep -Milliseconds 500
-  $p = Get-Content -Raw -LiteralPath $Plan | ConvertFrom-Json
   $staging = $p.staging; $dest = $p.dest
   foreach ($rel in @($p.updates)) {
     if (-not $rel) { continue }
@@ -206,7 +208,14 @@ try {
 '''
 
 
-def write_helper(staging: Path, dest: Path, info: UpdateInfo, relaunch: str) -> dict:
+def write_helper(
+    staging: Path,
+    dest: Path,
+    info: UpdateInfo,
+    relaunch: str,
+    *,
+    log_path: str | Path | None = None,
+) -> dict:
     """把 plan.json + apply.ps1 写到一个独立控制目录（不在 staging 内，免被 helper 自删时连累）。
 
     返回 {plan, plan_path, ps1, ctrl}，供 launch_helper / 测试直接驱动。
@@ -219,6 +228,7 @@ def write_helper(staging: Path, dest: Path, info: UpdateInfo, relaunch: str) -> 
         "deletes": list(info.deleted),
         "relaunch": relaunch,
         "version": info.version,
+        "log_path": str(log_path) if log_path is not None else "",
     }
     plan_path = ctrl / "plan.json"
     plan_path.write_text(json.dumps(plan, ensure_ascii=False), encoding="utf-8")

@@ -169,7 +169,14 @@ def test_helper_swap_real(tmp_path):
         version="0.9.1", notes="",
         changed=[("app.txt", "", 0), ("sub/new.txt", "", 0)],
         deleted=["obsolete.txt"], raw={})
-    h = updater.write_helper(staging, dest, info, relaunch="relaunch.bat")
+    helper_log = tmp_path / "update-test.log"
+    h = updater.write_helper(
+        staging,
+        dest,
+        info,
+        relaunch="relaunch.bat",
+        log_path=helper_log,
+    )
     # MainPid=0 → 不等待，立即换。同步跑到 helper 退出。
     subprocess.run(
         ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
@@ -183,6 +190,7 @@ def test_helper_swap_real(tmp_path):
     assert (dest / "app.txt").read_text(encoding="utf-8") == "NEW"            # 改
     assert (dest / "sub" / "new.txt").read_text(encoding="utf-8") == "ADDED"  # 增（含建子目录）
     assert json.loads((dest / "manifest.json").read_text(encoding="utf-8"))["version"] == "0.9.1"  # 清单落地
+    assert "swap done -> v0.9.1" in helper_log.read_text(encoding="utf-8")
     assert not (dest / "obsolete.txt").exists()                               # 删废弃
     assert (dest / "sub" / "keep.txt").read_text(encoding="utf-8") == "KEEP"  # 未列文件原封不动
     assert marker.exists()                                                    # 重启确实触发

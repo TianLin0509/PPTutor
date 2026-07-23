@@ -46,6 +46,55 @@ def test_catch_up_root_builds_versions(tmp_path):
     assert len(mgr.list_versions(str(docs / "b.pptx"))) == 1
 
 
+def test_project_dist_is_not_added_to_version_vault(tmp_path):
+    project = tmp_path / "project"
+    dist = project / "dist"
+    dist.mkdir(parents=True)
+    (project / "pyproject.toml").write_text("[project]\nname='demo'\n", encoding="utf-8")
+    deck = dist / "generated.pptx"
+    fx.make_pptx(deck, [{"body": "generated copy"}])
+    mgr = _mgr()
+
+    assert mgr.snapshot_now(str(deck)) is None
+    assert mgr.list_versions(str(deck)) == []
+
+
+def test_explicit_project_output_root_supports_snapshot_move_and_reconcile(tmp_path):
+    project = tmp_path / "project"
+    output = project / "build"
+    output.mkdir(parents=True)
+    (project / "pyproject.toml").write_text("[project]\nname='demo'\n", encoding="utf-8")
+    original = output / "original.pptx"
+    moved = output / "moved.pptx"
+    fx.make_pptx(original, [{"body": "v1"}])
+    mgr = VersionManager(
+        store.connect(tmp_path / "explicit-output-vault.db"),
+        index_roots=[str(output)],
+    )
+
+    assert mgr.snapshot_now(str(original))
+    original.rename(moved)
+    assert mgr.move_path(str(original), str(moved)) is True
+    fx.make_pptx(moved, [{"body": "v2"}])
+    future = time.time() + 3
+    os.utime(moved, (future, future))
+    assert mgr.reconcile_known_docs(scan_new_files=False) == 1
+    assert len(mgr.list_versions(str(moved))) == 2
+
+
+def test_catch_up_root_treats_project_output_as_explicit_opt_in(tmp_path):
+    project = tmp_path / "project"
+    output = project / "target"
+    output.mkdir(parents=True)
+    (project / "Cargo.toml").write_text("[package]\nname='demo'\n", encoding="utf-8")
+    deck = output / "release.pptx"
+    fx.make_pptx(deck, [{"body": "explicit catch-up"}])
+    mgr = VersionManager(store.connect(tmp_path / "catch-up-output-vault.db"))
+
+    assert mgr.catch_up_root(str(output)) == 1
+    assert len(mgr.list_versions(str(deck))) == 1
+
+
 def test_reconcile_known_docs_catches_missed_save(tmp_path):
     p = tmp_path / "a.pptx"
     fx.make_pptx(p, [{"body": "v1"}])

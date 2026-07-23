@@ -77,6 +77,8 @@ EXCLUDE_DIR_NAMES: set[str] = {
     "$recycle.bin", "system volume information",
     "local settings",  # AppData 正式纳入覆盖；系统 Temp 由 scanner 按完整路径排除
     "node_modules", ".git", "__pycache__", ".venv", "venv", "env",
+    # AI/开发自动化产物：PPT Doctor 自身压测与 agent artifacts 不应进入索引/版本库。
+    ".selftest", ".arena", ".ai-team",
     "$winreagent", "recovery", "msocache", "intel", "perflogs",
 }
 

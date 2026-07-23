@@ -18,6 +18,9 @@ def test_handler_skips_system_and_cache():
     h._trigger("C:\\Windows\\System32\\x.pptx")
     h._trigger("C:\\Users\\me\\AppData\\Local\\Temp\\y.pptx")
     h._trigger("C:\\proj\\node_modules\\pkg\\z.pptx")
+    h._trigger("C:\\proj\\.selftest\\random\\self.pptx")
+    h._trigger("C:\\proj\\.arena\\artifacts\\agent.pptx")
+    h._trigger("C:\\proj\\.ai-team\\runs\\team.pptx")
     assert not h._timers, "系统/缓存目录的 .pptx 应被跳过，不起防抖定时器"
     h._trigger("C:\\Users\\me\\Desktop\\方案.pptx")
     assert h._timers, "用户目录的 .pptx 应进入防抖"

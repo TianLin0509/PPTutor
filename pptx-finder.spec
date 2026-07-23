@@ -29,6 +29,7 @@ a = Analysis(
     runtime_hooks=[],
     excludes=['PIL', 'Pillow', 'pptx', 'tkinter', 'matplotlib', 'pandas', 'IPython', 'pytest',
               'datasketch', 'numpy', 'scipy',
+              'jieba.analyse', 'jieba.posseg', 'jieba.lac_small',
               'PySide6.QtQuick', 'PySide6.QtQml', 'PySide6.QtQuickWidgets', 'PySide6.QtQuick3D',
               'PySide6.QtWebEngineCore', 'PySide6.QtWebEngineWidgets', 'PySide6.QtWebChannel',
               'PySide6.QtMultimedia', 'PySide6.QtMultimediaWidgets',
@@ -44,6 +45,15 @@ pyz = PYZ(a.pure)
 # MinHash，datasketch/numpy/scipy 不再进入打包产物。
 _DROP = (
     'opengl32sw', 'd3dcompiler',
+    # report_insights only calls basic jieba.cut. Keyword-extraction corpora,
+    # POS models and Paddle/LAC weights are unreachable and cost ~23 MiB.
+    'jieba/lac_small/', 'jieba/analyse/', 'jieba/posseg/',
+    # Qt's OpenSSL backend can discover these x64-named DLLs dynamically, so a
+    # static PE import graph cannot prove them unused.  Removing them is safe
+    # only while product QtNetwork use stays limited to local IPC
+    # via QLocalSocket and QLocalServer.  Python HTTPS keeps the non-suffixed pair;
+    # tests/test_package_spec.py locks this boundary.  Saves about 5.8 MiB.
+    'libcrypto-3-x64.dll', 'libssl-3-x64.dll',
     'opencc/clib/lib', 'opencc/clib/include', 'opencc/clib/bin',
     'qt6quick', 'qt6qml', 'qml', 'qt6pdf', 'qt6webengine', 'qt6webchannel', 'qt6websockets',
     'qt63d', 'qt6quick3d', 'qt6multimedia', 'qt6charts', 'qt6datavisualization', 'qt6designer',

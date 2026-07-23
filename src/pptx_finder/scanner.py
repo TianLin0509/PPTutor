@@ -9,9 +9,10 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 
 from .config import EXCLUDE_DIR_NAMES, SUPPORTED_EXTS, data_dir
+from .path_policy import explicit_project_output_roots, is_project_output_path
 
 DRIVE_FIXED = 3
-SCAN_POLICY_VERSION = "3"  # v3: user folders named Temp are covered; only real OS temp stays excluded
+SCAN_POLICY_VERSION = "5"  # v5: consistent project-output policy + explicit-root opt-in
 
 
 def _norm_path(path: str | os.PathLike[str]) -> str:
@@ -79,6 +80,7 @@ def iter_ppt_files(
         _norm_path(p)
         for p in (exclude_roots if exclude_roots is not None else [str(data_dir())])
     ]
+    explicit_output_roots = explicit_project_output_roots(roots)
     directories_seen = 0
     last_progress_at = 0.0
     for root in roots:
@@ -106,6 +108,10 @@ def iter_ppt_files(
                 if (
                     d.lower() not in ex
                     and not d.startswith("$")
+                    and not is_project_output_path(
+                        os.path.join(dirpath, d),
+                        explicit_output_roots=explicit_output_roots,
+                    )
                     and not _is_system_temp_subtree(os.path.join(dirpath, d), root)
                     and not any(
                         _under(os.path.join(dirpath, d), skip_root)

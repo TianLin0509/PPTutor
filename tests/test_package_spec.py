@@ -1,3 +1,4 @@
+import ast
 from pathlib import Path
 
 
@@ -47,3 +48,42 @@ def test_no_portable_preview_engine_packager_or_runtime_route_remains():
     assert not (root / "tools" / ("package_" + "preview_engine.py")).exists()
     assert "LibreOffice" not in renderer
     assert ("_render_page_" + "compat") not in renderer
+
+
+def test_qtnetwork_usage_stays_local_ipc_only_while_x64_openssl_is_pruned():
+    """The x64 pair is dynamically loaded; source scope, not PE graph, is the guard."""
+    root = Path(__file__).resolve().parents[1]
+    spec = (root / "pptx-finder.spec").read_text(encoding="utf-8")
+    allowed = {"QLocalServer", "QLocalSocket"}
+    seen = set()
+    for source in (root / "src" / "pptx_finder").rglob("*.py"):
+        tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module == "PySide6.QtNetwork":
+                names = {item.name for item in node.names}
+                assert "*" not in names
+                assert names <= allowed, f"QtNetwork TLS/client use requires packaging review: {source}"
+                seen.update(names)
+            if isinstance(node, ast.Import):
+                assert all(
+                    item.name != "PySide6.QtNetwork" for item in node.names
+                ), f"module-level QtNetwork access bypasses the packaging guard: {source}"
+    assert seen == allowed
+    assert "'libcrypto-3-x64.dll', 'libssl-3-x64.dll'" in spec
+    assert "static PE import graph cannot prove them unused" in spec
+
+
+def test_frozen_verifier_checks_tls_manifest_and_second_instance_ipc():
+    script = (
+        Path(__file__).resolve().parents[1] / "scripts" / "verify_frozen.py"
+    ).read_text(encoding="utf-8")
+    for required in (
+        '"_ssl.pyd"',
+        '"libssl-3.dll"',
+        '"libcrypto-3.dll"',
+        '"qt6network.dll"',
+        '"qschannelbackend.dll"',
+    ):
+        assert required in script
+    assert "subprocess.run([str(EXE)], env=ENV, timeout=5" in script
+    assert "proc.poll() is None" in script

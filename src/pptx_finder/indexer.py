@@ -38,6 +38,7 @@ from .config import (
     ext_path,
 )
 from .document_parser import parse_document
+from .path_policy import explicit_project_output_roots, is_project_output_path
 from .text_tokenize import tokenize
 
 log = logging.getLogger(__name__)
@@ -75,6 +76,46 @@ def _is_cloud_placeholder(path: str | Path, st: os.stat_result | None = None) ->
     except OSError:
         return False
     return bool(int(getattr(st, "st_file_attributes", 0) or 0) & _CLOUD_PLACEHOLDER_ATTRS)
+
+
+def _unchanged_index_row(
+    row,
+    st: os.stat_result,
+    ext: str,
+    *,
+    compute_content_hash: bool,
+) -> bool:
+    """Return whether an indexed file can safely bypass parse and SQLite writes.
+
+    Keep this decision shared by full scans and live watcher indexing.  Pending
+    rows, hydrated placeholders, hash backfills and retryable parse errors must
+    still flow through the heavy path even when size/mtime happen to match.
+    """
+    if row is None:
+        return False
+    same_stat = (
+        int(st.st_size) == int(row["size"])
+        and abs(float(st.st_mtime) - float(row["mtime"])) <= 1e-6
+    )
+    if not same_stat:
+        return False
+    if (
+        compute_content_hash
+        and row["status"] == "ok"
+        and ext in CONTENT_EXTS
+        and not str(row["content_hash"] or "").startswith("sha256:")
+    ):
+        return False
+    if row["status"] in ("pending", "cloud_placeholder"):
+        return False
+    if row["status"] == "error":
+        failures = int(row["parse_failures"] or 0)
+        retry_after = float(row["retry_after"] or 0)
+        return not (
+            failures < MAX_UNCHANGED_PARSE_FAILURES
+            and time.time() >= retry_after
+        )
+    return True
 
 
 def _path_under_any_root(path: str, roots: tuple[str, ...]) -> bool:
@@ -365,6 +406,7 @@ def update_index(
         for root in roots
         if os.path.isdir(ext_path(root))
     )
+    selected_output_roots = explicit_project_output_roots(roots)
     scan_started_at = time.monotonic()
 
     def scan_heartbeat(directories_seen: int, _current: str) -> None:
@@ -539,34 +581,15 @@ def update_index(
                     )
                 summary["skipped_cloud"] += 1
                 continue
-            # (size, mtime) 快筛。永久解析错误用熔断式退避：同一份字节最多
-            # 自动尝试三次；文件 stat 真变化时始终立即重试。
             ext = p.suffix.lower()
-            same_stat = (
-                row is not None
-                and int(st.st_size) == int(row["size"])
-                and abs(st.st_mtime - row["mtime"]) <= 1e-6
-            )
-            unchanged = same_stat
-            needs_hash_backfill = bool(
-                same_stat
-                and compute_content_hash
-                and row["status"] == "ok"
-                and ext in CONTENT_EXTS
-                and not str(row["content_hash"] or "").startswith("sha256:")
-            )
-            if needs_hash_backfill:
-                unchanged = False
-            elif same_stat and row["status"] in ("pending", "cloud_placeholder"):
-                unchanged = False
-            elif same_stat and row["status"] == "error":
-                failures = int(row["parse_failures"] or 0)
-                retry_after = float(row["retry_after"] or 0)
-                unchanged = not (
-                    failures < MAX_UNCHANGED_PARSE_FAILURES
-                    and time.time() >= retry_after
-                )
-            if unchanged:
+            # (size, mtime) 快筛。永久解析错误用熔断式退避；placeholder
+            # hydration 与内容 hash 回填仍由共享判定放行。
+            if _unchanged_index_row(
+                row,
+                st,
+                ext,
+                compute_content_hash=compute_content_hash,
+            ):
                 continue
             if ext == PPT_EXT:
                 try:
@@ -629,7 +652,17 @@ def update_index(
                 os.path.splitext(path)[1].lower() in allowed_exts
                 and path not in seen
                 and _path_under_any_root(path, available_roots)
-                and _path_is_explicitly_missing(path)
+                # A policy-pruned generated file still exists on disk, so the
+                # normal "missing" test cannot retire its old DB row.  Remove
+                # it explicitly during the policy-version rescan; ordinary
+                # user folders named dist are not classified here.
+                and (
+                    is_project_output_path(
+                        path,
+                        explicit_output_roots=selected_output_roots,
+                    )
+                    or _path_is_explicitly_missing(path)
+                )
             ):
                 db.delete_file(conn, path)
                 summary["deleted"] += 1
@@ -710,6 +743,7 @@ def index_single(
     *,
     supported_exts: tuple[str, ...] | set[str] | None = None,
     compute_content_hash: bool = True,
+    explicit_output_roots: tuple[str, ...] | list[str] = (),
 ) -> bool:
     """实时增量：索引单个文件（watcher 捕获到新建/改存时调用）。
 
@@ -725,14 +759,31 @@ def index_single(
         }
         if ext not in allowed_exts:
             return False
+        row = db.get_file_by_path(conn, str(p))
+        if is_project_output_path(
+            p,
+            explicit_output_roots=explicit_output_roots,
+        ):
+            if row is None:
+                return False
+            db.delete_file(conn, str(p))
+            conn.commit()
+            return True
         if not p.exists():
-            if db.get_file_by_path(conn, str(p)) is None:
+            if row is None:
                 return False
             db.delete_file(conn, str(p))
             conn.commit()
             return True
         st = p.stat()
         if _is_cloud_placeholder(p, st):
+            if (
+                row is not None
+                and int(st.st_size) == int(row["size"])
+                and abs(float(st.st_mtime) - float(row["mtime"])) <= 1e-6
+                and row["status"] == "cloud_placeholder"
+            ):
+                return False
             _mark_skipped(
                 conn,
                 p,
@@ -741,6 +792,13 @@ def index_single(
             )
             conn.commit()
             return True
+        if _unchanged_index_row(
+            row,
+            st,
+            ext,
+            compute_content_hash=compute_content_hash,
+        ):
+            return False
         if ext == PPT_EXT:
             _write_filename_only(conn, p)
         elif ext in CONTENT_EXTS:

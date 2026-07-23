@@ -10,6 +10,7 @@ from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
 from ..config import CONTENT_EXTS, PPTX_EXT, data_dir
+from ..path_policy import explicit_project_output_roots, is_project_output_path
 
 DEBOUNCE_SEC = 1.5
 SAVE_RETRY_DELAYS_SEC = (0.75, 2.0, 5.0)
@@ -18,6 +19,7 @@ log = logging.getLogger(__name__)
 _SKIP_SEGS = (
     "\\windows\\", "\\program files", "\\programdata\\", "\\$recycle.bin\\",
     "\\appdata\\local\\temp\\", "\\node_modules\\", "\\.git\\", "\\__pycache__\\",
+    "\\.venv\\", "\\venv\\", "\\env\\", "\\.selftest\\", "\\.arena\\", "\\.ai-team\\",
 )
 
 
@@ -74,6 +76,9 @@ class _Handler(FileSystemEventHandler):
             _norm_path(r) for r in (roots or [])
             if any(seg in _norm_path(r).lower() for seg in _SKIP_SEGS)
         ]
+        self._explicit_project_output_roots = list(
+            explicit_project_output_roots(roots)
+        )
         self._always_skip_roots = [_norm_path(str(data_dir()))]
         self._timers: dict[str, _PendingCall] = {}
         self._retry_delays = SAVE_RETRY_DELAYS_SEC
@@ -89,6 +94,11 @@ class _Handler(FileSystemEventHandler):
 
     def _skip_path(self, path: str) -> bool:
         if any(_under(path, root) for root in self._always_skip_roots):
+            return True
+        if is_project_output_path(
+            path,
+            explicit_output_roots=self._explicit_project_output_roots,
+        ):
             return True
         low = _norm_path(path).lower()
         if not any(seg in low for seg in _SKIP_SEGS):
@@ -214,23 +224,42 @@ class _Handler(FileSystemEventHandler):
 
     def on_moved(self, e):  # noqa: N802
         if not e.is_directory:
+            src_skipped = self._skip_path(e.src_path)
+            dest_skipped = self._skip_path(e.dest_path)
             if (
-                self._on_content_saved is not None
+                not src_skipped
+                and self._on_content_saved is not None
                 and os.path.splitext(e.src_path)[1].lower() in self._allowed_exts()
             ):
                 try:
                     self._on_content_saved(e.src_path)  # 删除旧路径的搜索索引
                 except Exception:  # noqa: BLE001
                     pass
-            if self._on_moved is not None and os.path.splitext(e.dest_path)[1].lower() == PPTX_EXT:
+            if (
+                not src_skipped
+                and not dest_skipped
+                and self._on_moved is not None
+                and os.path.splitext(e.dest_path)[1].lower() == PPTX_EXT
+            ):
                 try:
                     self._on_moved(e.src_path, e.dest_path)
                 except Exception:  # noqa: BLE001
                     pass
-            self._trigger(e.dest_path)
+            elif (
+                not src_skipped
+                and dest_skipped
+                and self._on_removed is not None
+                and os.path.splitext(e.src_path)[1].lower() == PPTX_EXT
+            ):
+                try:
+                    self._on_removed(e.src_path)
+                except Exception:  # noqa: BLE001
+                    pass
+            if not dest_skipped:
+                self._trigger(e.dest_path)
 
     def on_deleted(self, e):  # noqa: N802
-        if e.is_directory:
+        if e.is_directory or self._skip_path(e.src_path):
             return
         ext = os.path.splitext(e.src_path)[1].lower()
         if ext not in self._allowed_exts():

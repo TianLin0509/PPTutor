@@ -5,7 +5,9 @@ import threading
 import time
 
 import fixtures_gen as fx
-from test_ui import StubRender, StubThumb, _finish_fake_task, _index, _index_multi, _install_fake_background_task
+from PySide6.QtGui import QPixmap
+
+from test_ui import PendingRender, StubRender, StubThumb, _finish_fake_task, _index, _index_multi, _install_fake_background_task
 
 from pptx_finder import db, indexer, search
 from pptx_finder.ui.index_worker import IndexWorker
@@ -59,6 +61,44 @@ def test_index_single_missing_file(tmp_path):
     conn = db.connect(tmp_path / "i.db")
     db.init_db(conn)
     assert indexer.index_single(conn, str(tmp_path / "nope.pptx")) is False
+
+
+def test_index_single_skips_unchanged_file_before_parse(tmp_path, monkeypatch):
+    """watcher 重复投递同一 stat 时不得再解析、写库或触发 UI indexed。"""
+    conn = db.connect(tmp_path / "i.db")
+    db.init_db(conn)
+    deck = tmp_path / "same.pptx"
+    fx.make_pptx(deck, [{"body": "只应解析一次"}])
+    assert indexer.index_single(conn, str(deck)) is True
+
+    monkeypatch.setattr(
+        indexer,
+        "_index_one",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("unchanged live event must stop before parse")
+        ),
+    )
+
+    assert indexer.index_single(conn, str(deck)) is False
+
+
+def test_index_single_removes_stale_project_dist_record(tmp_path):
+    project = tmp_path / "project"
+    dist = project / "dist"
+    dist.mkdir(parents=True)
+    deck = dist / "generated.pptx"
+    fx.make_pptx(deck, [{"body": "build copy"}])
+    conn = db.connect(tmp_path / "i.db")
+    db.init_db(conn)
+
+    # Before the directory becomes a recognised project, it is a normal user
+    # dist folder and remains searchable.
+    assert indexer.index_single(conn, str(deck)) is True
+    assert db.get_file_by_path(conn, str(deck)) is not None
+
+    (project / "package.json").write_text("{}", encoding="utf-8")
+    assert indexer.index_single(conn, str(deck)) is True
+    assert db.get_file_by_path(conn, str(deck)) is None
 
 
 def test_health_recycle_sync_deletes_recycled_paths_from_index(qtbot, monkeypatch, tmp_path):
@@ -731,6 +771,43 @@ def test_live_indexer_retries_transient_database_connect_failure(
         li.wait(3000)
 
 
+def test_live_indexer_forwards_explicit_output_roots(monkeypatch, qtbot, tmp_path):
+    captured = []
+
+    class FakeConn:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        "pptx_finder.ui.live_indexer.db.connect",
+        lambda _path: FakeConn(),
+    )
+
+    def fake_index_single(_conn, path, **kwargs):
+        captured.append((path, kwargs))
+        return True
+
+    monkeypatch.setattr(
+        "pptx_finder.ui.live_indexer.indexer.index_single",
+        fake_index_single,
+    )
+    output = str(tmp_path / "app" / "artifacts")
+    deck = str(tmp_path / "app" / "artifacts" / "deck.pptx")
+    li = LiveIndexer(
+        str(tmp_path / "i.db"),
+        explicit_output_roots_provider=lambda: (output,),
+    )
+    li.start()
+    try:
+        with qtbot.waitSignal(li.indexed, timeout=1000):
+            li.submit(deck)
+    finally:
+        li.stop()
+        li.wait(3000)
+
+    assert captured == [(deck, {"explicit_output_roots": (output,)})]
+
+
 def test_live_index_deferred_while_full_index_running(qtbot, tmp_path):
     conn = _index(tmp_path)
     win = MainWindow(conn=conn, render_worker=StubRender(), do_index=False)
@@ -1033,7 +1110,7 @@ def test_user_requery_still_selects_first(qtbot, tmp_path):
 # ---------- 后台刷新节流（F1 重搜间隔/输入宽限、F2 预览去重、F3 detail 免重载） ----------
 
 def test_live_refresh_throttles_background_research(qtbot, monkeypatch, tmp_path):
-    """F1：后台重搜最小间隔 15s——间隔内的第二次 tick 直接放弃，不 reschedule。"""
+    """F1：后台重搜最小间隔 15s——窗口内延迟，但 dirty 尾刷新不能丢。"""
     win = MainWindow(conn=_index(tmp_path), render_worker=StubRender(), thumb_worker=StubThumb(), do_index=False)
     qtbot.addWidget(win)
     win.search_box.setText("昇腾")
@@ -1045,7 +1122,8 @@ def test_live_refresh_throttles_background_research(qtbot, monkeypatch, tmp_path
     assert searches == [1]           # 首次后台重搜放行
 
     win._do_live_refresh()
-    assert searches == [1]           # 15s 内第二次被跳过
+    assert searches == [1]           # 15s 内第二次暂不执行
+    assert win._live_refresh.isActive()
 
     win._last_bg_research_ts -= MainWindow._BG_RESEARCH_MIN_INTERVAL_SEC + 1
     win._do_live_refresh()
@@ -1062,10 +1140,53 @@ def test_live_refresh_waits_for_user_input_grace(qtbot, monkeypatch, tmp_path):
 
     win._do_live_refresh()
     assert searches == []            # 宽限 5s 内不放行
+    assert win._live_refresh.isActive()
 
     win._last_user_input_ts = time.monotonic() - MainWindow._USER_INPUT_GRACE_SEC - 1
     win._do_live_refresh()
     assert searches == [1]           # 宽限过后放行
+
+
+def test_live_refresh_trailing_edge_runs_without_another_watcher_event(
+    qtbot, monkeypatch, tmp_path,
+):
+    """最后一次事件落在节流窗内，也必须由同一个 timer 在窗口结束后补跑。"""
+    win = MainWindow(conn=_index(tmp_path), render_worker=StubRender(), thumb_worker=StubThumb(), do_index=False)
+    qtbot.addWidget(win)
+    win.search_box.setText("昇腾")
+    searches = []
+    monkeypatch.setattr(win, "_do_search", lambda: searches.append(1))
+    win._BG_RESEARCH_MIN_INTERVAL_SEC = 0.05
+    win._last_user_input_ts = 0.0
+    win._last_bg_research_ts = time.monotonic()
+    win._live_refresh_pending = True
+
+    win._do_live_refresh()
+
+    assert searches == []
+    qtbot.waitUntil(lambda: searches == [1], timeout=500)
+    assert win._live_refresh_pending is False
+
+
+def test_live_refresh_throttles_empty_query_dashboard(qtbot, monkeypatch, tmp_path):
+    """空查询仪表盘与搜索页共用后台刷新预算，避免 churn 下每 2.5s 强刷。"""
+    win = MainWindow(conn=_index(tmp_path), render_worker=StubRender(), thumb_worker=StubThumb(), do_index=False)
+    qtbot.addWidget(win)
+    win.search_box.clear()
+    win._showing_recent = True
+    calls = []
+    monkeypatch.setattr(win, "_show_recent", lambda **kwargs: calls.append(kwargs))
+    win._last_bg_research_ts = time.monotonic()
+    win._live_refresh_pending = True
+
+    win._do_live_refresh()
+
+    assert calls == []
+    assert win._live_refresh.isActive()
+    win._live_refresh.stop()
+    win._last_bg_research_ts -= MainWindow._BG_RESEARCH_MIN_INTERVAL_SEC + 1
+    win._do_live_refresh()
+    assert calls == [{"dashboard_force_refresh": True, "recent_force_refresh": True}]
 
 
 def test_live_refresh_manual_search_bypasses_throttle(qtbot, tmp_path):
@@ -1083,9 +1204,27 @@ def test_live_refresh_manual_search_bypasses_throttle(qtbot, tmp_path):
     assert win._last_bg_research_ts > 0.0
 
 
+def test_manual_search_consumes_existing_live_dirty_latch(qtbot, tmp_path):
+    win = MainWindow(conn=_index(tmp_path), render_worker=StubRender(), thumb_worker=StubThumb(), do_index=False)
+    qtbot.addWidget(win)
+    win.search_box.setText("昇腾")
+    win._live_refresh_pending = True
+    win._schedule_live_refresh(1000)
+    assert win._live_refresh.isActive()
+
+    win._do_search()
+
+    assert win._results
+    assert win._live_refresh_pending is False
+    assert not win._live_refresh.isActive()
+
+
 def test_preview_request_dedupes_same_file_same_page(qtbot, tmp_path):
     """F2：同文件同页的预览重发被去重；翻页/文件内容变化照常发出。"""
     render = StubRender()
+    render.request = lambda req_id, path, page_no, **_kwargs: render.calls.append(
+        (req_id, path, page_no)
+    )
     win = MainWindow(conn=_index(tmp_path), render_worker=render, thumb_worker=StubThumb(), do_index=False)
     qtbot.addWidget(win)
     win.search_box.setText("昇腾")
@@ -1102,6 +1241,74 @@ def test_preview_request_dedupes_same_file_same_page(qtbot, tmp_path):
     assert len(render.calls) == 2
 
     win._cur.mtime += 1000           # 文件内容已变（编辑后重索引）→ 照常重渲染
+    win._request_preview()
+    assert len(render.calls) == 3
+
+
+def test_preview_failure_releases_inflight_key_for_same_page_retry(qtbot, tmp_path):
+    render = StubRender()
+    win = MainWindow(conn=_index(tmp_path), render_worker=render, thumb_worker=StubThumb(), do_index=False)
+    qtbot.addWidget(win)
+    win.search_box.setText("昇腾")
+    win._do_search()
+
+    win._request_preview()
+    assert len(render.calls) == 1
+    win._on_rendered(win._req_id, "")
+    assert win._inflight_preview_key is None
+
+    win._request_preview()
+    assert len(render.calls) == 2
+
+
+def test_preview_cancel_releases_only_inflight_key(qtbot, tmp_path):
+    render = StubRender()
+    render.request = lambda req_id, path, page_no, **_kwargs: render.calls.append(
+        (req_id, path, page_no)
+    )
+    win = MainWindow(conn=_index(tmp_path), render_worker=render, thumb_worker=StubThumb(), do_index=False)
+    qtbot.addWidget(win)
+    win.search_box.setText("昇腾")
+    win._do_search()
+
+    win._request_preview()
+    assert len(render.calls) == 1
+    win._invalidate_preview_request(clear_deferred=False)
+    assert win._inflight_preview_key is None
+
+    win._request_preview()
+    assert len(render.calls) == 2
+
+
+def test_preview_failure_clears_previous_success_key(qtbot, tmp_path):
+    """R-1：翻页渲染失败后，上一页成功 key 不得残留——翻回上一页必须能重发
+    （生产里同页缓存命中秒出；不修复则被去重卡住，永久显示错误文本）。"""
+    render = PendingRender()
+    win = MainWindow(conn=_index(tmp_path), render_worker=render, thumb_worker=StubThumb(), do_index=False)
+    qtbot.addWidget(win)
+    win.search_box.setText("昇腾")
+    win._do_search()
+
+    # 第一页渲染成功：成功 key 落位
+    win._request_preview()
+    assert len(render.calls) == 1
+    png = tmp_path / "ok.png"
+    pm = QPixmap(32, 32)
+    pm.fill()
+    assert pm.save(str(png))
+    win._on_rendered(win._req_id, str(png))
+    assert win._last_preview_key is not None
+
+    # 翻到第二页：渲染失败，不得残留上一页成功 key
+    win._view_page += 1
+    win._request_preview()
+    assert len(render.calls) == 2
+    win._on_rendered(win._req_id, "")
+    assert win._inflight_preview_key is None
+    assert win._last_preview_key is None
+
+    # 翻回第一页：不被去重卡住，重发请求
+    win._view_page -= 1
     win._request_preview()
     assert len(render.calls) == 3
 

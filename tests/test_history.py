@@ -34,11 +34,50 @@ def test_blank_ignored(tmp_path):
     assert history.load_history(base=tmp_path) == []
 
 
-def test_ui_has_completer(qtbot, tmp_path):
-    conn = _index(tmp_path)
-    win = MainWindow(conn=conn, render_worker=StubRender(), do_index=False)
+def test_completer_attached_only_during_explicit_popup(qtbot, tmp_path, monkeypatch):
+    """B4：completer 不常驻——初始/打字时不挂载，仅显式唤起历史时瞬时挂载，关闭即卸。"""
+    _stub_history(monkeypatch)
+    win = MainWindow(conn=_index(tmp_path), render_worker=StubRender(), do_index=False)
     qtbot.addWidget(win)
+    win.show()
+    assert win.search_box.completer() is None
+    win.show_history_popup()
     assert win.search_box.completer() is win._completer
+    assert win._completer.popup().isVisible()
+    win._completer.popup().hide()
+    qtbot.waitUntil(lambda: win.search_box.completer() is None, timeout=500)
+
+
+def test_explicit_history_selection_updates_query_then_detaches(qtbot, tmp_path, monkeypatch):
+    """The transient completer must still accept a real keyboard selection."""
+    _stub_history(monkeypatch)
+    win = MainWindow(conn=_index(tmp_path), render_worker=StubRender(), do_index=False)
+    qtbot.addWidget(win)
+    win.show()
+    win.show_history_popup()
+    popup = win._completer.popup()
+    popup.setCurrentIndex(popup.model().index(0, 0))
+
+    qtbot.keyClick(popup, Qt.Key_Return)
+
+    qtbot.waitUntil(lambda: win.search_box.completer() is None, timeout=500)
+    assert win.search_box.text() == "算力"
+    assert not popup.isVisible()
+
+
+def test_explicit_history_escape_closes_without_changing_query(qtbot, tmp_path, monkeypatch):
+    _stub_history(monkeypatch)
+    win = MainWindow(conn=_index(tmp_path), render_worker=StubRender(), do_index=False)
+    qtbot.addWidget(win)
+    win.show()
+    win.show_history_popup()
+    popup = win._completer.popup()
+
+    qtbot.keyClick(popup, Qt.Key_Escape)
+
+    qtbot.waitUntil(lambda: win.search_box.completer() is None, timeout=500)
+    assert win.search_box.text() == ""
+    assert not popup.isVisible()
 
 
 def _stub_history(monkeypatch):
@@ -74,3 +113,26 @@ def test_focus_search_pops_history_explicitly(qtbot, tmp_path, monkeypatch):
     win.focus_search()
 
     assert win._completer.popup().isVisible()
+
+
+def test_typing_does_not_autopopup_history(qtbot, tmp_path, monkeypatch):
+    """B4：有历史时打字不自动弹下拉；显式弹出后一旦开始打字立即关闭并卸载 completer。"""
+    _stub_history(monkeypatch)
+    win = MainWindow(conn=_index(tmp_path), render_worker=StubRender(), do_index=False)
+    qtbot.addWidget(win)
+    win.show()
+    popup = win._completer.popup()
+
+    qtbot.keyClicks(win.search_box, "abc")
+    assert win.search_box.text() == "abc"
+    assert not popup.isVisible()                       # 打字全程不弹
+    assert win.search_box.completer() is None
+    assert win._history_detach_scheduled is False      # 普通打字不创建无用 singleShot
+
+    win.search_box.clear()
+    win.show_history_popup()
+    assert popup.isVisible()                           # 显式唤起仍弹
+    qtbot.keyClicks(win.search_box, "d")
+    qtbot.waitUntil(lambda: win.search_box.completer() is None, timeout=500)  # 卸载推迟到事件循环空闲
+    assert not popup.isVisible()                       # 一打字即关
+    assert win.search_box.completer() is None          # 已卸载，Enter/Esc/方向键不再被 completer 截获

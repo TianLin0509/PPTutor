@@ -67,6 +67,20 @@ def test_exclude_has_temp_dirs():
     assert "tmp" not in EXCLUDE_DIR_NAMES
 
 
+def test_scanner_skips_pptdoctor_automation_artifact_dirs(tmp_path):
+    for dirname in (".selftest", ".arena", ".ai-team"):
+        folder = tmp_path / dirname / "nested"
+        folder.mkdir(parents=True)
+        fx.make_pptx(folder / f"{dirname}.pptx", [{"body": "automation noise"}])
+    keep = tmp_path / "docs"
+    keep.mkdir()
+    fx.make_pptx(keep / "keep.pptx", [{"body": "business deck"}])
+
+    found = {p.name for p in iter_ppt_files([str(tmp_path)])}
+
+    assert found == {"keep.pptx"}
+
+
 def test_scanner_includes_company_documents_under_appdata_roaming(tmp_path):
     roaming = tmp_path / "Users" / "l00807938" / "AppData" / "Roaming" / "CorpDocs"
     roaming.mkdir(parents=True)

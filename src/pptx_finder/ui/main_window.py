@@ -15,7 +15,7 @@ from collections import deque
 import sys
 import time
 
-from PySide6.QtCore import QEvent, QMimeData, QPoint, QPropertyAnimation, QSize, Qt, QStringListModel, QTimer, QUrl, Signal
+from PySide6.QtCore import QEvent, QMimeData, QObject, QPoint, QPropertyAnimation, QSize, Qt, QStringListModel, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QCursor, QDrag, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QCompleter, QDialog, QFrame, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QLineEdit, QListWidget,
@@ -43,6 +43,7 @@ from ..config import (
     set_theme as cfg_set_theme, update_base_url,
 )
 from ..models import FileResult
+from ..path_policy import explicit_project_output_roots
 from ..query_explain import explain_query, mode_label, suggestion_keys
 from . import theme
 from .bg_task import BackgroundTask
@@ -730,6 +731,19 @@ class ResultItem(QWidget):
         self.setStyleSheet(f"ResultItem{{background:{bg};border-radius:{t['radius']}px;border-left:3px solid {bar};}}")
 
 
+class _PopupHideFilter(QObject):
+    """历史下拉关闭（选中/Esc/点别处）即回调卸载 completer：打字期间搜索框不挂 completer。"""
+
+    def __init__(self, on_hide) -> None:
+        super().__init__()
+        self._on_hide = on_hide
+
+    def eventFilter(self, obj, ev):  # noqa: N802 - Qt 命名约定
+        if ev.type() == QEvent.Hide:
+            self._on_hide()
+        return False
+
+
 class MainWindow(QMainWindow):
     _SEARCH_SLOW_HINT_MS = 1000
     _AUTO_PREVIEW_DELAY_MS = 420
@@ -741,6 +755,7 @@ class MainWindow(QMainWindow):
     _LIVE_FLUSH_BATCH = 64
     _LIVE_FLUSH_YIELD_MS = 1
     _DEFERRED_LIVE_SEARCH_YIELD_MS = 1
+    _LIVE_REFRESH_DEBOUNCE_MS = 2500
     _LIVE_STATUS_REFRESH_MS = 1500
     _DETAIL_UPDATE_DELAY_MS = 80
     _DETAIL_DOT_DELAY_MS = 80
@@ -794,6 +809,8 @@ class MainWindow(QMainWindow):
         self._db_path = str(cfg_db_path())
         self._conn = conn or db.connect(self._db_path)
         db.init_db(self._conn)
+        self._index_roots = self._resolve_index_roots(roots)
+        self._explicit_output_roots = explicit_project_output_roots(self._index_roots)
 
         self._results: list[FileResult] = []
         self._results_raw: list[FileResult] = []
@@ -818,6 +835,7 @@ class MainWindow(QMainWindow):
         self._search_worker: SearchWorker | None = None
         self._async_search = conn is None and do_index
         self._live_refresh_after_search = False
+        self._live_refresh_pending = False  # watcher 已写库、当前视图尚未完成一次尾刷新
         self._last_bg_research_ts = 0.0   # 上次后台重搜时刻（monotonic，F1）
         self._last_user_input_ts = 0.0    # 用户最近一次改查询词时刻（monotonic，F1）
         self._live_deferred_paths: set[str] = set()
@@ -888,8 +906,9 @@ class MainWindow(QMainWindow):
         self._preview_direction = 1  # 最近一次翻页方向；邻页预取优先沿该方向
         self._req_id = 0
         self._req_path: str | None = None  # 当前 req_id 渲染请求的源文件 path（迟到渲染校验用）
-        # F2 预览去重：当前已显示/在途预览的 (path, page, mtime, size)；同 key 重发直接 no-op
+        # F2 预览去重：成功态与在途态分离；失败/取消只释放在途 key，成功态继续挡重复 COM。
         self._last_preview_key: tuple | None = None
+        self._inflight_preview_key: tuple | None = None
         self._cur_pixmap: QPixmap | None = None
         self._zoom = 1.0  # 棰勮缂╂斁锛?.0=閫傞厤绐楀彛锛?1 鏀惧ぇ鐪嬬粏鑺?
         self._to_tray_on_close = False
@@ -964,7 +983,7 @@ class MainWindow(QMainWindow):
         # 鏈搷搴旓級銆傚悎骞舵垚涓€娆″欢杩熷埛鏂帮細椋庢毚 N 涓簨浠?鈫?鏈€澶?1 娆℃悳绱€?
         self._live_refresh = QTimer(self)
         self._live_refresh.setSingleShot(True)
-        self._live_refresh.setInterval(2500)
+        self._live_refresh.setInterval(self._LIVE_REFRESH_DEBOUNCE_MS)
         self._live_refresh.timeout.connect(self._do_live_refresh)
         self._live_status_refresh = QTimer(self)
         self._live_status_refresh.setSingleShot(True)
@@ -1014,11 +1033,12 @@ class MainWindow(QMainWindow):
                 self._db_path,
                 allowed_exts_provider=self._enabled_index_exts,
                 compute_content_hash_provider=lambda: self._smart_grouping_enabled,
+                explicit_output_roots_provider=self.explicit_output_roots,
             )
             self._live.indexed.connect(self._on_live_indexed)
             self._live.start()
         if do_index:
-            self._schedule_startup_index_check(roots, workers)
+            self._schedule_startup_index_check(self._index_roots, workers)
             self._render_cache_maintenance_timer.start()
         else:
             self._refresh_status()
@@ -1078,6 +1098,9 @@ class MainWindow(QMainWindow):
 
     def diagnostic_lines(self) -> list[str]:
         lines = [
+            "index_roots: " + (" | ".join(self._index_roots) or "(none)"),
+            "explicit_project_outputs: "
+            + (" | ".join(self._explicit_output_roots) or "(none)"),
             "ui_loop: "
             f"samples={self._ui_loop_samples} "
             f"last_gap={self._ui_loop_last_gap_ms:.0f} ms "
@@ -1141,6 +1164,28 @@ class MainWindow(QMainWindow):
         if hasattr(renderer_mod, "diagnostic_lines"):
             lines.extend(renderer_mod.diagnostic_lines())
         return lines
+
+    @staticmethod
+    def _resolve_index_roots(roots: list[str] | None) -> list[str]:
+        selected = list(roots or ())
+        if not selected:
+            env = os.environ.get("PPTX_FINDER_ROOTS", "").strip()
+            if env:
+                selected = [root for root in env.split(os.pathsep) if root]
+        if not selected:
+            from ..scanner import fixed_drives
+            selected = fixed_drives()
+        return [
+            root if os.path.isabs(root) else os.path.abspath(root)
+            for root in selected
+        ]
+
+    def index_roots(self) -> list[str]:
+        """The one root contract shared by scans, live events, and versions."""
+        return list(self._index_roots)
+
+    def explicit_output_roots(self) -> tuple[str, ...]:
+        return tuple(self._explicit_output_roots)
 
     # ---------- UI ----------
     def _build_ui(self) -> None:
@@ -1714,7 +1759,15 @@ class MainWindow(QMainWindow):
         self._completer = QCompleter(self._history_model, self)
         self._completer.setCompletionMode(QCompleter.UnfilteredPopupCompletion)
         self._completer.setCaseSensitivity(Qt.CaseInsensitive)
-        self.search_box.setCompleter(self._completer)
+        self._completer.activated.connect(self._accept_history_completion)
+        # B4：completer 只在显式唤起历史时瞬时挂载（show_history_popup），关闭即卸。
+        # 常驻挂载会让 QLineEdit 每次 textEdited 都自动弹历史，抢走 Enter/Esc/方向键。
+        # 打字卸载推迟到事件循环空闲：textEdited 信号内同步 setCompleter(None) 会重入崩溃
+        self._history_detach_inflight = False
+        self._history_detach_scheduled = False
+        self.search_box.textEdited.connect(self._on_history_text_edited)
+        self._history_popup_filter = _PopupHideFilter(self._schedule_history_detach)
+        self._completer.popup().installEventFilter(self._history_popup_filter)
         self._completer.popup().setObjectName("historyPopup")
         lay.addWidget(self.search_box, 1)
 
@@ -2091,7 +2144,40 @@ class MainWindow(QMainWindow):
             return
         self._refresh_history_model()
         if self._history_model.stringList():
+            if self.search_box.completer() is None:
+                self.search_box.setCompleter(self._completer)  # B4：瞬时挂载，关闭即卸
             self._completer.complete()
+
+    def _on_history_text_edited(self, *_args) -> None:
+        """Only allocate a deferred callback while the explicit popup is attached."""
+        self._schedule_history_detach()
+
+    def _accept_history_completion(self, completion: str) -> None:
+        """Apply an explicit history choice before the transient completer detaches."""
+        value = str(completion or "")
+        if value and self.search_box.text() != value:
+            self.search_box.setText(value)
+        self._schedule_history_detach()
+
+    def _schedule_history_detach(self, *_args) -> None:
+        """Detach after Qt has finished popup selection/hide signal delivery."""
+        if self.search_box.completer() is None or self._history_detach_scheduled:
+            return
+        self._history_detach_scheduled = True
+        QTimer.singleShot(0, self._detach_history_completer)
+
+    def _detach_history_completer(self, *_args) -> None:
+        """历史下拉关闭（选中/Esc/点别处/开始打字）即卸载 completer。
+        打字期间搜索框不挂 completer，从根源杜绝 QLineEdit 自动弹历史抢按键。"""
+        self._history_detach_scheduled = False
+        if self.search_box.completer() is None or self._history_detach_inflight:
+            return
+        self._history_detach_inflight = True  # 弹层可见时 setCompleter 会同步触发 Hide 重入
+        try:
+            self._completer.popup().hide()      # 先关弹层（重入被 inflight 挡下）
+            self.search_box.setCompleter(None)  # 弹层已关，卸载不再产生 Hide
+        finally:
+            self._history_detach_inflight = False
 
     def _mode_key(self) -> str:
         return {1: "filename", 2: "content"}.get(self.mode.currentIndex(), "all")
@@ -2211,6 +2297,12 @@ class MainWindow(QMainWindow):
         if hasattr(self, "_history_hint"):
             self._history_hint.hide()
         query = self.search_box.text().strip()
+        # A manual non-empty search consumes all index changes committed before
+        # it starts. A new watcher event during the async search sets the latch
+        # again and still receives one trailing refresh.
+        if query:
+            self._live_refresh_pending = False
+            self._live_refresh.stop()
         # 区分「用户改词」与「后台重搜」（live 刷新等文本未变的重搜）：
         # 后者在结果重建后按 path 恢复选中，而不是拽回首行
         self._search_keep_selection = bool(query) and query == self._last_query_text
@@ -2309,13 +2401,13 @@ class MainWindow(QMainWindow):
         self._search_slow_hint_timer.stop()
 
     def _maybe_run_deferred_live_refresh(self, query: str) -> None:
-        if not self._live_refresh_after_search:
+        if not self._live_refresh_after_search and not self._live_refresh_pending:
             return
         self._live_refresh_after_search = False
         if self._closing or self.search_box.text().strip() != query:
             return
-        # 文件风暴期间不要刚搜完就原样重搜；等 watcher 真正空闲后至多合并跑一次。
-        self._live_refresh.start()
+        # 文件风暴期间不要刚搜完就原样重搜；dirty latch 保证空闲后仍会补跑一次。
+        self._schedule_live_refresh()
 
     def _show_search_slow_hint(self, req_id: int, query: str) -> None:
         if self._closing or self._search_pending_req != req_id:
@@ -4192,12 +4284,15 @@ class MainWindow(QMainWindow):
             self._preview_deferred_due_to_busy = False
         self._req_id += 1
         self._req_path = None
+        # 取消只释放在途状态；已成功显示的 key 仍可挡住后台重搜造成的重复 COM。
+        self._inflight_preview_key = None
         if hasattr(self, "_spin_timer"):
             self._stop_spinner()
 
     def _show_preview_pending(self) -> None:
         self._cur_pixmap = None
         self._last_preview_key = None  # 画面被占位文本替换，F2 去重 key 一并失效
+        self._inflight_preview_key = None
         self.image_label.setPixmap(QPixmap())
         self.image_label.setText(
             f'<div style="font-size:28px;color:{self._tok["ink4"]}">…</div>'
@@ -4206,11 +4301,13 @@ class MainWindow(QMainWindow):
     def _clear_preview_empty(self, message: str = "选中左侧结果查看预览") -> None:
         self._cur_pixmap = None
         self._last_preview_key = None  # F2
+        self._inflight_preview_key = None
         self.image_label.setPixmap(QPixmap())
         self.image_label.setText(
             f'<div style="color:{self._tok["ink3"]};font-size:13px">{message}</div>')
 
     def _show_preview_unavailable(self) -> None:
+        self._last_preview_key = None  # 错误文本替换画面，上一页成功 key 一并失效（否则翻回上一页被去重卡住）
         self.image_label.setPixmap(QPixmap())
         self.image_label.setText(
             f'<div style="font-size:15px;font-weight:600;color:{self._tok["ink2"]}">暂时无法生成原图预览</div>'
@@ -4221,6 +4318,7 @@ class MainWindow(QMainWindow):
 
     def _show_non_powerpoint_preview(self, ext: str) -> None:
         self._last_preview_key = None  # F2：非 PPT 文本占位替换画面，去重 key 失效
+        self._inflight_preview_key = None
         kind = "Word" if ext == DOCX_EXT else "PDF"
         unit = "段落" if ext == DOCX_EXT else "页面"
         self.image_label.setPixmap(QPixmap())
@@ -4266,9 +4364,10 @@ class MainWindow(QMainWindow):
     def _request_preview(self) -> None:
         if not self._cur:
             return
+        preview_key = (self._cur.path, self._view_page, self._cur.mtime, self._cur.size)
         # F2 去重：同文件同页同内容的预览已显示/在途时不重发（挡住后台重搜恢复选中后的
         # 连带 COM 渲染）；翻页/换文件/文件内容已变（mtime/size 变）时 key 不同照常
-        if self._last_preview_key == (self._cur.path, self._view_page, self._cur.mtime, self._cur.size):
+        if self._last_preview_key == preview_key or self._inflight_preview_key == preview_key:
             return
         if self._search_pending_req is not None:
             return
@@ -4325,11 +4424,13 @@ class MainWindow(QMainWindow):
             self._start_spinner()
         self._req_id += 1
         self._req_path = self._cur.path  # 记录本次渲染的源文件：迟到回包按 path 复核
-        self._last_preview_key = (self._cur.path, page, self._cur.mtime, self._cur.size)  # F2
         if cache_hit:
+            self._last_preview_key = preview_key
+            self._inflight_preview_key = None
             self._preview_hinted = True
             self._prefetch_neighbors()
         else:
+            self._inflight_preview_key = preview_key
             self._request_render(
                 self._req_id,
                 self._cur.path,
@@ -4432,12 +4533,17 @@ class MainWindow(QMainWindow):
             return
         self._stop_spinner()
         if not png or not os.path.exists(png):
+            self._inflight_preview_key = None
             self._show_preview_unavailable()
             return
         pm = QPixmap(png)
         if pm.isNull():
+            self._inflight_preview_key = None
             self._show_preview_unavailable()
             return
+        if self._inflight_preview_key is not None:
+            self._last_preview_key = self._inflight_preview_key
+        self._inflight_preview_key = None
         self._cur_pixmap = pm
         self._preview_hinted = True  # 棣栨棰勮宸叉垚鍔燂紝涔嬪悗涓嶅啀鎻愩€屽敜璧?PowerPoint銆?
         self._update_pixmap()
@@ -5414,7 +5520,11 @@ class MainWindow(QMainWindow):
             return
         from .. import indexer
         try:
-            ok = indexer.index_single(self._conn, path)
+            ok = indexer.index_single(
+                self._conn,
+                path,
+                explicit_output_roots=self._explicit_output_roots,
+            )
         except Exception:  # noqa: BLE001
             _log.warning("live index failed %s", path, exc_info=True)
             return
@@ -5438,8 +5548,17 @@ class MainWindow(QMainWindow):
     def _after_live_index(self) -> None:
         if self._closing:
             return
+        self._live_refresh_pending = True
         self._index_status_cache = None
         self._live_status_refresh.start()       # 鍚堝苟 watcher 椋庢毚涓嬬殑鐘舵€?DB 鏌ヨ
+        self._schedule_live_refresh()
+
+    def _schedule_live_refresh(self, delay_ms: int | None = None) -> None:
+        """安排一次 live 尾刷新；重复调用只移动同一个 single-shot timer。"""
+        if self._closing:
+            return
+        delay = self._LIVE_REFRESH_DEBOUNCE_MS if delay_ms is None else max(1, int(delay_ms))
+        self._live_refresh.setInterval(delay)
         self._live_refresh.start()
 
     def _do_live_refresh(self) -> None:
@@ -5450,17 +5569,27 @@ class MainWindow(QMainWindow):
             self._live_refresh_after_search = True
             return
         query = self.search_box.text().strip()
-        if query:
-            # F1 后台重搜节流：距上次后台重搜 <15s、或用户 <5s 前刚改过词，
-            # 本次 tick 直接放弃（不 reschedule；下一个 live 事件会再启动 2.5s 去抖）
+        refreshes_dashboard = (
+            not query
+            and getattr(self, "dashboard", None) is not None
+            and self._showing_recent
+        )
+        if query or refreshes_dashboard:
+            # 搜索页和空查询仪表盘共用同一个后台刷新预算。窗口内不执行，但 dirty latch
+            # 不会被清掉；按最早允许时刻重新调度，保证最后一个 watcher 事件不会丢。
             now = time.monotonic()
-            if now - self._last_bg_research_ts < self._BG_RESEARCH_MIN_INTERVAL_SEC:
-                return
-            if now - self._last_user_input_ts < self._USER_INPUT_GRACE_SEC:
+            not_before = self._last_bg_research_ts + self._BG_RESEARCH_MIN_INTERVAL_SEC
+            if query:
+                not_before = max(not_before, self._last_user_input_ts + self._USER_INPUT_GRACE_SEC)
+            remaining = not_before - now
+            if remaining > 0:
+                self._schedule_live_refresh(int(remaining * 1000 + 0.999))
                 return
             self._last_bg_research_ts = now
+            self._live_refresh_pending = False
+        if query:
             self._do_search()
-        elif getattr(self, "dashboard", None) is not None and self._showing_recent:
+        elif refreshes_dashboard:
             self._show_recent(dashboard_force_refresh=True, recent_force_refresh=True)  # 绌烘悳绱㈠仠鍦ㄤ华琛ㄧ洏 鈫?鏂版枃浠跺苟鍏ュ悗鍒锋柊缁熻
 
     def _start_indexing(self, roots: list[str] | None, workers: int | None) -> bool:
@@ -5471,12 +5600,12 @@ class MainWindow(QMainWindow):
         if self._indexer is not None and self._indexer.isRunning():
             self._toast("正在扫描中，请稍候…")
             return False
-        from ..scanner import fixed_drives
-        if not roots:
-            env = os.environ.get("PPTX_FINDER_ROOTS", "").strip()
-            if env:
-                roots = [r for r in env.split(os.pathsep) if r]
-        roots = roots or fixed_drives()
+        if roots:
+            self._index_roots = self._resolve_index_roots(roots)
+            self._explicit_output_roots = explicit_project_output_roots(
+                self._index_roots
+            )
+        roots = self.index_roots()
         # 两个低优先级隔离 worker 是“速度/前台流畅”折中上限；显式传入更大值
         # 也不允许应用把八个解析进程同时压到用户的 PowerPoint 上。
         worker_count = max(1, min(2, int(workers))) if workers is not None else 2
