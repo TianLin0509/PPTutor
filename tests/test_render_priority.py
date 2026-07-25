@@ -15,6 +15,13 @@ import pytest
 from pptx_finder import renderer
 
 
+@pytest.fixture(autouse=True)
+def _no_user_powerpoint(monkeypatch):
+    """隔离本机真实 PowerPoint：后台渲染安全闸（_powerpoint_active 为真即拒绝渲染）
+    会让这些用例在本机开着 PowerPoint 时误失败。默认无活动实例；专门用例自行覆盖。"""
+    monkeypatch.setattr(renderer, "_powerpoint_active", lambda **_kwargs: False)
+
+
 def test_pid_for_app_accepts_powerpoint_hwnd_as_callable(monkeypatch):
     """Real PowerPoint dynamic dispatch exposes HWND as a bound method."""
     app = types.SimpleNamespace(HWND=lambda: 4321)

@@ -484,3 +484,77 @@ def highlight_css(theme: str) -> str:
     t = tok(theme)
     return (f"background:{t['hl_bg']};"
             f"border-radius:3px;font-weight:700;color:{t['hl_fg']};padding:0 1px;")
+
+
+# ---------- 与操作系统深浅模式脱钩（2026-07-24） ----------
+def _solid_qcolor(color: str, bg_hex: str):
+    """把 token 颜色（#hex 或 CSS rgba(float alpha)）折算成不透明 QColor。
+
+    半透明值按 alpha 合成到 bg_hex 上——QPalette 角色本身不需要 alpha，
+    且 QColor 不接受 CSS 浮点 alpha 写法。
+    """
+    from PySide6.QtGui import QColor
+
+    c = (color or "").strip()
+    if c.startswith("#"):
+        return QColor(c)
+    if c.startswith("rgba(") and c.endswith(")"):
+        r, g, b, a = [p.strip() for p in c[5:-1].split(",")]
+        r, g, b, a = int(r), int(g), int(b), float(a)
+        br, bg_, bb = _rgb(bg_hex)
+        return QColor(round(r * a + br * (1 - a)), round(g * a + bg_ * (1 - a)), round(b * a + bb * (1 - a)))
+    if c.startswith("rgb(") and c.endswith(")"):
+        r, g, b = [p.strip() for p in c[4:-1].split(",")]
+        return QColor(int(r), int(g), int(b))
+    return QColor(c)
+
+
+def build_palette(theme: str):
+    """由主题 token 构造全局 QPalette：QSS 覆盖不到的控件（对话框、通用输入框、
+    系统弹窗等）回退到应用主题色，而不是操作系统深浅模式的调色板。"""
+    from PySide6.QtGui import QPalette
+
+    t = tok(theme)
+    win = t["win"]
+    window = _solid_qcolor(win, win)
+    panel = _solid_qcolor(t["panel"], win)
+    field = _solid_qcolor(t["field"], win)
+    ink1 = _solid_qcolor(t["ink1"], win)
+    ink4 = _solid_qcolor(t["ink4"], win)
+    acc = _solid_qcolor(t["acc"], win)
+    acctext = _solid_qcolor(t["acctext"], win)
+
+    pal = QPalette()
+    pal.setColor(QPalette.Window, window)
+    pal.setColor(QPalette.WindowText, ink1)
+    pal.setColor(QPalette.Base, field)
+    pal.setColor(QPalette.AlternateBase, panel)
+    pal.setColor(QPalette.Text, ink1)
+    pal.setColor(QPalette.Button, panel)
+    pal.setColor(QPalette.ButtonText, ink1)
+    pal.setColor(QPalette.ToolTipBase, window)
+    pal.setColor(QPalette.ToolTipText, ink1)
+    pal.setColor(QPalette.PlaceholderText, ink4)
+    pal.setColor(QPalette.Highlight, acc)
+    pal.setColor(QPalette.HighlightedText, acctext)
+    pal.setColor(QPalette.Link, acc)
+    pal.setColor(QPalette.BrightText, acctext)
+    for role in (QPalette.WindowText, QPalette.Text, QPalette.ButtonText):
+        pal.setColor(QPalette.Disabled, role, ink4)
+    return pal
+
+
+def apply_to_app(app, theme: str) -> None:
+    """把应用主题钉死在应用层，与操作系统深浅模式彻底脱钩（三件套）。
+
+    - colorScheme：Qt 6.5+ 起 Windows 默认跟随系统深浅；显式钉住后系统切换不再影响本应用；
+    - QPalette：QSS 未覆盖的控件回退到应用 token 色（本机深色主题不再渗进来）；
+    - 全局 QSS：既有全覆盖样式表，照旧。
+    """
+    from PySide6.QtCore import Qt
+
+    t = tok(theme)
+    scheme = Qt.ColorScheme.Light if t.get("is_light", False) else Qt.ColorScheme.Dark
+    app.styleHints().setColorScheme(scheme)
+    app.setPalette(build_palette(theme))
+    app.setStyleSheet(build_qss(theme))

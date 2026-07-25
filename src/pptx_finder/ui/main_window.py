@@ -2084,7 +2084,7 @@ class MainWindow(QMainWindow):
         self._tok = theme.tok(name)
         app = QApplication.instance()
         if app is not None:
-            app.setStyleSheet(theme.build_qss(name))
+            theme.apply_to_app(app, name)  # colorScheme+palette+QSS 三件套：与本机深浅主题脱钩
         if getattr(self, "index_bar", None) is not None:
             self.index_bar.set_accent_color(self._tok["acc"])
         theme_label = dict(theme.THEMES).get(name, name)
