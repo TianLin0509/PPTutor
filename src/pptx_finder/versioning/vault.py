@@ -9,6 +9,7 @@ from __future__ import annotations
 import datetime
 from contextlib import contextmanager
 import json
+import logging
 import os
 import re
 import shutil
@@ -23,6 +24,8 @@ from ..config import data_dir, ext_path
 from ..parser import parse_pptx
 from ..text_tokenize import tokenize
 from . import store
+
+log = logging.getLogger(__name__)
 
 _OBJECT_HASH_RE = re.compile(r"^[0-9a-f]{16}$")
 _GLOBAL_OBJECTS_DIRNAME = "_objects"
@@ -319,10 +322,52 @@ def stable_snapshot_source(path: str):
     try:
         yield prepared
     finally:
+        _unlink_snapshot_tmp(prepared)
+
+
+_STALE_SNAPSHOT_TMP_PREFIX = ".pptdoctor-snapshot-"
+
+
+def _unlink_snapshot_tmp(tmp: str) -> None:
+    """删除留底暂存副本：杀软/索引器可能短暂锁定新写入的大文件，
+    静默吞 OSError 会让 180MB 级暂存永久残留（实测同事 C 盘被此类文件堆爆）。"""
+    for attempt in range(4):
         try:
-            os.unlink(ext_path(prepared))
+            os.unlink(ext_path(tmp))
+            return
         except OSError:
-            pass
+            if attempt == 3:
+                log.warning("snapshot temp cleanup failed after retries: %s", tmp, exc_info=True)
+            else:
+                time.sleep(0.3 * (attempt + 1))
+
+
+def sweep_stale_snapshot_temps(*, max_age_sec: float = 0.0, tempdir: str | None = None) -> int:
+    """清扫 %TEMP% 里残留的留底暂存副本，返回删除数。
+
+    暂存文件只应存活于一次留底操作期间；进程被杀或删除失败都会永久残留，
+    且此前没有任何清扫机制。启动时调用（max_age_sec=0）：此刻不可能有在途留底操作。
+    """
+    root = Path(tempdir) if tempdir is not None else Path(tempfile.gettempdir())
+    now = time.time()
+    deleted = 0
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return 0
+    for entry in entries:
+        try:
+            if not entry.name.startswith(_STALE_SNAPSHOT_TMP_PREFIX):
+                continue
+            if max_age_sec > 0 and now - entry.stat().st_mtime < max_age_sec:
+                continue
+            entry.unlink()
+            deleted += 1
+        except OSError:
+            continue
+    if deleted:
+        log.info("swept %d stale snapshot temp files", deleted)
+    return deleted
 
 
 def _write_zip(dest: str, doc_id: str, names: list[str], parts: dict[str, str]) -> None:

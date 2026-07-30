@@ -605,6 +605,11 @@ def main() -> int:
     from .logging_setup import configure_logging
     configure_logging()
     log = logging.getLogger(__name__)
+    try:
+        from .versioning.vault import sweep_stale_snapshot_temps
+        sweep_stale_snapshot_temps()  # 启动即清扫历史残留的留底暂存（启动瞬间无在途留底）
+    except Exception:  # noqa: BLE001
+        log.warning("stale snapshot temp sweep failed", exc_info=True)
     app = QApplication(sys.argv)
 
     # 单实例：已有实例在跑则通知其显示窗口并退出本实例（防重复全盘索引、数据库抢锁）
