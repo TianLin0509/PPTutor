@@ -6,7 +6,7 @@
 ;   - 自启完全交给应用内设置（versioning/autostart.py），安装器不写 Run 项，避免双重注册
 ;   - 用户数据（index.db / vault）在 %LOCALAPPDATA%\pptx-finder，不在 {app}，卸载不触碰
 
-#define AppVersion "1.2.6"
+#define AppVersion "1.2.7"
 
 [Setup]
 AppId={{B7E2A8F3-5C4D-4E1F-9A2B-3D4C5E6F7A08}
