@@ -338,6 +338,15 @@ def delete_version(conn, version_id: str) -> None:
     conn.execute("DELETE FROM version_pages_fts WHERE version_id=?", (version_id,))
 
 
+def delete_doc(conn, doc_id: str) -> None:
+    """删除文档及其全部版本/路径/分支记录（磁盘目录与对象回收由调用方处理）。"""
+    for row in conn.execute("SELECT version_id FROM versions WHERE doc_id=?", (doc_id,)).fetchall():
+        delete_version(conn, str(row["version_id"] if isinstance(row, sqlite3.Row) else row[0]))
+    conn.execute("DELETE FROM doc_paths WHERE doc_id=?", (doc_id,))
+    conn.execute("DELETE FROM doc_branches WHERE doc_id=? OR parent_doc_id=?", (doc_id, doc_id))
+    conn.execute("DELETE FROM managed_docs WHERE doc_id=?", (doc_id,))
+
+
 # ---- Copy branches ----
 def record_branch(
     conn,

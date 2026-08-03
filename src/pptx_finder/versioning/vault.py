@@ -46,7 +46,10 @@ class InvalidSnapshotError(SnapshotSourceError):
 
 
 def vault_dir() -> Path:
-    p = data_dir() / "vault"
+    from ..config import get_version_vault_dir
+
+    override = get_version_vault_dir()
+    p = Path(override) if override else data_dir() / "vault"
     p.mkdir(parents=True, exist_ok=True)
     return p
 
@@ -285,12 +288,14 @@ def stable_snapshot_source(path: str):
     copy, and make every later snapshot stage read only the temporary file.
     """
     source = os.path.abspath(path)
+    tmp_root = vault_dir() / "_tmp"
+    tmp_root.mkdir(parents=True, exist_ok=True)
     last_error: Exception | None = None
     prepared = ""
     for attempt, delay in enumerate((0.0, *_STABLE_COPY_RETRY_DELAYS_SEC)):
         if delay:
             time.sleep(delay)
-        fd, tmp = tempfile.mkstemp(prefix=".pptdoctor-snapshot-", suffix=".pptx")
+        fd, tmp = tempfile.mkstemp(prefix=".pptdoctor-snapshot-", suffix=".pptx", dir=str(tmp_root))
         os.close(fd)
         try:
             before = os.stat(ext_path(source))
@@ -343,28 +348,36 @@ def _unlink_snapshot_tmp(tmp: str) -> None:
 
 
 def sweep_stale_snapshot_temps(*, max_age_sec: float = 0.0, tempdir: str | None = None) -> int:
-    """清扫 %TEMP% 里残留的留底暂存副本，返回删除数。
+    """清扫残留的留底暂存副本（%TEMP% 与版本库 _tmp），返回删除数。
 
     暂存文件只应存活于一次留底操作期间；进程被杀或删除失败都会永久残留，
     且此前没有任何清扫机制。启动时调用（max_age_sec=0）：此刻不可能有在途留底操作。
     """
-    root = Path(tempdir) if tempdir is not None else Path(tempfile.gettempdir())
+    if tempdir is not None:
+        roots = [Path(tempdir)]
+    else:
+        roots = [Path(tempfile.gettempdir())]
+        try:
+            roots.append(vault_dir() / "_tmp")  # 暂存已改为随版本库位置（可迁出 C 盘）
+        except OSError:
+            pass
     now = time.time()
     deleted = 0
-    try:
-        entries = list(root.iterdir())
-    except OSError:
-        return 0
-    for entry in entries:
+    for root in roots:
         try:
-            if not entry.name.startswith(_STALE_SNAPSHOT_TMP_PREFIX):
-                continue
-            if max_age_sec > 0 and now - entry.stat().st_mtime < max_age_sec:
-                continue
-            entry.unlink()
-            deleted += 1
+            entries = list(root.iterdir())
         except OSError:
             continue
+        for entry in entries:
+            try:
+                if not entry.name.startswith(_STALE_SNAPSHOT_TMP_PREFIX):
+                    continue
+                if max_age_sec > 0 and now - entry.stat().st_mtime < max_age_sec:
+                    continue
+                entry.unlink()
+                deleted += 1
+            except OSError:
+                continue
     if deleted:
         log.info("swept %d stale snapshot temp files", deleted)
     return deleted
@@ -927,3 +940,107 @@ def rebuild_to(doc_id: str, version_id: str, dest: str) -> bool:
             os.unlink(ext_path(tmp))
         except OSError:
             pass
+
+
+# ---- 幽灵文档收割与版本库迁移（2026-07-30） ----
+def list_ghost_docs(conn) -> list[dict]:
+    """所有登记路径均已不存在的受管文档（幽灵文档）。
+
+    判定覆盖 doc_paths 全部历史路径与 managed_docs.path 主路径：任一仍存在即算活文档。
+    """
+    ghosts: list[dict] = []
+    rows = conn.execute(
+        """SELECT d.doc_id AS doc_id, d.path AS path,
+                  (SELECT COUNT(*) FROM versions v WHERE v.doc_id=d.doc_id) AS n_versions
+           FROM managed_docs d"""
+    ).fetchall()
+    paths_by_doc: dict[str, list[str]] = {}
+    for pr in conn.execute("SELECT doc_id, path FROM doc_paths").fetchall():
+        paths_by_doc.setdefault(str(pr["doc_id"]), []).append(str(pr["path"]))
+    for row in rows:
+        doc_id = str(row["doc_id"])
+        candidates = set(paths_by_doc.get(doc_id, [])) | {str(row["path"])}
+        if not any(os.path.exists(p) for p in candidates):
+            ghosts.append({
+                "doc_id": doc_id,
+                "path": str(row["path"]),
+                "versions": int(row["n_versions"]),
+            })
+    return ghosts
+
+
+def reap_ghost_docs(conn, *, dry_run: bool = True) -> dict:
+    """清理幽灵文档：删除其版本、磁盘目录与 DB 记录，再做对象级 GC（collect_garbage）。"""
+    ghosts = list_ghost_docs(conn)
+    result = {
+        "ghost_docs": len(ghosts),
+        "ghost_versions": sum(g["versions"] for g in ghosts),
+        "removed_dirs": 0,
+        "gc": None,
+        "dry_run": dry_run,
+    }
+    if dry_run or not ghosts:
+        return result
+    for g in ghosts:
+        store.delete_doc(conn, g["doc_id"])
+        d = vault_dir() / g["doc_id"]
+        if d.is_dir():
+            shutil.rmtree(d, ignore_errors=True)
+            result["removed_dirs"] += 1
+    conn.commit()
+    result["gc"] = collect_garbage(conn, dry_run=False)
+    return result
+
+
+def _copy_db_live(src_db: Path, dst_db: Path) -> None:
+    """用 sqlite backup API 复制可能处于打开状态的库（普通 copy 对 WAL 活跃库不安全）。"""
+    import sqlite3 as _sq
+
+    src = _sq.connect(str(src_db))
+    dst = _sq.connect(str(dst_db))
+    try:
+        src.backup(dst)
+    finally:
+        dst.close()
+        src.close()
+
+
+def migrate_vault_dir(src: Path, dst: Path, progress_cb=None) -> dict:
+    """把版本库整体迁到新目录：复制 → 校验（文件数+字节）→ 删除源。失败回滚目标、保留源。
+
+    versions.db 走 sqlite backup（活跃连接下也一致）；WAL/SHM 随 checkpoint 并入新库不单独复制。
+    """
+    src = Path(src)
+    dst = Path(dst)
+    if not src.is_dir():
+        raise ValueError(f"源目录不存在: {src}")
+    dst.mkdir(parents=True, exist_ok=True)
+    if any(dst.iterdir()):
+        raise ValueError(f"目标目录非空: {dst}")
+
+    files = [f for f in src.rglob("*") if f.is_file()]
+    total = len(files)
+    copied = 0
+    for f in files:
+        rel = f.relative_to(src)
+        out = dst / rel
+        out.parent.mkdir(parents=True, exist_ok=True)
+        if f.name == "versions.db":
+            _copy_db_live(f, out)
+        elif f.name.startswith("versions.db-"):
+            continue  # WAL/SHM 不复制
+        else:
+            shutil.copy2(f, out)
+        copied += 1
+        if progress_cb and (copied % 50 == 0 or copied == total):
+            progress_cb(copied, total)
+
+    src_count = total - sum(1 for f in files if f.name.startswith("versions.db-"))
+    dst_files = [f for f in dst.rglob("*") if f.is_file()]
+    dst_bytes = sum(f.stat().st_size for f in dst_files)
+    src_bytes = sum(f.stat().st_size for f in files if not f.name.startswith("versions.db-"))
+    if src_count != len(dst_files):
+        shutil.rmtree(dst, ignore_errors=True)
+        raise RuntimeError(f"迁移校验失败（文件数 {src_count}/{len(dst_files)}），已回滚目标目录")
+    shutil.rmtree(src)
+    return {"files": src_count, "bytes": dst_bytes}

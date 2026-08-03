@@ -15,10 +15,13 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
+    QFileDialog,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QPlainTextEdit,
+    QProgressDialog,
     QPushButton,
     QTabWidget,
     QVBoxLayout,
@@ -44,12 +47,15 @@ from ..config import (
     get_smart_grouping_enabled,
     get_version_management_enabled,
     get_version_keep_per_doc,
+    get_version_vault_dir,
     set_autostart,
     set_document_search_enabled,
     set_hotkey,
     set_smart_grouping_enabled,
     set_version_management_enabled,
     set_version_keep_per_doc,
+    set_version_vault_dir,
+    validate_version_vault_dir,
 )
 from ..versioning import autostart
 from . import bg_task
@@ -284,6 +290,29 @@ class SettingsDialog(QDialog):
         retention_row.addWidget(self.retention, 1)
         lay.addLayout(retention_row)
 
+        vault_dir_row = QHBoxLayout()
+        vault_dir_row.addWidget(QLabel("版本库存储位置："))
+        self.vault_dir_edit = QLineEdit(get_version_vault_dir())
+        self.vault_dir_edit.setPlaceholderText(f"默认：{data_dir() / 'vault'}")
+        vault_dir_row.addWidget(self.vault_dir_edit, 1)
+        vault_browse = QPushButton("浏览…")
+        vault_browse.clicked.connect(self._browse_vault_dir)
+        vault_dir_row.addWidget(vault_browse)
+        vault_reset = QPushButton("还原默认")
+        vault_reset.clicked.connect(lambda: self.vault_dir_edit.setText(""))
+        vault_dir_row.addWidget(vault_reset)
+        vault_apply = QPushButton("应用")
+        vault_apply.clicked.connect(self._apply_vault_dir)
+        vault_dir_row.addWidget(vault_apply)
+        lay.addLayout(vault_dir_row)
+        self._vault_dir_result = QLabel("")
+        self._vault_dir_result.setWordWrap(True)
+        self._vault_dir_result.setStyleSheet("font-size:11.5px;")
+        lay.addWidget(self._vault_dir_result)
+        self._ghost_btn = QPushButton("清理失效版本（源文件已删除的留底）…")
+        self._ghost_btn.clicked.connect(self._reap_ghost_docs)
+        lay.addWidget(self._ghost_btn)
+
         # 全局唤起热键（#2 可改：解决状态栏「热键被占用」无修复路径）
         hk_title = QLabel("全局唤起热键")
         hk_title.setStyleSheet("font-weight:700;font-size:13px;margin-top:8px;")
@@ -305,6 +334,100 @@ class SettingsDialog(QDialog):
 
         lay.addStretch(1)
         return page
+
+    def _browse_vault_dir(self) -> None:
+        start = self.vault_dir_edit.text().strip() or str(data_dir() / "vault")
+        d = QFileDialog.getExistingDirectory(self, "选择版本库存储位置", start)
+        if d:
+            self.vault_dir_edit.setText(d)
+
+    def _apply_vault_dir(self) -> None:
+        from ..versioning import vault as vault_mod
+
+        raw = self.vault_dir_edit.text().strip()
+        if raw:
+            err = validate_version_vault_dir(raw)
+            if err:
+                self._vault_dir_result.setText(f"✗ {err}")
+                return
+        current = vault_mod.vault_dir()
+        new_eff = Path(raw) if raw else (data_dir() / "vault")
+        same = os.path.normcase(os.path.abspath(str(new_eff))) == os.path.normcase(
+            os.path.abspath(str(current))
+        )
+        if same:
+            set_version_vault_dir(raw)
+            self._vault_dir_result.setText("已是该位置，设置已保存。")
+            return
+        has_content = current.is_dir() and (
+            (current / "versions.db").exists()
+            or any(p.is_dir() and p.name != "_tmp" for p in current.iterdir())
+        )
+        note = "✓ 已保存。重启应用后版本库在新位置工作。"
+        if has_content:
+            box = QMessageBox(self)
+            box.setWindowTitle("迁移版本库")
+            box.setText(
+                f"当前版本库 {current} 已有数据。\n\n"
+                f"「迁移」：整体复制到 {new_eff}，校验文件数与字节后删除旧库（期间请勿使用版本功能）。\n"
+                f"「仅切换」：旧库保留原位但不再被读写，新位置从空库开始。"
+            )
+            mig = box.addButton("迁移", QMessageBox.AcceptRole)
+            box.addButton("仅切换", QMessageBox.DestructiveRole)
+            box.addButton(QMessageBox.Cancel)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked is None or clicked is box.button(QMessageBox.Cancel):
+                return
+            if clicked is mig:
+                prog = QProgressDialog("正在迁移版本库…", None, 0, 0, self)
+                prog.setCancelButton(None)
+                prog.setWindowModality(Qt.WindowModal)
+                prog.setMinimumDuration(0)
+                prog.show()
+                QApplication.processEvents()
+                try:
+                    def _cb(done: int, total: int) -> None:
+                        prog.setLabelText(f"正在迁移版本库… {done}/{total} 个文件")
+                        QApplication.processEvents()
+
+                    result = vault_mod.migrate_vault_dir(current, new_eff, _cb)
+                except Exception as e:  # noqa: BLE001
+                    prog.close()
+                    self._vault_dir_result.setText(f"✗ 迁移失败：{e}")
+                    return
+                prog.close()
+                note = f"✓ 已迁移 {result['files']} 个文件（{result['bytes'] / 1048576:.0f} MB）并切换。重启应用后生效。"
+        set_version_vault_dir(raw)
+        self._vault_dir_result.setText(note)
+
+    def _reap_ghost_docs(self) -> None:
+        from ..versioning import store as vstore
+        from ..versioning import vault as vault_mod
+
+        conn = vstore.connect(vault_mod.db_path())
+        try:
+            dry = vault_mod.reap_ghost_docs(conn, dry_run=True)
+            if not dry["ghost_docs"]:
+                self._vault_dir_result.setText("没有失效版本（所有登记路径仍存在）。")
+                return
+            ret = QMessageBox.question(
+                self,
+                "清理失效版本",
+                f"发现 {dry['ghost_docs']} 份源文件已删除的文档，共 {dry['ghost_versions']} 个版本。\n"
+                f"清理将删除这些留底并回收对象池空间，不可恢复。继续？",
+            )
+            if ret != QMessageBox.Yes:
+                return
+            res = vault_mod.reap_ghost_docs(conn, dry_run=False)
+            gc = res.get("gc") or {}
+            mb = int(gc.get("bytes_reclaimed", 0) or 0) / 1048576
+            self._vault_dir_result.setText(
+                f"✓ 已清理 {res['ghost_docs']} 份文档 / {res['ghost_versions']} 个版本；"
+                f"回收对象 {gc.get('objects_removed', 0)} 个、约 {mb:.0f} MB。"
+            )
+        finally:
+            conn.close()
 
     def _toggle_feature(self, key: str, enabled: bool) -> None:
         setters = {

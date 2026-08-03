@@ -171,6 +171,40 @@ def set_version_management_enabled(enabled: bool) -> None:
     update_ui_settings(version_management_enabled=bool(enabled))
 
 
+DEFAULT_VERSION_VAULT_DIR = ""  # 空 = 默认 data_dir()/vault
+
+
+def get_version_vault_dir(default: str = DEFAULT_VERSION_VAULT_DIR) -> str:
+    """用户自选的版本库存储目录；空串表示默认位置。"""
+    v = load_ui_settings().get("version_vault_dir")
+    return str(v).strip() if isinstance(v, str) and v.strip() else default
+
+
+def set_version_vault_dir(path: str) -> None:
+    update_ui_settings(version_vault_dir=str(path or "").strip())
+
+
+def validate_version_vault_dir(path: str) -> str | None:
+    """校验版本库候选目录，返回错误文案；None 表示可用。"""
+    if not path or not path.strip():
+        return "目录不能为空"
+    p = Path(path.strip())
+    low = str(p).lower().replace("/", "\\")
+    for banned in ("\\windows", "\\program files", "\\programdata"):
+        if low.startswith(banned) or (len(low) > 3 and banned in low):
+            return f"不允许放在系统目录（{banned.strip(chr(92))}）下"
+    if low in ("c:\\", "d:\\", "e:\\"):
+        return "不允许直接放在盘符根目录，请选择其子文件夹"
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+        probe = p / ".pptdoctor-write-probe"
+        probe.write_text("ok", encoding="ascii")
+        probe.unlink()
+    except OSError as e:
+        return f"目录不可写：{e}"
+    return None
+
+
 def get_document_search_enabled(
     default: bool = DEFAULT_DOCUMENT_SEARCH_ENABLED,
 ) -> bool:
