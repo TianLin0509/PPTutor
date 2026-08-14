@@ -11,9 +11,10 @@
 """
 from __future__ import annotations
 
+import re
 from string import Template
 
-from ..config import resource_path
+from ..config import resource_path, sanitize_font_family
 
 
 def _rgb(hx: str):
@@ -130,7 +131,7 @@ THEMES: list[tuple[str, str]] = [
 
 # 控件语言（方向 A）：圆角三档 卡$radius/控件8/小件5；hover 只变底色；焦点环统一 1.5px 强调色。
 _QSS = Template("""
-* { font-family: "Microsoft YaHei UI", "Segoe UI", "PingFang SC", sans-serif; }
+* { font-family: $font_family; }
 QWidget { background: $base; color: $ink1; font-size: 13px; }
 QMainWindow { background: $win; }
 QWidget#central { background: transparent; }
@@ -140,7 +141,7 @@ QToolTip { background: $win; color: $ink1; border: 1px solid $bd; border-radius:
 QWidget#glassTitle { background: $panel; border-bottom: 1px solid $bd2; }
 QLabel#gtDot { color: $acc; font-size: 12px; background: transparent; }
 QLabel#gtName { color: $ink1; font-size: 13px; font-weight: 700; background: transparent; }
-QLabel#gtVer { color: $ink4; font-size: 10.5px; font-family: "Consolas", "Segoe UI"; background: transparent; }
+QLabel#gtVer { color: $ink4; font-size: 10.5px; font-family: $mono_family; background: transparent; }
 QLabel#gtTheme { color: $ink3; font-size: 12px; background: transparent; }
 QPushButton#updateChip { background: $acc; color: #FFFFFF; border: none; border-radius: 9px; padding: 3px 11px; font-size: 11px; font-weight: 600; }
 QPushButton#updateChip:hover { background: $accd; }
@@ -237,7 +238,7 @@ QWidget#previewPanel { background: $panel; border: 1px solid $bd; border-radius:
 QWidget#previewHeadBar { background: transparent; }
 QLabel#previewImage { background: $canvas; border: 1px solid $bd2; border-radius: 10px; }
 QLabel#pathLabel { color: $ink3; font-size: 12px; }
-QLabel#metaLabel { color: $ink4; font-size: 11.5px; font-family: "Consolas", "Microsoft YaHei UI"; }
+QLabel#metaLabel { color: $ink4; font-size: 11.5px; font-family: $mono_family; }
 QPushButton#linkBtn { background: transparent; border: none; border-radius: 6px; padding: 3px 8px; color: $ink3; font-size: 11.5px; font-weight: 600; }
 QPushButton#linkBtn:hover { background: $hover; color: $acc; }
 QPushButton#detailAction {
@@ -335,14 +336,14 @@ QToolButton#thumb:checked { background: $panel; border: 1.5px solid $acc; color:
 QPushButton#navBtn { background: transparent; border: none; border-radius: 6px; padding: 4px 10px; color: $ink3; font-size: 12px; }
 QPushButton#navBtn:hover { background: $hover; color: $ink1; }
 QPushButton#navBtn:disabled { color: $ink4; background: transparent; }
-QLabel#pageLabel { color: $ink3; font-size: 12px; font-family: "Consolas", "Microsoft YaHei UI"; background: transparent; }
+QLabel#pageLabel { color: $ink3; font-size: 12px; font-family: $mono_family; background: transparent; }
 
 /* 状态栏 */
 QStatusBar#statusBar { background: $panel2; border-top: 1px solid $bd2; color: $ink3; }
 QStatusBar#statusBar QLabel { color: $ink3; font-size: 12px; background: transparent; }
-QLabel#kbd { color: $ink2; background: $field; border: 1px solid $bd2; border-bottom: 2px solid $bd2; border-radius: 5px; padding: 1px 7px; font-size: 10.5px; font-weight: 600; font-family: "Consolas", "Microsoft YaHei UI"; }
+QLabel#kbd { color: $ink2; background: $field; border: 1px solid $bd2; border-bottom: 2px solid $bd2; border-radius: 5px; padding: 1px 7px; font-size: 10.5px; font-weight: 600; font-family: $mono_family; }
 QLabel#verShield { color: $grn; font-size: 11.5px; font-weight: 600; background: transparent; padding: 0 6px; }
-QLabel#hotkeyLabel { color: $ink3; background: $field; border: 1px solid $bd2; border-radius: 6px; padding: 2px 9px; font-size: 11px; font-family: "Consolas", "Microsoft YaHei UI"; }
+QLabel#hotkeyLabel { color: $ink3; background: $field; border: 1px solid $bd2; border-radius: 6px; padding: 2px 9px; font-size: 11px; font-family: $mono_family; }
 QLabel#hotkeyLabel:hover { color: $acc; border-color: $bd; }
 QLabel#navDot { color: #ff453a; font-size: 13px; font-weight: 700; background: transparent; }
 
@@ -353,10 +354,10 @@ QLabel#indexPhase {
   padding: 2px 7px; font-size: 10.5px; font-weight: 700;
 }
 QProgressBar#indexBar { background: transparent; border: none; min-height: 8px; max-height: 8px; }
-QLabel#indexCount { color: $ink2; font-size: 11.5px; font-weight: 600; padding: 0 3px; background: transparent; font-family: "Consolas", "Microsoft YaHei UI"; }
+QLabel#indexCount { color: $ink2; font-size: 11.5px; font-weight: 600; padding: 0 3px; background: transparent; font-family: $mono_family; }
 QLabel#pctLabel {
   color: $acc; background: rgba($hl_r,$hl_g,$hl_b,0.10);
-  border-radius: 6px; font-size: 11px; font-weight: 700; padding: 1px 5px; font-family: "Consolas", "Microsoft YaHei UI";
+  border-radius: 6px; font-size: 11px; font-weight: 700; padding: 1px 5px; font-family: $mono_family;
 }
 QLabel#statusDot { color: $grn; font-size: 13px; padding: 0 2px 0 4px; background: transparent; }
 QStatusBar#statusBar QLabel#lastIndexLabel { color: $ink4; font-size: 12px; background: transparent; }
@@ -368,12 +369,12 @@ QWidget#dashView { background: transparent; }
 QFrame#dashCard { background: $panel; border: 1px solid $bd; border-radius: ${radius}px; }
 QLabel#dashTitle { color: $ink1; font-size: 21px; font-weight: 800; background: transparent; }
 QLabel#dashSub { color: $ink3; font-size: 12.5px; background: transparent; }
-QLabel#kpiNum { color: $acc; font-size: 27px; font-weight: 800; font-family: "Consolas"; background: transparent; }
+QLabel#kpiNum { color: $acc; font-size: 27px; font-weight: 800; font-family: $mono_family; background: transparent; }
 QLabel#kpiLab { color: $ink2; font-size: 12.5px; font-weight: 600; background: transparent; }
 QLabel#kpiSub { color: $ink4; font-size: 11px; background: transparent; }
 QLabel#dashCardT { color: $ink2; font-size: 13px; font-weight: 700; background: transparent; }
 QLabel#legName { color: $ink2; font-size: 12px; background: transparent; }
-QLabel#legPc { color: $ink3; font-size: 12px; font-weight: 700; font-family: "Consolas"; background: transparent; }
+QLabel#legPc { color: $ink3; font-size: 12px; font-weight: 700; font-family: $mono_family; background: transparent; }
 QFrame#dashRec { background: $field; border: 1px solid $bd2; border-radius: 9px; }
 QLabel#recName { color: $ink1; font-size: 12px; font-weight: 600; background: transparent; }
 QLabel#recTime { color: $ink4; font-size: 11px; background: transparent; }
@@ -457,13 +458,40 @@ _QSS_KEYS = ("win", "base", "appbg", "panel", "panel2", "field", "hover", "sel",
              "ink1", "ink2", "ink3", "ink4", "bd", "bd2", "acc", "accd", "acctext", "grn",
              "scroll", "scrollh", "hl_r", "hl_g", "hl_b", "radius", "canvas")
 
+# 界面字体默认字族：与 2026-08 前硬编码值一致；用户覆盖走 ui.json 的 font_family
+DEFAULT_FONT_FAMILY = '"Microsoft YaHei UI", "Segoe UI", "PingFang SC", sans-serif'
+DEFAULT_MONO_FAMILY = '"Consolas", "Microsoft YaHei UI"'
+
+# build_qss 末尾按倍率统一缩放模板里硬编码的 px 字号（参数化几十个值不现实）
+# 数值段只认 1.2 这类合法小数：旧的 [0-9.]+ 会吞下注入进来的 1.2.3px，
+# float("1.2.3") 直接 ValueError → 配置持久化后每次启动都在这崩（崩溃循环）
+_FONT_SIZE_RE = re.compile(r"font-size:\s*([0-9]+(?:\.[0-9]+)?)px")
+
 
 def _qss_asset(name: str) -> str:
     """Return a Qt-style URL that works from source and a PyInstaller bundle."""
     return resource_path("assets", name).resolve().as_posix()
 
 
-def build_qss(theme: str) -> str:
+def _scale_font_size(m: "re.Match[str]", scale: float) -> str:
+    # 吸附到 0.5px 网格，避免 12.075px 这类毛边值；注意 Python round 是银行家舍入，
+    # 恰落网格中点的值向偶数取整（如 12.5×0.9=11.25→11 而非 11.5）；整数值不带小数点
+    px = round(float(m.group(1)) * scale * 2) / 2
+    return f"font-size: {px:g}px"
+
+
+def _font_family_qss(family: str) -> str:
+    """用户字族加引号并回退到内置字族；空串/清洗后为空 = 内置字族（与旧硬编码一致）。
+
+    字族名原样拼进 QSS 的 * 规则：不清洗的话引号/花括号/换行可突围注入任意样式，
+    甚至让 Qt 拒收整表（配置已持久化 → 每次重启裸奔）。清洗与 config.set_font_family
+    同源（sanitize_font_family），这里再过一道是双保险。
+    """
+    name = sanitize_font_family(family)
+    return f'"{name}", {DEFAULT_FONT_FAMILY}' if name else DEFAULT_FONT_FAMILY
+
+
+def build_qss(theme: str, font_family: str = "", font_scale: float = 1.0) -> str:
     t = TOKENS.get(theme, TOKENS["atelier"])
     values = {k: t[k] for k in _QSS_KEYS}
     values.update(
@@ -471,8 +499,13 @@ def build_qss(theme: str) -> str:
             "ui-chevron-dark.svg" if t.get("is_light", False) else "ui-chevron-light.svg"
         ),
         check_icon=_qss_asset("ui-check.svg"),
+        font_family=_font_family_qss(font_family),
+        mono_family=DEFAULT_MONO_FAMILY,
     )
-    return _QSS.substitute(values)
+    qss = _QSS.substitute(values)
+    if abs(font_scale - 1.0) > 1e-9:
+        qss = _FONT_SIZE_RE.sub(lambda m: _scale_font_size(m, font_scale), qss)
+    return qss
 
 
 def tok(theme: str) -> dict:
@@ -544,17 +577,39 @@ def build_palette(theme: str):
     return pal
 
 
-def apply_to_app(app, theme: str) -> None:
+# 首次 apply_to_app 时缓存的原始 app.font：setFont 只在本函数内发生，
+# 首次调用时拿到的必是系统默认字体；「恢复默认（内置字体）」时靠它还原，
+# 否则旧自定义字体会永久残留在 app.font 上（QSS 之外的对话框/菜单回不去）
+_DEFAULT_APP_FONT = None
+
+
+def apply_to_app(app, theme: str, font_family: str = "", font_scale: float = 1.0) -> None:
     """把应用主题钉死在应用层，与操作系统深浅模式彻底脱钩（三件套）。
 
     - colorScheme：Qt 6.5+ 起 Windows 默认跟随系统深浅；显式钉住后系统切换不再影响本应用；
     - QPalette：QSS 未覆盖的控件回退到应用 token 色（本机深色主题不再渗进来）；
-    - 全局 QSS：既有全覆盖样式表，照旧。
+    - 全局 QSS：既有全覆盖样式表，照旧；font_family/font_scale 来自设置的界面字体项。
+
+    family 非空时额外 app.setFont：兜底 QSS 覆盖不到的控件（对话框、菜单）。
+    字号与 QSS 同口径用像素（QFont 第二参是 pointSize，pt≠px 会整体偏大 ~33%）；
+    family 为空时恢复首次 apply 缓存的默认字体，而不是把旧自定义值留在原地。
     """
     from PySide6.QtCore import Qt
+    from PySide6.QtGui import QFont
+
+    global _DEFAULT_APP_FONT
+    if _DEFAULT_APP_FONT is None:
+        _DEFAULT_APP_FONT = QFont(app.font())
 
     t = tok(theme)
     scheme = Qt.ColorScheme.Light if t.get("is_light", False) else Qt.ColorScheme.Dark
     app.styleHints().setColorScheme(scheme)
     app.setPalette(build_palette(theme))
-    app.setStyleSheet(build_qss(theme))
+    name = sanitize_font_family(font_family)
+    if name:
+        font = QFont(name)
+        font.setPixelSize(round(13 * font_scale))
+        app.setFont(font)
+    else:
+        app.setFont(QFont(_DEFAULT_APP_FONT))
+    app.setStyleSheet(build_qss(theme, font_family, font_scale))

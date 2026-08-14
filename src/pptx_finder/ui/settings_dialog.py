@@ -9,13 +9,14 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import QSignalBlocker, Qt, QTimer
-from PySide6.QtGui import QKeySequence
+from PySide6.QtGui import QColor, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
     QFileDialog,
+    QFontComboBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -43,13 +44,18 @@ from ..config import (
     enabled_index_exts,
     get_autostart,
     get_document_search_enabled,
+    get_font_family,
+    get_font_scale,
     get_hotkey,
     get_smart_grouping_enabled,
     get_version_management_enabled,
     get_version_keep_per_doc,
     get_version_vault_dir,
+    sanitize_font_family,
     set_autostart,
     set_document_search_enabled,
+    set_font_family,
+    set_font_scale,
     set_hotkey,
     set_smart_grouping_enabled,
     set_version_management_enabled,
@@ -332,8 +338,49 @@ class SettingsDialog(QDialog):
         self._hotkey_result.setStyleSheet("font-size:11.5px;")
         lay.addWidget(self._hotkey_result)
 
+        # 界面字体（字族 + 字号档位）：点「应用」即时全 App 生效并写 ui.json
+        font_title = QLabel("界面字体")
+        font_title.setStyleSheet("font-weight:700;font-size:13px;margin-top:8px;")
+        lay.addWidget(font_title)
+        font_row = QHBoxLayout()
+        font_row.addWidget(QLabel("字族："))
+        self._font_family = QFontComboBox()
+        self._font_family.insertItem(0, "默认（内置字体）", "")
+        # QFontComboBox 的模型不回显 insertItem 的文本，DisplayRole 要补写一次
+        self._font_family.setItemData(0, "默认（内置字体）", Qt.DisplayRole)
+        saved_family = get_font_family()
+        idx = self._font_family.findText(saved_family) if saved_family else -1
+        # 已存字族在本机不存在（被卸载）时回落到默认项
+        self._font_family.setCurrentIndex(idx if idx > 0 else 0)
+        font_row.addWidget(self._font_family, 1)
+        font_row.addWidget(QLabel("字号："))
+        self._font_scale = QComboBox()
+        for label, value in (
+            ("小（90%）", 0.9),
+            ("标准（100%）", 1.0),
+            ("大（115%）", 1.15),
+        ):
+            self._font_scale.addItem(label, value)
+        saved_scale = get_font_scale()
+        idx = self._font_scale.findData(saved_scale)
+        self._font_scale.setCurrentIndex(idx if idx >= 0 else 1)
+        font_row.addWidget(self._font_scale)
+        font_apply = QPushButton("应用")
+        font_apply.clicked.connect(self._apply_font)
+        font_row.addWidget(font_apply)
+        lay.addLayout(font_row)
+        self._font_result = QLabel("部分卡片的固定字号样式不受影响。")
+        self._font_result.setWordWrap(True)
+        self._font_result.setStyleSheet("font-size:11.5px;")
+        lay.addWidget(self._font_result)
+
         lay.addStretch(1)
-        return page
+        # 区块已累计超过 600px 设计高度：滚动承载，避免窗口被内容最小高度撑高
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.NoFrame)
+        scroll.setWidget(page)
+        return scroll
 
     def _browse_vault_dir(self) -> None:
         start = self.vault_dir_edit.text().strip() or str(data_dir() / "vault")
@@ -485,6 +532,23 @@ class SettingsDialog(QDialog):
             self._hotkey_result.setText(f"⚠ {spec} 注册失败（可能被占用），换一个再试")
         else:
             self._hotkey_result.setText(f"已保存：{spec}（重启后生效）")
+
+    def _apply_font(self) -> None:
+        # QFontComboBox 可编辑（用户能手输任意文本）：入库前过 config 的同一道清洗，
+        # 剥掉可注入 QSS 的字符；不存在的字体名允许保存（QSS 回退链兜底）
+        family = (
+            "" if self._font_family.currentIndex() == 0
+            else sanitize_font_family(self._font_family.currentFont().family())
+        )
+        scale = float(self._font_scale.currentData())
+        set_font_family(family)
+        set_font_scale(scale)
+        apply_cb = getattr(self._diagnostic_parent, "_apply_font", None)  # 主窗口注入的热应用回调
+        if callable(apply_cb):
+            apply_cb()
+            self._font_result.setText("✓ 已生效；部分卡片的固定字号样式不受影响。")
+        else:
+            self._font_result.setText("已保存（重启后生效）；部分卡片的固定字号样式不受影响。")
 
     def _build_health_tab(self) -> QWidget:
         page = QWidget()

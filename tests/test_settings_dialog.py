@@ -1112,3 +1112,67 @@ def test_settings_late_powerpoint_result_ignored_after_owner_closing(qtbot, mgr,
 
     assert dlg.powerpoint_btn.isEnabled() is False
     assert dlg.powerpoint_status.text() == "checking"
+
+
+def test_font_settings_persist_and_echo(qtbot, mgr, monkeypatch, tmp_path):
+    """界面字体：默认回显内置字族 + 标准档；应用后写 ui.json，重开对话框回显。"""
+    monkeypatch.setenv("PPTX_FINDER_DATA_DIR", str(tmp_path / "cfg"))
+
+    dlg = SettingsDialog(mgr)
+    qtbot.addWidget(dlg)
+    assert dlg._font_family.currentIndex() == 0  # 默认（内置字体）
+    assert dlg._font_scale.currentData() == 1.0
+
+    # 字体库项数随平台而变（offscreen 可能为空）：不再写死下标，
+    # 选「默认项之外的第一个真实字族」，空字体库平台直接跳过
+    if dlg._font_family.count() < 2:
+        pytest.skip("当前平台字体库为空（如 offscreen），无真实字族可选")
+    dlg._font_family.setCurrentIndex(1)  # 字体库里的第一个真实字族
+    dlg._font_scale.setCurrentIndex(2)   # 大（115%）
+    family = dlg._font_family.currentFont().family()
+    dlg._apply_font()
+
+    assert config.get_font_family() == family
+    assert config.get_font_scale() == 1.15
+    assert "重启后生效" in dlg._font_result.text()  # 无父窗口回调时的兜底文案
+
+    dlg2 = SettingsDialog(mgr)
+    qtbot.addWidget(dlg2)
+    assert dlg2._font_family.currentText() == family
+    assert dlg2._font_scale.currentData() == 1.15
+
+
+def test_font_apply_invokes_parent_callback(qtbot, mgr, monkeypatch, tmp_path):
+    """父窗口注入 _apply_font 回调时即时热生效（仿热键应用区）。"""
+    monkeypatch.setenv("PPTX_FINDER_DATA_DIR", str(tmp_path / "cfg"))
+    calls = []
+
+    class Parent(QWidget):
+        def _apply_font(self):
+            calls.append("font")
+
+    parent = Parent()
+    qtbot.addWidget(parent)
+    dlg = SettingsDialog(mgr, parent)
+    qtbot.addWidget(dlg)
+
+    dlg._font_scale.setCurrentIndex(0)  # 小（90%）
+    dlg._apply_font()
+
+    assert calls == ["font"]
+    assert config.get_font_scale() == 0.9
+    assert "已生效" in dlg._font_result.text()
+
+
+def test_font_family_default_persists_empty(qtbot, mgr, monkeypatch, tmp_path):
+    """字族留在「默认（内置字体）」时存空串 = 跟随内置；非法倍率回落默认。"""
+    monkeypatch.setenv("PPTX_FINDER_DATA_DIR", str(tmp_path / "cfg"))
+
+    dlg = SettingsDialog(mgr)
+    qtbot.addWidget(dlg)
+    dlg._apply_font()
+    assert config.get_font_family() == ""
+    assert config.get_font_scale() == 1.0
+
+    config.set_font_scale(2.5)  # 非合法档位
+    assert config.get_font_scale() == 1.0

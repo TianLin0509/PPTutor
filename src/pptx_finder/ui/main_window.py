@@ -36,7 +36,8 @@ from ..config import (
     enabled_index_exts as cfg_enabled_index_exts, ext_path,
     ensure_completed_index_feature_signature,
     get_completed_index_feature_signature,
-    get_document_search_enabled, get_hotkey, get_smart_grouping_enabled, get_theme,
+    get_document_search_enabled, get_font_family, get_font_scale, get_hotkey,
+    get_smart_grouping_enabled, get_theme,
     index_feature_signature,
     is_first_run, mark_welcomed,
     set_completed_index_feature_signature,
@@ -2084,7 +2085,8 @@ class MainWindow(QMainWindow):
         self._tok = theme.tok(name)
         app = QApplication.instance()
         if app is not None:
-            theme.apply_to_app(app, name)  # colorScheme+palette+QSS 三件套：与本机深浅主题脱钩
+            # colorScheme+palette+QSS 三件套 + 界面字体（设置项），与本机深浅主题脱钩
+            theme.apply_to_app(app, name, get_font_family(), get_font_scale())
         if getattr(self, "index_bar", None) is not None:
             self.index_bar.set_accent_color(self._tok["acc"])
         theme_label = dict(theme.THEMES).get(name, name)
@@ -2105,6 +2107,12 @@ class MainWindow(QMainWindow):
             self.dashboard.set_theme()
         if getattr(self, "_empty_icon", None) is not None:
             self._set_empty_icon(getattr(self, "_empty_icon_kind", "search"))
+
+    def _apply_font(self) -> None:
+        """界面字体热生效（设置对话框「应用」回调）：与主题切换同一条 QSS 热替换链路。"""
+        app = QApplication.instance()
+        if app is not None:
+            theme.apply_to_app(app, self._theme, get_font_family(), get_font_scale())
 
     def _refresh_toolbar_icons(self) -> None:
         """合一工具栏与导航轨图标色跟随主题（ink3 静默灰），checked/hover 色由 QSS 承担。"""

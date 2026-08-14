@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -295,6 +296,49 @@ def get_hotkey() -> str:
 
 def set_hotkey(spec: str) -> None:
     update_ui_settings(hotkey=spec)
+
+
+# 界面字体：font_family 空串 = 跟随内置字族；font_scale 只接受下面的合法档位
+FONT_SCALES = (0.9, 1.0, 1.15)
+
+# 字族名会被拼进 QSS（ui/theme.py 的 * font-family 规则）：引号/反斜杠/控制字符/
+# 花括号/分号可突围注入任意样式，甚至让 Qt 拒收整表——入库前一律剥掉并限长。
+# theme._font_family_qss 侧用同一函数再洗一道（双保险）。
+_FONT_FAMILY_BAD_RE = re.compile(r'["\\\r\n\t{};]')
+FONT_FAMILY_MAX_LEN = 100
+
+
+def sanitize_font_family(family: str) -> str:
+    """清洗界面字族名：剥掉可注入 QSS 的字符、限长；返回空串 = 回退内置字族。"""
+    name = _FONT_FAMILY_BAD_RE.sub("", str(family or "").strip()).strip()
+    return name[:FONT_FAMILY_MAX_LEN]
+
+
+def get_font_family(default: str = "") -> str:
+    """界面字族覆盖；空串 = 内置字族（跟随 QSS 模板默认）。"""
+    v = load_ui_settings().get("font_family")
+    return v.strip() if isinstance(v, str) and v.strip() else default
+
+
+def set_font_family(family: str) -> None:
+    update_ui_settings(font_family=sanitize_font_family(family))
+
+
+def get_font_scale(default: float = 1.0) -> float:
+    """界面字号倍率：非法/非档位值回默认。"""
+    v = load_ui_settings().get("font_scale")
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        for s in FONT_SCALES:
+            if abs(float(v) - s) < 1e-9:
+                return s
+    return float(default)
+
+
+def set_font_scale(scale: float) -> None:
+    v = float(scale)
+    if not any(abs(v - s) < 1e-9 for s in FONT_SCALES):
+        v = 1.0
+    update_ui_settings(font_scale=v)
 
 # 增量自动更新：清单 + 内容寻址块的根地址。E2E/灰度可用 PPTX_FINDER_UPDATE_URL 覆盖（如指 localhost）
 _DEFAULT_UPDATE_URL = "https://me.lt-stockpartner.tech/pptutor"
