@@ -32,12 +32,14 @@ class LiveIndexer(QThread):
         allowed_exts_provider=None,
         compute_content_hash_provider=None,
         explicit_output_roots_provider=None,
+        index_all_files_provider=None,
     ) -> None:
         super().__init__(parent)
         self._db_path = db_path
         self._allowed_exts_provider = allowed_exts_provider
         self._compute_content_hash_provider = compute_content_hash_provider
         self._explicit_output_roots_provider = explicit_output_roots_provider
+        self._index_all_files_provider = index_all_files_provider
         self._q: queue.Queue = queue.Queue()
         self._stop = threading.Event()
         self._queued: set[str] = set()
@@ -94,6 +96,10 @@ class LiveIndexer(QThread):
                     if self._explicit_output_roots_provider is not None:
                         kwargs["explicit_output_roots"] = tuple(
                             self._explicit_output_roots_provider()
+                        )
+                    if self._index_all_files_provider is not None:
+                        kwargs["index_all_files"] = bool(
+                            self._index_all_files_provider()
                         )
                     if indexer.index_single(conn, item, **kwargs):
                         self.indexed.emit(item)

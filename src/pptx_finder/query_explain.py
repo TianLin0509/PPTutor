@@ -18,6 +18,7 @@ def mode_label(mode_key: str) -> str:
     return {
         "filename": "仅文件名",
         "content": "仅内容",
+        "any_filename": "任意文件名（全类型）",
     }.get(mode_key, "全部范围")
 
 

@@ -35,11 +35,12 @@ from .config import (
     PDF_EXT,
     PPT_EXT,
     PPTX_EXT,
+    SUPPORTED_EXTS,
     ext_path,
 )
 from .document_parser import parse_document
 from .path_policy import explicit_project_output_roots, is_project_output_path
-from .text_tokenize import tokenize
+from .text_tokenize import normalize, tokenize
 
 log = logging.getLogger(__name__)
 
@@ -47,6 +48,7 @@ ProgressCb = Callable[[int, int, str], None]
 ThrottleCb = Callable[[], None]
 COMMIT_EVERY = 50
 SCAN_COMMIT_EVERY = 200  # 扫描期每登记这么多就提交一次，让文件名尽快可搜
+INVENTORY_COMMIT_EVERY = SCAN_COMMIT_EVERY  # 全盘文件名盘点沿用同一批提交节奏
 PARSE_TIMEOUT_S = 60.0   # 单文件解析超时：超过判定卡住 → 跳过不阻塞整批（子进程隔离的关键保护）
 DEFERRED_CONTENT_EXTS = (DOCX_EXT, PDF_EXT)  # 砍掉 xlsx/txt；PPT 优先建完后补建这些
 MAX_UNCHANGED_PARSE_FAILURES = 3
@@ -84,6 +86,7 @@ def _unchanged_index_row(
     ext: str,
     *,
     compute_content_hash: bool,
+    parse_enabled_exts: set[str] | frozenset[str] | None = None,
 ) -> bool:
     """Return whether an indexed file can safely bypass parse and SQLite writes.
 
@@ -105,6 +108,11 @@ def _unchanged_index_row(
         and ext in CONTENT_EXTS
         and not str(row["content_hash"] or "").startswith("sha256:")
     ):
+        return False
+    # 盘点期登记的 docx/pdf 只有文件名；仅当本轮会解析该类型时才重走解析流程
+    # （否则内容索引关闭期间每次重扫都会重写一次盘点行）。
+    parse_enabled = CONTENT_EXTS if parse_enabled_exts is None else parse_enabled_exts
+    if row["status"] == "filename_only" and ext in parse_enabled:
         return False
     if row["status"] in ("pending", "cloud_placeholder"):
         return False
@@ -225,7 +233,7 @@ def _write_result(conn: sqlite3.Connection, res: dict[str, Any]) -> None:
 
 
 def _write_filename_only(conn: sqlite3.Connection, path: Path) -> None:
-    """.ppt 旧格式：仅登记文件名，不解析内容。"""
+    """仅登记文件名、不解析内容（.ppt 旧格式 / 任意文件盘点的单文件兜底）。"""
     st = path.stat()
     fid = db.upsert_file(
         conn,
@@ -234,6 +242,135 @@ def _write_filename_only(conn: sqlite3.Connection, path: Path) -> None:
         status="filename_only", error="", indexed_at=time.time(),
     )
     db.replace_pages(conn, fid, [])
+
+
+# 盘点批量 upsert 时绝不降级的「内容扩展名」既有行（同名同路径 ⇒ 同行扩展名必然相同）
+_INVENTORY_CONTENT_GUARD = tuple(e.lower() for e in SUPPORTED_EXTS)
+
+
+def _write_filename_only_batch(conn: sqlite3.Connection, rows: list[tuple]) -> int:
+    """全盘文件名盘点的批量登记。与 db.upsert_file 同语义，但 executemany 一次落一批，
+    控制数百万行盘点时的写放大。rows = [(path, name, ext, size, mtime, indexed_at), ...]。
+    调用方负责提交节奏（沿用 SCAN_COMMIT_EVERY）。
+
+    性能关键：仅对「本批之前确已存在」的 file_id 发 FTS DELETE（先按 files.path 唯一
+    索引批量查出），首轮盘点因此是纯插入。旧实现对每行 DELETE FROM file_names_fts
+    WHERE file_id=?——file_id 是 FTS5 UNINDEXED 列，逐行删 = 全表扫，吞吐随表规模
+    O(n²) 塌掉（实测 2116→60 rows/s）。
+    """
+    if not rows:
+        return 0
+    guard_marks = ",".join("?" * len(_INVENTORY_CONTENT_GUARD))
+    # 同批同 path 去重（嵌套/重复根会把同一文件重复枚举进同一批）：files 表
+    # ON CONFLICT 幂等，但 file_names_fts 无唯一约束，不去重会写入重复 FTS 行。
+    deduped = list({str(r[0]): r for r in rows}.values())
+    paths = [str(r[0]) for r in deduped]
+    # 批量 upsert 前查出本批已存在的 path→file_id（files.path 有唯一索引，快）
+    pre_existing: dict[str, int] = {}
+    for i in range(0, len(paths), 500):
+        chunk = paths[i:i + 500]
+        qmarks = ",".join("?" * len(chunk))
+        for r in conn.execute(
+            f"SELECT id, path FROM files WHERE path IN ({qmarks})", chunk
+        ):
+            pre_existing[str(r["path"])] = int(r["id"])
+    conn.executemany(
+        """
+        INSERT INTO files(
+          path,name,name_norm,ext,size,mtime,content_hash,page_count,status,error,
+          parse_failures,retry_after,indexed_at
+        )
+        VALUES(?,?,?,?,?,?,?,0,'filename_only','',0,0,?)
+        ON CONFLICT(path) DO UPDATE SET
+          name=excluded.name, name_norm=excluded.name_norm, ext=excluded.ext,
+          size=excluded.size, mtime=excluded.mtime,
+          content_hash=excluded.content_hash, page_count=0,
+          status='filename_only', error='',
+          parse_failures=0, retry_after=0, indexed_at=excluded.indexed_at
+        WHERE lower(files.ext) NOT IN ("""
+        + guard_marks + ")",
+        [
+            (
+                path,
+                db.sqlite_safe_text(name),
+                normalize(db.sqlite_safe_text(name)),
+                ext,
+                int(size),
+                float(mtime),
+                f"size:{int(size)}",
+                float(indexed_at),
+                *_INVENTORY_CONTENT_GUARD,
+            )
+            for path, name, ext, size, mtime, indexed_at in deduped
+        ],
+    )
+    # 守卫整行跳过内容扩展名既有行，连 size/mtime 也被冻住（每次重扫都因 stat
+    # 漂移重试同一行）。这里只放行 stat/indexed_at 字段；status/page_count/
+    # content_hash 等内容字段仍由上面的 WHERE 守卫保护，绝不被盘点降级。
+    stat_refresh = [
+        (int(size), float(mtime), float(indexed_at), path, *_INVENTORY_CONTENT_GUARD)
+        for path, _name, _ext, size, mtime, indexed_at in deduped
+        if path in pre_existing
+    ]
+    if stat_refresh:
+        conn.executemany(
+            "UPDATE files SET size=?, mtime=?, indexed_at=? "
+            f"WHERE path=? AND lower(ext) IN ({guard_marks})",
+            stat_refresh,
+        )
+    # executemany 拿不到 RETURNING，按批查回 file_id 维护文件名 FTS（上限 999 留余量）
+    ids: dict[str, int] = {}
+    for i in range(0, len(paths), 500):
+        chunk = paths[i:i + 500]
+        qmarks = ",".join("?" * len(chunk))
+        for r in conn.execute(
+            f"SELECT id, path FROM files WHERE path IN ({qmarks})", chunk
+        ):
+            ids[str(r["path"])] = int(r["id"])
+    fts_rows = [
+        (tokenize(db.sqlite_safe_text(name)), ids[path])
+        for path, name, _ext, _size, _mtime, _indexed in deduped
+        if path in ids
+    ]
+    # 仅对确已存在的 file_id 发 DELETE（首轮盘点为空集 → 纯插入）；file_id 在本批唯一
+    delete_ids = sorted(
+        {int(fid) for path, fid in ids.items() if path in pre_existing}
+    )
+    conn.executemany(
+        "DELETE FROM file_names_fts WHERE file_id=?",
+        [(fid,) for fid in delete_ids],
+    )
+    conn.executemany(
+        "INSERT INTO file_names_fts(content,file_id) VALUES(?,?)", fts_rows,
+    )
+    return len(fts_rows)
+
+
+def purge_non_content_filename_only(
+    conn: sqlite3.Connection,
+    content_exts: tuple[str, ...] | set[str] | None = None,
+) -> int:
+    """「索引所有文件」关闭后的一次性清理：删除 status='filename_only' 且扩展名不在
+    内容集（默认 SUPPORTED_EXTS，含 .ppt 旧格式登记行）的行及其文件名 FTS。
+    单批 DELETE；耗时随盘点规模增长，调用方必须放后台线程。"""
+    keep = tuple(
+        e.lower()
+        for e in (content_exts if content_exts is not None else SUPPORTED_EXTS)
+    )
+    qmarks = ",".join("?" * len(keep))
+    conn.execute(
+        "DELETE FROM file_names_fts WHERE file_id IN ("
+        "SELECT id FROM files WHERE status='filename_only' "
+        f"AND lower(ext) NOT IN ({qmarks}))",
+        keep,
+    )
+    cur = conn.execute(
+        "DELETE FROM files WHERE status='filename_only' "
+        f"AND lower(ext) NOT IN ({qmarks})",
+        keep,
+    )
+    conn.commit()
+    return int(cur.rowcount or 0)
 
 
 def _mark_skipped(
@@ -376,20 +513,28 @@ def update_index(
     compute_content_hash: bool = True,
     throttle_cb: ThrottleCb | None = None,
     max_pending_factor: int = 4,
+    index_all_files: bool = False,
+    index_all_files_provider: Callable[[], bool] | None = None,
 ) -> dict[str, int]:
     """增量更新：流式扫描 → 即时登记文件名 → 并行解析补全内容。
 
     progress_cb(done, total, cur)：total<0 = 扫描阶段（文件名渐进可搜），
     total>=0 = 内容解析阶段（done/total）。
+    index_all_files_provider：「索引所有文件」开关的实时读取器；扫描收尾时复检——
+    本轮带着 index_all_files=True 扫描、期间开关被关闭时（设置页的即时 purge 清不掉
+    在途扫描之后写入的行），对本类盘点行补一次 purge。
     """
     from .scanner import SCAN_POLICY_VERSION, iter_ppt_files
 
-    existing = db.all_indexed(conn)
+    # 轻量投影：全量 Row（db.all_indexed）在百万行盘点库上实测约 700MB；
+    # 只载入增量比对所需字段，峰值内存约减半
+    existing = db.all_indexed_stats(conn)
     seen: set[str] = set()
     summary = {
         "indexed": 0,
         "errors": 0,
         "skipped_ppt": 0,
+        "filename_only": 0,
         "skipped_cloud": 0,
         "deleted": 0,
         "cancelled": 0,
@@ -406,6 +551,8 @@ def update_index(
         for root in roots
         if os.path.isdir(ext_path(root))
     )
+    # 本轮真正会解析的内容类型：决定 filename_only 盘点行是否需要重走解析流程
+    parse_enabled_exts = {e for e in CONTENT_EXTS if e in allowed_exts}
     selected_output_roots = explicit_project_output_roots(roots)
     scan_started_at = time.monotonic()
 
@@ -443,6 +590,7 @@ def update_index(
             supported_exts=allowed_exts,
             scan_progress_cb=scan_heartbeat,
             scan_error_cb=scan_error,
+            inventory_all=index_all_files,
         )
     )
 
@@ -468,6 +616,18 @@ def update_index(
     # 非 pptx 文档：先按类型排队，PPT 全部处理完后再按稳定顺序整类补建。
     deferred_by_ext: dict[str, list[Path]] = {ext: [] for ext in DEFERRED_CONTENT_EXTS}
     deferred_other: list[Path] = []
+    inventory_rows: list[tuple] = []  # 任意文件盘点待入库批次（非内容扩展名）
+
+    def flush_inventory() -> None:
+        """盘点批次落盘；提交节奏沿用调用处的 SCAN_COMMIT_EVERY。"""
+        if not inventory_rows:
+            return
+        try:
+            summary["filename_only"] += _write_filename_only_batch(conn, inventory_rows)
+        except Exception as e:  # noqa: BLE001 单批失败不中断扫描
+            log.warning("inventory batch failed: %s", e)
+            summary["errors"] += len(inventory_rows)
+        inventory_rows.clear()
 
     def stopped() -> bool:
         return stop_event is not None and stop_event.is_set()
@@ -555,6 +715,8 @@ def update_index(
                 break
             yield_to_foreground()
             sp = str(p)
+            if sp in seen:
+                continue  # 嵌套/重复根会重复枚举同一文件；本轮已处理过，跳过避免双倍写入
             seen.add(sp)
             if len(seen) % SCAN_COMMIT_EVERY == 0:
                 conn.commit()  # 已登记的文件名落盘 → 立即可搜
@@ -589,7 +751,17 @@ def update_index(
                 st,
                 ext,
                 compute_content_hash=compute_content_hash,
+                parse_enabled_exts=parse_enabled_exts,
             ):
+                continue
+            if index_all_files and ext not in allowed_exts:
+                # 任意文件盘点：非内容扩展名不解析内容，批量登记文件名（可搜）
+                inventory_rows.append(
+                    (sp, p.name, ext, int(st.st_size), float(st.st_mtime), time.time())
+                )
+                if len(inventory_rows) >= INVENTORY_COMMIT_EVERY:
+                    flush_inventory()
+                    conn.commit()
                 continue
             if ext == PPT_EXT:
                 try:
@@ -635,6 +807,7 @@ def update_index(
                 harvest_ready()   # 非阻塞收割已完成 + 清理超时
                 backpressure()    # 积压则阻塞收割到容量内（带超时保护）
         conn.commit()
+        flush_inventory()  # 扫描循环收尾：剩余盘点批次落盘（随后 commit 一起提交）
         scan_done = True  # 扫描结束：total 已是最终值，收尾解析的进度走真实百分比
         deferred = [
             p
@@ -649,7 +822,7 @@ def update_index(
             if stopped():
                 break
             if (
-                os.path.splitext(path)[1].lower() in allowed_exts
+                (index_all_files or os.path.splitext(path)[1].lower() in allowed_exts)
                 and path not in seen
                 and _path_under_any_root(path, available_roots)
                 # A policy-pruned generated file still exists on disk, so the
@@ -711,6 +884,20 @@ def update_index(
             _shutdown_executor(ex)
 
     was_cancelled = stopped()
+    if (
+        index_all_files
+        and not was_cancelled
+        and index_all_files_provider is not None
+    ):
+        # 收尾复检：扫描期间「索引所有文件」被关闭时，对本类盘点行补一次 purge——
+        # 关开关那一下的即时 purge 清不掉在途扫描之后继续写入的行。
+        try:
+            if not index_all_files_provider():
+                removed = purge_non_content_filename_only(conn)
+                if removed:
+                    log.info("index_all_files 扫描中被关闭：收尾补清理盘点行 %d 条", removed)
+        except Exception as e:  # noqa: BLE001 清理失败不影响本轮扫描结果
+            log.warning("inventory end-of-scan purge failed: %s", e)
     summary["cancelled"] = int(was_cancelled)
     if progress_cb and not was_cancelled:
         progress_cb(total, total, "完成")  # 进度走满
@@ -744,6 +931,7 @@ def index_single(
     supported_exts: tuple[str, ...] | set[str] | None = None,
     compute_content_hash: bool = True,
     explicit_output_roots: tuple[str, ...] | list[str] = (),
+    index_all_files: bool = False,
 ) -> bool:
     """实时增量：索引单个文件（watcher 捕获到新建/改存时调用）。
 
@@ -751,13 +939,16 @@ def index_single(
     其他记录。供实时 watcher 使用——新建、改存、移动、删除都无需全盘重扫。
     """
     p = Path(path)
+    if p.name.startswith("~$"):
+        # Office 临时锁文件：与 scanner 口径一致，watcher 增量同样不登记
+        return False
     try:
         ext = p.suffix.lower()
         allowed_exts = {
             e.lower()
             for e in (supported_exts if supported_exts is not None else (*CONTENT_EXTS, PPT_EXT))
         }
-        if ext not in allowed_exts:
+        if ext not in allowed_exts and not index_all_files:
             return False
         row = db.get_file_by_path(conn, str(p))
         if is_project_output_path(
@@ -797,18 +988,25 @@ def index_single(
             st,
             ext,
             compute_content_hash=compute_content_hash,
+            parse_enabled_exts={e for e in CONTENT_EXTS if e in allowed_exts},
         ):
             return False
         if ext == PPT_EXT:
             _write_filename_only(conn, p)
-        elif ext in CONTENT_EXTS:
+        elif ext in CONTENT_EXTS and ext in allowed_exts:
             result = (
                 _index_one(str(p))
                 if compute_content_hash else _index_one(str(p), False)
             )
             _write_result(conn, result)
         else:
-            return False
+            # 任意文件盘点：非内容扩展名只登记文件名（watcher 增量新鲜）；
+            # 内容类型（docx/pdf）的既有内容行不降级为 filename_only。
+            if not index_all_files:
+                return False
+            if row is not None and ext in SUPPORTED_EXTS:
+                return False
+            _write_filename_only(conn, p)
         conn.commit()
         return True
     except Exception as e:  # noqa: BLE001

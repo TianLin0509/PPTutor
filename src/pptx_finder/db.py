@@ -7,6 +7,7 @@ from __future__ import annotations
 import logging
 import os
 import sqlite3
+import sys
 from pathlib import Path
 from urllib.parse import quote
 
@@ -227,6 +228,50 @@ def get_file_by_path(conn: sqlite3.Connection, path: str) -> sqlite3.Row | None:
 def all_indexed(conn: sqlite3.Connection) -> dict[str, sqlite3.Row]:
     """path -> row，用于增量比对。"""
     return {r["path"]: r for r in conn.execute("SELECT * FROM files").fetchall()}
+
+
+class IndexStat:
+    """增量比对的轻量投影行：与 sqlite3.Row 一样支持 ``row["字段"]`` 访问，
+    消费方（indexer 的未变更快筛/删除通道）无需区分两种来源。"""
+
+    __slots__ = (
+        "size", "mtime", "status", "content_hash", "parse_failures", "retry_after",
+    )
+
+    def __init__(self, size, mtime, status, content_hash, parse_failures, retry_after):
+        self.size = size
+        self.mtime = mtime
+        self.status = status
+        self.content_hash = content_hash
+        self.parse_failures = parse_failures
+        self.retry_after = retry_after
+
+    def __getitem__(self, key: str):
+        return getattr(self, key)
+
+
+def all_indexed_stats(conn: sqlite3.Connection) -> dict[str, IndexStat]:
+    """path -> IndexStat 轻量投影，用于增量比对。
+
+    ``all_indexed`` 把全量 Row 载入内存，百万行盘点库实测约 700MB；本投影只保留
+    增量比对所需字段（path/size/mtime/status/content_hash/parse_failures/retry_after），
+    且非 ok 行不带 content_hash（只有 ok 行的 sha256 回填判定会读它），峰值约减半。
+    """
+    out: dict[str, IndexStat] = {}
+    for r in conn.execute(
+        "SELECT path, size, mtime, status, content_hash, parse_failures, retry_after "
+        "FROM files"
+    ):
+        status = sys.intern(r["status"] or "")  # 状态值高度重复，驻留去重
+        out[r["path"]] = IndexStat(
+            r["size"],
+            r["mtime"],
+            status,
+            r["content_hash"] if status == "ok" else None,
+            r["parse_failures"],
+            r["retry_after"],
+        )
+    return out
 
 
 def upsert_file(

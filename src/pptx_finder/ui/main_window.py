@@ -37,6 +37,7 @@ from ..config import (
     ensure_completed_index_feature_signature,
     get_completed_index_feature_signature,
     get_document_search_enabled, get_font_family, get_font_scale, get_hotkey,
+    get_index_all_files,
     get_smart_grouping_enabled, get_theme,
     index_feature_signature,
     is_first_run, mark_welcomed,
@@ -256,9 +257,14 @@ def _scan_known_index_changes(
             ext.lower()
             for ext in (SUPPORTED_EXTS if supported_exts is None else supported_exts)
         }
+        # SQL 侧先按扩展名收窄：全盘文件名盘点后 files 可能数百万行，
+        # 全表拉进 Python 再过滤会拖垮启动 reconcile（内容口径不变，仍只看 allowed_exts）。
+        qmarks = ",".join("?" * len(allowed_exts))
         rows = [
             row for row in conn.execute(
-                "SELECT path, ext, size, mtime, status, parse_failures, retry_after FROM files"
+                "SELECT path, ext, size, mtime, status, parse_failures, retry_after FROM files "
+                f"WHERE lower(ext) IN ({qmarks})",
+                tuple(sorted(allowed_exts)),
             ).fetchall()
             if str(row["ext"] or "").lower() in allowed_exts
         ]
@@ -368,6 +374,18 @@ def _scan_known_index_changes(
     finally:
         conn.close()
 
+
+def _count_inventory_leftovers(conn) -> int:
+    """「索引所有文件」关闭状态下残留的非内容盘点行数（启动自检/收尾复检用）。"""
+    keep = tuple(e.lower() for e in SUPPORTED_EXTS)
+    qmarks = ",".join("?" * len(keep))
+    return int(
+        conn.execute(
+            "SELECT COUNT(*) FROM files WHERE status='filename_only' "
+            f"AND lower(ext) NOT IN ({qmarks})",
+            keep,
+        ).fetchone()[0]
+    )
 
 def _app_logo() -> QPixmap:
     """鍝佺墝 logo锛歅PTutor 鍚夌ゥ鐗╋紙瀛﹀＋甯?+ 鎼滅储/PPT锛夛紝鍔犺浇鎵撳寘鍐?assets/logo.png銆?"""
@@ -591,7 +609,8 @@ class ResultItem(QWidget):
                 f"background:{tok['field']};border:none;border-radius:5px;padding:2px 7px;")
             row.addWidget(nh, 0)
         if r.status == "filename_only":
-            ext = QLabel(".ppt")
+            # 按真实扩展名显示：.ppt 旧格式 / 任意文件盘点都走这个 badge
+            ext = QLabel((r.ext or "").lower() or "?")
             ext.setStyleSheet(f"font-size:10px;color:{tok['ink4']};border:1px solid {tok['bd2']};border-radius:5px;padding:1px 6px;background:transparent;")
             row.addWidget(ext, 0)
         if r.hits and r.status not in ("ok", "filename_only"):
@@ -632,7 +651,10 @@ class ResultItem(QWidget):
             sn.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
             lay.addWidget(sn)
         elif r.status == "filename_only":
-            sub = QLabel("\u8001\u683c\u5f0f \u00b7 \u4ec5\u6587\u4ef6\u540d\u641c\u7d22\u4e0e\u9884\u89c8")
+            if (r.ext or "").lower() == ".ppt":
+                sub = QLabel("\u8001\u683c\u5f0f \u00b7 \u4ec5\u6587\u4ef6\u540d\u641c\u7d22\u4e0e\u9884\u89c8")
+            else:
+                sub = QLabel("仅文件名收录 · 未解析内容")
             sub.setStyleSheet(f"font-size:11.5px;color:{tok['ink4']};background:transparent;")
             lay.addWidget(sub)
 
@@ -784,7 +806,8 @@ class MainWindow(QMainWindow):
     def __init__(self, conn=None, render_worker=None, thumb_worker=None, version_mgr=None,
                  do_index=True, roots: list[str] | None = None, workers: int | None = None,
                  document_search_enabled: bool | None = None,
-                 smart_grouping_enabled: bool | None = None):
+                 smart_grouping_enabled: bool | None = None,
+                 index_all_files_enabled: bool | None = None):
         super().__init__()
         self.setWindowTitle(f"PPT Doctor · PPT 查询助手   v{__version__}")
         app_icon = QApplication.instance().windowIcon()
@@ -804,6 +827,10 @@ class MainWindow(QMainWindow):
         self._smart_grouping_enabled = (
             get_smart_grouping_enabled()
             if smart_grouping_enabled is None else bool(smart_grouping_enabled)
+        )
+        self._index_all_files_enabled = (
+            get_index_all_files()
+            if index_all_files_enabled is None else bool(index_all_files_enabled)
         )
         ensure_completed_index_feature_signature(self._current_index_feature_signature())
         self._feature_change_cb = None
@@ -1035,6 +1062,7 @@ class MainWindow(QMainWindow):
                 allowed_exts_provider=self._enabled_index_exts,
                 compute_content_hash_provider=lambda: self._smart_grouping_enabled,
                 explicit_output_roots_provider=self.explicit_output_roots,
+                index_all_files_provider=lambda: self._index_all_files_enabled,
             )
             self._live.indexed.connect(self._on_live_indexed)
             self._live.start()
@@ -1170,9 +1198,24 @@ class MainWindow(QMainWindow):
     def _resolve_index_roots(roots: list[str] | None) -> list[str]:
         selected = list(roots or ())
         if not selected:
+            from ..config import _clean_index_roots, get_index_roots
+            custom = list(get_index_roots())
             env = os.environ.get("PPTX_FINDER_ROOTS", "").strip()
-            if env:
-                selected = [root for root in env.split(os.pathsep) if root]
+            # env 根与自定义根同口径清洗（去空白/尾分隔符/normcase 去重）：
+            # 不清洗时尾分隔符变体会成为独立根，同一棵树被重复扫描
+            env_roots = list(_clean_index_roots(env.split(os.pathsep))) if env else []
+            if custom:
+                # 自定义根是增量语义：本地固定盘照索，env 作为追加，按 normcase 去重
+                from ..scanner import fixed_drives
+                seen: set[str] = set()
+                for root in custom + fixed_drives() + env_roots:
+                    key = os.path.normcase(root)
+                    if key not in seen:
+                        seen.add(key)
+                        selected.append(root)
+            elif env_roots:
+                # 无自定义根时保留旧行为：env 单独存在仍是完整索引范围（脚本靠它限定）
+                selected = env_roots
         if not selected:
             from ..scanner import fixed_drives
             selected = fixed_drives()
@@ -1789,7 +1832,7 @@ class MainWindow(QMainWindow):
         self.type_filter.setFixedHeight(30)
         lay.addWidget(self.type_filter)
         self.mode = QComboBox()
-        self.mode.addItems(["全部", "仅文件名", "仅内容"])
+        self._rebuild_mode_filter()  # 「任意文件名」项跟随索引所有文件开关
         self.mode.setFixedHeight(30)
         self.mode.currentIndexChanged.connect(self._do_search)
         lay.addWidget(self.mode)
@@ -2188,7 +2231,29 @@ class MainWindow(QMainWindow):
             self._history_detach_inflight = False
 
     def _mode_key(self) -> str:
-        return {1: "filename", 2: "content"}.get(self.mode.currentIndex(), "all")
+        # 按文案映射而非下标：「任意文件名」项随开关动态增删，下标会漂
+        return {
+            "仅文件名": "filename",
+            "仅内容": "content",
+            "任意文件名": "any_filename",
+        }.get(self.mode.currentText(), "all")
+
+    def _rebuild_mode_filter(self) -> None:
+        """重建搜索模式下拉；「任意文件名」项跟随「索引所有文件」开关增删。"""
+        mode = getattr(self, "mode", None)
+        if mode is None:
+            return
+        previous = mode.currentText() or "全部"
+        blocked = mode.blockSignals(True)
+        try:
+            mode.clear()
+            mode.addItems(["全部", "仅文件名", "仅内容"])
+            if self._index_all_files_enabled:
+                mode.addItem("任意文件名")
+            idx = mode.findText(previous)
+            mode.setCurrentIndex(idx if idx >= 0 else 0)
+        finally:
+            mode.blockSignals(blocked)
 
     def _update_query_hint(self, query: str) -> None:
         if not query:
@@ -2213,6 +2278,7 @@ class MainWindow(QMainWindow):
         return index_feature_signature(
             self._document_search_enabled,
             self._smart_grouping_enabled,
+            self._index_all_files_enabled,
         )
 
     def _enabled_type_buckets(self):
@@ -2246,24 +2312,60 @@ class MainWindow(QMainWindow):
         *,
         document_search_enabled: bool | None = None,
         smart_grouping_enabled: bool | None = None,
+        index_all_files_enabled: bool | None = None,
     ) -> None:
         """设置页热切换后的轻量 UI 更新；重建索引始终由后台 worker 承担。"""
         docs_changed = False
+        all_files_changed = False
         if document_search_enabled is not None:
             next_value = bool(document_search_enabled)
             docs_changed = next_value != self._document_search_enabled
             self._document_search_enabled = next_value
         if smart_grouping_enabled is not None:
             self._smart_grouping_enabled = bool(smart_grouping_enabled)
+        if index_all_files_enabled is not None:
+            next_value = bool(index_all_files_enabled)
+            all_files_changed = next_value != self._index_all_files_enabled
+            self._index_all_files_enabled = next_value
         self._rebuild_type_filter()
+        self._rebuild_mode_filter()
         self._recent_cache = None
         self._index_status_cache = None
-        if docs_changed:
+        if all_files_changed and not self._index_all_files_enabled:
+            # 关闭后一次性清理非内容类型的 filename_only 盘点行（后台线程，单批 DELETE）
+            self._purge_inventory_rows()
+        if docs_changed or all_files_changed:
             if self.search_box.text().strip():
                 self._do_search()
             else:
                 self._show_recent(recent_force_refresh=True)
             self._refresh_status()
+
+    def _purge_inventory_rows_sync(self, conn_path: str) -> int:
+        own = db.connect(conn_path)
+        try:
+            return indexer_mod.purge_non_content_filename_only(own)
+        finally:
+            own.close()
+
+    def _purge_inventory_rows(self) -> None:
+        """后台清理全盘文件名盘点行；内存库（测试）无并发写者，直接同步执行。"""
+        conn_path = _sqlite_file_path(self._conn)
+        if not conn_path:
+            try:
+                indexer_mod.purge_non_content_filename_only(self._conn)
+            except Exception:  # noqa: BLE001 清理失败不影响开关生效
+                _log.debug("purge inventory rows failed", exc_info=True)
+            return
+        task = BackgroundTask(
+            lambda conn_path=conn_path: self._purge_inventory_rows_sync(conn_path),
+            "inventory-purge",
+        )
+        self._bg_tasks.append(task)
+        task.done.connect(lambda _payload: self._refresh_status())
+        task.finished.connect(
+            lambda task=task: self._bg_tasks.remove(task) if task in self._bg_tasks else None)
+        task.start()
 
     def set_version_manager(self, manager) -> None:
         if manager is not None:
@@ -2288,7 +2390,10 @@ class MainWindow(QMainWindow):
             note()
 
     def _search_exts(self) -> tuple[str, ...] | None:
-        """当前文件类型过滤；即使选“全部”也只覆盖用户已开启的类型。"""
+        """当前文件类型过滤；即使选“全部”也只覆盖用户已开启的类型。
+        「任意文件名」模式返回 None：不按扩展名过滤，覆盖全盘所有已登记文件。"""
+        if self._mode_key() == "any_filename":
+            return None
         tf = getattr(self, "type_filter", None)
         return tf.currentData() if tf is not None else self._enabled_index_exts()
 
@@ -5479,6 +5584,12 @@ class MainWindow(QMainWindow):
         self._startup_index_check_last_files = file_count
         self._startup_index_check_last_pages = page_count
         self._startup_index_check_last_pending = pending_count
+        if (
+            not self._index_all_files_enabled
+            and int(stats.get("inventory_leftover_count", 0) or 0) > 0
+        ):
+            # 启动自愈：上次「扫描进行中关开关」竞态残留的盘点行，后台补一次清理
+            self._purge_inventory_rows()
         if not isinstance(payload, dict):
             self._startup_index_check_error = "stats_unavailable"
         if file_count <= 0:
@@ -5532,6 +5643,7 @@ class MainWindow(QMainWindow):
                 self._conn,
                 path,
                 explicit_output_roots=self._explicit_output_roots,
+                index_all_files=self._index_all_files_enabled,
             )
         except Exception:  # noqa: BLE001
             _log.warning("live index failed %s", path, exc_info=True)
@@ -5625,6 +5737,7 @@ class MainWindow(QMainWindow):
             supported_exts=self._enabled_index_exts(),
             compute_groups=self._smart_grouping_enabled,
             feature_signature=self._current_index_feature_signature(),
+            index_all_files=self._index_all_files_enabled,
         )
         self._indexer.progress.connect(self._on_index_progress)
         self._indexer.finished_index.connect(self._on_index_done)
@@ -5641,6 +5754,8 @@ class MainWindow(QMainWindow):
         self._index_rate_last_done = 0
         self._index_rate_last_at = self._index_started_at
         self._index_status_cache = None
+        # 记录本轮扫描是否带着「索引所有文件」启动：扫描中关开关时收尾要补 purge
+        self._index_scan_had_inventory = self._index_all_files_enabled
         self.type_rail.hide()  # 避免建库写锁期间在 GUI 线程反复查 type_counts
         self.index_phase_label.setText("升级" if self._index_rebuild_reason else "扫描")
         self.index_phase_label.show()
@@ -5653,6 +5768,10 @@ class MainWindow(QMainWindow):
         self.status_dot.hide()
         if self._index_rebuild_reason:
             self.status_label.setText("正在升级索引：需要重新整理一次，期间可边扫边搜")
+        elif self._index_all_files_enabled:
+            # 全盘文件名盘点量级提示：首轮会登记几十万级文件名，耗时明显更长
+            self.status_label.setText(
+                f"开始索引：{', '.join(roots)} · 含全盘文件名盘点，首轮耗时较长")
         else:
             self.status_label.setText(f"开始索引：{', '.join(roots)}")
         self._indexer.start()
@@ -5781,6 +5900,13 @@ class MainWindow(QMainWindow):
             else:
                 self.status_label.setText("建库已暂停，已完成的结果仍可搜索")
             return
+        if not self._index_all_files_enabled and getattr(
+            self, "_index_scan_had_inventory", False
+        ):
+            # 扫描期间用户在设置里关了「索引所有文件」：关开关那一下的即时 purge
+            # 清不掉在途扫描之后写入的盘点行，扫描收尾在这里补一次（后台线程）
+            self._purge_inventory_rows()
+        self._index_scan_had_inventory = False
         completed_signature = str((summary or {}).get("feature_signature") or "")
         if (
             completed_signature
@@ -5830,6 +5956,11 @@ class MainWindow(QMainWindow):
                 stats["completed_feature_signature"] = (
                     get_completed_index_feature_signature()
                 )
+                # 启动自愈自检：仅开关关闭时才需要数残留（全表 COUNT，避免开关开启时白付）
+                stats["inventory_leftover_count"] = (
+                    _count_inventory_leftovers(own)
+                    if not self._index_all_files_enabled else 0
+                )
                 return stats
             finally:
                 own.close()
@@ -5848,6 +5979,10 @@ class MainWindow(QMainWindow):
             self._conn, db.META_LAST_SCAN_ERROR_PATHS, "")
         stats["type_counts"] = db.type_counts(self._conn)
         stats["completed_feature_signature"] = get_completed_index_feature_signature()
+        stats["inventory_leftover_count"] = (
+            _count_inventory_leftovers(self._conn)
+            if not self._index_all_files_enabled else 0
+        )
         return stats
 
     def _refresh_status(self, summary: dict | None = None, *, celebrate: bool = False) -> None:

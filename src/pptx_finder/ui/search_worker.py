@@ -93,7 +93,7 @@ class SearchWorker(QThread):
 
     @staticmethod
     def _apply_mode(results: list, mode_key: str) -> list:
-        if mode_key == "filename":
+        if mode_key in ("filename", "any_filename"):
             return [r for r in results if r.name_hit]
         if mode_key == "content":
             return [r for r in results if r.hits]
@@ -198,6 +198,11 @@ class SearchWorker(QThread):
                                 raise RuntimeError("interrupted")
                             self._active_conn = conn
                     search_kwargs = {"exts": exts}
+                    # 任意文件名模式：放宽文件名 FTS 候选截断（全盘盘点后 3000 不够）；
+                    # 结果只保留文件名命中，内容召回纯空转，传标记跳过 pages_fts 全库白召
+                    if mode_key == "any_filename":
+                        search_kwargs["name_limit"] = search_mod.ANY_FILE_NAME_LIMIT
+                        search_kwargs["name_only"] = True
                     # Keep the default call shape backward-compatible with test/fake
                     # search functions and older integrations; only opt in explicitly.
                     if case_sensitive:

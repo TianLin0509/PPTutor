@@ -46,6 +46,7 @@ class IndexWorker(QThread):
         compute_groups: bool = True,
         interaction_pause_sec: float = 0.8,
         feature_signature: str = "",
+        index_all_files: bool = False,
     ):
         super().__init__(parent)
         self._db_path = db_path
@@ -56,6 +57,7 @@ class IndexWorker(QThread):
         self._compute_groups = bool(compute_groups)
         self._interaction_pause_sec = max(0.0, float(interaction_pause_sec))
         self._feature_signature = str(feature_signature or "")
+        self._index_all_files = bool(index_all_files)
         self._activity_lock = threading.Lock()
         self._pause_until = 0.0
         self._stop = threading.Event()
@@ -127,6 +129,8 @@ class IndexWorker(QThread):
                 }
                 if self._supported_exts is not None:
                     index_kwargs["supported_exts"] = self._supported_exts
+                if self._index_all_files:
+                    index_kwargs["index_all_files"] = True
                 if not self._compute_groups:
                     index_kwargs["compute_content_hash"] = False
                 if self._background_priority:

@@ -20,10 +20,13 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QPlainTextEdit,
     QProgressDialog,
     QPushButton,
+    QScrollArea,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -47,6 +50,8 @@ from ..config import (
     get_font_family,
     get_font_scale,
     get_hotkey,
+    get_index_all_files,
+    get_index_roots,
     get_smart_grouping_enabled,
     get_version_management_enabled,
     get_version_keep_per_doc,
@@ -57,10 +62,13 @@ from ..config import (
     set_font_family,
     set_font_scale,
     set_hotkey,
+    set_index_all_files,
+    set_index_roots,
     set_smart_grouping_enabled,
     set_version_management_enabled,
     set_version_keep_per_doc,
     set_version_vault_dir,
+    validate_index_root,
     validate_version_vault_dir,
 )
 from ..versioning import autostart
@@ -180,6 +188,7 @@ class SettingsDialog(QDialog):
         self._diag_extra_lines: list[str] = []
         self._powerpoint_inflight = False
         self._vault_audit_inflight = False
+        self._index_roots_inflight = False
         self._autostart_toggle_token = 0
         self._autostart_toggle_inflight = False
         self._retention_update_token = 0
@@ -231,8 +240,8 @@ class SettingsDialog(QDialog):
         lay.addWidget(title)
 
         desc = QLabel(
-            "基础模式始终开启：全盘 PPT 检索 + PPT 统计。下面三项默认关闭，"
-            "只在你确实需要时才占用额外 CPU、磁盘和后台线程。"
+            "基础模式始终开启：全盘 PPT 检索 + PPT 统计。文件名盘点默认开启，"
+            "其余高阶项默认关闭，只在你确实需要时才占用额外 CPU、磁盘和后台线程。"
         )
         desc.setWordWrap(True)
         lay.addWidget(desc)
@@ -252,6 +261,17 @@ class SettingsDialog(QDialog):
             lambda on: self._toggle_feature("document_search", on)
         )
         lay.addWidget(self.document_feature)
+
+        self.all_files_feature = QCheckBox("索引所有文件（Everything 式文件名搜索）")
+        self.all_files_feature.setChecked(get_index_all_files())
+        self.all_files_feature.setToolTip(
+            "开启后登记全盘所有文件的名字（不解析内容），搜索模式里可选「任意文件名」；"
+            "关闭后停止收录并在后台清理盘点数据。"
+        )
+        self.all_files_feature.toggled.connect(
+            lambda on: self._toggle_feature("index_all_files", on)
+        )
+        lay.addWidget(self.all_files_feature)
 
         self.grouping_feature = QCheckBox("相似稿 / 重复稿智能归组")
         self.grouping_feature.setChecked(get_smart_grouping_enabled())
@@ -373,6 +393,57 @@ class SettingsDialog(QDialog):
         self._font_result.setWordWrap(True)
         self._font_result.setStyleSheet("font-size:11.5px;")
         lay.addWidget(self._font_result)
+
+        # 索引范围（自定义根：本地目录 + 网络 UNC，增量于固定盘；保存后重启生效）
+        roots_title = QLabel("索引范围")
+        roots_title.setStyleSheet("font-weight:700;font-size:13px;margin-top:8px;")
+        lay.addWidget(roots_title)
+        roots_desc = QLabel(
+            "默认索引所有本地固定磁盘；下面添加的目录会与固定盘一起被索引（不是替换）。"
+            "网络路径（如 \\\\server\\share\\dir）当前不可达也可保存，可达时自动纳入；"
+            "网络路径上的内容变化最坏约一周后才随完整扫描被感知，重启应用可加速。"
+        )
+        roots_desc.setWordWrap(True)
+        lay.addWidget(roots_desc)
+        # 环境变量旧语义是「限定索引范围」；一旦保存自定义根，它降级为追加项且
+        # 本地固定盘并入索引——老用户无感知会索引量暴涨，必须显式提示
+        env_roots_note = QLabel(
+            "检测到 PPTX_FINDER_ROOTS 环境变量限定；保存自定义根后本地固定盘将一并纳入索引。"
+        )
+        env_roots_note.setWordWrap(True)
+        env_roots_note.setStyleSheet("color:#9a6a00;font-size:11.5px;")
+        env_roots_note.setVisible(bool(os.environ.get("PPTX_FINDER_ROOTS", "").strip()))
+        lay.addWidget(env_roots_note)
+        self.index_roots_list = QListWidget()
+        self.index_roots_list.setMaximumHeight(90)
+        for root in get_index_roots():
+            self._append_index_root_item(root)
+        lay.addWidget(self.index_roots_list)
+        net_row = QHBoxLayout()
+        self.index_root_edit = QLineEdit()
+        self.index_root_edit.setPlaceholderText("网络路径，如 \\\\server\\share\\dir")
+        self.index_root_edit.returnPressed.connect(self._add_index_root_network)
+        net_row.addWidget(self.index_root_edit, 1)
+        self._index_root_net_add = QPushButton("添加网络路径")
+        self._index_root_net_add.clicked.connect(self._add_index_root_network)
+        net_row.addWidget(self._index_root_net_add)
+        lay.addLayout(net_row)
+        roots_btn_row = QHBoxLayout()
+        self._index_root_local_add = QPushButton("添加本地目录…")
+        self._index_root_local_add.clicked.connect(self._add_index_root_local)
+        roots_btn_row.addWidget(self._index_root_local_add)
+        self._index_root_remove = QPushButton("删除选中")
+        self._index_root_remove.clicked.connect(self._remove_index_root)
+        roots_btn_row.addWidget(self._index_root_remove)
+        roots_btn_row.addStretch(1)
+        self._index_roots_save = QPushButton("保存")
+        self._index_roots_save.clicked.connect(self._apply_index_roots)
+        roots_btn_row.addWidget(self._index_roots_save)
+        lay.addLayout(roots_btn_row)
+        self._index_roots_result = QLabel("")
+        self._index_roots_result.setWordWrap(True)
+        self._index_roots_result.setStyleSheet("font-size:11.5px;")
+        lay.addWidget(self._index_roots_result)
 
         lay.addStretch(1)
         # 区块已累计超过 600px 设计高度：滚动承载，避免窗口被内容最小高度撑高
@@ -503,6 +574,7 @@ class SettingsDialog(QDialog):
             "version_management": getattr(self, "version_feature", None),
             "document_search": getattr(self, "document_feature", None),
             "smart_grouping": getattr(self, "grouping_feature", None),
+            "index_all_files": getattr(self, "all_files_feature", None),
         }
         control = controls.get(str(key))
         if control is None:
@@ -729,6 +801,7 @@ class SettingsDialog(QDialog):
             f"smart_grouping={'on' if get_smart_grouping_enabled() else 'off'}",
             f"autostart_preference: {'on' if get_autostart() else 'off'}",
             f"PPTX_FINDER_ROOTS: {os.environ.get('PPTX_FINDER_ROOTS', '') or '(auto fixed drives)'}",
+            f"custom_index_roots: {' | '.join(get_index_roots()) or '(none)'}",
             f"PPTX_FINDER_DATA_DIR: {os.environ.get('PPTX_FINDER_DATA_DIR', '') or '(default)'}",
             f"exclude_dirs: {len(EXCLUDE_DIR_NAMES)} rules",
         ]
@@ -961,6 +1034,7 @@ class SettingsDialog(QDialog):
         self._diag_inflight_token = None
         self._powerpoint_inflight = False
         self._vault_audit_inflight = False
+        self._index_roots_inflight = False
         self._autostart_toggle_token += 1
         self._autostart_toggle_inflight = False
         self._retention_update_token += 1

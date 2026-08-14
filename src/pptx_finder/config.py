@@ -15,6 +15,8 @@ DEFAULT_VERSION_KEEP_PER_DOC = 100
 DEFAULT_VERSION_MANAGEMENT_ENABLED = False
 DEFAULT_DOCUMENT_SEARCH_ENABLED = False
 DEFAULT_SMART_GROUPING_ENABLED = False
+# Everything 式文件名搜索：默认开。只登记文件名（status=filename_only），不解析内容。
+DEFAULT_INDEX_ALL_FILES = True
 
 
 def resource_path(*parts: str) -> Path:
@@ -206,6 +208,70 @@ def validate_version_vault_dir(path: str) -> str | None:
     return None
 
 
+def _clean_index_roots(roots) -> tuple[str, ...]:
+    """清洗索引根列表：去空白、去尾分隔符（盘符根除外）、按 normcase 去重，保持顺序。"""
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in roots or ():
+        p = str(raw or "").strip()
+        if not p:
+            continue
+        stripped = p.rstrip("/\\")
+        if stripped:  # 尾部分隔符统一剥掉，避免同一目录两种写法重复登记
+            p = stripped
+        if len(p) == 2 and p[1] == ":":  # "C:\" 被剥成 "C:" 会变成盘当前目录，还原
+            p += "\\"
+        key = os.path.normcase(p)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(p)
+    return tuple(out)
+
+
+def get_index_roots() -> tuple[str, ...]:
+    """用户在设置里维护的自定义索引根（本地目录 / 网络 UNC）；空 = 未配置。"""
+    v = load_ui_settings().get("index_roots")
+    return _clean_index_roots(v) if isinstance(v, list) else ()
+
+
+def set_index_roots(roots) -> None:
+    update_ui_settings(index_roots=list(_clean_index_roots(roots)))
+
+
+def validate_index_root(path: str) -> tuple[bool, bool, str]:
+    """校验自定义索引根，返回 (可保存, 当前可达, 提示文案) 三态。
+
+    格式非法 → (False, False, 原因)；合法且可达 → (True, True, "")；
+    合法但暂不可达 → (True, False, 警告)——网络盘时通时断，拒存是错误的，
+    保存后由索引器在其可达时自动纳入。
+    注意：可达性探测（isdir 触网络盘）可能耗时数秒，UI 线程请放后台调用。
+    """
+    p = str(path or "").strip()
+    if not p:
+        return False, False, "路径不能为空"
+    normalized = p.replace("/", "\\")
+    is_drive = (
+        len(normalized) >= 3
+        and normalized[0].isalpha()
+        and normalized[1] == ":"
+        and normalized[2] == "\\"
+    )
+    is_unc = False
+    if normalized.startswith("\\\\") and not normalized.startswith("\\\\?\\"):
+        # 至少 \\server\share 两段；\\?\ 设备路径不接收
+        is_unc = len([s for s in normalized[2:].split("\\") if s]) >= 2
+    if not (is_drive or is_unc):
+        return False, False, "只支持本地目录（如 D:\\资料）或网络路径（如 \\\\server\\share\\dir）"
+    try:
+        reachable = os.path.isdir(ext_path(p))
+    except Exception:  # noqa: BLE001 含 \x00 等异常字符抛 ValueError，按不可达处理而非卡死对话框
+        reachable = False
+    if reachable:
+        return True, True, ""
+    return True, False, "当前不可达：保存后将在其可用时自动纳入索引"
+
+
 def get_document_search_enabled(
     default: bool = DEFAULT_DOCUMENT_SEARCH_ENABLED,
 ) -> bool:
@@ -243,6 +309,7 @@ def enabled_index_exts(document_search_enabled: bool | None = None) -> tuple[str
 def index_feature_signature(
     document_search_enabled: bool | None = None,
     smart_grouping_enabled: bool | None = None,
+    index_all_files: bool | None = None,
 ) -> str:
     docs_on = (
         get_document_search_enabled()
@@ -252,7 +319,23 @@ def index_feature_signature(
         get_smart_grouping_enabled()
         if smart_grouping_enabled is None else bool(smart_grouping_enabled)
     )
-    return f"documents={int(docs_on)};smart_grouping={int(groups_on)}"
+    any_on = (
+        get_index_all_files()
+        if index_all_files is None else bool(index_all_files)
+    )
+    return (
+        f"documents={int(docs_on)};smart_grouping={int(groups_on)}"
+        f";any_file={int(any_on)}"
+    )
+
+
+def get_index_all_files(default: bool = DEFAULT_INDEX_ALL_FILES) -> bool:
+    """Everything 式全盘文件名盘点开关（默认开；只登记文件名，不解析内容）。"""
+    return _get_bool_setting("index_all_files", default)
+
+
+def set_index_all_files(enabled: bool) -> None:
+    update_ui_settings(index_all_files=bool(enabled))
 
 
 def get_completed_index_feature_signature(default: str = "") -> str:

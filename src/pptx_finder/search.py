@@ -21,6 +21,10 @@ W_REL = 0.60      # 内容相关度（bm25）
 W_RECENCY = 0.25  # 修改时间（越新越高）
 NAME_BONUS = 0.50  # 文件名命中加分
 MAX_HITS_PER_FILE = 10
+# 「任意文件名」模式的文件名 FTS 候选上限：全盘盘点后 3000 会稳定截断召回
+ANY_FILE_NAME_LIMIT = 100_000
+# SQLite 单语句变量上限 32766：id IN (...) 查询按此分批，留足余量
+_ID_IN_BATCH = 10_000
 
 _EXT_RE = re.compile(r"\.(pptx?|potx?|ppsx?)$", re.IGNORECASE)
 _CAND_SPLIT_RE = re.compile(rf"{SEPARATOR_CLASS}+")
@@ -371,7 +375,9 @@ def _recall(
 def search(conn: sqlite3.Connection, query: str, scope: str | None = None,
            limit: int = 200, exts: tuple[str, ...] | None = None,
            case_sensitive: bool = False,
-           group_similar: bool = True) -> list[FileResult]:
+           group_similar: bool = True,
+           name_limit: int = 3000,
+           name_only: bool = False) -> list[FileResult]:
     ext_filter = {e.lower() for e in exts} if exts else None  # 文件类型过滤；None=全部类型
     terms, phrases = parse_query(query)
     if not terms and not phrases:
@@ -393,12 +399,17 @@ def search(conn: sqlite3.Connection, query: str, scope: str | None = None,
             break
 
     # 字级召回 + 原文验证（精度）；多词必须在同一页共同出现。
-    content = _recall(
-        conn,
-        terms + phrases,
-        scope=scope,
-        exts=exts,
-        case_sensitive=case_sensitive,
+    # name_only（任意文件名模式）：结果只保留文件名命中，内容召回纯空转，直接跳过。
+    content = (
+        {}
+        if name_only
+        else _recall(
+            conn,
+            terms + phrases,
+            scope=scope,
+            exts=exts,
+            case_sensitive=case_sensitive,
+        )
     )
 
     # 文件名命中：索引期维护 name_norm + file_names_fts。查询先走 FTS 收窄候选，再用
@@ -426,7 +437,9 @@ def search(conn: sqlite3.Connection, query: str, scope: str | None = None,
                 name_rows = conn.execute(
                     "SELECT f.id, f.name, f.name_norm "
                     "FROM file_names_fts JOIN files AS f ON f.id=file_names_fts.file_id "
-                    f"WHERE {' AND '.join(name_predicates)} LIMIT 3000",
+                    f"WHERE {' AND '.join(name_predicates)} "
+                    # LIMIT 截断必须有确定性序：否则常见词的召回丢弃是随机的
+                    f"ORDER BY f.mtime DESC, f.id LIMIT {max(1, int(name_limit))}",
                     tuple(name_params),
                 )
             except sqlite3.OperationalError as e:
@@ -453,9 +466,15 @@ def search(conn: sqlite3.Connection, query: str, scope: str | None = None,
     gmap = cluster.group_map(conn) if group_similar else {}
 
     rows: dict[int, sqlite3.Row] = {}
-    qmarks = ",".join("?" * len(file_ids))
-    for r in conn.execute(f"SELECT * FROM files WHERE id IN ({qmarks})", tuple(file_ids)):
-        rows[r["id"]] = r
+    # id IN (...) 单语句变量上限 32766：任意文件名模式候选可达 10 万，必须分批
+    id_list = list(file_ids)
+    for i in range(0, len(id_list), _ID_IN_BATCH):
+        chunk = id_list[i:i + _ID_IN_BATCH]
+        qmarks = ",".join("?" * len(chunk))
+        for r in conn.execute(
+            f"SELECT * FROM files WHERE id IN ({qmarks})", chunk
+        ):
+            rows[r["id"]] = r
 
     # 收集中间结果用于归一化
     raw_items = []  # (row, hits, name_hit, best_rank, recalled_pages)
