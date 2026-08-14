@@ -12,7 +12,7 @@ from functools import lru_cache
 from . import cluster
 from .models import FileResult, SearchHit
 from .ranking import relevance_components
-from .text_tokenize import char_match, normalize, parse_query
+from .text_tokenize import SEPARATOR_CLASS, char_match, normalize, parse_query
 
 log = logging.getLogger(__name__)
 
@@ -23,9 +23,12 @@ NAME_BONUS = 0.50  # 文件名命中加分
 MAX_HITS_PER_FILE = 10
 
 _EXT_RE = re.compile(r"\.(pptx?|potx?|ppsx?)$", re.IGNORECASE)
-_CAND_SPLIT_RE = re.compile(r"[^0-9A-Za-z\u4e00-\u9fff]+")
+_CAND_SPLIT_RE = re.compile(rf"{SEPARATOR_CLASS}+")
 _TEXT_CAND_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]{2,40}|[0-9A-Za-z]{3,40}|[\u4e00-\u9fff]{2,12}")
-_COMPACT_RE = re.compile(r"[^0-9a-z\u4e00-\u9fff]+", re.IGNORECASE)
+# 只删标点/空白/下划线，保留所有 Unicode 字母数字。原先写死 [^0-9a-z 汉字]
+# 会把 τ é ひ 一并抹掉，导致 query_exact 变空串、含希腊字母的命中永远评不到
+# exact 档、只能落 partial（召回没问题，排序被压低）。
+_COMPACT_RE = re.compile(rf"{SEPARATOR_CLASS}+")
 _WS_RE = re.compile(r"\s+")
 _ASCII_CASE_TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
 def _stem_name(name: str) -> str:
@@ -173,7 +176,7 @@ def _contains_compact_exact(text_norm: str, query_exact: str) -> bool:
     """Match the compact query through separators without ASCII prefix leaks."""
     if not query_exact:
         return False
-    separator = r"[^0-9A-Za-z\u4e00-\u9fff]*"
+    separator = rf"{SEPARATOR_CLASS}*"
     pattern = separator.join(re.escape(ch) for ch in query_exact)
     if query_exact[0].isascii() and query_exact[0].isalnum():
         pattern = r"(?<![0-9A-Za-z])" + pattern

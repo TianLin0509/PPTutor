@@ -22,7 +22,9 @@ DEFAULT_VACUUM_MIN_FREE_RATIO = 0.25
 # 也兼作"强制重建"开关：v0.7.0 首启重扫会冻结 UI，多数人的库停在残缺态（部分文件 +
 # 已盖 v2 标记 → 不会自动重扫）；2→3 让修复版（重扫已不冻结）自动重建这些残缺库。
 # 5→6：内容搜索从只 pptx 扩到 docx/xlsx/txt/pdf，旧库需重建以纳入这些文档类型。
-INDEX_VERSION = "6"
+# 6→7：切词补上希腊字母/带音标拉丁/假名/韩文/CJK 扩展 A 汉字（原先这些字符被当
+#      分隔符丢弃，τ λ Δ 一类根本搜不到）。旧库里没有这些 token，不重建等于没修。
+INDEX_VERSION = "7"
 META_INDEX_REBUILD_REASON = "last_index_rebuild_reason"
 META_LAST_COMPLETED_SCAN_AT = "last_completed_scan_at"
 META_LAST_KNOWN_RECONCILE_AT = "last_known_reconcile_at"

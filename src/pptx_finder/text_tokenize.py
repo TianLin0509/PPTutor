@@ -23,8 +23,28 @@ except Exception:  # noqa: BLE001 OpenCC 不可用则跳过繁简(降级,不致�
 
 
 _PHRASE_RE = re.compile(r'"([^"]+)"')
-# 字级 token:连续英文/数字算一个词、每个中文字算一个 token;其余(标点/空白)作分隔
-_TOKEN_RE = re.compile(r"[a-z0-9]+|[一-鿿]")
+
+# 汉字区间:基本区 + 扩展 A + 兼容汉字。原先只有基本区(U+4E00–U+9FFF),
+# 扩展 A 的生僻字(㐂 䶮 等姓氏用字)会被当分隔符整条丢掉。
+CJK_RANGES = "㐀-䶿一-鿿豈-﫿"
+
+# 「非内容字符」的唯一事实源:标点/空白/下划线才是分隔符,任何 Unicode 字母
+# 数字都算内容。search 层的紧凑归一化与原文验证共用这一份——本次 bug 的成因
+# 正是同一套假设在 text_tokenize / search 各写了一份、只改一处等于没改。
+SEPARATOR_CLASS = r"[\W_]"
+
+# 字级 token:
+#   ① 连续英文/数字 = 一个词
+#   ② 每个汉字 = 一个 token
+#   ③ 其余任意 Unicode 字母/数字 = 逐字 token
+# 第 ③ 条是 2026-07-28 补的:希腊字母(τ λ Δ σ μ)、带音标拉丁(é ü ñ)、假名、
+# 韩文原本全部落在两条规则之外 → 被当分隔符丢弃 → char_match 返回空串 →
+# build_fts_match 整个变成空 → 搜索在进 SQL 之前就废了。逐字成 token 与中文
+# 的处理方式一致,精度仍由 search 的原文验证兜底。
+# 2026-08-14:③ 从 [^\W\d_] 放宽到 [^\W_]——原先排除 \d,非 ASCII 十进制数字
+# (阿拉伯-印度数字 ٤٥٦ 等)切不出 token,而 SEPARATOR_CLASS/compact 验证侧把
+# 它们当内容,两侧口径不一,「会议室 ٤٥٦」这类名字搜不到。
+_TOKEN_RE = re.compile(rf"[a-z0-9]+|[{CJK_RANGES}]|[^\W_]")
 # 中文弯引号/书名号/方角引号 → ASCII 双引号，使其也能当短语定界符
 # （修「用 “…”/「…」/《…》 包短语搜不到」——否则引号字符进了原文验证、原文里没有→0 结果）
 _FANCY_QUOTES = str.maketrans({
