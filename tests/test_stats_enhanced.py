@@ -42,7 +42,7 @@ def _put(
 
 
 def test_feature_manifest_covers_all_user_selected_statistics():
-    assert len(stats.STAT_FEATURE_KEYS) == 37
+    assert len(stats.STAT_FEATURE_KEYS) == 38
     assert {
         "hall_of_fame",
         "most_edited",
@@ -81,6 +81,7 @@ def test_feature_manifest_covers_all_user_selected_statistics():
         "paper_stack",
         "achievements",
         "library_one_liner",
+        "career_chronicle",
     } == set(stats.STAT_FEATURE_KEYS)
 
 
@@ -231,3 +232,140 @@ def test_unknown_zero_mtime_is_not_presented_as_a_1970_creation_record():
     assert activity.active_days == 1
     assert hall.oldest.name == "real.pptx"
     assert [item.label for item in creation.yearly_counts] == ["2024"]
+
+
+def test_yearly_chronicle_buckets_metrics_keywords_and_version_saves(tmp_path):
+    conn = db.connect(tmp_path / "index.db")
+    db.init_db(conn)
+    _put(conn, r"C:\work\2019 星云观测.pptx", mtime=_ts(2019, 3, 5), pages=["nebula 观测记录"], size=100)
+    _put(conn, r"C:\work\2026 类星体.pptx", mtime=_ts(2026, 2, 1), pages=["quasar 能谱"] * 2, size=9000)
+    _put(conn, r"C:\work\2026 类星体复盘.pptx", mtime=_ts(2026, 8, 2), pages=["quasar 复盘", "谢谢"], size=3000)
+    conn.commit()
+
+    vpath = tmp_path / "versions.db"
+    vault = store.connect(vpath)
+    store.init_db(vault)
+    store.upsert_doc(vault, "doc-old", r"C:\work\2019 星云观测.pptx", _ts(2019, 3, 5))
+    _add_version(vault, "doc-old", "o1", _ts(2019, 3, 5, 21), 1, 100, "")
+    store.upsert_doc(vault, "doc-new", r"C:\work\2026 类星体.pptx", _ts(2026, 2, 1))
+    _add_version(vault, "doc-new", "n1", _ts(2026, 2, 2, 9), 2, 200, "")
+    _add_version(vault, "doc-new", "n2", _ts(2026, 2, 3, 9), 2, 220, "改 1 页")
+    vault.commit()
+    vault.close()
+
+    files = stats.fetch_file_stats(conn)
+    chronicle = report_insights.yearly_chronicle(conn, files, version_db_path=vpath)
+
+    assert [c.year for c in chronicle] == [2019, 2026]
+    c2019, c2026 = chronicle
+    assert (c2019.deck_count, c2019.page_count) == (1, 1)
+    assert (c2026.deck_count, c2026.page_count) == (2, 4)
+    assert c2019.char_count == len("nebula 观测记录")
+    assert c2026.char_count == 2 * len("quasar 能谱") + len("quasar 复盘") + len("谢谢")
+    assert (c2019.total_size, c2026.total_size) == (100, 12000)
+    labels2019 = [k.label for k in c2019.top_keywords]
+    labels2026 = [k.label for k in c2026.top_keywords]
+    assert "nebula" in labels2019 and "nebula" not in labels2026
+    assert "quasar" in labels2026 and "quasar" not in labels2019
+    assert (c2019.version_saves, c2026.version_saves) == (1, 2)
+    assert c2019.top_files[0].name == "2019 星云观测.pptx"
+    assert c2019.top_files[0].path == r"C:\work\2019 星云观测.pptx"
+    assert c2026.top_files[0].name == "2026 类星体.pptx"  # 页数并列时体积大的在前
+
+    # build_report 直接把生涯履历挂上 Report
+    report = stats.build_report(conn, version_db_path=vpath)
+    assert [c.year for c in report.chronicle] == [2019, 2026]
+    assert report.chronicle[1].version_saves == 2
+
+
+def test_yearly_chronicle_still_samples_early_year_when_recent_year_is_huge(tmp_path):
+    conn = db.connect(tmp_path / "index.db")
+    db.init_db(conn)
+    _put(conn, r"C:\work\2010 老胶片.pptx", mtime=_ts(2010, 6, 1), pages=["oldschool 开场"], size=100)
+    _put(
+        conn,
+        r"C:\work\2026 大部头.pptx",
+        mtime=_ts(2026, 6, 1),
+        pages=[f"newwave 第{i}页" for i in range(1, 601)],
+        size=100,
+    )
+    conn.commit()
+
+    files = stats.fetch_file_stats(conn)
+    by_year = {c.year: c for c in report_insights.yearly_chronicle(conn, files)}
+
+    # 全局 ORDER BY mtime DESC LIMIT 的抽法下 2010 年一页都轮不到；按年分层则每年各有额度
+    assert "oldschool" in [k.label for k in by_year[2010].top_keywords]
+    assert by_year[2026].top_keywords
+
+
+def test_yearly_chronicle_skips_files_without_real_mtime(tmp_path):
+    conn = db.connect(tmp_path / "index.db")
+    db.init_db(conn)
+    _put(conn, r"C:\work\无时间.pptx", mtime=0.0, pages=["nebula"], size=100)
+    conn.commit()
+
+    files = stats.fetch_file_stats(conn)
+
+    assert report_insights.yearly_chronicle(conn, files) == ()
+
+
+def test_yearly_chronicle_version_saves_follow_report_scope(tmp_path):
+    """月/周 scope 下年卡留版数必须按 scope 过滤，而不是全年口径（M1 回归）。
+
+    2026 年共 12 次健康留版，其中只有 1 次落在 6 月；「全部」「本年」scope
+    下年卡留版数与改动前一致（12），「本月」scope 下必须是 1。
+    """
+    conn = db.connect(tmp_path / "index.db")
+    db.init_db(conn)
+    _put(conn, r"C:\work\2026 六月甲.pptx", mtime=_ts(2026, 6, 3), pages=["june 复盘"], size=100)
+    _put(conn, r"C:\work\2026 六月乙.pptx", mtime=_ts(2026, 6, 20), pages=["june 周报"], size=100)
+    conn.commit()
+
+    vpath = tmp_path / "versions.db"
+    vault = store.connect(vpath)
+    store.init_db(vault)
+    store.upsert_doc(vault, "doc-j", r"C:\work\2026 六月甲.pptx", _ts(2026, 6, 3))
+    _add_version(vault, "doc-j", "j1", _ts(2026, 6, 5, 20), 2, 200, "")  # 唯一落在 6 月的留版
+    for k in range(11):  # 其余 11 次散落在 1~5 月
+        _add_version(vault, "doc-j", f"x{k}", _ts(2026, 1 + (k % 5), 10 + k, 9), 2, 200, "")
+    vault.commit()
+    vault.close()
+
+    # 「全部」scope：全年 12 次（与改动前口径一致）
+    report_all = stats.build_report(conn, version_db_path=vpath)
+    assert [c.year for c in report_all.chronicle] == [2026]
+    assert report_all.chronicle[0].version_saves == 12
+    # 「本年」scope：同样 12 次（year 边界本就正确）
+    report_year = stats.build_report(conn, year=2026, version_db_path=vpath)
+    assert report_year.chronicle[0].version_saves == 12
+    # 「本月」scope（2026-06）：文件与留版都按月过滤
+    report_month = stats.build_report(
+        conn,
+        since_ts=_ts(2026, 6, 1, 0),
+        until_ts=_ts(2026, 7, 1, 0),
+        version_db_path=vpath,
+    )
+    assert [c.year for c in report_month.chronicle] == [2026]
+    assert report_month.chronicle[0].deck_count == 2
+    assert report_month.chronicle[0].version_saves == 1
+
+
+def test_yearly_chronicle_version_saves_none_when_version_db_unavailable(tmp_path):
+    """版本库缺失/不可读时留版数为 None（未知），不是 0（n1 降级口径）。"""
+    conn = db.connect(tmp_path / "index.db")
+    db.init_db(conn)
+    _put(conn, r"C:\work\2024 星云.pptx", mtime=_ts(2024, 5, 1), pages=["nebula"], size=100)
+    conn.commit()
+    files = stats.fetch_file_stats(conn)
+
+    # 未传 version_db_path
+    assert report_insights.yearly_chronicle(conn, files)[0].version_saves is None
+    # 路径不存在
+    missing = report_insights.yearly_chronicle(conn, files, version_db_path=tmp_path / "no-such.db")
+    assert missing[0].version_saves is None
+    # 文件存在但不是合法 SQLite 库
+    bad = tmp_path / "bad.db"
+    bad.write_bytes(b"not a sqlite db")
+    corrupt = report_insights.yearly_chronicle(conn, files, version_db_path=bad)
+    assert corrupt[0].version_saves is None

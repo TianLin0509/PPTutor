@@ -20,7 +20,7 @@ from urllib.parse import quote
 from .config import PPT_EXTS
 
 
-# 用户确认的 12 项核心统计 + 25 项趣味增强。这个清单既是实现清单，也是回归测试门禁。
+# 用户确认的 12 项核心统计 + 26 项趣味增强。这个清单既是实现清单，也是回归测试门禁。
 STAT_FEATURE_KEYS = (
     "hall_of_fame",
     "most_edited",
@@ -59,6 +59,7 @@ STAT_FEATURE_KEYS = (
     "paper_stack",
     "achievements",
     "library_one_liner",
+    "career_chronicle",
 )
 
 # 首屏报告的内容分析预算。真实片库实测 2M 字会把首次报告拖到 6 秒以上；
@@ -69,6 +70,9 @@ MAX_PAGE_SAMPLE_CHARS = 1_500
 _MEETING_MINUTES_PER_PAGE = 2
 _PAPER_MM_PER_PAGE = 0.1
 _MIN_VALID_MTIME = datetime(1980, 1, 1).timestamp()
+# 生涯履历年度关键词抽样预算：按年分层（每年 ≤400 页 / ≤6 万字），早年不被近年挤占。
+_CHRONICLE_YEAR_PAGES = 400
+_CHRONICLE_YEAR_CHARS = 60_000
 
 
 @dataclass
@@ -197,6 +201,20 @@ class VersionInsightsStat:
     most_migrated_count: int = 0
     page_flip_flop_name: str | None = None
     page_flip_flops: int = 0
+
+
+@dataclass
+class YearChronicleStat:
+    """一年一卷的生涯履历：文件指标 + 年度关键词 + 代表文件 + 真实留版数。"""
+
+    year: int = 0
+    deck_count: int = 0
+    page_count: int = 0
+    char_count: int = 0
+    total_size: int = 0
+    top_keywords: tuple[CountedItem, ...] = ()
+    top_files: tuple[NamedMetric, ...] = ()
+    version_saves: int | None = None  # None = 版本库缺失/不可读，留版数未知（不是 0）
 
 
 @dataclass
@@ -728,6 +746,119 @@ def version_insights(
         return VersionInsightsStat()
     finally:
         conn.close()
+
+
+def yearly_chronicle(
+    conn: sqlite3.Connection,
+    files: list,
+    *,
+    year: int | None = None,
+    since_ts: float | None = None,
+    until_ts: float | None = None,
+    version_db_path: str | Path | None = None,
+) -> tuple[YearChronicleStat, ...]:
+    """按 mtime 自然年分桶的生涯履历（无创建时间可用，口径同「创作年轮」）。
+
+    文件指标零新 SQL；年度关键词按年分层抽样——每年各跑一条有界小查询
+    （≤400 页 / ≤6 万字），一趟循环累加各年 Counter，大库下早年也抽得到样，
+    不像全局 ORDER BY mtime DESC LIMIT 会被近年挤占；年度留版数一条 SQL
+    group by，时间边界复用 _version_scope(year/since_ts/until_ts)，与报告
+    其余口径同 scope；版本库缺失或不可读时留版数为 None（未知，不是 0）。
+    """
+    buckets: dict[int, list] = defaultdict(list)
+    for f in files:
+        if float(f.mtime or 0) >= _MIN_VALID_MTIME:
+            buckets[datetime.fromtimestamp(f.mtime).year].append(f)
+    if not buckets:
+        return ()
+
+    keyword_counters: dict[int, Counter] = {}
+    for bucket_year, year_files in buckets.items():
+        # 年内取最新若干份（页数预算 400），只查这些文件的页文本
+        picked = []
+        pages_left = _CHRONICLE_YEAR_PAGES
+        for f in sorted(year_files, key=lambda x: (-float(x.mtime), str(x.name))):
+            pages = max(0, int(f.page_count or 0))
+            if pages <= 0:
+                continue  # 未解析出页的文件没有页文本，不占抽样名额
+            if picked and pages > pages_left:
+                continue  # 放不下的跳过大部头，继续用后续文件装满预算（mtime 新→旧优先）
+            picked.append(f)
+            pages_left -= pages
+        if not picked:
+            continue
+        ph = ",".join("?" * len(picked))
+        rows = conn.execute(
+            f"""SELECT substr(COALESCE(p.raw_text,''),1,{MAX_PAGE_SAMPLE_CHARS}) AS raw_text
+                FROM pages_raw AS p
+                WHERE p.file_id IN ({ph})
+                ORDER BY p.file_id, p.page_no""",
+            tuple(int(f.file_id) for f in picked),
+        ).fetchall()
+        counter = Counter()
+        chars = 0
+        for row in rows:
+            text = str(row["raw_text"] or "")
+            if chars and chars + len(text) > _CHRONICLE_YEAR_CHARS:
+                break
+            counter.update(_terms(text))
+            chars += len(text)
+        keyword_counters[bucket_year] = counter
+
+    version_years: dict[int, int] | None = None
+    if version_db_path:
+        vconn = None
+        try:
+            vconn = _open_version_db_ro(version_db_path)
+            if vconn is not None:
+                where, params = _version_scope(year, since_ts, until_ts)
+                rows = vconn.execute(
+                    f"""SELECT strftime('%Y', v.ts, 'unixepoch', 'localtime') AS yr,
+                              COUNT(*) AS n
+                       FROM versions AS v
+                       WHERE {where} AND v.ts>=?
+                       GROUP BY yr""",
+                    (*params, _MIN_VALID_MTIME),
+                ).fetchall()
+                version_years = {int(r["yr"]): int(r["n"]) for r in rows if r["yr"]}
+        except (OSError, sqlite3.Error):
+            version_years = None
+        finally:
+            if vconn is not None:
+                vconn.close()
+
+    chronicle: list[YearChronicleStat] = []
+    for bucket_year in sorted(buckets):
+        year_files = buckets[bucket_year]
+        top_files = sorted(
+            year_files,
+            key=lambda f: (max(0, int(f.page_count or 0)), int(f.size or 0), str(f.name)),
+            reverse=True,
+        )[:3]
+        chronicle.append(
+            YearChronicleStat(
+                year=bucket_year,
+                deck_count=len(year_files),
+                page_count=sum(max(0, int(f.page_count or 0)) for f in year_files),
+                char_count=sum(max(0, int(f.char_count or 0)) for f in year_files),
+                total_size=sum(max(0, int(f.size or 0)) for f in year_files),
+                top_keywords=tuple(
+                    CountedItem(k, v)
+                    for k, v in keyword_counters.get(bucket_year, Counter()).most_common(5)
+                ),
+                top_files=tuple(
+                    NamedMetric(
+                        name=str(f.name),
+                        value=max(0, int(f.page_count or 0)),
+                        path=str(getattr(f, "path", "") or "") or None,
+                        detail=f"{max(0, int(f.char_count or 0)):,} 字",
+                    )
+                    for f in top_files
+                ),
+                version_saves=None if version_years is None else version_years.get(bucket_year, 0),
+            )
+        )
+    return tuple(chronicle)
 
 
 def _achievements(files: list, hall, content, library, versions) -> tuple[str, ...]:

@@ -20,7 +20,9 @@ from .report_insights import (
     HallOfFameStat,
     LibraryInsightsStat,
     VersionInsightsStat,
+    YearChronicleStat,
     build_enhanced_insights,
+    yearly_chronicle,
 )
 
 _MIN_VALID_MTIME = datetime(1980, 1, 1).timestamp()
@@ -339,6 +341,7 @@ class Report:
     content: ContentInsightsStat
     library: LibraryInsightsStat
     versions: VersionInsightsStat
+    chronicle: tuple[YearChronicleStat, ...]
     achievements: tuple[str, ...]
     one_liner: str
 
@@ -436,6 +439,14 @@ def build_report(
         now_ts=now_ts,
         persona_role=base_persona.role or base_persona.title,
     )
+    chronicle = yearly_chronicle(
+        conn,
+        files,
+        year=year,
+        since_ts=since_ts,
+        until_ts=until_ts,
+        version_db_path=version_db_path,
+    )
     return Report(
         scope_year=year,
         deck_count=len(files),
@@ -451,6 +462,7 @@ def build_report(
         content=enhanced.content,
         library=enhanced.library,
         versions=enhanced.versions,
+        chronicle=chronicle,
         achievements=enhanced.achievements,
         one_liner=enhanced.one_liner,
     )

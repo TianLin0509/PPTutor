@@ -51,6 +51,7 @@ _REPORT_TABS = (
     ("versions", "版本时光机"),
     ("content", "内容人格"),
     ("library", "片库版图"),
+    ("chronicle", "生涯履历"),
 )
 
 
@@ -617,6 +618,7 @@ class ReportOverlay(QWidget):
             "versions": self._fill_versions_tab,
             "content": self._fill_content_tab,
             "library": self._fill_library_tab,
+            "chronicle": self._fill_chronicle_tab,
         }
         builders.get(self._current_tab_key(), self._fill_overview_tab)(report)
         self._content_lay.addStretch(1)
@@ -680,6 +682,20 @@ class ReportOverlay(QWidget):
             self._library_dna_card(report.library_dna, report.deck_count),
             self._scale_card(report.scale),
         )
+
+    def _fill_chronicle_tab(self, report) -> None:
+        chronicle = getattr(report, "chronicle", ()) or ()
+        if self.current_scope != _SCOPE_ALL:
+            self._add_cards(self._section(
+                "📅 生涯履历",
+                [f"当前报告范围为「{self._scope_text()}」，只显示落在范围内的年份；"
+                 "切回「全部」可查看完整生涯。"],
+            ))
+        if not chronicle:
+            self._add_cards(self._section("📅 生涯履历", ["暂无可按年份统计的胶片记录。"]))
+            return
+        for stat in reversed(chronicle):  # 最新一年排最前
+            self._add_cards(self._chronicle_year_card(stat))
 
     # ---- 卡片构建（配色经 self._tok 跟随主题） ----
     def _stat_box(self, value_widget, label: str) -> QFrame:
@@ -1007,6 +1023,49 @@ class ReportOverlay(QWidget):
             f"活跃 <b>{report.activity.active_days}</b> 天，最长连续开工 <b>{report.activity.longest_streak_days}</b> 天",
         ]
         return self._section("🌳 创作年轮与旺季", lines)
+
+    def _chronicle_year_card(self, stat) -> QFrame:
+        tok = self._tok
+        lines = [
+            f"<b>{stat.deck_count}</b> 份胶片　<b>{stat.page_count:,}</b> 页　"
+            f"<b>{stat.char_count:,}</b> 字　<b>{human_bytes(stat.total_size)}</b>",
+            # 版本库未连接时留版数是「未知」而不是 0，与版本 Tab 降级口径一致
+            (
+                f"时光机留版：<b>{stat.version_saves}</b> 次"
+                if stat.version_saves is not None
+                else "时光机留版：<b>—</b>（版本库未连接）"
+            ),
+            f"年度关键词：{self._count_items(stat.top_keywords, limit=5)}",
+        ]
+        card = self._section(f"📅 {stat.year} 年", lines)
+        # 年度代表文件沿用名人堂「定位」按钮模式：一键打开所在文件夹
+        for metric in stat.top_files:
+            row = QHBoxLayout()
+            row.setSpacing(8)
+            value = QLabel(
+                f"《{self._h(metric.name)}》　<b>{int(metric.value or 0)}</b> 页 · {self._h(metric.detail)}"
+            )
+            value.setTextFormat(Qt.RichText)
+            value.setWordWrap(True)
+            value.setStyleSheet(
+                f"font-size:12.5px;color:{tok['ink2']};background:transparent;border:none;"
+            )
+            row.addWidget(value, 1)
+            path = getattr(metric, "path", None)
+            if path:
+                locate = QPushButton("定位")
+                locate.setAccessibleName(f"定位{stat.year}年代表文件{metric.name}")
+                locate.setToolTip(str(path))
+                locate.setCursor(Qt.PointingHandCursor)
+                locate.setStyleSheet(
+                    f"QPushButton{{background:{tok['field']};color:{tok['ink3']};"
+                    f"border:1px solid {tok['bd']};border-radius:7px;padding:3px 9px;}}"
+                    f"QPushButton:hover{{color:{tok['acc']};border-color:{tok['acc']};}}"
+                )
+                locate.clicked.connect(lambda _=False, p=str(path): actions.open_folder(p))
+                row.addWidget(locate)
+            card.layout().addLayout(row)
+        return card
 
     def _revision_night_card(self, versions) -> QFrame:
         if not versions.available:
