@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import time
 from pathlib import Path
 
 SCHEMA = """
@@ -53,6 +54,8 @@ def init_db(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "versions", "thumb_path", "TEXT DEFAULT ''")
     _ensure_column(conn, "versions", "health", "TEXT DEFAULT 'ok'")
     _ensure_column(conn, "versions", "health_error", "TEXT DEFAULT ''")
+    # 幽灵收割宽限期锚点：首次确认所有路径缺失的时刻（reconcile/扫描标记 deleted 时写入）
+    _ensure_column(conn, "managed_docs", "deleted_at", "REAL DEFAULT 0")
     # Backfill path aliases for existing vaults created before doc_paths existed.
     for row in conn.execute("SELECT doc_id, path, created_at, updated_at FROM managed_docs").fetchall():
         ts = row["updated_at"] or row["created_at"] or 0
@@ -76,7 +79,7 @@ def upsert_doc(conn, doc_id: str, path: str, ts: float) -> None:
         """INSERT INTO managed_docs(doc_id, path, status, created_at, updated_at)
            VALUES(?,?,'active',?,?)
            ON CONFLICT(doc_id) DO UPDATE SET
-             path=excluded.path, status='active', updated_at=excluded.updated_at""",
+             path=excluded.path, status='active', deleted_at=0, updated_at=excluded.updated_at""",
         (doc_id, path, ts, ts),
     )
     record_path(conn, doc_id, path, ts, "current")
@@ -120,6 +123,16 @@ def get_doc_by_path(conn, path: str):
            LIMIT 1""",
         (path_key(path),),
     ).fetchone()
+
+
+def list_doc_paths(conn, doc_id: str) -> list[str]:
+    """文档的全部登记路径（含历史 alias）；存活判定时与主路径一起探测。"""
+    return [
+        str(row["path"])
+        for row in conn.execute(
+            "SELECT path FROM doc_paths WHERE doc_id=?", (doc_id,)
+        ).fetchall()
+    ]
 
 
 def list_docs(conn):
@@ -220,7 +233,23 @@ def summary_stats(conn) -> dict[str, int]:
 
 
 def set_status(conn, doc_id: str, status: str, *, commit: bool = True) -> None:
-    conn.execute("UPDATE managed_docs SET status=? WHERE doc_id=?", (status, doc_id))
+    if status == "deleted":
+        # deleted_at 是幽灵收割宽限期的锚点：保留首次确认缺失的时刻，
+        # 重复标记不重置计时；恢复/重建回 active 时清零。
+        conn.execute(
+            """UPDATE managed_docs
+               SET status=?,
+                   deleted_at=CASE WHEN deleted_at>0 THEN deleted_at ELSE ? END
+               WHERE doc_id=?""",
+            (status, time.time(), doc_id),
+        )
+    elif status == "active":
+        conn.execute(
+            "UPDATE managed_docs SET status=?, deleted_at=0 WHERE doc_id=?",
+            (status, doc_id),
+        )
+    else:
+        conn.execute("UPDATE managed_docs SET status=? WHERE doc_id=?", (status, doc_id))
     if commit:
         conn.commit()
 

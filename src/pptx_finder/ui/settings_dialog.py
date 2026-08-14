@@ -53,6 +53,7 @@ from ..config import (
     get_index_all_files,
     get_index_roots,
     get_smart_grouping_enabled,
+    get_vault_max_mb,
     get_version_management_enabled,
     get_version_keep_per_doc,
     get_version_vault_dir,
@@ -65,6 +66,7 @@ from ..config import (
     set_index_all_files,
     set_index_roots,
     set_smart_grouping_enabled,
+    set_vault_max_mb,
     set_version_management_enabled,
     set_version_keep_per_doc,
     set_version_vault_dir,
@@ -193,6 +195,7 @@ class SettingsDialog(QDialog):
         self._autostart_toggle_inflight = False
         self._retention_update_token = 0
         self._retention_update_inflight = False
+        self._vault_size_inflight = False
         self._closing = False
         self.setObjectName("settingsWin")
         self.setWindowTitle("设置 · PPT Doctor")
@@ -335,6 +338,32 @@ class SettingsDialog(QDialog):
         self._vault_dir_result.setWordWrap(True)
         self._vault_dir_result.setStyleSheet("font-size:11.5px;")
         lay.addWidget(self._vault_dir_result)
+        vault_max_row = QHBoxLayout()
+        vault_max_row.addWidget(QLabel("版本库容量上限："))
+        self.vault_max = QComboBox()
+        for label, value in (
+            ("2 GB", 2048),
+            ("5 GB（推荐）", 5120),
+            ("10 GB", 10240),
+            ("20 GB", 20480),
+            ("不限", 0),
+        ):
+            self.vault_max.addItem(label, value)
+        current_max = get_vault_max_mb()
+        index = self.vault_max.findData(current_max)
+        if index < 0:
+            self.vault_max.addItem(f"{current_max} MB", current_max)
+            index = self.vault_max.count() - 1
+        self.vault_max.setCurrentIndex(index)
+        self.vault_max.setToolTip(
+            "超出后由每周维护按从老到新驱逐健康版本；隔离与分支基版本始终保留。"
+        )
+        self.vault_max.currentIndexChanged.connect(self._apply_vault_max)
+        vault_max_row.addWidget(self.vault_max, 1)
+        lay.addLayout(vault_max_row)
+        self._vault_size_label = QLabel("当前版本库占用：打开对话框时测量…")
+        self._vault_size_label.setStyleSheet("font-size:11.5px;")
+        lay.addWidget(self._vault_size_label)
         self._ghost_btn = QPushButton("清理失效版本（源文件已删除的留底）…")
         self._ghost_btn.clicked.connect(self._reap_ghost_docs)
         lay.addWidget(self._ghost_btn)
@@ -520,11 +549,14 @@ class SettingsDialog(QDialog):
         self._vault_dir_result.setText(note)
 
     def _reap_ghost_docs(self) -> None:
+        import sqlite3
+
         from ..versioning import store as vstore
         from ..versioning import vault as vault_mod
 
         conn = vstore.connect(vault_mod.db_path())
         try:
+            vstore.init_db(conn)  # 老库补列（deleted_at 等），保证收割查询可用
             dry = vault_mod.reap_ghost_docs(conn, dry_run=True)
             if not dry["ghost_docs"]:
                 self._vault_dir_result.setText("没有失效版本（所有登记路径仍存在）。")
@@ -544,14 +576,147 @@ class SettingsDialog(QDialog):
                 f"✓ 已清理 {res['ghost_docs']} 份文档 / {res['ghost_versions']} 个版本；"
                 f"回收对象 {gc.get('objects_removed', 0)} 个、约 {mb:.0f} MB。"
             )
+            self._refresh_vault_size()
+        except sqlite3.OperationalError:
+            # 与周维护并发时，第二连接 busy_timeout 8s 后抛 OperationalError——
+            # 友好提示而不是让异常直接抛出 slot。
+            conn.rollback()
+            self._vault_dir_result.setText("版本库正忙，请稍后重试。")
         finally:
             conn.close()
+
+    def _apply_vault_max(self, _index: int) -> None:
+        # 纯配置写入；下一次每周维护按新上限执行，不打扰运行中的版本管理器
+        set_vault_max_mb(int(self.vault_max.currentData() or 0))
+
+    def _refresh_vault_size(self) -> None:
+        if self._vault_size_inflight:
+            return
+        self._vault_size_inflight = True
+        task = BackgroundTask(_vault_size_bytes_off_ui, "vault-size-measure", None)
+        self._track_diag_task(task)
+        task.done.connect(self._on_vault_size_ready)
+        task.finished.connect(lambda task=task: self._finish_vault_size(task))
+        task.start()
+
+    def _on_vault_size_ready(self, result: object) -> None:
+        if not self._ui_alive() or not _qt_is_valid(getattr(self, "_vault_size_label", None)):
+            return
+        if not isinstance(result, int):
+            self._vault_size_label.setText("当前版本库占用：暂不可用")
+            return
+        self._vault_size_label.setText(f"当前版本库占用：{_format_size_text(result)}")
+
+    def _finish_vault_size(self, task) -> None:
+        self._forget_diag_task(task)
+        self._vault_size_inflight = False
+
+    # ---------- 索引范围（自定义根） ----------
+    def _append_index_root_item(self, root: str, warning: str = "") -> None:
+        item = QListWidgetItem(root + (f"　⚠ {warning}" if warning else ""))
+        item.setData(Qt.UserRole, root)  # 干净路径存 UserRole，警示文字不进持久化
+        if warning:
+            item.setForeground(QColor("#9a6a00"))
+            item.setToolTip(warning)
+        self.index_roots_list.addItem(item)
+
+    def _index_root_items(self) -> list[str]:
+        return [
+            str(self.index_roots_list.item(i).data(Qt.UserRole) or "")
+            for i in range(self.index_roots_list.count())
+        ]
+
+    def _add_index_root_local(self) -> None:
+        d = QFileDialog.getExistingDirectory(self, "选择要加入索引的目录", "")
+        if d:
+            self._append_index_root_item(d)
+            self._index_roots_result.setText("")
+
+    def _add_index_root_network(self) -> None:
+        raw = self.index_root_edit.text().strip()
+        if not raw:
+            return
+        # 列表只是暂存区：形态与可达性都在「保存」时统一校验（探测网络盘慢，放后台）
+        self._append_index_root_item(raw)
+        self.index_root_edit.clear()
+        self._index_roots_result.setText("")
+
+    def _remove_index_root(self) -> None:
+        for item in self.index_roots_list.selectedItems():
+            self.index_roots_list.takeItem(self.index_roots_list.row(item))
+
+    def _set_index_root_editing_enabled(self, enabled: bool) -> None:
+        """校验在途期间锁定根列表编辑：在途添加的根会被校验完成后的列表重建静默覆盖。"""
+        for w in (
+            self.index_root_edit,
+            self._index_root_net_add,
+            self._index_root_local_add,
+            self._index_root_remove,
+        ):
+            w.setEnabled(enabled)
+
+    def _apply_index_roots(self) -> None:
+        if self._index_roots_inflight:
+            return
+        roots = tuple(self._index_root_items())
+        self._index_roots_inflight = True
+        self._index_roots_save.setEnabled(False)
+        self._set_index_root_editing_enabled(False)
+        self._index_roots_result.setText("正在检测各路径可达性…")
+        task = BackgroundTask(
+            lambda roots=roots: [(root,) + validate_index_root(root) for root in roots],
+            "index-roots-validate",
+            None,
+        )
+        self._track_diag_task(task)
+        task.done.connect(self._on_index_roots_validated)
+        task.finished.connect(lambda task=task: self._finish_index_roots_validate(task))
+        task.start()
+
+    def _on_index_roots_validated(self, result: object) -> None:
+        if not self._ui_alive() or not isinstance(result, list):
+            return
+        malformed = [(root, msg) for root, ok, _reach, msg in result if not ok]
+        if malformed:
+            self._index_roots_result.setText(
+                "✗ 未保存：" + "；".join(f"{root}（{msg}）" for root, msg in malformed)
+            )
+            return
+        set_index_roots([root for root, _ok, _reach, _msg in result])
+        # 回写列表：不可达的根标警告样式，但允许保存（网络盘时通时断）
+        self.index_roots_list.clear()
+        warnings = 0
+        for root, _ok, reachable, msg in result:
+            if reachable:
+                self._append_index_root_item(root)
+            else:
+                warnings += 1
+                self._append_index_root_item(root, msg)
+        note = "✓ 已保存，重启后与本地固定盘一起被索引。"
+        if warnings:
+            note += f" {warnings} 个路径当前不可达，其可用时会自动纳入。"
+        self._index_roots_result.setText(note)
+
+    def _finish_index_roots_validate(self, task) -> None:
+        self._forget_diag_task(task)
+        self._index_roots_inflight = False
+        try:
+            if _qt_is_valid(getattr(self, "_index_roots_save", None)):
+                self._index_roots_save.setEnabled(True)
+        except RuntimeError:
+            pass
+        try:
+            if _qt_is_valid(getattr(self, "index_root_edit", None)):
+                self._set_index_root_editing_enabled(True)
+        except RuntimeError:
+            pass
 
     def _toggle_feature(self, key: str, enabled: bool) -> None:
         setters = {
             "version_management": set_version_management_enabled,
             "document_search": set_document_search_enabled,
             "smart_grouping": set_smart_grouping_enabled,
+            "index_all_files": set_index_all_files,
         }
         setters[key](bool(enabled))
         self._sync_feature_controls()
@@ -565,6 +730,8 @@ class SettingsDialog(QDialog):
             self.retention.setEnabled(
                 version_on and not self._retention_update_inflight
             )
+        if hasattr(self, "vault_max"):
+            self.vault_max.setEnabled(version_on)
         if hasattr(self, "stat") and not version_on:
             self.stat.setText("版本管理已关闭；已有历史数据不会删除。")
 
@@ -1025,6 +1192,11 @@ class SettingsDialog(QDialog):
         self.powerpoint_btn.setEnabled(True)
         self.powerpoint_status.setText(str(result or "检测失败，请查看日志。"))
 
+    def showEvent(self, event):  # noqa: N802
+        # 版本库体积测量（rglob 全目录）只在对话框真正打开时惰性触发，放后台线程
+        super().showEvent(event)
+        self._refresh_vault_size()
+
     def closeEvent(self, event):  # noqa: N802
         # Closing the settings panel should never block on a COM diagnostic.
         # QDialog close hides the window; running tasks are kept alive by
@@ -1039,7 +1211,22 @@ class SettingsDialog(QDialog):
         self._autostart_toggle_inflight = False
         self._retention_update_token += 1
         self._retention_update_inflight = False
+        self._vault_size_inflight = False
         super().closeEvent(event)
+
+
+def _vault_size_bytes_off_ui() -> int:
+    """后台线程里测量版本库体积；目录不存在返回 0（不创建目录）。"""
+    from ..versioning import vault as vault_mod
+
+    return vault_mod.vault_size_bytes()
+
+
+def _format_size_text(nbytes: int) -> str:
+    mb = nbytes / 1048576
+    if mb >= 1024:
+        return f"{mb / 1024:.1f} GB"
+    return f"{mb:.0f} MB"
 
 
 def _run_with_com_apartment(fn):

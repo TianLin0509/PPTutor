@@ -371,6 +371,20 @@ def set_version_keep_per_doc(limit: int) -> None:
     update_ui_settings(version_keep_per_doc=max(0, int(limit)))
 
 
+DEFAULT_VAULT_MAX_MB = 5120  # 版本库总容量上限（MB）；0 = 不限。超出按从老到新驱逐健康版本
+
+
+def get_vault_max_mb(default: int = DEFAULT_VAULT_MAX_MB) -> int:
+    value = load_ui_settings().get("vault_max_mb")
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return max(0, int(default))
+
+
+def set_vault_max_mb(limit: int) -> None:
+    update_ui_settings(vault_max_mb=max(0, int(limit)))
+
+
 def get_hotkey() -> str:
     """当前全局唤起热键：用户覆盖值优先，否则默认 GLOBAL_HOTKEY。"""
     v = load_ui_settings().get("hotkey")

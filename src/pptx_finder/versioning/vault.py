@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import shutil
+import sqlite3
 import tempfile
 import time
 import zipfile
@@ -330,7 +331,13 @@ def stable_snapshot_source(path: str):
         _unlink_snapshot_tmp(prepared)
 
 
-_STALE_SNAPSHOT_TMP_PREFIX = ".pptdoctor-snapshot-"
+# 所有受管暂存前缀：留底副本 / 保真自检 / 版本预览 / 重组恢复（崩溃残留靠启动清扫回收）
+_STALE_TMP_PREFIXES = (
+    ".pptdoctor-snapshot-",
+    ".pptdoctor-verify-",
+    ".pptdoctor-preview-",
+    ".pptdoctor-restore-",
+)
 
 
 def _unlink_snapshot_tmp(tmp: str) -> None:
@@ -348,7 +355,7 @@ def _unlink_snapshot_tmp(tmp: str) -> None:
 
 
 def sweep_stale_snapshot_temps(*, max_age_sec: float = 0.0, tempdir: str | None = None) -> int:
-    """清扫残留的留底暂存副本（%TEMP% 与版本库 _tmp），返回删除数。
+    """清扫残留的 .pptdoctor-* 暂存（%TEMP% 与版本库 _tmp），返回删除数。
 
     暂存文件只应存活于一次留底操作期间；进程被杀或删除失败都会永久残留，
     且此前没有任何清扫机制。启动时调用（max_age_sec=0）：此刻不可能有在途留底操作。
@@ -370,7 +377,7 @@ def sweep_stale_snapshot_temps(*, max_age_sec: float = 0.0, tempdir: str | None 
             continue
         for entry in entries:
             try:
-                if not entry.name.startswith(_STALE_SNAPSHOT_TMP_PREFIX):
+                if not entry.name.startswith(_STALE_TMP_PREFIXES):
                     continue
                 if max_age_sec > 0 and now - entry.stat().st_mtime < max_age_sec:
                     continue
@@ -502,8 +509,25 @@ def collect_garbage(conn, *, dry_run: bool = True) -> dict[str, int | bool]:
         "manifests_removed": 0,
         "full_files_removed": 0,
         "objects_removed": 0,
+        "temp_objects_removed": 0,
         "bytes_reclaimed": 0,
     }
+    # 崩溃残留的 .object-* 暂存永远不会被任何 manifest 引用：超过 1 小时直接清扫。
+    # 独立于下面的结构安全门——恢复图不一致时中止 GC，但清残留总是安全的。
+    now = time.time()
+    for path in _global_objects_dir().iterdir():
+        try:
+            if not path.is_file() or not path.name.startswith(".object-"):
+                continue
+            if now - path.stat().st_mtime < 3600:
+                continue  # 可能是在途写入（mkstemp 创建后随即 os.replace）
+            size = path.stat().st_size
+            if not dry_run:
+                path.unlink()
+            result["temp_objects_removed"] = int(result["temp_objects_removed"]) + 1
+            result["bytes_reclaimed"] = int(result["bytes_reclaimed"]) + size
+        except OSError:
+            continue
     rows = conn.execute("SELECT version_id, doc_id FROM versions").fetchall()
     live_manifests = {
         (str(row["doc_id"]), str(row["version_id"])) for row in rows
@@ -752,7 +776,12 @@ def audit_repository(conn, *, deep: bool = False) -> dict:
 
 def _verify(doc_id: str, names: list[str], parts: dict[str, str]) -> bool:
     """重组到临时文件并验证能正常解析（保真自检）。"""
-    fd, tmp = tempfile.mkstemp(suffix=".pptx")
+    # 自检暂存改放版本库 _tmp（启动清扫覆盖，可随库迁出 C 盘），不再落裸 %TEMP%。
+    tmp_root = vault_dir() / "_tmp"
+    tmp_root.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(
+        prefix=".pptdoctor-verify-", suffix=".pptx", dir=str(tmp_root)
+    )
     os.close(fd)
     try:
         _write_zip(tmp, doc_id, names, parts)
@@ -763,10 +792,7 @@ def _verify(doc_id: str, names: list[str], parts: dict[str, str]) -> bool:
     except Exception:  # noqa: BLE001
         return False
     finally:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
+        _unlink_snapshot_tmp(tmp)
 
 
 def _change_summary(conn, latest_vid: str, new_pages: list, new_pc: int, old_pc: int) -> str:
@@ -943,35 +969,139 @@ def rebuild_to(doc_id: str, version_id: str, dest: str) -> bool:
 
 
 # ---- 幽灵文档收割与版本库迁移（2026-07-30） ----
-def list_ghost_docs(conn) -> list[dict]:
+def _norm_root(root: str) -> str:
+    r = os.path.normcase(os.path.abspath(str(root)))
+    return r if r.endswith(os.sep) else r + os.sep
+
+
+def _fixed_drive_roots() -> list[str]:
+    """本地固定磁盘根（normcase、带尾分隔符）。非 Windows 无盘符概念，返回空 = 不筛。"""
+    if os.name != "nt":
+        return []
+    from ..scanner import fixed_drives
+
+    try:
+        return [_norm_root(r) for r in fixed_drives()]
+    except Exception:  # noqa: BLE001 探测失败时不筛，等价于全部路径可判定
+        return []
+
+
+def _checkable_disappearance_paths(paths, fixed_roots: list[str]) -> list[str]:
+    """可用来判定「消失」的路径子集：只有固定盘上的路径算数。
+
+    移动硬盘/网络盘未挂载时 os.path.exists 同样是 False，但那不是消失；
+    fixed_roots 为空（非 Windows 或探测失败）时不做盘筛选，全部路径可判定。
+    """
+    if not fixed_roots:
+        return list(paths)
+    out = []
+    for p in paths:
+        try:
+            norm = os.path.normcase(os.path.abspath(p))
+        except (OSError, ValueError):
+            continue
+        if any(norm.startswith(root) for root in fixed_roots):
+            out.append(p)
+    return out
+
+
+def list_ghost_docs(
+    conn,
+    *,
+    min_missing_sec: float = 0.0,
+    fixed_roots: list[str] | None = None,
+) -> list[dict]:
     """所有登记路径均已不存在的受管文档（幽灵文档）。
 
-    判定覆盖 doc_paths 全部历史路径与 managed_docs.path 主路径：任一仍存在即算活文档。
+    存活判定覆盖 doc_paths 全部历史路径（含 alias）与 managed_docs.path 主路径：
+    任一仍存在即算活文档。可判定性只基于「当前位置」——主路径 + doc_paths 中
+    status='current' 的路径；历史 alias 可能是文件搬到网络盘之前的固定盘旧路径，
+    拿它做可判定依据会把「当前在未挂载网络盘」的文档误判成可收割。
+    移动硬盘/网络盘未挂载不算消失——当前位置全在可移动/网络盘上的文档无法判定，
+    永不列入（也因此跳过了对离线 UNC 的秒级 exists 慢探测）。
+
+    min_missing_sec > 0 时启用宽限期：仅当首次确认缺失（managed_docs.deleted_at，
+    由对账/扫描/mark_ghost_docs_seen 写入）至今已满该时长才列入；deleted_at=0
+    （从未被确认过缺失）在宽限模式下不列入——先补记，下轮维护再收。
     """
+    roots = (
+        [_norm_root(r) for r in fixed_roots]
+        if fixed_roots is not None
+        else _fixed_drive_roots()
+    )
+    now = time.time()
     ghosts: list[dict] = []
     rows = conn.execute(
-        """SELECT d.doc_id AS doc_id, d.path AS path,
+        """SELECT d.doc_id AS doc_id, d.path AS path, d.deleted_at AS deleted_at,
                   (SELECT COUNT(*) FROM versions v WHERE v.doc_id=d.doc_id) AS n_versions
            FROM managed_docs d"""
     ).fetchall()
     paths_by_doc: dict[str, list[str]] = {}
-    for pr in conn.execute("SELECT doc_id, path FROM doc_paths").fetchall():
+    current_by_doc: dict[str, list[str]] = {}
+    for pr in conn.execute("SELECT doc_id, path, status FROM doc_paths").fetchall():
         paths_by_doc.setdefault(str(pr["doc_id"]), []).append(str(pr["path"]))
+        if str(pr["status"] or "") == "current":
+            current_by_doc.setdefault(str(pr["doc_id"]), []).append(str(pr["path"]))
     for row in rows:
         doc_id = str(row["doc_id"])
         candidates = set(paths_by_doc.get(doc_id, [])) | {str(row["path"])}
-        if not any(os.path.exists(p) for p in candidates):
-            ghosts.append({
-                "doc_id": doc_id,
-                "path": str(row["path"]),
-                "versions": int(row["n_versions"]),
-            })
+        # 先固定盘过滤再 exists：无法判定的文档直接 skip，不付离线 UNC 的慢探测。
+        checkable = _checkable_disappearance_paths(
+            set(current_by_doc.get(doc_id, [])) | {str(row["path"])}, roots
+        )
+        if not checkable:
+            continue
+        if any(os.path.exists(p) for p in candidates):
+            continue
+        missing_since = float(row["deleted_at"] or 0)
+        if min_missing_sec > 0 and (
+            missing_since <= 0 or now - missing_since < min_missing_sec
+        ):
+            continue
+        ghosts.append({
+            "doc_id": doc_id,
+            "path": str(row["path"]),
+            "versions": int(row["n_versions"]),
+            "missing_since": missing_since,
+        })
     return ghosts
 
 
-def reap_ghost_docs(conn, *, dry_run: bool = True) -> dict:
-    """清理幽灵文档：删除其版本、磁盘目录与 DB 记录，再做对象级 GC（collect_garbage）。"""
-    ghosts = list_ghost_docs(conn)
+def mark_ghost_docs_seen(conn, *, fixed_roots: list[str] | None = None) -> int:
+    """给当前观察到的幽灵候选补记 deleted_at=now（宽限期从首次确认缺失起算）。
+
+    只补 deleted_at=0 的文档；已确认过缺失的保留原时刻。返回新标记数。
+    """
+    marked = 0
+    now = time.time()
+    for g in list_ghost_docs(conn, fixed_roots=fixed_roots):
+        if g["missing_since"] > 0:
+            continue
+        conn.execute(
+            "UPDATE managed_docs SET deleted_at=? WHERE doc_id=? AND deleted_at=0",
+            (now, g["doc_id"]),
+        )
+        marked += 1
+    if marked:
+        conn.commit()
+    return marked
+
+
+def reap_ghost_docs(
+    conn,
+    *,
+    dry_run: bool = True,
+    min_missing_sec: float = 0.0,
+    fixed_roots: list[str] | None = None,
+) -> dict:
+    """清理幽灵文档：删除其版本、磁盘目录与 DB 记录，再做对象级 GC（collect_garbage）。
+
+    min_missing_sec/fixed_roots 透传 list_ghost_docs：自动维护传 30 天宽限；
+    设置页手动清理由用户逐次确认，保持默认立即判定。
+    """
+    ghosts = list_ghost_docs(
+        conn, min_missing_sec=min_missing_sec, fixed_roots=fixed_roots
+    )
     result = {
         "ghost_docs": len(ghosts),
         "ghost_versions": sum(g["versions"] for g in ghosts),
@@ -990,6 +1120,268 @@ def reap_ghost_docs(conn, *, dry_run: bool = True) -> dict:
     conn.commit()
     result["gc"] = collect_garbage(conn, dry_run=False)
     return result
+
+
+# ---- 容量上限 / 库卫生 / 迁移备份清扫（版本库减负） ----
+DEFAULT_VACUUM_MIN_FREE_BYTES = 64 * 1024 * 1024
+DEFAULT_VACUUM_MIN_FREE_RATIO = 0.20
+_SIZE_BUDGET_MAX_ROUNDS = 8
+# 无进展即停：一轮（估计或实测）回收不足缺口 5%、或连最小字节数都收不回时，
+# 继续驱逐只是拿健康历史换不到达标的纯损失（缺口被豁免地板占住）。
+_SIZE_BUDGET_MIN_PROGRESS_RATIO = 0.05
+_SIZE_BUDGET_MIN_PROGRESS_BYTES = 1
+_MIGRATION_BACKUP_MAX_AGE_SEC = 30 * 24 * 60 * 60
+
+
+def _vault_dir_no_create() -> Path:
+    """解析版本库目录但不创建（只读统计/清扫用，不给未开启版本管理的用户造目录）。"""
+    from ..config import get_version_vault_dir
+
+    override = get_version_vault_dir()
+    return Path(override) if override else data_dir() / "vault"
+
+
+def vault_size_bytes() -> int:
+    """版本库目录当前总占用（字节）；目录不存在返回 0。"""
+    root = _vault_dir_no_create()
+    if not root.is_dir():
+        return 0
+    total = 0
+    for p in root.rglob("*"):
+        try:
+            if p.is_file():
+                total += p.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def _budget_relevant_bytes() -> int:
+    """容量上限计量口径：vault 总占用减去 versions.db 三件套。
+
+    版本删除本身会写 WAL——把库文件算进预算会让驱逐对着一个越删越大的目标空转；
+    库文件体积由 maintain_db 的条件 VACUUM + WAL TRUNCATE 单独约束。
+    """
+    total = vault_size_bytes()
+    root = _vault_dir_no_create()
+    for name in ("versions.db", "versions.db-wal", "versions.db-shm"):
+        try:
+            total -= (root / name).stat().st_size
+        except OSError:
+            pass
+    return max(0, total)
+
+
+def enforce_size_budget(conn, *, max_bytes: int) -> dict:
+    """容量上限：超出时按 ts 从老到新驱逐健康版本，随后对象级 GC。
+
+    只驱逐 health='ok' 且非分支基的版本：隔离版本可能可修复、分支基是副本的
+    恢复根，两者永不进驱逐候选。versions.size 是快照时源文件大小，只是占用估计；
+    去重共享对象可能让实际回收小于估计，因此按轮循环直到达标或候选耗尽。
+    GC 安全门一旦中止立即停止——不在结构存疑的库上继续删。
+    无进展即停：一轮的估计回收（驱逐前）或实测回收（GC 后）不足缺口 5%
+    （且不足最小字节数）时立即 break——预算低于豁免地板（隔离/分支基全量）
+    时继续驱逐只是净损失健康历史。诊断字段：converged（最终是否达标）、
+    floor_bytes（豁免地板估计下限，驱逐全部候选也降不到它以下；去重共享使
+    真实地板更高）。计量口径见 _budget_relevant_bytes（不含 versions.db 本体）。
+    """
+    result = {
+        "max_bytes": int(max_bytes),
+        "skipped": False,
+        "vault_bytes_before": 0,
+        "evicted_versions": 0,
+        "gc": None,
+        "vault_bytes_after": 0,
+        "converged": True,
+        "floor_bytes": 0,
+    }
+    budget = int(max_bytes)
+    if budget <= 0:
+        result["skipped"] = True  # 0 = 不限
+        return result
+    total = _budget_relevant_bytes()
+    result["vault_bytes_before"] = total
+    if total > budget:
+        # 豁免地板估计：全部可驱逐候选的 size 总和之外的部分永远降不下去。
+        branch_bases = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT branched_from_version_id FROM doc_branches"
+            ).fetchall()
+            if row[0]
+        }
+        claimable = 0
+        for row in conn.execute(
+            "SELECT version_id, size FROM versions WHERE COALESCE(health,'ok')='ok'"
+        ).fetchall():
+            if str(row["version_id"]) not in branch_bases:
+                claimable += max(0, int(row["size"] or 0))
+        result["floor_bytes"] = max(0, total - claimable)
+    gc_result: dict | None = None
+    for _ in range(_SIZE_BUDGET_MAX_ROUNDS):
+        if total <= budget:
+            break
+        branch_bases = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT branched_from_version_id FROM doc_branches"
+            ).fetchall()
+            if row[0]
+        }
+        over_by = total - budget
+        min_progress = max(
+            _SIZE_BUDGET_MIN_PROGRESS_BYTES,
+            int(over_by * _SIZE_BUDGET_MIN_PROGRESS_RATIO),
+        )
+        candidates: list[tuple[str, str, str]] = []
+        claimed = 0
+        for row in conn.execute(
+            """SELECT version_id, doc_id, size, thumb_path FROM versions
+               WHERE COALESCE(health,'ok')='ok'
+               ORDER BY ts ASC, version_id ASC"""
+        ).fetchall():
+            vid = str(row["version_id"])
+            if vid in branch_bases:
+                continue
+            candidates.append((vid, str(row["doc_id"]), str(row["thumb_path"] or "")))
+            claimed += max(0, int(row["size"] or 0))
+            if claimed >= over_by:
+                break
+        if not candidates:
+            break  # 只剩豁免版本：驱逐也降不下去，停
+        if claimed < min_progress:
+            break  # 估计口径无进展：整轮驱逐也收不到缺口的 5%，纯属损失健康历史
+        for vid, doc_id, thumb_path in candidates:
+            store.delete_version(conn, vid)
+            delete_version_artifacts(doc_id, vid)
+            if thumb_path:
+                try:
+                    Path(thumb_path).unlink(missing_ok=True)
+                except OSError:
+                    pass
+            result["evicted_versions"] += 1
+        conn.commit()
+        gc_result = collect_garbage(conn, dry_run=False)
+        new_total = _budget_relevant_bytes()
+        progressed = total - new_total
+        total = new_total
+        if bool(gc_result.get("aborted", False)) or int(gc_result.get("errors", 0) or 0):
+            break
+        if progressed < min_progress:
+            break  # 实测口径无进展：去重共享让实际回收远低于估计，同样停
+    result["gc"] = gc_result
+    result["vault_bytes_after"] = total
+    result["converged"] = total <= budget
+    return result
+
+
+def maintain_db(
+    conn,
+    *,
+    min_free_bytes: int = DEFAULT_VACUUM_MIN_FREE_BYTES,
+    min_free_ratio: float = DEFAULT_VACUUM_MIN_FREE_RATIO,
+) -> dict:
+    """versions.db 卫生：FTS optimize + 条件 VACUUM + wal_checkpoint(TRUNCATE)。
+
+    与索引侧（db.maintain）同一思路：删版本留下的 FTS 行先合并段树防退化；
+    空闲页同时超过绝对量与比率阈值才做全量 VACUUM，重维护不为小碎片白扛大库重写。
+    """
+    result = {
+        "fts_optimized": 0,
+        "checkpointed": False,
+        "vacuumed": False,
+        "free_bytes_before": 0,
+        "free_ratio_before": 0.0,
+        "error": "",
+    }
+    try:
+        try:
+            conn.execute(
+                "INSERT INTO version_pages_fts(version_pages_fts) VALUES('optimize')"
+            )
+            result["fts_optimized"] += 1
+        except sqlite3.DatabaseError as exc:
+            log.debug("fts optimize skipped: %s", exc)
+        conn.commit()
+
+        page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+        page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
+        free_pages = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
+        free_bytes = page_size * free_pages
+        free_ratio = (free_pages / page_count) if page_count else 0.0
+        result["free_bytes_before"] = free_bytes
+        result["free_ratio_before"] = free_ratio
+
+        if (
+            free_pages > 0
+            and free_bytes >= max(0, int(min_free_bytes))
+            and free_ratio >= max(0.0, float(min_free_ratio))
+        ):
+            try:
+                conn.execute("VACUUM")
+                result["vacuumed"] = True
+                log.info(
+                    "versions.db vacuum reclaimed candidate space: %.1f MiB (%.1f%% freelist)",
+                    free_bytes / (1024 * 1024),
+                    free_ratio * 100,
+                )
+            except sqlite3.DatabaseError as exc:
+                result["error"] = f"{type(exc).__name__}: {exc}"
+                log.warning("versions.db vacuum skipped: %s", exc)
+
+        try:
+            row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            result["checkpointed"] = row is None or int(row[0]) == 0
+        except sqlite3.DatabaseError as exc:
+            log.debug("wal checkpoint skipped: %s", exc)
+        conn.commit()
+    except Exception as exc:  # noqa: BLE001
+        result["error"] = f"{type(exc).__name__}: {exc}"
+    return result
+
+
+def sweep_stale_migration_backups(
+    *,
+    max_age_sec: float = _MIGRATION_BACKUP_MAX_AGE_SEC,
+    data_root: str | None = None,
+    vault_root: str | None = None,
+) -> int:
+    """清理一次性迁移备份：data_dir 下 index.db*.bak、vault/backups/versions-pre-*.db。
+
+    只删匹配明确迁移备份命名模式且 mtime 超过 max_age_sec 的普通文件；
+    同目录其它文件（包括现行 versions.db / index.db）一律不动。
+    """
+    data_dir_path = Path(data_root) if data_root is not None else data_dir()
+    backups_dir = (
+        Path(vault_root) / "backups"
+        if vault_root is not None
+        else _vault_dir_no_create() / "backups"
+    )
+    candidates: list[Path] = []
+    try:
+        candidates.extend(p for p in data_dir_path.glob("index.db*.bak") if p.is_file())
+    except OSError:
+        pass
+    try:
+        if backups_dir.is_dir():
+            candidates.extend(
+                p for p in backups_dir.glob("versions-pre-*.db") if p.is_file()
+            )
+    except OSError:
+        pass
+    now = time.time()
+    deleted = 0
+    for path in candidates:
+        try:
+            if max_age_sec > 0 and now - path.stat().st_mtime < max_age_sec:
+                continue
+            path.unlink()
+            deleted += 1
+        except OSError:
+            continue
+    if deleted:
+        log.info("swept %d stale migration backups", deleted)
+    return deleted
 
 
 def _copy_db_live(src_db: Path, dst_db: Path) -> None:

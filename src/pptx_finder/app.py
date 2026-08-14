@@ -605,11 +605,6 @@ def main() -> int:
     from .logging_setup import configure_logging
     configure_logging()
     log = logging.getLogger(__name__)
-    try:
-        from .versioning.vault import sweep_stale_snapshot_temps
-        sweep_stale_snapshot_temps()  # 启动即清扫历史残留的留底暂存（启动瞬间无在途留底）
-    except Exception:  # noqa: BLE001
-        log.warning("stale snapshot temp sweep failed", exc_info=True)
     app = QApplication(sys.argv)
 
     # 单实例：已有实例在跑则通知其显示窗口并退出本实例（防重复全盘索引、数据库抢锁）
@@ -625,6 +620,23 @@ def main() -> int:
     QLocalServer.removeServer(singleton_name)
     singleton_server = QLocalServer()
     singleton_server.listen(singleton_name)
+
+    # 启动清扫必须在单实例确认之后：否则第二实例会扫掉第一实例的在途留底暂存。
+    try:
+        from .versioning.vault import sweep_stale_snapshot_temps
+        sweep_stale_snapshot_temps()  # 单实例确认后，残留暂存均属已退出的历史运行
+    except Exception:  # noqa: BLE001
+        log.warning("stale snapshot temp sweep failed", exc_info=True)
+    try:
+        from .versioning.vault import sweep_stale_migration_backups
+        # 超龄迁移备份（index.db*.bak / vault/backups/versions-pre-*.db）后台清扫，不拖启动
+        threading.Thread(
+            target=sweep_stale_migration_backups,
+            name="PPTDoctorBackupSweep",
+            daemon=True,
+        ).start()
+    except Exception:  # noqa: BLE001
+        log.warning("stale migration backup sweep failed to start", exc_info=True)
 
     app.setQuitOnLastWindowClosed(False)
     icon = _make_icon()

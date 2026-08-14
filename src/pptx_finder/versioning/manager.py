@@ -9,7 +9,7 @@ import threading
 from pathlib import Path
 
 from .. import renderer
-from ..config import PPTX_EXT, get_version_keep_per_doc
+from ..config import PPTX_EXT, get_version_keep_per_doc, get_vault_max_mb
 from ..path_policy import explicit_project_output_roots, is_project_output_path
 from ..scanner import iter_ppt_files
 from ..text_tokenize import build_fts_match_exact
@@ -22,6 +22,8 @@ _DEFAULT_RECONCILE_INTERVAL_SEC = 300.0
 _DEFAULT_RECONCILE_BATCH_DOCS = 500
 _DEFAULT_RECONCILE_BATCH_NEW_FILES = 120
 _DEFAULT_VAULT_HEAVY_MAINTENANCE_INTERVAL_SEC = 7 * 24 * 60 * 60
+_DEFAULT_GHOST_GRACE_SEC = 30 * 24 * 60 * 60
+_DEFAULT_QUARANTINE_KEEP_PER_DOC = 10
 _FALSE_ENV = {"0", "false", "no", "off"}
 
 
@@ -201,6 +203,17 @@ class VersionManager:
         )
         self._vault_maintenance_result: dict = {}
         self._vault_maintenance_error = ""
+        # 幽灵收割宽限期：所有路径首次确认缺失满该时长才自动收割
+        self._ghost_grace_sec = max(
+            0.0,
+            _env_float("PPTUTOR_GHOST_GRACE_SEC", _DEFAULT_GHOST_GRACE_SEC),
+        )
+        # 隔离（quarantined）版本每 doc 封顶：豁免不能无界堆积
+        self._quarantine_keep_per_doc = max(
+            0,
+            _env_int("PPTUTOR_VERSION_QUARANTINE_KEEP", _DEFAULT_QUARANTINE_KEEP_PER_DOC),
+        )
+        self._vault_maintenance_stop = threading.Event()
 
     # ---------- Snapshot identity ----------
     def snapshot_now(
@@ -634,7 +647,12 @@ class VersionManager:
                 return cached
             doc_id = version["doc_id"]
 
-        fd, tmp = tempfile.mkstemp(suffix=".pptx")
+        # 预览重组暂存随版本库 _tmp（启动清扫覆盖），不再落裸 %TEMP%。
+        tmp_root = vault.vault_dir() / "_tmp"
+        tmp_root.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(
+            prefix=".pptdoctor-preview-", suffix=".pptx", dir=str(tmp_root)
+        )
         os.close(fd)
         try:
             if not vault.rebuild_to(doc_id, version_id, tmp):
@@ -655,10 +673,7 @@ class VersionManager:
                 self._conn.commit()
             return out
         finally:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
+            vault._unlink_snapshot_tmp(tmp)
 
     def describe_version_diff(self, version_id: str) -> dict:
         if self._db_path is None:
@@ -793,12 +808,26 @@ class VersionManager:
 
     # ---------- Deleted-file recovery ----------
     def scan_deleted(self) -> int:
+        """双向对账：active→deleted 标记缺失；deleted→active 复活未观测到的恢复。
+
+        反向 pass 的必要性：恢复若发生在应用关闭期间（或目录不在对账候选），
+        deleted_at 宽限锚点不会被 upsert/set_status('active') 清零；不复活的话
+        再次删除会继承旧锚点，幽灵收割的 30 天宽限被直接跳过（宁可保守也不许
+        误删）。任一登记路径（含历史 alias）仍存在即视为恢复，复活顺带清零锚点。
+        返回状态发生翻转的文档数（两个方向合计）。
+        """
         with self._lock:
             n = 0
             for doc in store.list_docs(self._conn):
-                if doc["status"] == "active" and not os.path.exists(doc["path"]):
-                    store.set_status(self._conn, doc["doc_id"], "deleted")
-                    n += 1
+                if doc["status"] == "active":
+                    if not os.path.exists(doc["path"]):
+                        store.set_status(self._conn, doc["doc_id"], "deleted")
+                        n += 1
+                elif doc["status"] == "deleted":
+                    candidates = [doc["path"], *store.list_doc_paths(self._conn, doc["doc_id"])]
+                    if any(os.path.exists(p) for p in candidates):
+                        store.set_status(self._conn, doc["doc_id"], "active")
+                        n += 1
             return n
 
     def mark_deleted(self, path: str) -> bool:
@@ -841,9 +870,6 @@ class VersionManager:
         preserve_version_ids: set[str] | None = None,
     ) -> None:
         vers = store.list_versions(self._conn, doc_id)
-        keep_limit = self._keep_per_doc
-        if keep_limit <= 0 or len(vers) <= keep_limit:
-            return
         branch_bases = {
             str(row["branched_from_version_id"])
             for row in self._conn.execute(
@@ -851,12 +877,17 @@ class VersionManager:
             ).fetchall()
             if row["branched_from_version_id"]
         }
+        if self._purge_quarantined_overflow(doc_id, vers, branch_bases):
+            vers = store.list_versions(self._conn, doc_id)
         quarantined = {
             str(version["version_id"])
             for version in vers
             if "health" in version.keys()
             and str(version["health"] or "ok") != "ok"
         }
+        keep_limit = self._keep_per_doc
+        if keep_limit <= 0 or len(vers) <= keep_limit:
+            return
         healthy_versions = [
             version
             for version in vers
@@ -876,7 +907,8 @@ class VersionManager:
         # This prevents one save-heavy afternoon from erasing months of useful
         # rollback history. Branch bases and quarantined snapshots stay outside
         # the healthy quota: the former are recovery roots; the latter may be
-        # repairable after a storage issue and require explicit cleanup.
+        # repairable after a storage issue, and are capped separately per doc
+        # (see _purge_quarantined_overflow) so the exemption cannot grow unbounded.
         candidates: list = [session_rows[key][0] for key in session_order]
         candidates.extend(
             version
@@ -914,6 +946,36 @@ class VersionManager:
                     pass
         self._conn.commit()
 
+    def _purge_quarantined_overflow(self, doc_id: str, vers, branch_bases: set[str]) -> int:
+        """隔离版本每 doc 封顶：只留最新若干个，超出的 purge（分支基继续豁免）。
+
+        豁免是为了「可能可修复」，但无界豁免会让坏恢复点随时间无限堆积。
+        vers 为 store.list_versions 结果（ts DESC，前 N 个即最新）。返回清除数。
+        """
+        limit = self._quarantine_keep_per_doc
+        if limit <= 0:
+            return 0
+        quarantined_versions = [
+            version
+            for version in vers
+            if "health" in version.keys()
+            and str(version["health"] or "ok") != "ok"
+            and str(version["version_id"]) not in branch_bases
+        ]
+        overflow = quarantined_versions[limit:]
+        for v in overflow:
+            thumb_path = str(v["thumb_path"] or "")
+            store.delete_version(self._conn, v["version_id"])
+            vault.delete_version_artifacts(doc_id, v["version_id"])
+            if thumb_path:
+                try:
+                    Path(thumb_path).unlink(missing_ok=True)
+                except OSError:
+                    pass
+        if overflow:
+            self._conn.commit()
+        return len(overflow)
+
     # ---------- Watcher lifecycle ----------
     def start(self, *, watch: bool = True) -> None:
         self.scan_deleted()
@@ -928,12 +990,21 @@ class VersionManager:
         thread = self._vault_maintenance_thread
         if thread is not None and thread.is_alive():
             return
+        self._vault_maintenance_stop.clear()
         self._vault_maintenance_thread = threading.Thread(
-            target=self.run_vault_maintenance,
+            target=self._vault_maintenance_loop,
             name="PPTDoctorVaultMaintenance",
             daemon=True,
         )
         self._vault_maintenance_thread.start()
+
+    def _vault_maintenance_loop(self) -> None:
+        # 托盘常驻数周重维护也得能跑到：启动即跑一次，之后按重维护节流间隔
+        # 周期触发；间隔内的重活仍由 _run_vault_maintenance_serialized 的账本节流。
+        self.run_vault_maintenance()
+        interval = self._vault_heavy_maintenance_interval_sec
+        while interval > 0 and not self._vault_maintenance_stop.wait(interval):
+            self.run_vault_maintenance()
 
     def run_vault_maintenance(self) -> dict:
         with self._vault_maintenance_lock:
@@ -976,22 +1047,54 @@ class VersionManager:
 
             with self._lock:
                 if heavy_due:
+                    # TODO(锁范围重构，排期后续版本)：重维护全程持 _lock——幽灵
+                    # exists 慢探测、批量驱逐、VACUUM 都在锁内，生产大库上可达分钟级，
+                    # 期间 watcher 快照被阻塞。方向：exists 探测移出 _lock、驱逐分批
+                    # 提交、VACUUM 拆到独立短事务。本轮仅做探测顺序优化（见
+                    # vault.list_ghost_docs），不动锁结构。
+                    # 幽灵收割带宽限期：先补记本轮新观察到的缺失，再收割已到期的。
+                    ghosts_marked = vault.mark_ghost_docs_seen(self._conn)
+                    ghosts = vault.reap_ghost_docs(
+                        self._conn,
+                        dry_run=False,
+                        min_missing_sec=self._ghost_grace_sec,
+                    )
+                    # 容量上限：超了才按从老到新驱逐健康版本（分支基/隔离豁免）。
+                    budget = vault.enforce_size_budget(
+                        self._conn,
+                        max_bytes=int(get_vault_max_mb()) * 1024 * 1024,
+                    )
                     # GC performs its own structural safety gate under the
                     # manager lock. Quarantined legacy full snapshots do not
                     # make unrelated live objects unsafe to collect.
                     garbage = vault.collect_garbage(self._conn, dry_run=False)
+                    # 删行之后回收库文件本身：FTS 合并 + 条件 VACUUM + WAL 截断。
+                    db_hygiene = vault.maintain_db(self._conn)
                 else:
-                    garbage = {
+                    ghosts_marked = 0
+                    ghosts = {
                         "skipped": True,
                         "reason": "interval",
                         "last_success": last_success,
                     }
+                    budget = dict(ghosts)
+                    garbage = dict(ghosts)
+                    db_hygiene = dict(ghosts)
+
+                def _step_clean(step: dict) -> bool:
+                    return (
+                        not bool(step.get("aborted", False))
+                        and int(step.get("errors", 0) or 0) == 0
+                    )
+
                 heavy_ok = (
                     heavy_due
-                    and int(migration.get("errors", 0) or 0) == 0
-                    and int(hash_backfill.get("errors", 0) or 0) == 0
-                    and not bool(garbage.get("aborted", False))
-                    and int(garbage.get("errors", 0) or 0) == 0
+                    and _step_clean(migration)
+                    and _step_clean(hash_backfill)
+                    and _step_clean(garbage)
+                    and _step_clean(ghosts.get("gc") or {})
+                    and _step_clean(budget.get("gc") or {})
+                    and not str(db_hygiene.get("error") or "")
                 )
                 if heavy_ok:
                     store.set_meta(
@@ -1004,7 +1107,11 @@ class VersionManager:
                 "migration": migration,
                 "hash_backfill": hash_backfill,
                 "audit": audit,
+                "ghosts_marked": ghosts_marked,
+                "ghosts": ghosts,
+                "budget": budget,
                 "garbage": garbage,
+                "db_hygiene": db_hygiene,
                 "heavy_due": heavy_due,
             }
             self._vault_maintenance_result = result
@@ -1117,6 +1224,10 @@ class VersionManager:
     def stop(self) -> None:
         self._stop_reconcile_loop()
         self._stop_watcher()
+        self._vault_maintenance_stop.set()
+        thread = self._vault_maintenance_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2)
 
     def diagnostic_lines(self) -> list[str]:
         alive = self._reconcile_thread is not None and self._reconcile_thread.is_alive()
@@ -1164,5 +1275,10 @@ class VersionManager:
             f"gc_aborted={bool(garbage.get('aborted', False))} "
             f"gc_skipped={bool(garbage.get('skipped', False))} "
             f"gc_objects={int(garbage.get('objects_removed', 0) or 0)} "
+            f"gc_temp_objects={int(garbage.get('temp_objects_removed', 0) or 0)} "
+            f"ghosts_marked={int(self._vault_maintenance_result.get('ghosts_marked', 0) or 0)} "
+            f"ghosts_reaped={int((self._vault_maintenance_result.get('ghosts') or {}).get('ghost_docs', 0) or 0)} "
+            f"budget_evicted={int((self._vault_maintenance_result.get('budget') or {}).get('evicted_versions', 0) or 0)} "
+            f"db_vacuumed={bool((self._vault_maintenance_result.get('db_hygiene') or {}).get('vacuumed', False))} "
             f"error={self._vault_maintenance_error or '-'}",
         ]
