@@ -46,6 +46,9 @@ class FileStat:
     path: str = ""
     file_id: int = 0
     indexed_at: float = 0.0
+    # PPT 内嵌的创建时间（dcterms:created），0 = 读不到。只有「按年归档」这类
+    # 口径该用它：mtime 会被复制/同步/下载重写，按 mtime 分年会把整库压进当年。
+    created_at: float = 0.0
 
 
 @dataclass
@@ -374,7 +377,7 @@ def fetch_file_stats(
         f"""
         WITH scoped_files AS (
             SELECT f.id, f.path, f.name, f.mtime, f.size, f.page_count, f.status,
-                   f.indexed_at
+                   f.indexed_at, COALESCE(f.created_at, 0) AS created_at
             FROM files f
             WHERE {' AND '.join(predicates)}
         ),
@@ -385,7 +388,7 @@ def fetch_file_stats(
             GROUP BY p.file_id
         )
         SELECT f.id, f.path, f.name, f.mtime, f.size, f.page_count, f.status,
-               f.indexed_at,
+               f.indexed_at, COALESCE(f.created_at, 0) AS created_at,
                m.group_id,
                COALESCE(c.chars, 0) AS char_count
         FROM scoped_files f
@@ -400,6 +403,7 @@ def fetch_file_stats(
             page_count=r["page_count"], status=r["status"],
             group_id=r["group_id"], char_count=r["char_count"] or 0,
             path=r["path"], file_id=r["id"], indexed_at=r["indexed_at"] or 0.0,
+            created_at=r["created_at"] or 0.0,
         )
         for r in rows
     ]

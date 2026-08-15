@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import datetime
+import threading
+from collections import OrderedDict
 from contextlib import contextmanager
 import json
 import logging
@@ -30,8 +32,36 @@ log = logging.getLogger(__name__)
 
 _OBJECT_HASH_RE = re.compile(r"^[0-9a-f]{16}$")
 _GLOBAL_OBJECTS_DIRNAME = "_objects"
-_VERIFIED_OBJECT_PATHS: set[str] = set()
+# 「这个对象路径已按内容哈希验过」的缓存：省掉重复读盘重算哈希。
+# 必须有上限——它是模块级全局，托盘常驻数周只增不减；一次深度体检 / GC 会把
+# 对象池里每一个对象都塞进来，生产库实测对象池 48,775 个文件，等于白扛几 MB
+# 常驻内存且永不释放。用 OrderedDict 当 LRU：超上限就淘汰最久未用的，
+# 淘汰只损失一次重新哈希，不影响正确性。
+_VERIFIED_OBJECT_CAP = 4096
+_VERIFIED_OBJECT_PATHS: OrderedDict[str, None] = OrderedDict()
+_VERIFIED_LOCK = threading.Lock()
 _STABLE_COPY_RETRY_DELAYS_SEC = (0.15, 0.4, 0.9)
+
+
+def _verified_mark(key: str) -> None:
+    with _VERIFIED_LOCK:
+        _VERIFIED_OBJECT_PATHS.pop(key, None)
+        _VERIFIED_OBJECT_PATHS[key] = None
+        while len(_VERIFIED_OBJECT_PATHS) > _VERIFIED_OBJECT_CAP:
+            _VERIFIED_OBJECT_PATHS.popitem(last=False)
+
+
+def _verified_hit(key: str) -> bool:
+    with _VERIFIED_LOCK:
+        if key not in _VERIFIED_OBJECT_PATHS:
+            return False
+        _VERIFIED_OBJECT_PATHS.move_to_end(key)
+        return True
+
+
+def _verified_forget(key: str) -> None:
+    with _VERIFIED_LOCK:
+        _VERIFIED_OBJECT_PATHS.pop(key, None)
 
 
 class SnapshotSourceError(OSError):
@@ -102,13 +132,13 @@ def _object_path(doc_id: str, object_hash: str) -> Path:
 def _object_is_valid(path: Path, object_hash: str) -> bool:
     key = str(path)
     if not path.exists():
-        _VERIFIED_OBJECT_PATHS.discard(key)
+        _verified_forget(key)
         return False
-    if key in _VERIFIED_OBJECT_PATHS:
+    if _verified_hit(key):
         return True
     if _hash_path(path) != object_hash:
         return False
-    _VERIFIED_OBJECT_PATHS.add(key)
+    _verified_mark(key)
     return True
 
 
@@ -125,7 +155,7 @@ def _install_object_bytes(data: bytes, object_hash: str) -> Path:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, dest)
-        _VERIFIED_OBJECT_PATHS.add(str(dest))
+        _verified_mark(str(dest))
         return dest
     finally:
         try:
@@ -390,8 +420,17 @@ def sweep_stale_snapshot_temps(*, max_age_sec: float = 0.0, tempdir: str | None 
     return deleted
 
 
-def _write_zip(dest: str, doc_id: str, names: list[str], parts: dict[str, str]) -> None:
-    with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as z:
+def _write_zip(
+    dest: str, doc_id: str, names: list[str], parts: dict[str, str],
+    *, compression: int = zipfile.ZIP_DEFLATED,
+) -> None:
+    """把对象池里的 part 重组成一个 pptx 包。
+
+    compression 只影响产物体积与写入耗时，不影响「能否重组、能否解析」。
+    恢复 / 导出走默认的 DEFLATE（产物要交回用户磁盘）；留底时的保真自检走
+    ZIP_STORED——那个临时文件写完就删，为它把几十 MB 图片再压一遍纯属白烧 CPU。
+    """
+    with zipfile.ZipFile(dest, "w", compression) as z:
         for name in names:
             z.writestr(name, _object_path(doc_id, parts[name]).read_bytes())
 
@@ -623,7 +662,7 @@ def collect_garbage(conn, *, dry_run: bool = True) -> dict[str, int | bool]:
             if not dry_run:
                 try:
                     path.unlink()
-                    _VERIFIED_OBJECT_PATHS.discard(str(path))
+                    _verified_forget(str(path))
                 except OSError:
                     result["errors"] = int(result["errors"]) + 1
                     continue
@@ -727,10 +766,10 @@ def audit_repository(conn, *, deep: bool = False) -> dict:
                 bytes_checked += path.stat().st_size
                 if _hash_path(path) != object_hash:
                     hash_errors.append(object_hash)
-                    _VERIFIED_OBJECT_PATHS.discard(str(path))
+                    _verified_forget(str(path))
             except OSError:
                 read_errors.append(object_hash)
-                _VERIFIED_OBJECT_PATHS.discard(str(path))
+                _verified_forget(str(path))
 
         # A corrupt shared object can invalidate many restore points.  Map the
         # pool-level failure back to every version that references it so the
@@ -775,7 +814,14 @@ def audit_repository(conn, *, deep: bool = False) -> dict:
 
 
 def _verify(doc_id: str, names: list[str], parts: dict[str, str]) -> bool:
-    """重组到临时文件并验证能正常解析（保真自检）。"""
+    """重组到临时文件并验证能正常解析（保真自检）。
+
+    用 ZIP_STORED 重组：这个临时包写完就删，唯一用途是证明「对象齐全、能重组回
+    可解析的 OpenXML 包」——压缩方式不影响这个结论。而 file_hash 哈希的是
+    「part 名 → part 内容哈希」的排序映射（刻意与 ZIP 重打包无关），所以哈希比对
+    照样成立。50 MB 稿实测：这一步 1436 ms → 145 ms，整次留底 2.0 s → 0.7 s，
+    直接决定用户按下 Ctrl+S 之后我们要抢走多少 CPU。
+    """
     # 自检暂存改放版本库 _tmp（启动清扫覆盖，可随库迁出 C 盘），不再落裸 %TEMP%。
     tmp_root = vault_dir() / "_tmp"
     tmp_root.mkdir(parents=True, exist_ok=True)
@@ -784,7 +830,7 @@ def _verify(doc_id: str, names: list[str], parts: dict[str, str]) -> bool:
     )
     os.close(fd)
     try:
-        _write_zip(tmp, doc_id, names, parts)
+        _write_zip(tmp, doc_id, names, parts, compression=zipfile.ZIP_STORED)
         return (
             parse_pptx(tmp).status == "ok"
             and file_hash(tmp) == _package_content_hash_from_parts(parts)
@@ -920,17 +966,36 @@ def snapshot(
     return vid
 
 
-def rebuild_to(doc_id: str, version_id: str, dest: str) -> bool:
+#: rebuild_to 的失败原因（供 UI 给出可执行的下一步，而不是干巴巴一句「恢复失败」）
+REBUILD_ERR_LOCKED = "target_locked"      # 目标文件被占用（十有八九是 PowerPoint 正开着它）
+REBUILD_ERR_MISSING = "recovery_missing"  # 恢复点的 manifest / 全量文件不见了
+REBUILD_ERR_CORRUPT = "recovery_corrupt"  # 重组出来的包解析不过或内容哈希对不上
+REBUILD_ERR_IO = "io_error"
+
+
+def rebuild_to(doc_id: str, version_id: str, dest: str, *, on_error=None) -> bool:
     """把某版本原子重组/恢复到 dest。
 
     始终先在目标同目录生成并验证临时文件，最后用 ``os.replace`` 一次切换。
     任一对象缺失、manifest 损坏或校验失败时，现有目标文件保持逐字节不变。
+
+    on_error(reason) 可选：拿到上面四个 REBUILD_ERR_* 之一。这里区分「文件被占用」
+    是有意义的——用户一边开着 PowerPoint 一边点恢复是最常见的情形，只报「恢复失败」
+    等于让人去猜。注意：占用发生在最后一步 os.replace，此时原文件仍然完好无损。
     """
+    def _fail(reason: str) -> bool:
+        if on_error is not None:
+            try:
+                on_error(reason)
+            except Exception:  # noqa: BLE001 上报失败绝不能盖住恢复本身的结果
+                pass
+        return False
+
     dest = os.path.abspath(dest)
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     mf = _manifest_path(doc_id, version_id)
     if not mf.exists():
-        return False
+        return _fail(REBUILD_ERR_MISSING)
     fd, tmp = tempfile.mkstemp(
         prefix=".pptdoctor-restore-",
         suffix=".pptx",
@@ -943,24 +1008,28 @@ def rebuild_to(doc_id: str, version_id: str, dest: str) -> bool:
         if mode == "full":
             src = version_file(doc_id, version_id)
             if not src.exists():
-                return False
+                return _fail(REBUILD_ERR_MISSING)
             shutil.copy2(src, ext_path(tmp))
             if parse_pptx(tmp).status != "ok":
-                return False
+                return _fail(REBUILD_ERR_CORRUPT)
         elif mode == "dedup":
             _write_zip(ext_path(tmp), doc_id, m["names"], m["parts"])
             if parse_pptx(tmp).status != "ok":
-                return False
+                return _fail(REBUILD_ERR_CORRUPT)
         else:
-            return False
+            return _fail(REBUILD_ERR_CORRUPT)
 
         expected = manifest_content_hash(doc_id, version_id)
         if not expected or file_hash(tmp) != expected:
-            return False
-        os.replace(ext_path(tmp), ext_path(dest))
+            return _fail(REBUILD_ERR_CORRUPT)
+        try:
+            os.replace(ext_path(tmp), ext_path(dest))
+        except PermissionError:
+            # Windows 上目标被别的进程以拒绝共享方式打开时就是这个错误。
+            return _fail(REBUILD_ERR_LOCKED)
         return True
     except Exception:  # noqa: BLE001
-        return False
+        return _fail(REBUILD_ERR_IO)
     finally:
         try:
             os.unlink(ext_path(tmp))

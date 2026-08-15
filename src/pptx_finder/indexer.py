@@ -171,6 +171,7 @@ def _index_one(path: str, compute_content_hash: bool = True) -> dict[str, Any]:
         "status": "ok",
         "error": "",
         "page_count": 0,
+        "created_at": 0.0,
         "pages": [],
     }
     # 先判尺寸再算 hash：超限直接跳过、连 sha256 都不读（省 IO，防大文件拖慢/卡死）。
@@ -190,6 +191,7 @@ def _index_one(path: str, compute_content_hash: bool = True) -> dict[str, Any]:
     res["status"] = deck.status
     res["error"] = deck.error
     res["page_count"] = deck.page_count
+    res["created_at"] = float(getattr(deck, "created_at", 0.0) or 0.0)
     if deck.status == "ok":
         res["pages"] = [
             (pg.page_no, raw, tokenize(raw))
@@ -227,7 +229,7 @@ def _write_result(conn: sqlite3.Connection, res: dict[str, Any]) -> None:
         path=res["path"], name=res["name"], ext=res["ext"], size=res["size"],
         mtime=res["mtime"], content_hash=res["content_hash"],
         page_count=res["page_count"], status=res["status"], error=res["error"],
-        indexed_at=time.time(),
+        indexed_at=time.time(), created_at=float(res.get("created_at") or 0.0),
     )
     db.replace_pages(conn, fid, res["pages"])
 

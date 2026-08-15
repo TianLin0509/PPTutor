@@ -1,7 +1,7 @@
-"""涓荤獥鍙ｏ細鍙屼富棰?+ 绮捐嚧缁撴灉椤癸紙鐒︾偣鍙屾€?鍗婇€忔槑楂樹寒/瀛楅噸灞傜骇锛? P0 浜や簰
-锛堝嵆鏃舵悳绱?/ 鍏ㄩ敭鐩樺鑸?/ 鍛戒腑椤电缉鐣ュ浘鏉?/ 绱㈠紩杩涘害鏉★級銆?
+"""主窗口：搜索框 + 结果列表 + 右侧预览卡，左侧导航轨串起概览 / 版本 / 健康 / 报告 / 设置。
 
-鍙祴璇曟€э細conn 涓?render_worker 鍙敞鍏ワ紱do_index=False 鏃朵笉鍚姩纾佺洏绱㈠紩銆?
+交互优先是这个文件的第一约束：搜索、翻页、打开文件永远不能被后台索引、
+渲染或版本维护挡住——重活一律丢后台线程，主线程只做装配与状态切换。
 """
 from __future__ import annotations
 
@@ -198,7 +198,7 @@ def _icon_clear() -> QIcon:
 
 
 def _asset_path(name: str) -> str:
-    """璧勬簮鏂囦欢璺緞锛歞ev=repo/assets锛宖rozen=_MEIPASS/assets锛坰pec 宸?bundle锛夈€?"""
+    """资源文件路径：开发态取 repo/assets，冻结态取 _MEIPASS/assets（spec 已把它打进包）。"""
     base = getattr(sys, "_MEIPASS", None)
     if base:
         return os.path.join(base, "assets", name)
@@ -389,7 +389,11 @@ def _count_inventory_leftovers(conn) -> int:
     )
 
 def _app_logo() -> QPixmap:
-    """鍝佺墝 logo锛歅PTutor 鍚夌ゥ鐗╋紙瀛﹀＋甯?+ 鎼滅储/PPT锛夛紝鍔犺浇鎵撳寘鍐?assets/logo.png銆?"""
+    """品牌 logo（学士帽 + 搜索），加载打包进包里的 assets/logo.png。
+
+    四角透明就直接缩放：旧实现逐像素抠背景，约 47 万次 Python/Qt 调用，
+    实测仅这一处就阻塞主线程约 0.84 秒。
+    """
     pm = QPixmap(_asset_path("logo.png"))
     if not pm.isNull():
         img = pm.toImage().convertToFormat(QImage.Format_ARGB32)
@@ -433,7 +437,7 @@ def _save_theme(name: str) -> None:
 
 
 def _highlight(snippet: str, hlcss: str) -> str:
-    """鎶婄墖娈甸噷鐨勩€愬懡涓€戣浆鎴愬崐閫忔槑搴曢珮浜紙涓嶅彉鑹蹭笉鍔犵矖锛夈€?"""
+    """把片段里的【命中】转成半透明底高亮（不改字色、不加粗）。"""
     s = html.escape(snippet)
     s = s.replace("\u3010", f'<span style="{hlcss}">').replace("\u3011", "</span>")
     return s
@@ -463,7 +467,7 @@ def _fmt_size(n: int) -> str:
 
 
 def _elide_middle(s: str, maxlen: int = 72) -> str:
-    """璺緞杩囬暱鏃朵腑闂寸渷鐣ワ紝淇濈暀鐩樼涓庢枃浠跺悕涓ょ銆?"""
+    """路径过长时省略中间，保留盘符与文件名两端。"""
     if len(s) <= maxlen:
         return s
     head = (maxlen - 1) * 2 // 3
@@ -531,7 +535,10 @@ class _TypeBar(QWidget):
 
 
 class ResultItem(QWidget):
-    """鍗曟潯缁撴灉鍗＄墖锛氬乏缂╃暐鍥?棣栭〉/鍛戒腑椤? + 鍙?鏂囦欢鍚?+ 鍛戒腑椤佃兌鍥?+ 楂樹寒鐗囨 + mtime)銆?"""
+    """单条结果卡片：文件名 + 命中页码胶囊 + 高亮片段 + 修改时间。
+
+    不加载封面图——一屏几十张缩略图会把解码预算从用户真正在看的右侧大图那里抢走。
+    """
 
     activated = Signal()
 
@@ -562,7 +569,7 @@ class ResultItem(QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(4)
 
-        # 绗?1 琛岋細鏂囦欢鍚?+ 鍛戒腑椤靛窘绔狅紙P1 / P3 P8锛屾渶澶?3 涓級
+        # 第 1 行：文件名 + 命中页徽章（P1 / P3 P8，最多 3 个）
         row = QHBoxLayout()
         row.setSpacing(6)
         if is_member:
@@ -644,7 +651,7 @@ class ResultItem(QWidget):
             row.addWidget(dup, 0)
         lay.addLayout(row)
 
-        # 绗?2 琛岋細楂樹寒鐗囨锛堝唴瀹瑰懡涓級/ 鑰佹牸寮忚鏄庯紙.ppt锛?
+        # 第 2 行：高亮片段（内容命中）/ 老格式说明（.ppt）
         if r.hits and r.hits[0].snippet:
             sn = QLabel(_highlight(r.hits[0].snippet, hlcss))
             sn.setTextFormat(Qt.RichText)
@@ -659,7 +666,7 @@ class ResultItem(QWidget):
             sub.setStyleSheet(f"font-size:11.5px;color:{tok['ink4']};background:transparent;")
             lay.addWidget(sub)
 
-        # 绗?3 琛岋細淇敼鏃堕棿锛堟樉寮忎綋鐜版柊鏃э級
+        # 第 3 行：修改时间（显式体现新旧）
         tm = _fmt_mtime(r.mtime)
         if tm:
             if len(dup_paths) > 1:
@@ -852,7 +859,7 @@ class MainWindow(QMainWindow):
         self._bg_tasks: list[BackgroundTask] = []
         self._settings_dialogs: list = []
         self._active_heavy_op: str | None = None
-        self._closing = False  # 鍏崇獥涓細鍚庡彴浠诲姟鍥炶皟涓嶅啀纰?UI锛堥槻瑙﹁揪宸查攢姣佹帶浠讹級
+        self._closing = False  # 关窗中：后台任务回调不再碰 UI（防触达已销毁控件）
         self._showing_recent = False
         self._recent_cache: list[FileResult] | None = None
         self._recent_cache_at = 0.0
@@ -936,7 +943,7 @@ class MainWindow(QMainWindow):
         self._index_rate_last_done = 0
         self._index_rate_last_at = 0.0
         self._hit_idx = 0
-        self._view_page = 1  # 褰撳墠棰勮椤碉紙鍘熷椤靛簭锛屾粴杞彲鑴辩鍛戒腑椤佃嚜鐢辩炕锛?
+        self._view_page = 1  # 当前预览页（原始页序，滚轮可脱离命中页自由翻）
         self._preview_direction = 1  # 最近一次翻页方向；邻页预取优先沿该方向
         self._req_id = 0
         self._req_path: str | None = None  # 当前 req_id 渲染请求的源文件 path（迟到渲染校验用）
@@ -944,7 +951,7 @@ class MainWindow(QMainWindow):
         self._last_preview_key: tuple | None = None
         self._inflight_preview_key: tuple | None = None
         self._cur_pixmap: QPixmap | None = None
-        self._zoom = 1.0  # 棰勮缂╂斁锛?.0=閫傞厤绐楀彛锛?1 鏀惧ぇ鐪嬬粏鑺?
+        self._zoom = 1.0  # 预览缩放：1.0=适配窗口，>1 放大看细节
         self._to_tray_on_close = False
         self._thumb_btns: list[QToolButton] = []
         self._last_result_activate_at = 0.0
@@ -1013,8 +1020,9 @@ class MainWindow(QMainWindow):
         self._detail_dot_timer.timeout.connect(
             lambda: self._run_detail_dot_refresh(self._detail_dot_token)
         )
-        # live 绱㈠紩鍒锋柊鍘绘姈锛歸atcher 鍦?OneDrive/PowerPoint 鍙嶅瀛樼洏鏃朵細椋庢毚寮忚Е鍙?        # _after_live_index锛岃嫢姣忔鍚屾閲嶈窇 _do_search 浼氭妸涓荤嚎绋嬬硦姝伙紙瀹炴祴 maxgap 7.89s
-        # 鏈搷搴旓級銆傚悎骞舵垚涓€娆″欢杩熷埛鏂帮細椋庢毚 N 涓簨浠?鈫?鏈€澶?1 娆℃悳绱€?
+        # live 索引刷新去抖：watcher 在 OneDrive/PowerPoint 反复存盘时会风暴式触发
+        # _after_live_index；每次都同步重跑 _do_search 会把主线程糊死（实测 maxgap
+        # 7.89s 未响应）。合并成一次延迟刷新：风暴 N 个事件 → 最多 1 次搜索。
         self._live_refresh = QTimer(self)
         self._live_refresh.setSingleShot(True)
         self._live_refresh.setInterval(self._LIVE_REFRESH_DEBOUNCE_MS)
@@ -1059,8 +1067,8 @@ class MainWindow(QMainWindow):
         self._coverage_scan_timer.setSingleShot(True)
         self._coverage_scan_timer.setInterval(self._FULL_COVERAGE_DELAY_MS)
         self._coverage_scan_timer.timeout.connect(self._run_scheduled_coverage_scan)
-        # 瀹炴椂绱㈠紩鍚庡彴绾跨▼锛氫繚瀛樹簨浠朵笉鍦ㄤ富绾跨▼ parse/鍐欏簱锛堥槻 UI 鍐荤粨锛夈€?
-        # do_index=False 鐨勬祴璇曟棤姝ょ嚎绋嬶紝璧?_index_file_live 鐨勫悓姝ュ厹搴曘€?
+        # 实时索引后台线程：保存事件不在主线程 parse/写库（防 UI 冻结）。
+        # do_index=False 的测试无此线程，走 _index_file_live 的同步兜底。
         self._live: LiveIndexer | None = None
         if do_index:
             self._live = LiveIndexer(
@@ -1088,10 +1096,10 @@ class MainWindow(QMainWindow):
             self._render_cache_maintenance_timer.start()
         else:
             self._refresh_status()
-        self._show_recent()  # 鍚姩鍗冲垪鏈€杩戞枃浠讹紙鈶?榛樿瑙嗗浘锛屾棤闇€鍏堣緭鍏ュ啀娓呯┖锛?
-        self._welcome = None  # 棣栨娆㈣繋瑕嗙洊灞傦紙app.py 鍦?show 鍚庤皟 maybe_show_welcome锛?
-        self._enable_native_frame()  # 鏃犺竟妗嗙獥鍙ｆ仮澶嶇郴缁熺缉鏀?Snap/鏈€澶у寲/Win11 鍦嗚
-        # 澧為噺鑷姩鏇存柊锛氫粎鎵撳寘鎬佸悗鍙伴潤榛樻鏌ワ紱鍙戠幇鏂扮増鍦ㄦ爣棰樻爮缁欓潪妯℃€?chip銆俤ev/娴嬭瘯涓嶈仈缃戜笉鎵撴壈
+        self._show_recent()  # 启动即列最近文件（空搜索默认视图，无需先输入再清空）
+        self._welcome = None  # 首次欢迎覆盖层（app.py 在 show 后调 maybe_show_welcome）
+        self._enable_native_frame()  # 无边框窗口找回系统缩放/Snap/最大化/Win11 圆角
+        # 增量自动更新：仅打包态后台静默检查；发现新版在标题栏给非模态 chip。dev/测试不联网不打扰
         self._updater = None
         if do_index and updater.is_frozen():
             self._updater = UpdateController(
@@ -1392,7 +1400,7 @@ class MainWindow(QMainWindow):
         wrap = QWidget()
         wrap.setObjectName("contentWrap")
         wl = QVBoxLayout(wrap)
-        wl.setContentsMargins(16, 6, 16, 10)  # 涓棿鍐呭鍖哄洓鍛ㄧ暀鐧斤紝涓嶈创绐楀彛杈?
+        wl.setContentsMargins(16, 6, 16, 10)  # 中间内容区四周留白，不贴窗口边
         wl.addWidget(self._page_stack)
 
         # 身体行：最左 56px 导航轨 + 页面区
@@ -1455,7 +1463,7 @@ class MainWindow(QMainWindow):
         self.status.addWidget(self.last_index_label)
         self.version_shield = QLabel("")
         self.version_shield.setObjectName("verShield")
-        self.version_shield.hide()  # 鏈夌増鏈悗鎵嶆樉绀?
+        self.version_shield.hide()  # 有版本后才显示
         self.status.addPermanentWidget(self.version_shield)
         self.hotkey_label = QLabel(f"全局热键 {get_hotkey()}")
         self.hotkey_label.setObjectName("hotkeyLabel")
@@ -1656,7 +1664,7 @@ class MainWindow(QMainWindow):
         lay.setContentsMargins(12, 10, 12, 12)
         lay.setSpacing(8)
 
-        # 椤舵爮锛氬畬鏁磋矾寰勶紙鍙鍒讹級+ 鏂囦欢鍏冧俊鎭紙澶у皬路椤垫暟路淇敼鏃堕棿锛?
+        # 顶栏：完整路径（可复制）+ 文件元信息（大小 · 页数 · 修改时间）
         head = QWidget()
         head.setObjectName("previewHeadBar")
         hv = QVBoxLayout(head)
@@ -1701,7 +1709,7 @@ class MainWindow(QMainWindow):
         self.image_label.setObjectName("previewImage")
         self.image_label.setAlignment(Qt.AlignCenter)
         self.scroll.setWidget(self.image_label)
-        # 棰勮鍖烘粴杞?= 鎸夊師濮嬮〉搴忕炕椤碉紙鐪嬪墠鍑犻〉鍒ゆ柇鏄笉鏄鎵剧殑 PPT锛?
+        # 预览区滚轮 = 按原始页序翻页（看前几页判断是不是要找的 PPT）
         self.scroll.viewport().installEventFilter(self)
         self.image_label.installEventFilter(self)
         bl.addWidget(self.scroll, 1)
@@ -1787,7 +1795,7 @@ class MainWindow(QMainWindow):
         self.gt_theme = QLabel(dict(theme.THEMES).get(self._theme, self._theme))
         self.gt_theme.setObjectName("gtTheme")
         self.gt_theme.hide()  # 当前主题已由工具栏按钮显示，标题栏不重复占位
-        self.update_chip = QPushButton("")  # 澧為噺鏇存柊 chip锛氬彂鐜版柊鐗堟墠鏄剧ず锛岄潪妯℃€併€佷笉鎵撴柇鎼滅储
+        self.update_chip = QPushButton("")  # 增量更新 chip：发现新版才显示，非模态、不打断搜索
         self.update_chip.setObjectName("updateChip")
         self.update_chip.setCursor(Qt.PointingHandCursor)
         self.update_chip.hide()
@@ -1878,7 +1886,7 @@ class MainWindow(QMainWindow):
         self.showNormal() if self.isMaximized() else self.showMaximized()
 
     def _enable_native_frame(self) -> None:
-        """鏃犺竟妗嗙獥鍙ｆ仮澶嶇郴缁熻兘鍔涳細鍙嫋鎷夌缉鏀?/ 鏈€澶у寲 / 鏈€灏忓寲 / Win11 鍦嗚銆?"""
+        """无边框窗口找回系统能力：可拖拽缩放 / 最大化 / 最小化 / Win11 圆角。"""
         if not _WIN:
             return
         try:
@@ -1898,10 +1906,10 @@ class MainWindow(QMainWindow):
             pass
 
     def nativeEvent(self, et, message):  # noqa: N802
-        """WM_NCHITTEST锛氭爣棰樻爮鍖哄洖 HTCAPTION锛堟嫋鍔?鍙屽嚮鏈€澶у寲/Snap锛夛紝鍥涜竟瑙掑洖缂╂斁鐮併€?
+        """WM_NCHITTEST：标题栏区回 HTCAPTION（可拖动、双击最大化、支持 Snap），四边与角回缩放码。
 
-        鐢?QCursor.pos 閫昏緫鍧愭爣锛堥潪 lParam 鐗╃悊鍧愭爣锛夐伩鍏嶉珮 DPI 缂╂斁閿欎綅锛?
-        鍙充晶鎸夐挳鍖轰笉鍥?HTCAPTION锛屼互渚跨獥鍙ｆ寜閽彲鐐瑰嚮銆?
+        用 QCursor.pos 的逻辑坐标而不是 lParam 的物理坐标，避免高 DPI 缩放下错位；
+        右侧按钮区不回 HTCAPTION，否则窗口按钮点不动。
         """
         if _WIN and et == "windows_generic_MSG":
             try:
@@ -1932,7 +1940,7 @@ class MainWindow(QMainWindow):
                         return True, 12   # HTTOP
                     if Bt:
                         return True, 15   # HTBOTTOM
-                # 鏍囬鏍忔嫋鍔ㄥ尯锛氶伩寮€椤堕儴 b 缂╂斁杈?+ 鍙充晶 146px 绐楀彛鎸夐挳鍖?
+                # 标题栏拖动区：避开顶部 b 缩放边 + 右侧 146px 窗口按钮区
                 if b <= y < self._title_h and x < w - 146:
                     # 合一工具栏：搜索框/下拉/按钮等交互控件区域必须回 HTCLIENT，
                     # 否则点击会被系统当成标题栏拖拽，控件收不到鼠标事件。
@@ -2014,15 +2022,15 @@ class MainWindow(QMainWindow):
         self._health_page_win = win
         return win
 
-    # ---------- 鍒楄〃 / 浠〃鐩?棣栧睆鍒囨崲 ----------
+    # ---------- 列表 / 仪表盘首屏切换 ----------
     def _show_dashboard(self, *, force_refresh: bool = False) -> None:
-        """鍒囧埌浠〃鐩橀灞忥紙绌烘悳绱㈤粯璁よ鍥撅級銆備笉鍔?result_list 鏈韩銆?"""
+        """切到仪表盘页（空搜索时的默认视图）。不动 result_list 本身。"""
         if getattr(self, "dashboard", None) is not None:
             self._switch_page("dashboard")
             self.dashboard.schedule_refresh(force=force_refresh)
 
     def _show_list(self) -> None:
-        """鍒囧埌缁撴灉鍒楄〃鍖猴紙鏈夋悳绱㈣瘝 / 鏈夌粨鏋滄椂锛夈€?"""
+        """切到结果列表页（有搜索词 / 有结果时）。"""
         self._switch_page("search")
 
     def _set_ops_enabled(self, on: bool) -> None:
@@ -2069,7 +2077,7 @@ class MainWindow(QMainWindow):
         self._set_ops_enabled(False)
 
     def _update_preview_header(self, r: FileResult | None) -> None:
-        """棰勮椤舵爮锛氬畬鏁磋矾寰勶紙鍙鍒讹級+ 澶у皬路椤垫暟路淇敼鏃堕棿銆?"""
+        """预览顶栏：完整路径（可复制）+ 大小 · 页数 · 修改时间。"""
         if r is None:
             self.path_label.setText("← 选中左侧结果查看预览")
             self.path_label.setToolTip("")
@@ -2108,18 +2116,18 @@ class MainWindow(QMainWindow):
     def showEvent(self, e):  # noqa: N802
         super().showEvent(e)
         self._start_ui_loop_monitor()
-        self._apply_titlebar_theme()  # 绐楀彛鏄剧ず鍚庣郴缁熸爣棰樻爮鎵嶆帴鍙楁繁鑹插睘鎬?
+        self._apply_titlebar_theme()  # 窗口显示后系统标题栏才接受深色属性
         if not getattr(self, "_did_fade", False):
             self._did_fade = True
             from .spotlight import animations_enabled
-            if animations_enabled():  # 灏婇噸绯荤粺銆屽噺寮卞姩鎬佹晥鏋溿€嶏紝鍏冲垯鐩存帴鏄剧ず
+            if animations_enabled():  # 尊重系统「减弱动态效果」，关则直接显示
                 self.setWindowOpacity(0.0)
                 self._fade = QPropertyAnimation(self, b"windowOpacity", self)
                 self._fade.setDuration(200)
                 self._fade.setStartValue(0.0)
                 self._fade.setEndValue(1.0)
                 self._fade.start()
-        self._maybe_show_version_intro()  # 鏈夈€岄娆＄暀鐗堛€嶅緟鍛婄煡涓旂獥鍙ｅ凡闇茶劯鍒欒ˉ寮?
+        self._maybe_show_version_intro()  # 有「首次留版」待告知且窗口已露脸则补弹
 
     def hideEvent(self, e):  # noqa: N802
         # 托盘常驻时不需要每秒唤醒 GUI 做卡顿采样；重新显示时 showEvent 会恢复。
@@ -2137,7 +2145,7 @@ class MainWindow(QMainWindow):
             # DWMWA_USE_IMMERSIVE_DARK_MODE = 20锛圵in10 20H1+锛?
             ctypes.windll.dwmapi.DwmSetWindowAttribute(
                 int(self.winId()), 20, ctypes.byref(val), ctypes.sizeof(val))
-        except Exception:  # noqa: BLE001 闈?Windows / 鏃х郴缁熼潤榛樿烦杩?
+        except Exception:  # 非 Windows / 旧系统静默跳过
             pass
 
     def _apply_theme(self, name: str, persist: bool = True) -> None:
@@ -2158,7 +2166,7 @@ class MainWindow(QMainWindow):
             self._apply_sort_render()
             self._select_first()
         self._apply_titlebar_theme()
-        # 鐜荤拑鍖栭灞忓悓姝ュ埛鏂帮細central 鏋佸厜 + 鏍囬鏍忎富棰樺悕 + 浠〃鐩樺浘琛?
+        # 玻璃化顶屏同步刷新：central 极光 + 标题栏主题名 + 仪表盘图表
         if getattr(self, "_central", None) is not None:
             self._central.update()
         if getattr(self, "gt_theme", None) is not None:
@@ -2196,7 +2204,7 @@ class MainWindow(QMainWindow):
         menu.exec(self.theme_btn.mapToGlobal(self.theme_btn.rect().bottomLeft()))
 
     def _toggle_theme(self) -> None:
-        """寰幆鍒囧埌涓嬩竴涓鏍硷紙淇濈暀鐨勫揩鎹峰垏鎹㈠叆鍙ｏ級銆?"""
+        """循环切到下一个主题（保留的快捷切换入口）。"""
         names = [n for n, _ in theme.THEMES]
         i = names.index(self._theme) if self._theme in names else 0
         self._apply_theme(names[(i + 1) % len(names)])
@@ -2534,7 +2542,7 @@ class MainWindow(QMainWindow):
             return
         self._recent_load_token += 1
         self._showing_recent = False
-        self._show_list()  # 鏈夋悳绱㈣瘝 鈫?鏄剧ず缁撴灉鍒楄〃鍖猴紙闅愯棌浠〃鐩橀灞忥級
+        self._show_list()  # 有搜索词 → 显示结果列表区（隐藏仪表盘首屏）
         if self._search_worker is not None:
             self._show_search_pending(query)
             request_args = (
@@ -2792,7 +2800,7 @@ class MainWindow(QMainWindow):
 
     def _show_recent(self, *, dashboard_force_refresh: bool = False,
                      recent_force_refresh: bool = False) -> None:
-        """绌烘煡璇㈤粯璁よ鍥撅細浠〃鐩橀灞?+ 澶囧ソ銆屾渶杩戞枃浠躲€嶇粨鏋滐紙鍒囧洖鎼滅储鍗崇敤锛夈€?"""
+        """空查询默认视图：仪表盘置顶 + 备好「最近文件」结果（切回搜索即用）。"""
         self._clear_search_pending()
         self.query_hint.hide()
         self._clear_stale_result_context()
@@ -3008,7 +3016,7 @@ class MainWindow(QMainWindow):
         self._empty_index_status.setText(self._index_status_text_from_stats(payload, mode_key))
 
     def _show_empty_hint(self, query: str) -> None:
-        """闆剁粨鏋滃紩瀵硷細鍒楄〃璁╀綅锛岀粰銆屾病鎵惧埌 + 鍙偣寤鸿銆嶃€?"""
+        """零结果引导：让出列表位置，给「没找到 + 可点建议」。"""
         self.result_list.hide()
         self._set_empty_icon("search")
         self._empty_tip.setText("换个说法试试")
@@ -3022,7 +3030,9 @@ class MainWindow(QMainWindow):
         self._set_empty_query_suggestion_async(query)
 
     def _show_start_hint(self) -> None:
-        """鏃犳渶杩戞枃浠讹紙鍒氳 / 杩樺湪绱㈠紩锛夋椂鐨勮捣姝ュ紩瀵硷紝澶嶇敤 emptyHint 瀹瑰櫒锛堥殣钘忓缓璁寜閽級銆?"""
+        """还没有最近文件（刚装 / 还在建索引）时的起步引导，
+        复用 emptyHint 容器但隐藏建议按钮。
+        """
         self.result_list.hide()
         self._set_empty_icon("folder")
         self._empty_query_label.setText("\u8fd8\u5728\u6574\u7406\u4f60\u7684 PPT...")
@@ -3141,7 +3151,7 @@ class MainWindow(QMainWindow):
         self._open_health_diagnostics()
 
     def _open_health_diagnostics(self) -> None:
-        """闆剁粨鏋?璧锋鎬佺殑涓€閿帓鏌ュ叆鍙ｏ細鎵撳紑璁剧疆骞跺畾浣嶅埌鍋ュ悍璇婃柇銆?"""
+        """零结果 / 异常态的一键排查入口：打开设置并定位到健康诊断页。"""
         from .settings_dialog import SettingsDialog
 
         for dlg in list(self._settings_dialogs):
@@ -3470,7 +3480,7 @@ class MainWindow(QMainWindow):
             self._open_version_window_for(query=q)
 
     def _request_full_rescan(self) -> bool:
-        """鍋ュ悍璇婃柇閲岀殑涓€閿噸鎵叆鍙ｏ細鍙彂璧峰悗鍙扮储寮曪紝涓嶉樆濉炶缃璇濇銆?"""
+        """健康诊断里的「重新扫描全盘」入口：只发起后台索引，不阻塞设置对话框。"""
         return self._start_indexing(None, None)
 
     def _sort_key(self) -> str:
@@ -3536,7 +3546,7 @@ class MainWindow(QMainWindow):
         self._group_member_items = {}
         self._group_others = {}
         self._expanded_groups = set()
-        self._render_gen += 1      # 浣滃簾涓婁竴鎵逛粛鍦ㄦ祦鍏ョ殑鍒嗘壒娓叉煋
+        self._render_gen += 1  # 作废上一批仍在流入的分批渲染
         hlcss = theme.highlight_css(self._theme)
         plan = self._build_render_plan(results)
         self._render_plan = plan
@@ -3598,7 +3608,7 @@ class MainWindow(QMainWindow):
             self._load_more_results()
 
     def _build_render_plan(self, results: list[FileResult]) -> list:
-        """灞曞紑鎴愮嚎鎬ф覆鏌撹鍒掞細('h', 鏍囬)=鍒嗙粍澶?/ ('i', idx, r)=缁撴灉鏉＄洰銆?"""
+        """把结果摊平成线性渲染计划：('h', 标题)=分组头 / ('i', idx, r, ginfo)=结果条目。"""
         plan: list = []
         if self._should_group_by_time():
             now_ts = datetime.datetime.now().timestamp()
@@ -3648,7 +3658,7 @@ class MainWindow(QMainWindow):
                     plan.append(("i", oidx, orr, {"member": True, "gid": gid}))
 
     def _flush_plan(self, plan: list, start: int, end: int, hlcss: str) -> int:
-        """娓叉煋 plan[start:end]锛岃繑鍥炲疄闄呮覆鍒扮殑浣嶇疆锛堜緵缁壒锛夈€?"""
+        """渲染 plan[start:end]，返回实际渲染到的位置（供续批）。"""
         for entry in plan[start:end]:
             if entry[0] == "h":
                 self._add_section_header(entry[1])
@@ -3658,18 +3668,18 @@ class MainWindow(QMainWindow):
         return min(end, len(plan))
 
     def _stream_plan_rest(self, plan: list, pos: int, hlcss: str, gen: int) -> None:
-        """鍓╀綑鏉＄洰鍒嗘壒娴佸叆锛氭瘡涓簨浠跺惊鐜?tick 琛ヤ竴鎵癸紝UI 淇濇寔鍙氦浜掋€佺粨鏋滈€愭潯娴幇銆?"""
+        """剩余条目分批流入：每个事件循环 tick 补一批，UI 保持可交互、结果逐条浮现。"""
         state = {"pos": pos}
 
         def step() -> None:
             if gen != self._render_gen:
-                return  # 宸茶鏂颁竴娆℃悳绱?/ 鎺掑簭 / 鍏抽棴浣滃簾
+                return  # 已被新一次搜索 / 排序 / 关闭作废
             try:
                 state["pos"] = self._flush_plan(
                     plan, state["pos"], state["pos"] + self._RENDER_CHUNK, hlcss)
             except RuntimeError as e:
-                # 浠呫€岀獥鍙?鎺т欢 C++ 瀵硅薄宸叉瀽鏋勩€嶆槸棰勬湡鍐呰壇鎬т腑鏂紱鍏朵綑 RuntimeError
-                # 鍙兘鏄湡 bug锛堜細璁╃粨鏋滃垪琛ㄩ潤榛樻埅鏂級锛岃鏃ュ織鍐嶅仠锛岀粷涓嶆棤澹板悶鎺夈€?
+                # 仅「窗口/控件 C++ 对象已析构」是预期内良性中断；其余 RuntimeError
+                # 可能是真 bug（会让结果列表静默截断），记日志再停，绝不无声吞掉。
                 if "already deleted" not in str(e).lower():
                     _log.error("娴佸紡娓叉煋寮傚父涓柇锛岀粨鏋滃彲鑳戒笉瀹屾暣", exc_info=True)
                 return
@@ -3679,7 +3689,7 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(self._RENDER_YIELD_MS, step)
 
     def _should_group_by_time(self) -> bool:
-        """鏃堕棿鍒嗙粍浠呭湪銆屾椂闂村簭銆嶄笅鐢熸晥锛氭渶杩戜慨鏀规帓搴忥紝鎴栫┖鏌ヨ榛樿瑙嗗浘銆?"""
+        """时间分组只在「时间序」下生效：按最近修改排序，或空查询的默认视图。"""
         key = self._sort_key()
         if key == "recent":
             return True
@@ -3764,7 +3774,7 @@ class MainWindow(QMainWindow):
     def _add_section_header(self, label: str) -> None:
         item = QListWidgetItem()
         item.setData(Qt.UserRole, None)
-        item.setFlags(Qt.NoItemFlags)  # 鍒嗙粍澶达細涓嶅彲閫変笉鍙氦浜?
+        item.setFlags(Qt.NoItemFlags)  # 分组头：不可选不可交互
         lbl = QLabel(label)
         lbl.setObjectName("sectionHead")
         item.setSizeHint(lbl.sizeHint())
@@ -3870,7 +3880,7 @@ class MainWindow(QMainWindow):
         self._invalidate_preview_request(clear_deferred=False)
         self._hit_idx = 0
         self._preview_direction = 1
-        self._view_page = self._current_page()  # 鍒濆瀹氫綅棣栦釜鍛戒腑椤碉紙鏃犲懡涓?绗?椤碉級
+        self._view_page = self._current_page()  # 初始定位首个命中页（无命中→第 1 页）
         w = self.result_list.itemWidget(cur)
         if isinstance(w, ResultItem):
             w.set_selected(True, self.isActiveWindow())
@@ -3939,7 +3949,7 @@ class MainWindow(QMainWindow):
                 self._select_first(delayed_preview=True)
         else:
             QTimer.singleShot(0, lambda: setattr(self, "_suppress_select_preview", False))
-            # 绛涢€夊悗鏃犵粨鏋滐細鍒暀銆屽懡涓?N 涓€嶉檲鏃ц鏁?+ 缁欑┖鐘舵€佹彁绀猴紙鍖哄埆浜庛€屾病鎼滃埌銆嶏級
+            # 筛选后无结果：别留「命中 N 个」陈旧计数 + 给空状态提示（区别于「没搜到」）
             self.result_count.setText("筛选后无结果")
             self._cur = None
             self._clear_detail_load_inflight()
@@ -3951,7 +3961,7 @@ class MainWindow(QMainWindow):
             self._show_facet_empty()
 
     def _show_facet_empty(self) -> None:
-        """facet 鎶婄粨鏋滅瓫绌烘椂鐨勬彁绀衡€斺€旀槸绛涢€夊お绐勶紝涓嶆槸娌℃悳鍒般€?"""
+        """facet 把结果筛空时的提示——是筛选太窄，不是没搜到。"""
         self.result_list.hide()
         self._set_empty_icon("search")
         self._empty_query_label.setText("筛选后没有结果")
@@ -3962,7 +3972,7 @@ class MainWindow(QMainWindow):
         self.empty_hint.show()
 
     def _refresh_facets(self) -> None:
-        """鏂扮粨鏋滈泦鏃堕噸绠楀悇缁村害鏁伴噺骞堕噸缃€変腑銆?"""
+        """新结果集时重算各维度数量并重置选中。"""
         self._facet_filters = {}
         self.facet_panel.update_counts(
             facet_counts(self._results_raw, datetime.datetime.now().timestamp()), keep=False)
@@ -3975,7 +3985,7 @@ class MainWindow(QMainWindow):
         self._apply_detail_dot(getattr(self, "_detail_dot_has", False))
 
     def _maybe_hint_detail_versions(self) -> None:
-        """棣栨灞曞紑璇︽儏涓斿綋鍓嶆枃浠舵湁鍘嗗彶鐗堟湰鏃讹紝鎻愮ず銆岃繖閲岃兘涓€閿洖鍒板巻鍙茬増鏈€嶃€?"""
+        """首次展开详情且当前文件有历史版本时，提示「这里能一键回到历史版本」。"""
         if getattr(self, "_detail_opened_once", False):
             return
         cur = getattr(self, "_cur", None)
@@ -4212,7 +4222,11 @@ class MainWindow(QMainWindow):
         self.detail_panel.set_version_preview(version_id, str(image_path) if image_path else None)
 
     def _run_bg(self, fn, on_done=None, label: str = "") -> bool:
-        """鎶婂彲鑳介樆濉?UI 鐨勯噸娲讳涪鍚庡彴绾跨▼璺戯紝瀹屾垚缁忎俊鍙峰洖涓荤嚎绋嬨€備富绾跨▼鍙?start() 鍗宠繑鍥炪€?"""
+        """把可能阻塞 UI 的重活丢后台线程跑，完成经信号回主线程。主线程只 start() 即返回。
+
+        恢复 / 导出 / 打开这三类互斥：同一时刻只允许一个在跑，否则用户点两下就会
+        看到两个操作同时改同一个文件。
+        """
         heavy = label in {"restore", "export", "open"}
         if heavy and self._active_heavy_op is not None:
             self._toast("已有文件操作正在进行，请稍候…")
@@ -4224,7 +4238,7 @@ class MainWindow(QMainWindow):
         self._bg_tasks.append(task)
 
         def _safe_done(result):
-            # 鍏崇獥涓?/ 鎺т欢宸查攢姣佹椂涓嶅啀纰?UI鈥斺€擟OM 鍐峰惎鍔ㄥ彲鑳芥參浜?_shutdown 鐨?wait 瓒呮椂锛?
+            # 关窗中 / 控件已销毁时不再碰 UI——COM 冷启动可能慢于 _shutdown 的 wait 超时
             # Late callbacks may arrive after widgets are destroyed.
             if self._closing:
                 return
@@ -4363,7 +4377,7 @@ class MainWindow(QMainWindow):
         return "这版的主要变化：\n" + "\n".join(f"• {line}" for line in lines[:6])
 
     def _confirm_restore(self, diff: object | None = None) -> bool:
-        """鎭㈠鍓嶅弸濂界‘璁わ細寮鸿皟銆屼細鑷姩鐣欏簳銆侀殢鏃跺垏鍥炪€嶏紝闄嶄綆鐮村潖鎬ф搷浣滅殑蹇冪悊璐熸媴銆?"""
+        """恢复前的友好确认：强调「会自动留底、随时切回来」，降低破坏性操作的心理负担。"""
         from PySide6.QtWidgets import QMessageBox
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Question)
@@ -4611,23 +4625,23 @@ class MainWindow(QMainWindow):
             self._show_non_powerpoint_preview(ext)
             return
         # 命中页判定与序号已并入下方 ordn 计算（不再单独维护 hit_pages 集合）
-        # 椤电爜锛氱 X / 鍏?N 椤碉紙婊氳疆鍙湪鍘熷椤靛簭闂磋嚜鐢辩炕锛涘懡涓〉鍔犳爣璁帮級
+        # 页码：第 X / 共 N 页（滚轮可在原始页序间自由翻；命中页加标记）
         ordn = next((i for i, h in enumerate(hits) if h.page_no == page), None)
         hit_tag = f" \u00b7 \u547d\u4e2d {ordn + 1}/{n}" if ordn is not None else ""
         if total:
             self.page_label.setText(f"\u7b2c {page} / {total} \u9875{hit_tag}")
         else:
             self.page_label.setText(f"\u7b2c {page} \u9875{hit_tag}")
-        # 涓?涓嬨€屽懡涓〉銆嶆寜閽細鍦ㄥ懡涓〉涔嬮棿璺?
+        # 上 / 下「命中页」按钮：在命中页之间跳
         nav_enabled = self._active_heavy_op is None and self._search_pending_req is None
         self.prev_btn.setEnabled(nav_enabled and n > 0 and self._hit_idx > 0)
         self.next_btn.setEnabled(nav_enabled and n > 0 and self._hit_idx < n - 1)
-        # 缂╃暐鍥鹃珮浜細褰撳墠椤垫濂芥槸鏌愬懡涓〉灏辩偣浜畠
+        # 缩略图高亮：当前页恰好是某命中页就点亮它
         for b in self._thumb_btns:
             i = b.property("hit_index")
             b.setChecked(i is not None and i < n and hits[i].page_no == page)
-        # 娓愯繘寮忛瑙堬細璇ラ〉缂╃暐鍥惧凡缂撳瓨灏辩珛鍗虫斁澶ф樉绀轰綔鍗犱綅锛堢鍑哄唴瀹广€侀伄浣忔覆鏌撶瓑寰咃級锛岄珮娓呮覆鏌?
-        # 濂藉悗鍦?_on_rendered 鏃犵紳鏇挎崲銆傚懡涓〉閫氬父宸叉湁缂╃暐鍥撅紙缁撴灉鍗＄墖宸︿晶閭ｅ紶灏辨槸瀹冿級銆?
+        # 渐进式预览：该页缩略图已缓存就立即放大显示作占位（先出内容、遮住渲染等待），高清渲染
+        # 好后在 _on_rendered 无缝替换。命中页通常已有缩略图（结果卡片左侧那张就是它）。
         preview_edge = self._preview_long_edge()
         cache_hit = self._show_cached_com_preview(
             self._cur.path,
@@ -4696,14 +4710,14 @@ class MainWindow(QMainWindow):
             prewarm()
 
     def _wheel_page(self, delta_y: int) -> None:
-        """棰勮鍖烘粴杞細鎸夊師濮嬮〉搴忎笂涓嬬炕椤碉紙鍚戜笂婊?涓婁竴椤碉紝鍚戜笅婊?涓嬩竴椤碉級銆?"""
+        """预览区滚轮：按原始页序上下翻页（向上滚=上一页，向下滚=下一页）。"""
         if not self._cur:
             return
         if self._preview_interaction_blocked():
             return
         total = self._cur.page_count or 0
         if total <= 0:
-            return  # .ppt / 鏈В鏋愶紝椤垫暟鏈煡锛屼笉缈婚〉
+            return  # .ppt / 未解析，页数未知，不翻页
         new = self._view_page + (-1 if delta_y > 0 else 1)
         new = max(1, min(total, new))
         if new == self._view_page:
@@ -4712,7 +4726,7 @@ class MainWindow(QMainWindow):
         self._view_page = new
         for i, h in enumerate(self._cur.hits or []):
             if h.page_no == new:
-                self._hit_idx = i  # 缈诲埌鍛戒腑椤垫椂鍚屾锛岃涓?涓嬪懡涓〉鎸夐挳鎺ョ画
+                self._hit_idx = i  # 翻到命中页时同步，让上/下命中页按钮接着走
                 break
         self._request_preview()
 
@@ -4759,15 +4773,15 @@ class MainWindow(QMainWindow):
             self._last_preview_key = self._inflight_preview_key
         self._inflight_preview_key = None
         self._cur_pixmap = pm
-        self._preview_hinted = True  # 棣栨棰勮宸叉垚鍔燂紝涔嬪悗涓嶅啀鎻愩€屽敜璧?PowerPoint銆?
+        self._preview_hinted = True  # 首次预览已成功，之后不再提「唤起 PowerPoint」
         self._update_pixmap()
-        self._prefetch_neighbors()  # 鍚庡彴棰勬覆鏌撶浉閭?鍛戒腑椤碉紝缈昏繃鍘绘椂缂撳瓨鍛戒腑=鐬棿
+        self._prefetch_neighbors()  # 后台预渲染相邻/命中页，翻过去时缓存命中=瞬间
 
     def _prefetch_neighbors(self) -> None:
-        """鍚庡彴棰勬覆鏌撳綋鍓嶆枃浠躲€屽叾瀹冨懡涓〉 + 鍓嶅悗椤点€嶁啋 缈昏繃鍘绘椂缂撳瓨鍛戒腑銆佺灛闂村嚭鍥俱€?
+        """后台预渲染当前文件的「前后相邻页」→ 翻过去时缓存命中、瞬间出图。
 
-        鏂囦欢宸叉墦寮€鐫€锛岄鍙栨瘡椤靛彧鏄瀵煎嚭 ~0.07s锛屼綆浼樺厛銆佽鏂伴瑙堥殢鏃舵姠鍗犲苟浣滃簾
-        锛坃request_preview鈫抮ender_worker.request 浼氭竻绌哄緟棰勫彇锛夛紝鏁呭彧棰勫彇浣犲綋鍓嶅仠鐣欓〉鐨勯偦灞呫€?
+        文件已经打开着，预取每页只是多导出一次（约 0.07s），低优先级；
+        新预览随时抢占并把待预取作废，所以只预取你当前停留页的邻居。
         """
         if (
             self._cur is None
@@ -4777,7 +4791,7 @@ class MainWindow(QMainWindow):
         ):
             return
         if not hasattr(self._render, "prefetch"):
-            return  # 娴嬭瘯娉ㄥ叆鐨?StubRender 鏃犳鏂规硶
+            return  # 测试注入的 StubRender 无此方法
         total = self._cur.page_count or 0
         cur = self._view_page
         direction = 1 if self._preview_direction >= 0 else -1
@@ -4846,7 +4860,7 @@ class MainWindow(QMainWindow):
             self.image_label.resize(scaled.size())
 
     def maybe_show_welcome(self) -> None:
-        """棣栨杩愯鏃跺脊娆㈣繋瑕嗙洊灞傦紙app.py 鍦?win.show() 鍚庤皟鐢級銆?"""
+        """首次运行时弹欢迎覆盖层（app.py 在 win.show() 后调用）。"""
         if not is_first_run() or self._welcome is not None:
             return
         from .welcome_overlay import WelcomeOverlay
@@ -4945,7 +4959,7 @@ class MainWindow(QMainWindow):
                 return True
         return super().eventFilter(obj, ev)
 
-    # ---------- 鎵撳紑鍔ㄤ綔 ----------
+    # ---------- 打开动作 ----------
     def _release_preview_session_before_open(self, path: str) -> None:
         """Synchronously hand off the render COM apartment before opening a PPT.
 
@@ -5105,7 +5119,7 @@ class MainWindow(QMainWindow):
             self._toast(f"第 {page} 页没有可复制的文字")
 
     def _act_copy_clipboard(self) -> None:
-        """澶嶅埗鏂囦欢鏈綋鍒板壀璐存澘锛圵indows CF_HDROP锛夛紝鍙矘璐村埌閭欢 / 鑱婂ぉ / 璧勬簮绠＄悊鍣ㄣ€?"""
+        """复制文件本体到剪贴板（Windows CF_HDROP），可粘贴到邮件 / 聊天 / 资源管理器。"""
         if self._block_if_search_pending():
             return
         if self._block_if_file_op_active():
@@ -5257,7 +5271,7 @@ class MainWindow(QMainWindow):
         menu.exec(self.result_list.mapToGlobal(pos))
 
     def _init_toast(self) -> None:
-        """涓笅鏂规诞灞傛彁绀猴細涓€娆℃€ф搷浣滃弽棣堜笉鍐嶆薄鏌撶姸鎬佹爮銆?"""
+        """中下方浮层提示：一次性操作反馈不再污染状态栏。"""
         self._toast_hide_token = 0
         self._toast_label = QLabel(self)
         self._toast_label.setObjectName("toast")
@@ -5310,7 +5324,7 @@ class MainWindow(QMainWindow):
 
     # ---------- 鐗堟湰绠＄悊瀛樺湪鎰燂紙P0-1锛氭棩甯搁潤榛樼浘鐗?+ 浠呴娆″憡鐭ワ級 ----------
     def refresh_version_shield(self) -> None:
-        """鐘舵€佹爮銆岀増鏈繚鎶ゃ€嶇浘鐗岋細鏄剧ず宸插畧鎶ゆ枃浠舵暟锛屾棩甯搁潤榛樼殑瀛樺湪鎰熴€?"""
+        """状态栏「版本保护」盾牌：显示已守护文件数，日常静默的存在感。"""
         if getattr(self, "version_shield", None) is None or self._version_mgr is None:
             self._version_shield_inflight_token = None
             return
@@ -5389,7 +5403,7 @@ class MainWindow(QMainWindow):
         self._refresh_detail_dot()
 
     def _refresh_detail_dot(self) -> None:
-        """閫変腑鏂囦欢鏈夊巻鍙茬増鏈椂锛岃鎯呮寜閽寒绾㈢偣锛涙湰 session 棣栨鍙戠幇鏃跺懠鍚镐竴娆″紩瀵笺€?"""
+        """选中文件有历史版本时，给「版本」Tab 亮红点；本 session 首次发现时呼吸一次引导。"""
         cur = getattr(self, "_cur", None)
         if self._version_mgr is None or cur is None:
             self._detail_dot_inflight_token = None
@@ -5447,7 +5461,7 @@ class MainWindow(QMainWindow):
             self._detail_dot.move(rect.right() - 14, rect.top() + 3)
             self._detail_dot.show()
             self._detail_dot.raise_()
-            # 棣栨鍙戠幇 + 绐楀彛鍙鏃舵墠鍛煎惛寮曞锛堥殣钘忓埌鎵樼洏鏃朵笉娴垂鍔ㄧ敾锛岀暀鍒颁笅娆″啀璇曪級
+            # 首次发现 + 窗口可见时才呼吸引导（隐藏到托盘时不浪费动画，留到下次再试）
             if not getattr(self, "_detail_hint_done", False) and self.isVisible():
                 self._detail_hint_done = True
                 from .spotlight import attention_pulse
@@ -5457,7 +5471,7 @@ class MainWindow(QMainWindow):
             self._detail_dot.hide()
 
     def on_version_snapshot(self, path: str, version_id: str) -> None:
-        """鍚庡彴鐣欑増浜嬩欢锛堢粡 VersionBridge 闃熷垪淇″彿锛屽凡鍒囧洖涓荤嚎绋嬶級銆?"""
+        """后台留版事件（经 VersionBridge 队列信号，已切回主线程）。"""
         self._schedule_version_shield_refresh()
         self._index_file_live(path)
         cur = getattr(self, "_cur", None)
@@ -5472,7 +5486,7 @@ class MainWindow(QMainWindow):
         self._index_file_live(path)
 
     def _maybe_show_version_intro(self) -> None:
-        """棣栨鐣欑増 + 涓荤獥宸查湶鑴告椂锛屽脊涓€娆¤仛鍏夌伅鍛婄煡銆岀増鏈繚鎶ゃ€嶏紝涔嬪悗姘镐箙闈欓粯銆?"""
+        """首次留版且主窗已露脸时，弹一次聚光灯告知「版本保护」，之后永久静默。"""
         if not getattr(self, "_pending_version_intro", False):
             return
         from ..config import is_version_intro_done, mark_version_intro_done
@@ -5481,7 +5495,7 @@ class MainWindow(QMainWindow):
             return
         if (not self.isVisible() or self.isMinimized()
                 or getattr(self, "_welcome", None) is not None):
-            return  # 绐楀彛娌￠湶鑴?/ 娆㈣繋椤佃繕鍦?鈫?绛変笅娆?showEvent 琛ュ脊
+            return  # 窗口没露脸 / 欢迎页还在 → 等下次 showEvent 补弹
         self._show_spotlight(
             self.detail_panel.tabs.tabBar(),
             "已自动给你改过的 PPT 留了底 🛡️\n"
@@ -5490,19 +5504,19 @@ class MainWindow(QMainWindow):
         self._pending_version_intro = False
 
     def _show_spotlight(self, target, text: str) -> None:
-        """缁熶竴寮硅仛鍏夌伅寮曞锛氬厛鍏虫棫鐨勫啀寮规柊鐨勶紝閬垮厤鍙犲姞 / 娉勬紡銆?"""
+        """统一弹聚光灯引导：先关旧的再弹新的，避免叠加 / 泄漏。"""
         old = getattr(self, "_spotlight", None)
         if old is not None:
             try:
                 old.hide()
                 old.deleteLater()
             except RuntimeError:
-                pass  # widget C++ 瀵硅薄宸查攢姣佲€斺€擜ttributeError 绛夌被鍨嬮敊璇晠鎰忎笉鍚?
+                pass  # widget C++ 对象已销毁——AttributeError 等类型错误故意不吞
         from .spotlight import SpotlightOverlay
         self._spotlight = SpotlightOverlay(self.centralWidget(), target, text, tok=self._tok)
 
     def _show_search_coach(self) -> None:
-        """棣栨娆㈣繋椤佃阿骞曞悗锛岃仛鍏夌伅寮曞鎼滅储妗嗭紙涓€鐢熶竴娆★紝闅忔杩庨〉 flag锛夈€?"""
+        """首次欢迎页谢幕后，聚光灯引导搜索框（一生一次，随欢迎页 flag）。"""
         if not self.isVisible() or self.isMinimized() or self._welcome is not None:
             return
         self._show_spotlight(
@@ -5734,9 +5748,12 @@ class MainWindow(QMainWindow):
         self._apply_status_stats(None, stats)
 
     def _index_file_live(self, path: str) -> None:
-        """watcher 鎹曡幏淇濆瓨 鈫?鎶婅繖涓€涓枃浠跺苟鍏ユ悳绱㈢储寮曪紙鏃犻渶閲嶆壂鍏ㄧ洏锛夈€?
-        鐢熶骇锛堟湁鍚庡彴 live 绾跨▼锛夛細浠呭叆闃熷嵆杩斿洖锛?*缁濅笉鍦ㄤ富绾跨▼ parse/鍐欏簱**鈥斺€?
-        鍚﹀垯浼氭姠鍚庡彴 IndexWorker 鐨?SQLite 鍐欓攣锛堟渶闀跨瓑 8s锛夋妸 UI 椤舵垚銆屾湭鍝嶅簲銆嶃€?        鏃?live 绾跨▼锛坉o_index=False 娴嬭瘯锛夛細鍚屾鍏滃簳锛屼繚鎸佸彲娴嬨€?        """
+        """watcher 捕获保存 → 把这一个文件并入搜索索引（无需重扫全盘）。
+
+        生产（有后台 live 线程）：仅入队即返回，**绝不在主线程 parse / 写库**——
+        否则会抢后台 IndexWorker 的 SQLite 写锁（最长等 8s）把 UI 顶成「未响应」。
+        无 live 线程（do_index=False 的测试）：同步兜底，保持可测。
+        """
         if self._indexer is not None and self._indexer.isRunning():
             self._live_deferred_paths.add(path)
             return
@@ -5744,7 +5761,7 @@ class MainWindow(QMainWindow):
 
     def _submit_live_index(self, path: str) -> None:
         if self._live is not None:
-            self._live.submit(path)  # 鍚庡彴绾跨▼ parse+鍐欏簱锛屽畬鎴愮粡 indexed 淇″彿鍥炰富绾跨▼
+            self._live.submit(path)  # 后台线程 parse+写库，完成经 indexed 信号回主线程
             return
         from .. import indexer
         try:
@@ -5771,7 +5788,7 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(self._LIVE_FLUSH_YIELD_MS, self._flush_deferred_live_index)
 
     def _on_live_indexed(self, path: str) -> None:
-        """鍚庡彴 live 绾跨▼绱㈠紩瀹屼竴涓枃浠讹紙淇″彿宸插垏鍥炰富绾跨▼锛夆啋 鍒锋柊鐘舵€?缁撴灉銆?"""
+        """后台 live 线程索引完一个文件（信号已切回主线程）→ 刷新状态 / 结果。"""
         self._after_live_index()
 
     def _after_live_index(self) -> None:
@@ -5779,7 +5796,7 @@ class MainWindow(QMainWindow):
             return
         self._live_refresh_pending = True
         self._index_status_cache = None
-        self._live_status_refresh.start()       # 鍚堝苟 watcher 椋庢毚涓嬬殑鐘舵€?DB 鏌ヨ
+        self._live_status_refresh.start()  # 合并 watcher 风暴下的状态 DB 查询
         self._schedule_live_refresh()
 
     def _schedule_live_refresh(self, delay_ms: int | None = None) -> None:
@@ -5791,7 +5808,7 @@ class MainWindow(QMainWindow):
         self._live_refresh.start()
 
     def _do_live_refresh(self) -> None:
-        """live 绱㈠紩鍘绘姈鍒扮偣锛氭妸椋庢毚鏈熼棿绱Н鐨勬柊鏂囦欢涓€娆℃€у苟鍏ュ綋鍓嶈鍥俱€?"""
+        """live 索引去抖到点：把风暴期间累积的新文件一次性并入当前视图。"""
         if self._closing:
             return
         if self._search_pending_req is not None and self.search_box.text().strip():
@@ -5819,7 +5836,7 @@ class MainWindow(QMainWindow):
         if query:
             self._do_search()
         elif refreshes_dashboard:
-            self._show_recent(dashboard_force_refresh=True, recent_force_refresh=True)  # 绌烘悳绱㈠仠鍦ㄤ华琛ㄧ洏 鈫?鏂版枃浠跺苟鍏ュ悗鍒锋柊缁熻
+            self._show_recent(dashboard_force_refresh=True, recent_force_refresh=True)  # 空搜索停在仪表盘 → 新文件并入后刷新统计
 
     def _start_indexing(self, roots: list[str] | None, workers: int | None) -> bool:
         if hasattr(self, "_coverage_scan_timer"):
@@ -6042,7 +6059,7 @@ class MainWindow(QMainWindow):
             self._index_celebrated = True
         self._refresh_status(summary, celebrate=celebrate)
         if not self.search_box.text().strip():
-            self._show_recent(dashboard_force_refresh=True, recent_force_refresh=True)  # 绱㈠紩瀹屾垚鍚庡埛鏂版渶杩戯紙鐢ㄦ埛杩樻病寮€濮嬫悳鏃讹紝绾冲叆鏂扮储寮曠殑鏂囦欢锛?
+            self._show_recent(dashboard_force_refresh=True, recent_force_refresh=True)  # 索引完成后刷新最近（用户还没开始搜时，纳入新索引的文件）
     def _load_status_stats(self, conn_path: str | None) -> dict:
         exts = self._enabled_index_exts()
         if conn_path:
@@ -6237,11 +6254,11 @@ class MainWindow(QMainWindow):
 
     # ---------- 鐢熷懡鍛ㄦ湡 ----------
     def force_quit(self) -> None:
-        """鐪熸閫€鍑猴紙缁曡繃鎵樼洏鏈€灏忓寲锛夛紝璁╂洿鏂?helper 鎺ョ鏂囦欢鏇挎崲 + 閲嶅惎銆?
+        """真正退出（绕过托盘最小化），让更新 helper 接管文件替换 + 重启。
 
-        close() 瑙﹀彂 _shutdown() 姝ｅ父鏀跺熬绾跨▼骞堕噴鏀?PowerPoint COM/鏂囦欢鍙ユ焺锛?
-        闅忓悗 QApplication.quit() 纭繚杩涚▼閫€鍑猴紙鍗充娇鎵樼洏鍥炬爣椹荤暀锛夛紝helper 鐨?
-        Wait-Process 鎵嶄細杩斿洖銆佺户缁浛鎹€?
+        close() 触发 _shutdown() 正常收尾线程并释放 PowerPoint COM / 文件句柄，
+        随后 QApplication.quit() 确保进程退出（即使托盘图标驻留），
+        helper 的 Wait-Process 才会返回、继续替换。
         """
         self._to_tray_on_close = False
         self.close()

@@ -33,7 +33,22 @@ _busy = False        # COM 通道当前是否被占用
 _hi_waiting = 0      # 排队中的高优先(预览)请求数
 _waiting_by_priority: dict[int, int] = {}
 _FAILED_TTL_SEC = 90.0
+# 渲染失败的短期熔断表。TTL 只在读取时判断，过期项此前永远留在字典里：
+# key 含（路径, 页码, 缓存代, 清晰度），翻过的每一页失败都占一条，托盘常驻
+# 数周只增不减。定期扫掉已过期项，成本 O(表长) 且只在有失败时才会有表。
 _failed_until: dict[tuple[str, int, str, int], float] = {}
+_FAILED_SWEEP_EVERY_SEC = 120.0
+_failed_swept_at = 0.0
+
+
+def _sweep_failed_until() -> None:
+    global _failed_swept_at
+    now = time.monotonic()
+    if now - _failed_swept_at < _FAILED_SWEEP_EVERY_SEC:
+        return
+    _failed_swept_at = now
+    for key in [k for k, until in _failed_until.items() if until <= now]:
+        _failed_until.pop(key, None)
 _FALSE = {"0", "false", "no", "off"}
 _TRUE = {"1", "true", "yes", "on"}
 _POWERPOINT_ACTIVE_TTL_SEC = 2.0
@@ -1203,6 +1218,7 @@ def _render_page_direct(
     fail_key = (path, int(page_no), cache_key, int(long_edge))
     if time.monotonic() < _failed_until.get(fail_key, 0.0):
         return None
+    _sweep_failed_until()
 
     with _com_slot(hi_priority, priority):  # COM 串行单槽（预览优先抢占缩略图）
         if (

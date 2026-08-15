@@ -6,6 +6,9 @@ import sqlite3
 import time
 from pathlib import Path
 
+# WAL 文件在 checkpoint 后自动回缩到的上限（见 connect 里的说明）
+WAL_SIZE_LIMIT_BYTES = 8 * 1024 * 1024
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS managed_docs(
   doc_id TEXT PRIMARY KEY, path TEXT NOT NULL, status TEXT DEFAULT 'active',
@@ -45,6 +48,11 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA busy_timeout=8000")
+    # WAL 只在超过 1000 页（约 4 MB）时才自动 checkpoint，而 checkpoint 之后
+    # SQLite 不会缩小 WAL 文件——高水位会一直挂到进程退出。密集留底的长会话里
+    # 实测能挂着几十 MB。journal_size_limit 让每次 checkpoint 后自动回缩到上限，
+    # 不额外阻塞写入、也不需要我们自己挑时机做 TRUNCATE。
+    conn.execute(f"PRAGMA journal_size_limit={WAL_SIZE_LIMIT_BYTES}")
     return conn
 
 

@@ -816,6 +816,30 @@ class VersionWindow(QWidget):
             self.schedule_reload_docs,
         )
 
+    def _failure_text(self, fail_text: str) -> str:
+        """把「恢复失败」换成可执行的下一步。
+
+        最常见的失败是用户正开着 PowerPoint 编辑这份稿，目标文件被独占——
+        此时原文件毫发无损，只需要关掉再点一次。不说清楚等于让人去猜。
+        """
+        reason = ""
+        getter = getattr(self._mgr, "last_restore_error", None)
+        if callable(getter):
+            try:
+                reason = str(getter() or "")
+            except Exception:  # noqa: BLE001 取原因失败就退回原文案
+                reason = ""
+        from ..versioning import vault as vault_mod
+
+        if reason == vault_mod.REBUILD_ERR_LOCKED:
+            return (f"{fail_text}：这个文件正被 PowerPoint（或其它程序）打开。\n"
+                    "请先关闭它再试一次——你的原文件没有被改动。")
+        if reason == vault_mod.REBUILD_ERR_CORRUPT:
+            return f"{fail_text}：这个恢复点已损坏，无法重组。请换一个版本。"
+        if reason == vault_mod.REBUILD_ERR_MISSING:
+            return f"{fail_text}：这个恢复点的数据已不在版本库里。请换一个版本。"
+        return fail_text
+
     def _run_file_op(self, label: str, fn, title: str, busy_text: str,
                      ok_text: str, fail_text: str, on_ok=None) -> None:
         if self._block_if_file_op_active():
@@ -843,7 +867,8 @@ class VersionWindow(QWidget):
             ok = bool(result)
             if self.right_title.text() in (busy_text, self._FILE_OP_BUSY_NOTICE):
                 self.right_title.setText(prev_title)
-            QMessageBox.information(self, title, ok_text if ok else fail_text)
+            QMessageBox.information(
+                self, title, ok_text if ok else self._failure_text(fail_text))
             if ok and on_ok is not None:
                 on_ok()
             if reload_after_file_op and not self._callback_is_doc_reload(on_ok):

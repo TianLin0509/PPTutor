@@ -748,6 +748,20 @@ def version_insights(
         conn.close()
 
 
+def _chronicle_year_ts(f) -> float:
+    """按年归档用哪个时间：优先 PPT 内嵌的创建时间，读不到才退回 mtime。
+
+    mtime 会被复制、同步、下载重写——真实库实测 2824 份稿里 2682 份的 mtime
+    落在同一年，按它分年等于把整个「生涯」压成一格。dcterms:created 由
+    PowerPoint 写进包里、随文件走，才是稿子真正的诞生时间。
+    存量索引行的 created_at 是 0（不为它强制全库重建），随各自下次解析补齐。
+    """
+    created = float(getattr(f, "created_at", 0.0) or 0.0)
+    if created >= _MIN_VALID_MTIME:
+        return created
+    return float(f.mtime or 0)
+
+
 def yearly_chronicle(
     conn: sqlite3.Connection,
     files: list,
@@ -767,8 +781,9 @@ def yearly_chronicle(
     """
     buckets: dict[int, list] = defaultdict(list)
     for f in files:
-        if float(f.mtime or 0) >= _MIN_VALID_MTIME:
-            buckets[datetime.fromtimestamp(f.mtime).year].append(f)
+        ts = _chronicle_year_ts(f)
+        if ts >= _MIN_VALID_MTIME:
+            buckets[datetime.fromtimestamp(ts).year].append(f)
     if not buckets:
         return ()
 

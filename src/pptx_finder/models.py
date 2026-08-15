@@ -29,6 +29,10 @@ class ParsedDeck:
     pages: list[SlidePage] = field(default_factory=list)
     status: str = "ok"
     error: str = ""
+    # OpenXML docProps/core.xml 里的 dcterms:created（Unix 秒），读不到就是 0。
+    # 文件系统 mtime 会被复制、同步、下载重写，按它分年会把整个库压进「今年」；
+    # 这个字段才是稿子真正诞生的时间。
+    created_at: float = 0.0
 
 
 @dataclass

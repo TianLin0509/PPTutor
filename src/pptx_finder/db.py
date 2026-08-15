@@ -98,6 +98,10 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA busy_timeout=8000")  # 遇锁等待而非立即失败（多连接/偶发并发）
+    # 这里刻意不设 journal_size_limit（版本库侧设了）：索引库的写入形态是建库时的
+    # 批量灌入（盘点可达百万行），而回缩 WAL 要在 checkpoint 后额外截断文件，
+    # A/B 实测让分档写入吞吐的末/首比从 0.84 掉到 0.72。索引库的 WAL 只在扫描期
+    # 短暂变大、随后就被 checkpoint 收掉，为它牺牲建库速度不划算。
     return conn
 
 
@@ -186,6 +190,11 @@ def _ensure_parse_retry_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE files ADD COLUMN parse_failures INTEGER DEFAULT 0")
     if "retry_after" not in cols:
         conn.execute("ALTER TABLE files ADD COLUMN retry_after REAL DEFAULT 0")
+    # PPT 内嵌的创建时间（dcterms:created）。存量行留 0，随各自下一次解析自然补齐——
+    # 刻意不升 INDEX_VERSION：为一个「锦上添花」的统计口径让全体用户再全量重建一次
+    # 不值当，报告侧拿不到就退回 mtime。
+    if "created_at" not in cols:
+        conn.execute("ALTER TABLE files ADD COLUMN created_at REAL DEFAULT 0")
 
 
 def _migrate_index_version(conn: sqlite3.Connection) -> None:
@@ -299,6 +308,7 @@ def upsert_file(
     indexed_at: float,
     parse_failures: int = 0,
     retry_after: float = 0.0,
+    created_at: float = 0.0,
 ) -> int:
     name = sqlite_safe_text(name)
     error = sqlite_safe_text(error)
@@ -307,24 +317,28 @@ def upsert_file(
         """
         INSERT INTO files(
           path,name,name_norm,ext,size,mtime,content_hash,page_count,status,error,
-          parse_failures,retry_after,indexed_at
+          parse_failures,retry_after,indexed_at,created_at
         )
         VALUES(
           :path,:name,:name_norm,:ext,:size,:mtime,:content_hash,:page_count,:status,:error,
-          :parse_failures,:retry_after,:indexed_at
+          :parse_failures,:retry_after,:indexed_at,:created_at
         )
         ON CONFLICT(path) DO UPDATE SET
           name=excluded.name, name_norm=excluded.name_norm, ext=excluded.ext, size=excluded.size, mtime=excluded.mtime,
           content_hash=excluded.content_hash, page_count=excluded.page_count,
           status=excluded.status, error=excluded.error,
           parse_failures=excluded.parse_failures, retry_after=excluded.retry_after,
-          indexed_at=excluded.indexed_at
+          indexed_at=excluded.indexed_at,
+          -- 0 表示这次没解析出创建时间（如仅登记文件名），别把已有的好值冲掉
+          created_at=CASE WHEN excluded.created_at>0 THEN excluded.created_at
+                          ELSE files.created_at END
         RETURNING id
         """,
         dict(path=path, name=name, name_norm=name_norm, ext=ext, size=size, mtime=mtime,
              content_hash=content_hash, page_count=page_count, status=status,
              error=error, parse_failures=max(0, int(parse_failures)),
-             retry_after=max(0.0, float(retry_after)), indexed_at=indexed_at),
+             retry_after=max(0.0, float(retry_after)), indexed_at=indexed_at,
+             created_at=max(0.0, float(created_at or 0.0))),
     )
     file_id = cur.fetchone()[0]
     _update_filename_index(conn, file_id, name)

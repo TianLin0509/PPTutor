@@ -214,6 +214,7 @@ class VersionManager:
             _env_int("PPTUTOR_VERSION_QUARANTINE_KEEP", _DEFAULT_QUARANTINE_KEEP_PER_DOC),
         )
         self._vault_maintenance_stop = threading.Event()
+        self._restore_last_error = ""
 
     # ---------- Snapshot identity ----------
     def snapshot_now(
@@ -719,13 +720,24 @@ class VersionManager:
         }
 
     # ---------- Restore / export ----------
+    def last_restore_error(self) -> str:
+        """上一次恢复/导出失败的原因（vault.REBUILD_ERR_*），成功时为空串。
+
+        UI 拿它把「恢复失败」换成可执行的下一步——最常见的失败是用户正开着
+        PowerPoint 编辑这份稿，此时目标文件被独占，而原文件其实毫发无损。
+        """
+        return self._restore_last_error
+
     def restore_to(self, path: str, version_id: str, dest: str | None = None) -> bool:
+        self._restore_last_error = ""
         with self._lock:
             target = dest or path
             version = store.get_version(self._conn, version_id)
             if not version:
+                self._restore_last_error = vault.REBUILD_ERR_MISSING
                 return False
             if "health" in version.keys() and str(version["health"] or "ok") != "ok":
+                self._restore_last_error = vault.REBUILD_ERR_CORRUPT
                 return False
             if target == path and os.path.exists(path):
                 # Saving the current file before restore can itself cross the
@@ -737,15 +749,23 @@ class VersionManager:
                     notify=False,
                     preserve_version_ids={version_id},
                 )
-            return vault.rebuild_to(version["doc_id"], version_id, target)
+            return vault.rebuild_to(
+                version["doc_id"], version_id, target,
+                on_error=self._note_restore_error,
+            )
+
+    def _note_restore_error(self, reason: str) -> None:
+        self._restore_last_error = str(reason or "")
 
     def export(self, path: str, version_id: str, dest: str) -> bool:
+        self._restore_last_error = ""
         with self._lock:
             version = store.get_version(self._conn, version_id)
             if version and "health" in version.keys() and str(version["health"] or "ok") != "ok":
                 return False
             owner_doc_id = version["doc_id"] if version else self._doc_id_for_path_on_conn(self._conn, path)
-        return vault.rebuild_to(owner_doc_id, version_id, dest)
+        return vault.rebuild_to(
+            owner_doc_id, version_id, dest, on_error=self._note_restore_error)
 
     # ---------- Cross-version search ----------
     def search_history(self, query: str):

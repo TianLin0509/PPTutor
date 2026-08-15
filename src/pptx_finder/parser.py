@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import datetime
 import logging
 import posixpath
 import zipfile
@@ -164,7 +165,35 @@ def parse_pptx_page(path: str, page_no: int) -> SlidePage | None:
         return None
 
 
+_CORE_PROPS = "docProps/core.xml"
+_DCTERMS_CREATED = "{http://purl.org/dc/terms/}created"
+
+
+def _read_created_at(zf: zipfile.ZipFile) -> float:
+    """读 OpenXML 的 dcterms:created（稿子真正的诞生时间），读不到返回 0。
+
+    W3CDTF，形如 2019-11-15T17:59:11Z。文件系统 mtime 会被复制/同步/下载重写，
+    统计「按年」时几乎会把整个库压进当年；这个属性由 PowerPoint 写入并随包走。
+    任何异常都当读不到——它只是锦上添花，绝不能让解析失败。
+    """
+    try:
+        root = etree.fromstring(zf.read(_CORE_PROPS))
+    except (KeyError, etree.XMLSyntaxError, OSError, ValueError):
+        return 0.0
+    node = root.find(_DCTERMS_CREATED)
+    text = (node.text or "").strip() if node is not None else ""
+    if not text:
+        return 0.0
+    try:
+        return datetime.datetime.fromisoformat(
+            text.replace("Z", "+00:00")
+        ).timestamp()
+    except (ValueError, OverflowError, OSError):
+        return 0.0
+
+
 def _parse_zip(zf: zipfile.ZipFile, deck: ParsedDeck) -> ParsedDeck:
+    deck.created_at = _read_created_at(zf)
     pres = "ppt/presentation.xml"
     try:
         pres_xml = zf.read(pres)
