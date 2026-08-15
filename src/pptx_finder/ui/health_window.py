@@ -204,7 +204,56 @@ class HealthWindow(QWidget):
         self._body.addWidget(self._curse_card(r))
         self._body.addWidget(self._bloat_card(r))
         self._body.addWidget(self._parse_card(r))
+        self._body.addWidget(self._vault_card())
         self._body.addStretch(1)
+        self._start_vault_probe()
+
+    # ---------- 版本库占用（异步填充：要遍历整个版本库目录，不能阻塞体检渲染） ----------
+    def _vault_card(self) -> QFrame:
+        w, lay = self._card("🗄️ 版本库占用")
+        self._vault_lines = lay
+        self._vault_placeholder = self._muted("正在统计版本库占用…")
+        lay.addWidget(self._vault_placeholder)
+        return w
+
+    def _start_vault_probe(self) -> None:
+        if getattr(self, "_vault_probe_inflight", False):
+            return
+        self._vault_probe_inflight = True
+        task = BackgroundTask(_vault_health_off_ui, "health-vault-probe")
+        self._track(task, self._scan_tasks)
+        task.done.connect(self._on_vault_probed)
+        task.finished.connect(lambda task=task: self._finish_vault_probe(task))
+        task.start()
+
+    def _finish_vault_probe(self, task) -> None:
+        self._vault_probe_inflight = False
+        self._forget(task, self._scan_tasks)
+
+    def _on_vault_probed(self, payload: object) -> None:
+        lay = getattr(self, "_vault_lines", None)
+        if lay is None or not _qt_is_valid(getattr(self, "_vault_placeholder", None)):
+            return
+        self._vault_placeholder.setParent(None)
+        if not isinstance(payload, dict) or not payload.get("available"):
+            lay.addWidget(self._muted("未开启版本管理，或版本库尚未建立。"))
+            return
+        total = int(payload.get("vault_bytes", 0))
+        ghosts = int(payload.get("ghost_docs", 0))
+        gvers = int(payload.get("ghost_versions", 0))
+        gbytes = int(payload.get("ghost_bytes_estimate", 0))
+        docs = int(payload.get("docs", 0))
+        lay.addWidget(self._line(
+            f"版本库当前占用 {human_bytes(total)}，受管文档 {docs} 份"))
+        if ghosts:
+            lay.addWidget(self._line(
+                f"其中 {ghosts} 份的源文件已经不在磁盘上，留下 {gvers} 个版本"
+                f"（估计可回收 {human_bytes(gbytes)}）"))
+            lay.addWidget(self._muted(
+                "自动维护会在确认缺失满 30 天后收割它们；想立刻回收，"
+                "去「设置 → 功能 → 版本管理 → 清理失效版本」。"))
+        else:
+            lay.addWidget(self._muted("没有源文件已删除的失效留底 ✅"))
 
     def _score_color(self, score: int) -> str:
         if score >= 85:
@@ -527,3 +576,10 @@ class HealthWindow(QWidget):
         if callable(hook):
             hook(res)
         self.refresh()
+
+
+def _vault_health_off_ui() -> dict:
+    """后台线程里读版本库体检快照（遍历整个版本库目录 + 一次幽灵判定，不能在 UI 线程跑）。"""
+    from ..versioning import vault as vault_mod
+
+    return vault_mod.vault_health_snapshot()

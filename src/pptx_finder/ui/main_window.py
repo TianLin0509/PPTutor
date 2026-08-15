@@ -35,6 +35,7 @@ from ..config import (
     DOCX_EXT, PDF_EXT, PPTX_EXT, PPT_EXTS, SUPPORTED_EXTS, db_path as cfg_db_path,
     enabled_index_exts as cfg_enabled_index_exts, ext_path,
     ensure_completed_index_feature_signature,
+    feature_signature_needs_rescan,
     get_completed_index_feature_signature,
     get_document_search_enabled, get_font_family, get_font_scale, get_hotkey,
     get_index_all_files,
@@ -791,6 +792,11 @@ class MainWindow(QMainWindow):
     # 用户刚改过查询词的宽限期，期间后台重搜不抢跑（用户主动操作永不节流）
     _USER_INPUT_GRACE_SEC = 5.0
     _FULL_COVERAGE_INTERVAL_SEC = 7 * 24 * 60 * 60
+    # 盘点目录对账节拍：60 秒够「刚存的文件马上搜得到」，又足够稀疏，
+    # 不会把 churn 目录变成持续的后台 IO。
+    _INVENTORY_RECONCILE_INTERVAL_MS = 60_000
+    _INVENTORY_DIRS_MAX = 2_000   # 脏目录集合上限；溢出即放弃增量，交给下次完整扫描
+    _INVENTORY_DIRS_PER_ROUND = 60  # 每轮最多对账多少个目录（有界后台任务）
     _FULL_COVERAGE_DELAY_MS = 30_000
     _FULL_COVERAGE_RETRY_MS = 5_000
     _BG_LIGHT_SHUTDOWN_WAIT_MS = 250
@@ -1066,6 +1072,17 @@ class MainWindow(QMainWindow):
             )
             self._live.indexed.connect(self._on_live_indexed)
             self._live.start()
+        # 「索引所有文件」的目录级实时对账：watcher 只上报「有非内容文件变动的目录」，
+        # 这里合并去重 + 定时批量 scandir 对账。成本与事件数无关，只与目录内条目数
+        # 有关，浏览器缓存那种一分钟几千次 churn 会被折叠成一个目录名。
+        self._dirty_inventory_dirs: set[str] = set()
+        self._inventory_dirs_overflowed = False
+        self._inventory_reconcile_inflight = False
+        self._inventory_reconcile_timer = QTimer(self)
+        self._inventory_reconcile_timer.setInterval(self._INVENTORY_RECONCILE_INTERVAL_MS)
+        self._inventory_reconcile_timer.timeout.connect(self._run_inventory_reconcile)
+        if do_index and self._index_all_files_enabled:
+            self._inventory_reconcile_timer.start()
         if do_index:
             self._schedule_startup_index_check(self._index_roots, workers)
             self._render_cache_maintenance_timer.start()
@@ -2331,6 +2348,15 @@ class MainWindow(QMainWindow):
         self._rebuild_mode_filter()
         self._recent_cache = None
         self._index_status_cache = None
+        if all_files_changed:
+            timer = getattr(self, "_inventory_reconcile_timer", None)
+            if timer is not None:
+                if self._index_all_files_enabled:
+                    timer.start()
+                else:
+                    timer.stop()
+                    self._dirty_inventory_dirs.clear()
+                    self._inventory_dirs_overflowed = False
         if all_files_changed and not self._index_all_files_enabled:
             # 关闭后一次性清理非内容类型的 filename_only 盘点行（后台线程，单批 DELETE）
             self._purge_inventory_rows()
@@ -2340,6 +2366,81 @@ class MainWindow(QMainWindow):
             else:
                 self._show_recent(recent_force_refresh=True)
             self._refresh_status()
+
+    def note_inventory_dir_dirty(self, directory: str) -> None:
+        """watcher 上报的「有非内容文件变动的目录」入队（主线程槽，必须 O(1)）。"""
+        if not self._index_all_files_enabled or not directory:
+            return
+        if len(self._dirty_inventory_dirs) >= self._INVENTORY_DIRS_MAX:
+            # 溢出：一次性变动了几千个目录（解压大包、装软件）。放弃逐目录增量，
+            # 等下一次完整扫描统一收拢——继续无界堆积只会把内存和后台 IO 拖垮。
+            self._inventory_dirs_overflowed = True
+            return
+        self._dirty_inventory_dirs.add(directory)
+
+    def _run_inventory_reconcile(self) -> None:
+        """定时把一批脏目录交给后台线程对账（新增登记 + 消失删除）。"""
+        if (
+            not self._index_all_files_enabled
+            or self._inventory_reconcile_inflight
+            or not self._dirty_inventory_dirs
+        ):
+            return
+        if self._indexer is not None and self._indexer.isRunning():
+            return  # 全盘扫描本身就在覆盖这些目录，不重复劳动也不抢写锁
+        conn_path = _sqlite_file_path(self._conn)
+        if not conn_path:
+            return  # 内存库（测试）没有独立连接可用，交由显式调用驱动
+        batch = [
+            self._dirty_inventory_dirs.pop()
+            for _ in range(min(self._INVENTORY_DIRS_PER_ROUND, len(self._dirty_inventory_dirs)))
+        ]
+        if not batch:
+            return
+        self._inventory_reconcile_inflight = True
+        exts = self._enabled_index_exts()
+        roots = tuple(self.index_roots())
+        task = BackgroundTask(
+            lambda p=conn_path, dirs=tuple(batch), e=exts, r=roots:
+            self._reconcile_inventory_dirs_sync(p, dirs, e, r),
+            "inventory-dir-reconcile",
+        )
+        self._bg_tasks.append(task)
+        task.done.connect(self._on_inventory_reconciled)
+        task.finished.connect(
+            lambda task=task: self._finish_inventory_reconcile(task))
+        task.start()
+
+    @staticmethod
+    def _reconcile_inventory_dirs_sync(conn_path: str, dirs, exts, roots=()) -> dict:
+        own = db.connect(conn_path)
+        totals = {"added": 0, "removed": 0, "dirs": 0}
+        try:
+            for directory in dirs:
+                try:
+                    res = indexer_mod.reconcile_inventory_dir(
+                        own, directory, allowed_exts=exts, index_roots=roots)
+                except Exception:  # noqa: BLE001 单目录失败不拖垮整批
+                    _log.debug("inventory dir reconcile failed %s", directory, exc_info=True)
+                    continue
+                totals["added"] += int(res.get("added", 0))
+                totals["removed"] += int(res.get("removed", 0))
+                totals["dirs"] += 1
+        finally:
+            own.close()
+        return totals
+
+    def _on_inventory_reconciled(self, payload: object) -> None:
+        if not isinstance(payload, dict):
+            return
+        if int(payload.get("added", 0)) or int(payload.get("removed", 0)):
+            self._index_status_cache = None
+            self._refresh_status()
+
+    def _finish_inventory_reconcile(self, task) -> None:
+        self._inventory_reconcile_inflight = False
+        if task in self._bg_tasks:
+            self._bg_tasks.remove(task)
 
     def _purge_inventory_rows_sync(self, conn_path: str) -> int:
         own = db.connect(conn_path)
@@ -5601,11 +5702,19 @@ class MainWindow(QMainWindow):
             self._apply_status_stats(None, stats)
             self._schedule_full_coverage_scan(roots, "scan_policy_upgrade")
             return
-        if completed_feature_signature != self._current_index_feature_signature():
-            self._startup_index_check_decision = "schedule_full_coverage_feature_change"
-            self._apply_status_stats(None, stats)
-            self._schedule_full_coverage_scan(roots, "feature_change")
-            return
+        current_feature_signature = self._current_index_feature_signature()
+        if completed_feature_signature != current_feature_signature:
+            if feature_signature_needs_rescan(
+                completed_feature_signature, current_feature_signature
+            ):
+                self._startup_index_check_decision = "schedule_full_coverage_feature_change"
+                self._apply_status_stats(None, stats)
+                self._schedule_full_coverage_scan(roots, "feature_change")
+                return
+            # 只是关掉了「索引所有文件」：内容口径没变，盘点行由上面的自愈清理负责，
+            # 直接认账新签名，不让用户白等一次全盘扫描。
+            set_completed_index_feature_signature(current_feature_signature)
+            completed_feature_signature = current_feature_signature
         if time.time() - last_completed_scan_at >= self._FULL_COVERAGE_INTERVAL_SEC:
             self._startup_index_check_decision = "schedule_full_coverage"
             self._apply_status_stats(None, stats)

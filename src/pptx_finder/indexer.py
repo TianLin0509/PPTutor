@@ -380,6 +380,141 @@ def purge_non_content_filename_only(
     return int(cur.rowcount or 0)
 
 
+def _inventory_dir_excluded(directory: str, index_roots=()) -> bool:
+    """盘点目录对账的剪枝：与全盘扫描 (scanner.iter_ppt_files) 的目录规则保持一致。
+
+    系统 Temp 的判定必须相对索引根、而不是看绝对路径：用户显式把某个 Temp 下的
+    目录设为索引根时（测试夹具也是这么用的），那就是正常业务目录，剪掉它等于
+    这个根永远不生效。未提供根时不做 Temp 判定——watcher 侧的 _skip_path 已经
+    带着根信息挡过一道，这里再按绝对路径猜只会误伤。
+    """
+    from .config import EXCLUDE_DIR_NAMES, data_dir
+    from .scanner import _is_system_temp_subtree
+
+    norm = os.path.normcase(os.path.abspath(directory))
+    if norm.startswith(os.path.normcase(os.path.abspath(str(data_dir())))):
+        return True  # 自己的索引库 / 版本库 / 缓存
+    excluded = {e.lower() for e in EXCLUDE_DIR_NAMES}
+    for seg in (p for p in norm.replace("/", "\\").split("\\") if p):
+        if seg in excluded or seg.startswith("$"):
+            return True
+    for root in index_roots or ():
+        if _path_under_any_root(directory, (os.path.normcase(os.path.abspath(root)),)):
+            if _is_system_temp_subtree(directory, root):
+                return True
+            break
+    return is_project_output_path(directory)
+
+
+def _indexed_rows_directly_under(conn: sqlite3.Connection, directory: str) -> dict:
+    """目录下（非递归）已登记的行：path -> (id, ext, size, mtime, status)。
+
+    走 files.path 唯一索引的范围扫描，而不是 LIKE 或全表扫——盘点开启后 files
+    可达百万行，逐目录对账必须是 O(目录内条目) 而不是 O(全库)。
+    """
+    prefix = directory if directory.endswith(("\\", "/")) else directory + os.sep
+    out: dict[str, tuple] = {}
+    for r in conn.execute(
+        "SELECT id, path, ext, size, mtime, status FROM files "
+        "WHERE path >= ? AND path < ?",
+        (prefix, prefix + "￿"),
+    ):
+        rest = str(r["path"])[len(prefix):]
+        if "\\" in rest or "/" in rest:
+            continue  # 子目录里的条目由它自己的目录事件负责
+        out[str(r["path"])] = (
+            int(r["id"]), str(r["ext"] or ""), int(r["size"] or 0),
+            float(r["mtime"] or 0.0), str(r["status"] or ""),
+        )
+    return out
+
+
+def reconcile_inventory_dir(
+    conn: sqlite3.Connection,
+    directory: str,
+    *,
+    allowed_exts: tuple[str, ...] | set[str] | None = None,
+    index_roots: tuple[str, ...] | list[str] = (),
+) -> dict[str, int]:
+    """对单个目录做「任意文件名」盘点对账：新增/改动登记、消失的删除（均非递归）。
+
+    watcher 只对 PPT / Word / PDF 做实时索引，非内容扩展名此前完全没有实时通道——
+    新建与删除要等下一次完整扫描（最坏一周）才反映到搜索结果里。这里补上：
+    watcher 把「有非内容文件变动的目录」上报过来，后台按目录 scandir 一次对账。
+    成本与该目录事件数无关，只与目录内条目数有关，churn 目录天然被合并成一次。
+
+    只碰 status='filename_only' 且扩展名不在内容集的行：PPT / Word / PDF 的内容行
+    由既有实时索引通道负责，绝不在这里被降级或删除。
+    """
+    summary = {"added": 0, "removed": 0, "skipped": 0}
+    if not directory or _inventory_dir_excluded(directory, index_roots):
+        summary["skipped"] = 1
+        return summary
+    content_exts = {
+        e.lower()
+        for e in (allowed_exts if allowed_exts is not None else (*CONTENT_EXTS, PPT_EXT))
+    }
+    try:
+        entries = list(os.scandir(ext_path(directory)))
+    except OSError:
+        # 目录已被删除/不可达：整目录的清理交给完整扫描的删除通道，这里不猜
+        summary["skipped"] = 1
+        return summary
+
+    known = _indexed_rows_directly_under(conn, directory)
+    seen: set[str] = set()
+    rows: list[tuple] = []
+    now = time.time()
+    for entry in entries:
+        try:
+            if not entry.is_file(follow_symlinks=False):
+                continue
+        except OSError:
+            continue
+        name = entry.name
+        if name.startswith("~$"):
+            continue
+        ext = os.path.splitext(name)[1].lower()
+        if ext in content_exts:
+            continue  # 内容类型走既有实时索引通道
+        path = os.path.join(directory, name)
+        seen.add(path)
+        try:
+            st = entry.stat()
+        except OSError:
+            continue
+        if _is_cloud_placeholder(path, st):
+            continue
+        prev = known.get(path)
+        if (
+            prev is not None
+            and prev[2] == int(st.st_size)
+            and abs(prev[3] - float(st.st_mtime)) <= 1e-6
+        ):
+            continue  # 未变更
+        rows.append((path, name, ext, int(st.st_size), float(st.st_mtime), now))
+
+    if rows:
+        try:
+            summary["added"] = _write_filename_only_batch(conn, rows)
+        except Exception as e:  # noqa: BLE001 单目录失败不影响其它目录
+            log.warning("inventory dir upsert failed %s: %s", directory, e)
+
+    for path, (_fid, ext, _size, _mtime, status) in known.items():
+        if path in seen or status != "filename_only":
+            continue
+        if str(ext or "").lower() in content_exts:
+            continue  # .ppt 等内容集登记行不归盘点管
+        if os.path.exists(ext_path(path)):
+            continue  # scandir 漏看（权限/竞态）时宁可留着，不误删
+        db.delete_file(conn, path)
+        summary["removed"] += 1
+
+    if rows or summary["removed"]:
+        conn.commit()
+    return summary
+
+
 def _mark_skipped(
     conn: sqlite3.Connection,
     path: Path,

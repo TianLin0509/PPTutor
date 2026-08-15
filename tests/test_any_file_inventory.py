@@ -388,12 +388,15 @@ def test_filename_only_badge_keeps_ppt_wording(qtbot):
 
 def test_index_all_files_config_roundtrip(monkeypatch, tmp_path):
     monkeypatch.setenv("PPTX_FINDER_DATA_DIR", str(tmp_path / "cfg"))
-    assert config.get_index_all_files() is True  # 默认开
-    config.set_index_all_files(False)
+    # 默认关（2026-08-15）：真机实测 202 万个文件里内容类型只有 1934 个，
+    # 默认为它们建库对「PPT 小助教」是净亏，改成用户主动开启
     assert config.get_index_all_files() is False
     assert config.index_feature_signature().endswith("any_file=0")
     config.set_index_all_files(True)
+    assert config.get_index_all_files() is True
     assert config.index_feature_signature().endswith("any_file=1")
+    config.set_index_all_files(False)
+    assert config.index_feature_signature().endswith("any_file=0")
     # 显式传参优先于持久化
     assert config.index_feature_signature(False, False, False).endswith("any_file=0")
 
@@ -409,7 +412,11 @@ def test_settings_dialog_all_files_toggle(monkeypatch, qtbot, tmp_path):
         on_feature_change=lambda key, enabled: calls.append((key, enabled)),
     )
     qtbot.addWidget(dlg)
-    assert dlg.all_files_feature.isChecked() is True
+    assert dlg.all_files_feature.isChecked() is False  # 默认关
+
+    dlg.all_files_feature.setChecked(True)
+    assert config.get_index_all_files() is True
+    assert ("index_all_files", True) in calls
 
     dlg.all_files_feature.setChecked(False)
     assert config.get_index_all_files() is False

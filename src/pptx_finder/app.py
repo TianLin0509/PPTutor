@@ -284,6 +284,7 @@ class _FeatureRuntime:
                 self._on_content_saved,
                 self._on_removed,
                 allowed_exts=self.allowed_exts,
+                on_other_dir_changed=self._on_other_dir_changed,
             )
             watcher.start()
         except Exception as exc:  # noqa: BLE001 optional live freshness must not crash app
@@ -352,6 +353,16 @@ class _FeatureRuntime:
 
     def _on_content_saved(self, path: str) -> None:
         self._bridge.emit_content_changed(path)
+
+    def _on_other_dir_changed(self, directory: str) -> None:
+        """非内容扩展名的文件变动：只上报目录，由主窗按目录批量对账盘点行。
+
+        必须廉价——churn 目录一分钟能来几千次。这里只做一次信号发射，
+        合并与节流全在主窗侧（见 MainWindow._note_inventory_dir_dirty）。
+        """
+        emit = getattr(self._bridge, "emit_inventory_dir_changed", None)
+        if callable(emit):
+            emit(directory)
 
     def _on_moved(self, old_path: str, new_path: str) -> None:
         if self.version_enabled:
@@ -659,6 +670,7 @@ def main() -> int:
     app._version_manager = version_mgr  # 防 GC
     bridge.snapshotted.connect(win.on_version_snapshot)
     bridge.content_changed.connect(win.on_content_changed)
+    bridge.inventory_dir_changed.connect(win.note_inventory_dir_dirty)
     bridge.runtime_error.connect(win._toast)
     feature_runtime = _FeatureRuntime(win, version_mgr, bridge)
     app._feature_runtime = feature_runtime

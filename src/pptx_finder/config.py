@@ -15,8 +15,13 @@ DEFAULT_VERSION_KEEP_PER_DOC = 100
 DEFAULT_VERSION_MANAGEMENT_ENABLED = False
 DEFAULT_DOCUMENT_SEARCH_ENABLED = False
 DEFAULT_SMART_GROUPING_ENABLED = False
-# Everything 式文件名搜索：默认开。只登记文件名（status=filename_only），不解析内容。
-DEFAULT_INDEX_ALL_FILES = True
+# Everything 式文件名搜索：只登记文件名（status=filename_only），不解析内容。
+# 默认关（2026-08-15 从默认开改回）：真机实测固定盘共 202 万个文件，其中 PPT /
+# Word / PDF 只有 1934 个——1000:1。噪音的大头是 .py 39.9 万、.h 15.8 万、.png
+# 15.8 万这类源码树产物，为它们把 index.db 从 138MB 撑到约 500MB、首次启动多花
+# 数分钟，对「PPT 小助教」的默认体验是净亏。功能保留，设置里一键可开。
+# 与 v1.0.12 立下的默认轻量原则一致：高阶能力一律用户主动选择。
+DEFAULT_INDEX_ALL_FILES = False
 
 
 def resource_path(*parts: str) -> Path:
@@ -336,6 +341,31 @@ def get_index_all_files(default: bool = DEFAULT_INDEX_ALL_FILES) -> bool:
 
 def set_index_all_files(enabled: bool) -> None:
     update_ui_settings(index_all_files=bool(enabled))
+
+
+def feature_signature_needs_rescan(completed: str, current: str) -> bool:
+    """特征签名变化是否必须重扫全盘。
+
+    唯一的例外是 any_file 由 1 → 0（关闭「索引所有文件」）：内容索引的口径一个字
+    都没变，只需要后台把盘点行清掉，没有任何理由让用户再等一次全盘扫描。
+    从默认开改成默认关时，这条豁免让老用户升级即生效、不付重扫代价。
+    其余任何差异（documents / smart_grouping 变化、any_file 开启）都会改变入库
+    内容，必须重扫。
+    """
+    if completed == current:
+        return False
+
+    def _parse(sig: str) -> dict[str, str]:
+        return dict(
+            part.split("=", 1) for part in str(sig or "").split(";") if "=" in part
+        )
+
+    before, after = _parse(completed), _parse(current)
+    if before.get("any_file") == "1" and after.get("any_file") == "0":
+        before.pop("any_file", None)
+        after.pop("any_file", None)
+        return before != after
+    return True
 
 
 def get_completed_index_feature_signature(default: str = "") -> str:

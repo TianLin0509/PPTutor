@@ -14,6 +14,7 @@ class VersionBridge(QObject):
     content_changed = Signal(str)   # Word/PDF 保存，仅触发搜索索引
     runtime_error = Signal(str)     # optional service failure, queued to GUI
     feature_state = Signal(str, bool)  # backend rollback, queued to GUI
+    inventory_dir_changed = Signal(str)  # 「索引所有文件」：有非内容文件变动的目录
 
     def emit_snapshot(self, path: str, version_id: str) -> None:
         """供 VersionManager.on_snapshot 回调（可能在 watcher 子线程被调用）。"""
@@ -28,3 +29,7 @@ class VersionBridge(QObject):
 
     def emit_feature_state(self, key: str, enabled: bool) -> None:
         self.feature_state.emit(str(key), bool(enabled))
+
+    def emit_inventory_dir_changed(self, directory: str) -> None:
+        """watcher 线程里的「非内容扩展名文件有变动」→ 主线程的目录级盘点对账队列。"""
+        self.inventory_dir_changed.emit(str(directory))

@@ -66,12 +66,14 @@ class _Handler(FileSystemEventHandler):
         on_content_saved=None,
         on_removed=None,
         allowed_exts=None,
+        on_other_dir_changed=None,
     ):
         self._on_saved = on_saved
         self._on_moved = on_moved
         self._on_content_saved = on_content_saved
         self._on_removed = on_removed
         self._allowed_exts_source = allowed_exts
+        self._on_other_dir_changed = on_other_dir_changed
         self._explicit_skip_roots = [
             _norm_path(r) for r in (roots or [])
             if any(seg in _norm_path(r).lower() for seg in _SKIP_SEGS)
@@ -106,11 +108,21 @@ class _Handler(FileSystemEventHandler):
         return not any(_under(path, root) for root in self._explicit_skip_roots)
 
     def _trigger(self, path: str) -> None:
-        if os.path.splitext(path)[1].lower() not in self._allowed_exts():
-            return
         if os.path.basename(path).startswith("~$"):
             return
         if self._skip_path(path):
+            return
+        if os.path.splitext(path)[1].lower() not in self._allowed_exts():
+            # 「索引所有文件」的盘点通道：只上报所在目录，不为每个文件事件排防抖
+            # 定时器、更不逐个写库。浏览器缓存这类目录一分钟能churn几千个文件，
+            # 但落到消费侧只是同一个目录名进一次集合，天然合并；随后由后台按目录
+            # 做一次 scandir 对账即可（新增/删除一并解决）。回调必须廉价且不抛。
+            cb = self._on_other_dir_changed
+            if cb is not None:
+                try:
+                    cb(os.path.dirname(path))
+                except Exception:  # noqa: BLE001 盘点是尽力而为，绝不能拖垮 watcher
+                    pass
             return
         self._schedule(path, DEBOUNCE_SEC, 0)
 
@@ -263,6 +275,12 @@ class _Handler(FileSystemEventHandler):
             return
         ext = os.path.splitext(e.src_path)[1].lower()
         if ext not in self._allowed_exts():
+            cb = self._on_other_dir_changed  # 盘点通道：删除同样按目录对账
+            if cb is not None:
+                try:
+                    cb(os.path.dirname(e.src_path))
+                except Exception:  # noqa: BLE001
+                    pass
             return
         if self._on_content_saved is not None:
             try:
@@ -285,6 +303,7 @@ class VaultWatcher:
         on_content_saved=None,
         on_removed=None,
         allowed_exts=None,
+        on_other_dir_changed=None,
     ):
         self._obs = Observer()
         handler = _Handler(
@@ -294,6 +313,7 @@ class VaultWatcher:
             on_content_saved,
             on_removed,
             allowed_exts,
+            on_other_dir_changed,
         )
         self._handler = handler
         for r in roots:

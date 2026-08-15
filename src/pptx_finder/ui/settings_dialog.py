@@ -243,8 +243,8 @@ class SettingsDialog(QDialog):
         lay.addWidget(title)
 
         desc = QLabel(
-            "基础模式始终开启：全盘 PPT 检索 + PPT 统计。文件名盘点默认开启，"
-            "其余高阶项默认关闭，只在你确实需要时才占用额外 CPU、磁盘和后台线程。"
+            "基础模式始终开启：全盘 PPT 检索 + PPT 统计。下面四项默认关闭，"
+            "只在你确实需要时才占用额外 CPU、磁盘和后台线程。"
         )
         desc.setWordWrap(True)
         lay.addWidget(desc)
@@ -270,8 +270,9 @@ class SettingsDialog(QDialog):
         self.all_files_feature.setToolTip(
             "开启后登记全盘所有文件的名字（不解析内容），搜索模式里可选「任意文件名」；"
             "关闭后停止收录并在后台清理盘点数据。\n"
-            "注意：非 PPT / Word / PDF 的文件不走实时监听，新建与删除最坏要等一周的"
-            "完整扫描才反映到搜索结果里（PPT / Word / PDF 仍是改存即刻可搜）。"
+            "新建与删除的文件约一分钟内进出搜索结果（按目录增量对账）。\n"
+            "代价：本机实测固定盘共约 200 万个文件，首轮盘点耗时明显长于普通建库，"
+            "索引库也会显著变大——只在你确实需要按文件名找任意文件时开启。"
         )
         self.all_files_feature.toggled.connect(
             lambda on: self._toggle_feature("index_all_files", on)
