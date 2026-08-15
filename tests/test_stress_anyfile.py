@@ -578,11 +578,14 @@ def test_toggle_churn_converges(tmp_path):
     conn.close()
 
 
-def test_inventory_row_of_content_ext_refreshes_stat_when_doc_search_off(tmp_path):
+def test_inventory_never_freezes_content_row_change_signal(tmp_path):
     """对抗交错：docx 已有内容行 → 文档搜索关闭 + 任意文件开 → 文件被修改。
 
-    守卫拆字段后：status/page_count/content_hash 等内容字段仍被保护（不降级），
-    但 size/mtime/indexed_at 正常刷新——stat 不再永远冻结在旧值。
+    盘点必须完全不碰这一行：status/page_count/content_hash 不降级（守卫），
+    size/mtime 也不刷新。size/mtime 是 _unchanged_index_row 判定「内容需不需要
+    重解析」的唯一信号；盘点若把新 stat 写进 status='ok' 的行，就等于在没解析的
+    前提下宣布「已是最新」，重新开启文档搜索后内容索引会永久冻结在旧版本。
+    端到端后果见 test_docx_content_refreshes_after_doc_search_toggle_cycle。
     """
     root = tmp_path / "data"
     root.mkdir()
@@ -595,7 +598,6 @@ def test_inventory_row_of_content_ext_refreshes_stat_when_doc_search_off(tmp_pat
         content_hash="size:2", page_count=3, status="ok", error="", indexed_at=1.0,
     )
     conn.commit()
-    st = target.stat()
     # 文档搜索关（supported 只含 pptx/ppt）+ 任意文件开
     indexer.update_index(
         conn, [str(root)], workers=1,
@@ -604,8 +606,39 @@ def test_inventory_row_of_content_ext_refreshes_stat_when_doc_search_off(tmp_pat
     row = db.get_file_by_path(conn, str(target))
     assert row["status"] == "ok" and row["page_count"] == 3  # 未被降级
     assert row["content_hash"] == "size:2"  # 内容指纹受守卫保护
-    assert abs(float(row["mtime"]) - float(st.st_mtime)) <= 1e-6  # stat 已刷新
-    assert int(row["size"]) == int(st.st_size)
+    # 变更信号保持「未刷新」：下轮开启文档搜索时 same_stat=False → 重新解析
+    assert abs(float(row["mtime"]) - 1.0) <= 1e-6
+    assert int(row["size"]) == 2
+    conn.close()
+
+
+def test_docx_content_refreshes_after_doc_search_toggle_cycle(tmp_path):
+    """端到端回归：文档搜索 开→索引→关→改文件→再开，必须搜到新内容。
+
+    v1.2.7 之后的盘点分支曾把新 stat 刷进 status='ok' 的 docx 行，导致重新开启
+    文档搜索时 _unchanged_index_row 误判「未变更」→ 跳过解析 → 搜出来永远是旧文字。
+    """
+    root = tmp_path / "docs"
+    root.mkdir()
+    target = root / "report.docx"
+    fx.make_docx(target, ["原始内容 ALPHAWORD"])
+    conn = db.connect(tmp_path / "toggle.db")
+    db.init_db(conn)
+    docs_on = (".pptx", ".ppt", ".docx", ".pdf")
+
+    indexer.update_index(
+        conn, [str(root)], workers=1, supported_exts=docs_on, index_all_files=True)
+    assert [r.name for r in search.search(conn, "ALPHAWORD")] == ["report.docx"]
+
+    fx.make_docx(target, ["改后内容 BETAWORD " + "x" * 200])
+    os.utime(target, (time.time() + 5, time.time() + 5))
+    indexer.update_index(
+        conn, [str(root)], workers=1, supported_exts=CONTENT_EXTS, index_all_files=True)
+    indexer.update_index(
+        conn, [str(root)], workers=1, supported_exts=docs_on, index_all_files=True)
+
+    assert [r.name for r in search.search(conn, "BETAWORD")] == ["report.docx"]
+    assert search.search(conn, "ALPHAWORD") == []
     conn.close()
 
 

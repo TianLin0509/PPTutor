@@ -269,7 +269,9 @@ class SettingsDialog(QDialog):
         self.all_files_feature.setChecked(get_index_all_files())
         self.all_files_feature.setToolTip(
             "开启后登记全盘所有文件的名字（不解析内容），搜索模式里可选「任意文件名」；"
-            "关闭后停止收录并在后台清理盘点数据。"
+            "关闭后停止收录并在后台清理盘点数据。\n"
+            "注意：非 PPT / Word / PDF 的文件不走实时监听，新建与删除最坏要等一周的"
+            "完整扫描才反映到搜索结果里（PPT / Word / PDF 仍是改存即刻可搜）。"
         )
         self.all_files_feature.toggled.connect(
             lambda on: self._toggle_feature("index_all_files", on)

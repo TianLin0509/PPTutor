@@ -1130,6 +1130,10 @@ _SIZE_BUDGET_MAX_ROUNDS = 8
 # 继续驱逐只是拿健康历史换不到达标的纯损失（缺口被豁免地板占住）。
 _SIZE_BUDGET_MIN_PROGRESS_RATIO = 0.05
 _SIZE_BUDGET_MIN_PROGRESS_BYTES = 1
+# 每个 active 文档在容量驱逐下的保底版本数（最新 N 个永不驱逐）。
+# 生产库实测 3800 份文档里 3700 份只有 1 个版本——没有保底线时，一次超限驱逐
+# 就等于按「最久没动」的顺序逐份抹掉整个文档的全部回滚历史。
+_SIZE_BUDGET_KEEP_PER_ACTIVE_DOC = 1
 _MIGRATION_BACKUP_MAX_AGE_SEC = 30 * 24 * 60 * 60
 
 
@@ -1156,6 +1160,17 @@ def vault_size_bytes() -> int:
     return total
 
 
+def _branch_base_ids(conn) -> set[str]:
+    """所有作为复制分支基线的 version_id（永不驱逐：它们是副本的恢复根）。"""
+    return {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT branched_from_version_id FROM doc_branches"
+        ).fetchall()
+        if row[0]
+    }
+
+
 def _budget_relevant_bytes() -> int:
     """容量上限计量口径：vault 总占用减去 versions.db 三件套。
 
@@ -1172,18 +1187,53 @@ def _budget_relevant_bytes() -> int:
     return max(0, total)
 
 
-def enforce_size_budget(conn, *, max_bytes: int) -> dict:
+def survivor_version_ids(conn, keep_per_active_doc: int = _SIZE_BUDGET_KEEP_PER_ACTIVE_DOC):
+    """每个 active 文档最新 N 个版本的 version_id 集合——容量驱逐的保底线。
+
+    「源文件还在磁盘上、版本库里却一个可回滚版本都没有」是产品承诺的反面
+    （README：改崩了一键回到任意健康历史版本）。全局 ts ASC 驱逐天然先吃最久
+    没动过的文档，而那恰恰是最需要旧版的一类：近期文件还能靠 OneDrive/回收站
+    找回，两年前的稿子不能。这里按 doc 保留最新 N 个，不受全局驱逐顺序影响。
+
+    已 deleted 的文档不在保底范围：其留底本就是幽灵收割的目标。
+    """
+    if keep_per_active_doc <= 0:
+        return set()
+    by_doc: dict[str, list[tuple[float, str]]] = {}
+    for row in conn.execute(
+        """SELECT v.doc_id AS doc_id, v.version_id AS version_id, v.ts AS ts
+           FROM versions AS v
+           JOIN managed_docs AS d ON d.doc_id=v.doc_id
+           WHERE d.status='active'"""
+    ).fetchall():
+        by_doc.setdefault(str(row["doc_id"]), []).append(
+            (float(row["ts"] or 0), str(row["version_id"]))
+        )
+    survivors: set[str] = set()
+    for versions in by_doc.values():
+        versions.sort(reverse=True)  # ts 新→旧，同 ts 用 version_id 兜底定序
+        survivors.update(vid for _ts, vid in versions[:keep_per_active_doc])
+    return survivors
+
+
+def enforce_size_budget(
+    conn, *, max_bytes: int,
+    keep_per_active_doc: int = _SIZE_BUDGET_KEEP_PER_ACTIVE_DOC,
+) -> dict:
     """容量上限：超出时按 ts 从老到新驱逐健康版本，随后对象级 GC。
 
-    只驱逐 health='ok' 且非分支基的版本：隔离版本可能可修复、分支基是副本的
-    恢复根，两者永不进驱逐候选。versions.size 是快照时源文件大小，只是占用估计；
-    去重共享对象可能让实际回收小于估计，因此按轮循环直到达标或候选耗尽。
+    只驱逐 health='ok'、非分支基、且不在每文档保底线内的版本：隔离版本可能可
+    修复、分支基是副本的恢复根、每个 active 文档最新 N 个版本是「源文件还在就
+    至少留得住一次回滚」的底线（见 survivor_version_ids），三者永不进驱逐候选。
+    versions.size 是快照时源文件大小，只是占用估计；去重共享对象可能让实际回收
+    小于估计，因此按轮循环直到达标或候选耗尽。
     GC 安全门一旦中止立即停止——不在结构存疑的库上继续删。
     无进展即停：一轮的估计回收（驱逐前）或实测回收（GC 后）不足缺口 5%
-    （且不足最小字节数）时立即 break——预算低于豁免地板（隔离/分支基全量）
-    时继续驱逐只是净损失健康历史。诊断字段：converged（最终是否达标）、
+    （且不足最小字节数）时立即 break——预算低于豁免地板（隔离/分支基/保底线
+    全量）时继续驱逐只是净损失健康历史。诊断字段：converged（最终是否达标）、
     floor_bytes（豁免地板估计下限，驱逐全部候选也降不到它以下；去重共享使
-    真实地板更高）。计量口径见 _budget_relevant_bytes（不含 versions.db 本体）。
+    真实地板更高）、protected_versions（本轮保底线规模）。
+    计量口径见 _budget_relevant_bytes（不含 versions.db 本体）。
     """
     result = {
         "max_bytes": int(max_bytes),
@@ -1194,6 +1244,7 @@ def enforce_size_budget(conn, *, max_bytes: int) -> dict:
         "vault_bytes_after": 0,
         "converged": True,
         "floor_bytes": 0,
+        "protected_versions": 0,
     }
     budget = int(max_bytes)
     if budget <= 0:
@@ -1203,31 +1254,25 @@ def enforce_size_budget(conn, *, max_bytes: int) -> dict:
     result["vault_bytes_before"] = total
     if total > budget:
         # 豁免地板估计：全部可驱逐候选的 size 总和之外的部分永远降不下去。
-        branch_bases = {
-            str(row[0])
-            for row in conn.execute(
-                "SELECT branched_from_version_id FROM doc_branches"
-            ).fetchall()
-            if row[0]
-        }
+        branch_bases = _branch_base_ids(conn)
+        protected = branch_bases | survivor_version_ids(conn, keep_per_active_doc)
+        result["protected_versions"] = len(protected)
         claimable = 0
         for row in conn.execute(
             "SELECT version_id, size FROM versions WHERE COALESCE(health,'ok')='ok'"
         ).fetchall():
-            if str(row["version_id"]) not in branch_bases:
+            if str(row["version_id"]) not in protected:
                 claimable += max(0, int(row["size"] or 0))
         result["floor_bytes"] = max(0, total - claimable)
     gc_result: dict | None = None
     for _ in range(_SIZE_BUDGET_MAX_ROUNDS):
         if total <= budget:
             break
-        branch_bases = {
-            str(row[0])
-            for row in conn.execute(
-                "SELECT branched_from_version_id FROM doc_branches"
-            ).fetchall()
-            if row[0]
-        }
+        # 保底线每轮重算：上一轮驱逐后某文档的「最新 N 个」会变（少于 N 个时全保）
+        protected = _branch_base_ids(conn) | survivor_version_ids(
+            conn, keep_per_active_doc
+        )
+        result["protected_versions"] = len(protected)
         over_by = total - budget
         min_progress = max(
             _SIZE_BUDGET_MIN_PROGRESS_BYTES,
@@ -1241,7 +1286,7 @@ def enforce_size_budget(conn, *, max_bytes: int) -> dict:
                ORDER BY ts ASC, version_id ASC"""
         ).fetchall():
             vid = str(row["version_id"])
-            if vid in branch_bases:
+            if vid in protected:
                 continue
             candidates.append((vid, str(row["doc_id"]), str(row["thumb_path"] or "")))
             claimed += max(0, int(row["size"] or 0))
@@ -1292,7 +1337,13 @@ def maintain_db(
         "vacuumed": False,
         "free_bytes_before": 0,
         "free_ratio_before": 0.0,
+        # error = 意料之外的失败（会挡住重维护的 7 天节流标记）；
+        # vacuum_error = VACUUM 这一步失败，属可选优化，不挡节流标记。
+        # 二者分开是因为 VACUUM 需要约两倍库体积的临时空间，磁盘紧张时会稳定失败：
+        # 混在一起会让 vault_heavy_maintenance_last_success 永远写不进去，
+        # 于是每次启动都重跑一整套幽灵扫描 + 驱逐 + GC（全程持锁）。
         "error": "",
+        "vacuum_error": "",
     }
     try:
         try:
@@ -1326,7 +1377,7 @@ def maintain_db(
                     free_ratio * 100,
                 )
             except sqlite3.DatabaseError as exc:
-                result["error"] = f"{type(exc).__name__}: {exc}"
+                result["vacuum_error"] = f"{type(exc).__name__}: {exc}"
                 log.warning("versions.db vacuum skipped: %s", exc)
 
         try:

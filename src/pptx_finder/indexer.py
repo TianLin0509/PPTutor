@@ -307,6 +307,12 @@ def _write_filename_only_batch(conn: sqlite3.Connection, rows: list[tuple]) -> i
     # 守卫整行跳过内容扩展名既有行，连 size/mtime 也被冻住（每次重扫都因 stat
     # 漂移重试同一行）。这里只放行 stat/indexed_at 字段；status/page_count/
     # content_hash 等内容字段仍由上面的 WHERE 守卫保护，绝不被盘点降级。
+    #
+    # status='filename_only' 是刷新的硬前提（2026-08-14 修）：size/mtime 是
+    # _unchanged_index_row 判定「内容是否需要重解析」的唯一信号。若对一行
+    # status='ok' 的 docx/pdf 刷新 stat，就等于在不重新解析的前提下宣布「已是最新」——
+    # 用户「关文档搜索 → 改 docx → 再开文档搜索」之后，内容索引会永久停在旧版本，
+    # 搜出来的是旧文字、旧页码，且不会再自愈。盘点行没有内容可作废，刷新才安全。
     stat_refresh = [
         (int(size), float(mtime), float(indexed_at), path, *_INVENTORY_CONTENT_GUARD)
         for path, _name, _ext, size, mtime, indexed_at in deduped
@@ -315,7 +321,8 @@ def _write_filename_only_batch(conn: sqlite3.Connection, rows: list[tuple]) -> i
     if stat_refresh:
         conn.executemany(
             "UPDATE files SET size=?, mtime=?, indexed_at=? "
-            f"WHERE path=? AND lower(ext) IN ({guard_marks})",
+            "WHERE path=? AND status='filename_only' "
+            f"AND lower(ext) IN ({guard_marks})",
             stat_refresh,
         )
     # executemany 拿不到 RETURNING，按批查回 file_id 维护文件名 FTS（上限 999 留余量）

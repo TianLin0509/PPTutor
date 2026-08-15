@@ -213,22 +213,54 @@ def test_enforce_size_budget_exempts_branch_base_and_quarantined(tmp_path):
     conn.execute(
         "UPDATE versions SET health='invalid', health_error='deep: corrupt' WHERE version_id='v-q'"
     )
-    _add_full_version(conn, "parent", "v-healthy", 3.0, payload)
-    store.record_branch(conn, "child", "parent", "v-base", 4.0, "copy/hash_match")
+    _add_full_version(conn, "parent", "v-mid", 3.0, payload)
+    _add_full_version(conn, "parent", "v-newest", 4.0, payload)  # 每文档保底线占位
+    store.record_branch(conn, "child", "parent", "v-base", 5.0, "copy/hash_match")
     conn.commit()
 
     res = vault.enforce_size_budget(conn, max_bytes=1)  # 极限预算：能走的都走
 
     assert res["evicted_versions"] == 1
     remaining = {r["version_id"] for r in store.list_versions(conn, "parent")}
-    assert remaining == {"v-base", "v-q"}  # 分支基 + 隔离豁免
+    # 分支基 + 隔离 + 每 active 文档最新 1 个（v-newest）三重豁免
+    assert remaining == {"v-base", "v-q", "v-newest"}
     assert res["gc"] is not None and not res["gc"]["aborted"]
+
+
+def test_enforce_size_budget_keeps_last_version_of_live_doc(tmp_path):
+    """源文件还在磁盘上的文档，容量驱逐永远不能把它的最后一个版本删掉。"""
+    conn = _conn()
+    payload = b"z" * 4096
+    store.upsert_doc(conn, "doc", str(tmp_path / "deck.pptx"), 1.0)
+    for vid, ts in (("v1", 1.0), ("v2", 2.0), ("v3", 3.0)):
+        _add_full_version(conn, "doc", vid, ts, payload)
+
+    res = vault.enforce_size_budget(conn, max_bytes=1)  # 极限预算
+
+    remaining = {r["version_id"] for r in store.list_versions(conn, "doc")}
+    assert remaining == {"v3"}  # 最新一版是保底线，其余全走
+    assert res["evicted_versions"] == 2
+    assert res["protected_versions"] == 1
+
+
+def test_enforce_size_budget_evicts_all_versions_of_deleted_doc(tmp_path):
+    """已 deleted 的文档不在保底范围：留底本就是幽灵收割的目标。"""
+    conn = _conn()
+    store.upsert_doc(conn, "gone", str(tmp_path / "gone.pptx"), 1.0)
+    _add_full_version(conn, "gone", "g1", 1.0, b"w" * 4096)
+    store.set_status(conn, "gone", "deleted")
+
+    res = vault.enforce_size_budget(conn, max_bytes=1)
+
+    assert res["evicted_versions"] == 1
+    assert store.list_versions(conn, "gone") == []
 
 
 def test_enforce_size_budget_reclaims_shared_objects(tmp_path):
     conn = _conn()
     store.upsert_doc(conn, "doc", str(tmp_path / "deck.pptx"), 1.0)
     h = _add_dedup_version(conn, "doc", "v1", 1.0, b"shared-object-bytes")
+    _add_dedup_version(conn, "doc", "v2", 2.0, b"newer-object-bytes")  # 保底线占位
     obj = vault._global_objects_dir() / h
     assert obj.exists()
 
