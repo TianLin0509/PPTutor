@@ -267,3 +267,113 @@ def test_vault_health_snapshot_counts_ghost_docs(tmp_path, monkeypatch):
     assert snap["docs"] == 1
     assert snap["ghost_docs"] == 1  # deck.pptx 从来没被创建过 → 源文件不存在
     assert snap["vault_bytes"] >= 4096
+
+
+# ---------- 重维护：幽灵探测复用（锁外探一次，锁内两处共用） ----------
+
+def _vault_with_ghost(tmp_path, monkeypatch):
+    root = tmp_path / "vault"
+    root.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(vault, "_vault_dir_no_create", lambda: root)
+    monkeypatch.setattr(vault, "vault_dir", lambda: root)
+    monkeypatch.setattr(vault, "_fixed_drive_roots", lambda: [])
+    conn = store.connect(root / "versions.db")
+    store.init_db(conn)
+    return root, conn
+
+
+def test_reap_reuses_probe_and_rechecks_before_deleting(tmp_path, monkeypatch):
+    """探测在锁外做、删除在锁内做：中间文件被恢复时，必须复核后放弃删除。"""
+    root, conn = _vault_with_ghost(tmp_path, monkeypatch)
+    target = tmp_path / "back.pptx"
+    store.upsert_doc(conn, "doc", str(target), 1.0)
+    store.set_status(conn, "doc", "deleted")
+    conn.execute("UPDATE managed_docs SET deleted_at=? WHERE doc_id='doc'", (1.0,))
+    conn.commit()
+
+    probe = vault.list_ghost_docs(conn)
+    assert [g["doc_id"] for g in probe] == ["doc"]
+
+    target.write_bytes(b"restored")  # 探测之后、收割之前，源文件回来了
+    res = vault.reap_ghost_docs(conn, dry_run=False, ghosts=probe)
+
+    assert res["ghost_docs"] == 0
+    assert store.get_doc(conn, "doc") is not None  # 没被误删
+    conn.close()
+
+
+def test_mark_ghost_docs_seen_accepts_precomputed_probe(tmp_path, monkeypatch):
+    root, conn = _vault_with_ghost(tmp_path, monkeypatch)
+    store.upsert_doc(conn, "doc", str(tmp_path / "gone.pptx"), 1.0)
+    conn.commit()
+
+    probe = vault.list_ghost_docs(conn)
+    assert vault.mark_ghost_docs_seen(conn, ghosts=probe) == 1
+    assert float(store.get_doc(conn, "doc")["deleted_at"]) > 0
+    # 已确认过缺失的不重置计时
+    assert vault.mark_ghost_docs_seen(conn, ghosts=vault.list_ghost_docs(conn)) == 0
+    conn.close()
+
+
+def test_enforce_size_budget_accepts_measured_bytes(tmp_path, monkeypatch):
+    """体积测量放锁外：传进来的口径必须被采信，不再自己重新遍历一遍目录。"""
+    root, conn = _vault_with_ghost(tmp_path, monkeypatch)
+    calls = []
+    real = vault._budget_relevant_bytes
+    monkeypatch.setattr(
+        vault, "_budget_relevant_bytes",
+        lambda: (calls.append(1), real())[1])
+
+    res = vault.enforce_size_budget(conn, max_bytes=10 * 1024 * 1024, measured_bytes=123)
+    assert res["vault_bytes_before"] == 123
+    assert calls == []  # 没超预算 → 一次目录遍历都不做
+    conn.close()
+
+
+# ---------- 主窗接线：目录入队 → 后台对账 → 结果可搜（bug 最爱藏在接线处） ----------
+
+def test_main_window_dirty_dir_queue_and_reconcile(qtbot, tmp_path, monkeypatch):
+    from pptx_finder.ui import theme
+    from pptx_finder.ui.main_window import MainWindow
+
+    monkeypatch.setattr(theme, "apply_to_app", lambda *a, **k: None)
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "note.zzz").write_text("x", encoding="utf-8")
+    conn = _conn(tmp_path, "ui.db")
+    win = MainWindow(conn=conn, do_index=False, index_all_files_enabled=True)
+    qtbot.addWidget(win)
+
+    # watcher 侧只会丢一个目录名进来；churn 一千次也只应留下一个
+    for _ in range(1000):
+        win.note_inventory_dir_dirty(str(docs))
+    assert win._dirty_inventory_dirs == {str(docs)}
+
+    # 内存库场景（_sqlite_file_path 为空）不会起后台任务，直接验同步对账语义
+    res = MainWindow._reconcile_inventory_dirs_sync(
+        str(tmp_path / "ui.db"), (str(docs),), (".pptx", ".ppt"), ())
+    assert res["added"] == 1 and res["dirs"] == 1
+    assert [r.name for r in search.search(conn, "note", exts=None)] == ["note.zzz"]
+
+    # 开关关掉后：不再入队，脏目录清空，定时器停
+    win.apply_feature_flags(index_all_files_enabled=False)
+    win.note_inventory_dir_dirty(str(docs))
+    assert win._dirty_inventory_dirs == set()
+    assert not win._inventory_reconcile_timer.isActive()
+    conn.close()
+
+
+def test_main_window_dirty_dir_queue_is_bounded(qtbot, tmp_path, monkeypatch):
+    """一次解压大包能变动上万个目录：集合必须有上限，不能无界堆内存。"""
+    from pptx_finder.ui import theme
+    from pptx_finder.ui.main_window import MainWindow
+
+    monkeypatch.setattr(theme, "apply_to_app", lambda *a, **k: None)
+    conn = _conn(tmp_path, "ui2.db")
+    win = MainWindow(conn=conn, do_index=False, index_all_files_enabled=True)
+    qtbot.addWidget(win)
+    for i in range(MainWindow._INVENTORY_DIRS_MAX + 500):
+        win.note_inventory_dir_dirty(str(tmp_path / f"d{i}"))
+    assert len(win._dirty_inventory_dirs) == MainWindow._INVENTORY_DIRS_MAX
+    assert win._inventory_dirs_overflowed is True
+    conn.close()

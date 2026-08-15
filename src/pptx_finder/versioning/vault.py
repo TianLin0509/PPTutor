@@ -1067,14 +1067,28 @@ def list_ghost_docs(
     return ghosts
 
 
-def mark_ghost_docs_seen(conn, *, fixed_roots: list[str] | None = None) -> int:
+def _doc_has_live_path(conn, doc_id: str, main_path: str) -> bool:
+    """删除前的最后一道复核：该文档还有没有任何一条登记路径真实存在。"""
+    candidates = {str(main_path)} | set(store.list_doc_paths(conn, doc_id))
+    return any(os.path.exists(p) for p in candidates)
+
+
+def mark_ghost_docs_seen(
+    conn, *, fixed_roots: list[str] | None = None, ghosts=None
+) -> int:
     """给当前观察到的幽灵候选补记 deleted_at=now（宽限期从首次确认缺失起算）。
 
     只补 deleted_at=0 的文档；已确认过缺失的保留原时刻。返回新标记数。
+    ghosts 可传入已经探测好的 list_ghost_docs 结果——探测要对上千条路径做
+    os.path.exists，重维护里本来是 mark/reap 各跑一遍；调用方在锁外探测一次
+    再分给两边，能把持锁时间直接砍掉一半（见 manager 的重维护流程）。
     """
     marked = 0
     now = time.time()
-    for g in list_ghost_docs(conn, fixed_roots=fixed_roots):
+    candidates = (
+        list_ghost_docs(conn, fixed_roots=fixed_roots) if ghosts is None else ghosts
+    )
+    for g in candidates:
         if g["missing_since"] > 0:
             continue
         conn.execute(
@@ -1093,15 +1107,34 @@ def reap_ghost_docs(
     dry_run: bool = True,
     min_missing_sec: float = 0.0,
     fixed_roots: list[str] | None = None,
+    ghosts=None,
 ) -> dict:
     """清理幽灵文档：删除其版本、磁盘目录与 DB 记录，再做对象级 GC（collect_garbage）。
 
     min_missing_sec/fixed_roots 透传 list_ghost_docs：自动维护传 30 天宽限；
     设置页手动清理由用户逐次确认，保持默认立即判定。
+
+    ghosts 可传入已探测好的候选（省掉重复的上千次 os.path.exists，见
+    mark_ghost_docs_seen 的说明）。此时仍会在真正删除前逐个复核「所有登记路径
+    确实都不存在」——探测与删除之间文件可能被恢复，宁可白探一次也不能误删。
     """
-    ghosts = list_ghost_docs(
-        conn, min_missing_sec=min_missing_sec, fixed_roots=fixed_roots
-    )
+    if ghosts is None:
+        ghosts = list_ghost_docs(
+            conn, min_missing_sec=min_missing_sec, fixed_roots=fixed_roots
+        )
+    else:
+        now = time.time()
+        ghosts = [
+            g for g in ghosts
+            if (
+                min_missing_sec <= 0
+                or (
+                    float(g.get("missing_since") or 0) > 0
+                    and now - float(g["missing_since"]) >= min_missing_sec
+                )
+            )
+            and not _doc_has_live_path(conn, g["doc_id"], g["path"])
+        ]
     result = {
         "ghost_docs": len(ghosts),
         "ghost_versions": sum(g["versions"] for g in ghosts),
@@ -1248,6 +1281,11 @@ def vault_health_snapshot() -> dict:
     return result
 
 
+def budget_relevant_bytes() -> int:
+    """容量上限计量口径的公开入口——供调用方在持锁之前先量好（见 enforce_size_budget）。"""
+    return _budget_relevant_bytes()
+
+
 def _budget_relevant_bytes() -> int:
     """容量上限计量口径：vault 总占用减去 versions.db 三件套。
 
@@ -1296,6 +1334,7 @@ def survivor_version_ids(conn, keep_per_active_doc: int = _SIZE_BUDGET_KEEP_PER_
 def enforce_size_budget(
     conn, *, max_bytes: int,
     keep_per_active_doc: int = _SIZE_BUDGET_KEEP_PER_ACTIVE_DOC,
+    measured_bytes: int | None = None,
 ) -> dict:
     """容量上限：超出时按 ts 从老到新驱逐健康版本，随后对象级 GC。
 
@@ -1327,7 +1366,9 @@ def enforce_size_budget(
     if budget <= 0:
         result["skipped"] = True  # 0 = 不限
         return result
-    total = _budget_relevant_bytes()
+    # measured_bytes：调用方在锁外量好的口径。首次测量是整目录遍历（真实 3.4GB
+    # 库约 2 秒），没有理由让 watcher 的留底排在它后面——重维护在进锁前先量。
+    total = _budget_relevant_bytes() if measured_bytes is None else int(measured_bytes)
     result["vault_bytes_before"] = total
     if total > budget:
         # 豁免地板估计：全部可驱逐候选的 size 总和之外的部分永远降不下去。

@@ -1045,24 +1045,49 @@ class VersionManager:
             # save events are never blocked behind diagnostics.
             audit = self.audit_repository(deep=False)
 
+            # 锁外先把两件慢的只读活干完（原本它们都在锁内，生产库上合计约 10 秒，
+            # 期间 watcher 的留底快照全部排队）：
+            #   1) 幽灵探测要对上千条登记路径做 os.path.exists；而且此前 mark 与
+            #      reap 各自跑了一遍，等于白探两次。这里只探一次，分给两边用。
+            #   2) 版本库体积是整目录遍历（真实 3.4GB 库约 2 秒）。
+            # 探测结果可能在进锁前变旧：reap 在真正删除前会逐个复核路径是否复活。
+            ghost_probe = None
+            measured_bytes = None
+            if heavy_due:
+                probe_conn = None
+                try:
+                    probe_conn = store.connect(self._db_path)
+                    ghost_probe = vault.list_ghost_docs(probe_conn)
+                except Exception:  # noqa: BLE001 探测失败就退回锁内自己探
+                    ghost_probe = None
+                finally:
+                    if probe_conn is not None:
+                        probe_conn.close()
+                try:
+                    measured_bytes = vault.budget_relevant_bytes()
+                except OSError:
+                    measured_bytes = None
+
             with self._lock:
                 if heavy_due:
-                    # TODO(锁范围重构，排期后续版本)：重维护全程持 _lock——幽灵
-                    # exists 慢探测、批量驱逐、VACUUM 都在锁内，生产大库上可达分钟级，
-                    # 期间 watcher 快照被阻塞。方向：exists 探测移出 _lock、驱逐分批
-                    # 提交、VACUUM 拆到独立短事务。本轮仅做探测顺序优化（见
-                    # vault.list_ghost_docs），不动锁结构。
                     # 幽灵收割带宽限期：先补记本轮新观察到的缺失，再收割已到期的。
-                    ghosts_marked = vault.mark_ghost_docs_seen(self._conn)
+                    ghosts_marked = vault.mark_ghost_docs_seen(
+                        self._conn, ghosts=ghost_probe
+                    )
                     ghosts = vault.reap_ghost_docs(
                         self._conn,
                         dry_run=False,
                         min_missing_sec=self._ghost_grace_sec,
+                        # 复用同一份探测：其中 missing_since 是「本轮 mark 之前」的
+                        # 值，本轮刚补记的文档在这里仍是 0 → 被宽限过滤挡下，
+                        # 与旧实现（mark 之后再探一次）的结论一致，且更保守。
+                        ghosts=ghost_probe,
                     )
                     # 容量上限：超了才按从老到新驱逐健康版本（分支基/隔离豁免）。
                     budget = vault.enforce_size_budget(
                         self._conn,
                         max_bytes=int(get_vault_max_mb()) * 1024 * 1024,
+                        measured_bytes=measured_bytes,
                     )
                     # GC performs its own structural safety gate under the
                     # manager lock. Quarantined legacy full snapshots do not

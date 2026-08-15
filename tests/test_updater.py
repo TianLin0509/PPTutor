@@ -205,3 +205,86 @@ def test_download_delta_cancel_aborts_before_fetch(tmp_path):
         updater.download_delta("http://127.0.0.1:1/", info, tmp_path / "stg",
                                cancel=lambda: True)
     assert not (tmp_path / "stg" / "a.txt").exists()  # 取消在文件循环顶生效，未落任何文件
+
+
+def _run_helper(h, timeout=90):
+    subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+         "-File", h["ps1"], "-MainPid", "0", "-Plan", h["plan_path"]],
+        check=True, capture_output=True, timeout=timeout)
+
+
+def test_helper_preflight_aborts_without_touching_install(tmp_path):
+    """staging 缺文件时必须一个字节都不动安装目录，并重启仍然可用的旧版。
+
+    半套替换会让安装目录里同时躺着两个构建的 exe 与 DLL，通常根本起不来，
+    而用户没有任何退路——预检不通过就整批放弃，比"尽量装一部分"安全得多。
+    """
+    dest = tmp_path / "dist"
+    dest.mkdir()
+    (dest / "app.txt").write_text("OLD", encoding="utf-8")
+    (dest / "lib.txt").write_text("OLDLIB", encoding="utf-8")
+    marker = tmp_path / "relaunched.flag"
+    (dest / "relaunch.bat").write_text(f'@echo done> "{marker}"\r\n', encoding="ascii")
+
+    staging = tmp_path / "stg"
+    staging.mkdir()
+    (staging / "app.txt").write_text("NEW", encoding="utf-8")
+    # download_delta 总会落地 manifest.json，夹具照做，保证只缺 lib.txt 这一项
+    (staging / "manifest.json").write_text('{"version":"0.9.2"}', encoding="utf-8")
+    # lib.txt 故意不落地（模拟杀毒删除 / 磁盘清理 / 下载中断残局）
+
+    info = updater.UpdateInfo(
+        version="0.9.2", notes="",
+        changed=[("app.txt", "", 0), ("lib.txt", "", 0)], deleted=[], raw={})
+    log = tmp_path / "u.log"
+    h = updater.write_helper(staging, dest, info, relaunch="relaunch.bat", log_path=log)
+    _run_helper(h)
+
+    text = log.read_text(encoding="utf-8")
+    assert "ABORT preflight: 1 staged file(s) missing" in text
+    assert "swap done" not in text
+    assert (dest / "app.txt").read_text(encoding="utf-8") == "OLD"     # 一个字节没动
+    assert (dest / "lib.txt").read_text(encoding="utf-8") == "OLDLIB"
+    assert staging.exists()  # 保留 staging，下次可续用而不必重下整包
+
+
+def test_helper_rolls_back_when_a_file_cannot_be_replaced(tmp_path):
+    """中途某个文件换不动时，已经换掉的必须回滚，绝不留混版安装。"""
+    dest = tmp_path / "dist"
+    dest.mkdir()
+    (dest / "a.txt").write_text("OLD_A", encoding="utf-8")
+    (dest / "b.txt").write_text("OLD_B", encoding="utf-8")
+    marker = tmp_path / "relaunched.flag"
+    (dest / "relaunch.bat").write_text(f'@echo done> "{marker}"\r\n', encoding="ascii")
+
+    staging = tmp_path / "stg"
+    staging.mkdir()
+    (staging / "a.txt").write_text("NEW_A", encoding="utf-8")
+    (staging / "b.txt").write_text("NEW_B", encoding="utf-8")
+    (staging / "manifest.json").write_text('{"version":"0.9.3"}', encoding="utf-8")
+
+    info = updater.UpdateInfo(
+        version="0.9.3", notes="",
+        changed=[("a.txt", "", 0), ("b.txt", "", 0)], deleted=[], raw={})
+    log = tmp_path / "u.log"
+    h = updater.write_helper(staging, dest, info, relaunch="relaunch.bat", log_path=log)
+
+    # 独占打开 b.txt：Windows 上 Copy-Item 覆盖会失败，触发 40 次重试后放弃
+    handle = open(dest / "b.txt", "r+b")
+    import msvcrt
+    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+    try:
+        _run_helper(h, timeout=180)
+    finally:
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        finally:
+            handle.close()
+
+    text = log.read_text(encoding="utf-8")
+    assert "ROLLED BACK" in text
+    assert "swap done" not in text
+    # a.txt 先换成功，随后必须被回滚成旧内容——安装目录回到一致的旧版
+    assert (dest / "a.txt").read_text(encoding="utf-8") == "OLD_A"
+    assert (dest / "b.txt").read_text(encoding="utf-8") == "OLD_B"

@@ -174,26 +174,60 @@ try {
   if ($MainPid -gt 0) { try { Wait-Process -Id $MainPid -Timeout 60 -ErrorAction Stop } catch { Log "wait: $_" } }
   Start-Sleep -Milliseconds 500
   $staging = $p.staging; $dest = $p.dest
-  foreach ($rel in @($p.updates)) {
-    if (-not $rel) { continue }
-    $r = ($rel -replace '/','\')
-    $src = Join-Path $staging $r
-    $dst = Join-Path $dest $r
-    $dir = Split-Path -Parent $dst
-    if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
-    $ok = $false
-    for ($i=0; $i -lt 40; $i++) {
-      try { Copy-Item -LiteralPath $src -Destination $dst -Force; $ok = $true; break }
-      catch { Start-Sleep -Milliseconds 300 }
+  $updates = @($p.updates) | Where-Object { $_ }
+  # Preflight. A half-applied swap leaves exe and DLLs from two different builds
+  # in the install dir, which typically cannot start at all -- and the user has
+  # no way back. Verify the whole staging set first; if anything is missing,
+  # touch nothing and relaunch the still-working old build.
+  $missing = @()
+  foreach ($rel in $updates) {
+    if (-not (Test-Path -LiteralPath (Join-Path $staging ($rel -replace '/','\')))) { $missing += $rel }
+  }
+  $swapped = $false
+  if ($missing.Count -gt 0) {
+    Log ("ABORT preflight: " + $missing.Count + " staged file(s) missing, install untouched")
+  } else {
+    $backup = Join-Path ([System.IO.Path]::GetTempPath()) ("pptutor_rollback_" + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force -Path $backup | Out-Null
+    $restore = New-Object System.Collections.ArrayList
+    $failed = $null
+    foreach ($rel in $updates) {
+      $r = ($rel -replace '/','\')
+      $src = Join-Path $staging $r
+      $dst = Join-Path $dest $r
+      $dir = Split-Path -Parent $dst
+      if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+      if (Test-Path -LiteralPath $dst) {
+        $bak = Join-Path $backup $r
+        $bdir = Split-Path -Parent $bak
+        if ($bdir -and -not (Test-Path -LiteralPath $bdir)) { New-Item -ItemType Directory -Force -Path $bdir | Out-Null }
+        try { Copy-Item -LiteralPath $dst -Destination $bak -Force; [void]$restore.Add($r) }
+        catch { $failed = $rel; Log "FAILED backup $rel"; break }
+      }
+      $ok = $false
+      for ($i=0; $i -lt 40; $i++) {
+        try { Copy-Item -LiteralPath $src -Destination $dst -Force; $ok = $true; break }
+        catch { Start-Sleep -Milliseconds 300 }
+      }
+      if (-not $ok) { $failed = $rel; Log "FAILED copy $rel"; break }
     }
-    if (-not $ok) { Log "FAILED copy $rel" }
+    if ($failed) {
+      foreach ($r in $restore) {
+        try { Copy-Item -LiteralPath (Join-Path $backup $r) -Destination (Join-Path $dest $r) -Force }
+        catch { Log "ROLLBACK FAILED $r $_" }
+      }
+      Log ("ROLLED BACK " + $restore.Count + " file(s) after failure on " + $failed + "; backup kept at " + $backup)
+    } else {
+      $swapped = $true
+      foreach ($rel in @($p.deletes)) {
+        if (-not $rel) { continue }
+        $dst = Join-Path $dest ($rel -replace '/','\')
+        if (Test-Path -LiteralPath $dst) { try { Remove-Item -LiteralPath $dst -Force } catch { Log "del $rel $_" } }
+      }
+      Log "swap done -> v$($p.version)"
+      try { Remove-Item -LiteralPath $backup -Recurse -Force } catch {}
+    }
   }
-  foreach ($rel in @($p.deletes)) {
-    if (-not $rel) { continue }
-    $dst = Join-Path $dest ($rel -replace '/','\')
-    if (Test-Path -LiteralPath $dst) { try { Remove-Item -LiteralPath $dst -Force } catch { Log "del $rel $_" } }
-  }
-  Log "swap done -> v$($p.version)"
   if ($p.relaunch) {
     try {
       # Explicit cwd avoids inheriting the helper/control directory. Besides
@@ -202,7 +236,9 @@ try {
       Start-Process -FilePath (Join-Path $dest $p.relaunch) -WorkingDirectory $dest
     } catch { Log "relaunch $_" }
   }
-  try { Remove-Item -LiteralPath $staging -Recurse -Force } catch {}
+  # Keep staging when the swap did not happen: the next attempt can reuse it
+  # instead of downloading the whole delta again.
+  if ($swapped) { try { Remove-Item -LiteralPath $staging -Recurse -Force } catch {} }
   Log "helper done"
 } catch { Log "FATAL $_" }
 '''
