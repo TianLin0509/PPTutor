@@ -4325,7 +4325,10 @@ class MainWindow(QMainWindow):
             if ok == "locked":
                 self._toast("无法恢复：该文件正被 PowerPoint 打开，请先关闭它再恢复")
                 return
-            self._toast("✓ 已恢复到该版本（当前内容已自动留底，不会丢）" if ok else "恢复失败")
+            self._toast(
+                "✓ 已恢复到该版本（恢复前可正常读取的当前内容已自动留底）"
+                if ok else "恢复失败"
+            )
             if ok:
                 self._update_detail(force=True)
 
@@ -4353,7 +4356,10 @@ class MainWindow(QMainWindow):
             if ok == "locked":
                 self._toast("无法恢复：该文件正被 PowerPoint 打开，请先关闭后再试")
                 return
-            self._toast("已恢复到该版本（当前内容已自动留底）" if ok else "恢复失败")
+            self._toast(
+                "已恢复到该版本（恢复前可正常读取的当前内容已自动留底）"
+                if ok else "恢复失败"
+            )
             if ok:
                 self._update_detail(force=True)
 
@@ -4366,7 +4372,18 @@ class MainWindow(QMainWindow):
                     pass
             except OSError:
                 return "locked"
-        return bool(self._version_mgr.restore_to(path, version_id))
+        ok = bool(self._version_mgr.restore_to(path, version_id))
+        if not ok:
+            getter = getattr(self._version_mgr, "last_restore_error", None)
+            if callable(getter):
+                try:
+                    from ..versioning import vault as vault_mod
+
+                    if str(getter() or "") == vault_mod.REBUILD_ERR_LOCKED:
+                        return "locked"
+                except Exception:  # noqa: BLE001 generic failure UI remains available
+                    pass
+        return ok
 
     def _restore_diff_text(self, diff: object | None) -> str:
         if not isinstance(diff, dict):
@@ -4377,13 +4394,16 @@ class MainWindow(QMainWindow):
         return "这版的主要变化：\n" + "\n".join(f"• {line}" for line in lines[:6])
 
     def _confirm_restore(self, diff: object | None = None) -> bool:
-        """恢复前的友好确认：强调「会自动留底、随时切回来」，降低破坏性操作的心理负担。"""
+        """恢复前确认覆盖语义，以及损坏当前文件无法留成健康版本的边界。"""
         from PySide6.QtWidgets import QMessageBox
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Question)
         box.setWindowTitle("恢复到这个版本？")
         box.setText("会用这个历史版本覆盖当前文件。")
-        info = "别担心：覆盖前会自动把当前内容也留一版，之后随时能再切回来。"
+        info = (
+            "当前文件可正常读取时，覆盖前会自动留一版；若它本身已经损坏，"
+            "则直接用所选健康版本恢复。"
+        )
         diff_text = self._restore_diff_text(diff)
         if diff_text:
             info = diff_text + "\n\n" + info

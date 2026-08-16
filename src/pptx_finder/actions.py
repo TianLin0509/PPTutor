@@ -57,6 +57,75 @@ def _com_item(collection, index: int):
         return collection.Item(index)
 
 
+def _powerpoint_process_running() -> bool | None:
+    """Read-only fallback for distinguishing 'not running' from COM audit failure."""
+    if os.name != "nt":
+        return False
+    try:
+        completed = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq POWERPNT.EXE", "/FO", "CSV", "/NH"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            check=False,
+        )
+        if completed.returncode != 0:
+            return None
+        return "POWERPNT.EXE" in completed.stdout.upper()
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def presentation_open_state(path: str) -> bool | None:
+    """Return whether ``path`` is open in the existing PowerPoint session.
+
+    ``None`` means PowerPoint appears to be running but its document collection
+    cannot be audited.  Destructive callers must treat that state as busy.  The
+    helper uses ``GetActiveObject`` only: it never starts PowerPoint, opens a
+    presentation, activates a window, or changes the user's selection.
+    """
+    if os.name != "nt":
+        return False
+    pythoncom = None
+    initialized = False
+    target = _normalized_path(path)
+    try:
+        import pythoncom as _pythoncom  # type: ignore
+        import win32com.client  # type: ignore
+
+        pythoncom = _pythoncom
+        pythoncom.CoInitialize()
+        initialized = True
+        try:
+            app = win32com.client.GetActiveObject("PowerPoint.Application")
+        except Exception:  # noqa: BLE001 no ROT entry is safe only if no process exists
+            running = _powerpoint_process_running()
+            return False if running is False else None
+        try:
+            presentations = app.Presentations
+            for index in range(1, int(presentations.Count) + 1):
+                pres = _com_item(presentations, index)
+                if _normalized_path(getattr(pres, "FullName", "")) == target:
+                    return True
+            return False
+        except Exception as exc:  # noqa: BLE001 missing proof must fail closed
+            log.warning("cannot audit open PowerPoint presentations: %s", exc)
+            return None
+    except Exception as exc:  # noqa: BLE001 pywin32/COM unavailable
+        running = _powerpoint_process_running()
+        if running is not False:
+            log.warning("cannot initialize PowerPoint open-file audit: %s", exc)
+            return None
+        return False
+    finally:
+        if initialized and pythoncom is not None:
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:  # noqa: BLE001
+                pass
+
+
 def _goto_already_open_presentation(
     path: str,
     page_no: int,

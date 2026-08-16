@@ -8,12 +8,16 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import threading
+import time
+from pathlib import Path
 
 import pytest
 
 import fixtures_gen as fx
 from pptx_finder import config
 from pptx_finder.versioning import store, vault
+from pptx_finder.versioning.manager import VersionManager
 
 
 @pytest.fixture(autouse=True)
@@ -34,6 +38,9 @@ def test_validate_version_vault_dir(tmp_path):
     assert config.validate_version_vault_dir("C:\\") is not None
     assert config.validate_version_vault_dir("C:\\Windows\\x") is not None
     assert config.validate_version_vault_dir(str(tmp_path / "ok-dir")) is None
+    current = Path(config.data_dir()) / "vault"
+    assert config.validate_version_vault_dir(str(current / "nested")) is not None
+    assert config.validate_version_vault_dir(str(current.parent)) is not None
 
 
 def test_vault_dir_honors_override(tmp_path):
@@ -141,3 +148,170 @@ def test_migrate_vault_dir(tmp_path):
     (other / "x").write_bytes(b"x")
     with pytest.raises(ValueError):
         vault.migrate_vault_dir(other, dst)  # 目标非空拒绝
+
+
+def test_migration_rejects_same_size_corruption_and_preserves_source(tmp_path):
+    src = tmp_path / "src-vault"
+    src.mkdir()
+    payload = src / "object.bin"
+    payload.write_bytes(b"GOOD")
+    db = sqlite3.connect(str(src / "versions.db"))
+    db.execute("CREATE TABLE t(x)")
+    db.commit()
+    db.close()
+    dst = tmp_path / "dst-vault"
+
+    def corrupt_after_copy(done: int, total: int) -> None:
+        if done == total:
+            (dst / "object.bin").write_bytes(b"EVIL")  # 同为 4 字节
+
+    with pytest.raises(RuntimeError, match="内容不一致"):
+        vault.migrate_vault_dir(src, dst, corrupt_after_copy)
+
+    assert payload.read_bytes() == b"GOOD"
+    assert not dst.exists()
+
+
+def test_migration_rejects_nested_destination_without_deleting_source(tmp_path):
+    src = tmp_path / "src-vault"
+    src.mkdir()
+    (src / "keep.bin").write_bytes(b"must survive")
+
+    with pytest.raises(ValueError, match="不能互相嵌套"):
+        vault.migrate_vault_dir(src, src / "nested")
+
+    assert (src / "keep.bin").read_bytes() == b"must survive"
+
+
+def test_live_manager_migration_reconnects_and_keeps_snapshotting(tmp_path):
+    deck = tmp_path / "deck.pptx"
+    fx.make_pptx(deck, [{"body": "before migration"}])
+    manager = VersionManager(index_roots=[str(tmp_path)])
+    first = manager.snapshot_now(str(deck), notify=False)
+    assert first
+    old_vault = Path(manager._db_path).parent
+    new_vault = tmp_path / "new-vault"
+
+    result = manager.migrate_vault_dir(new_vault, config_value=str(new_vault))
+
+    assert result["source_backup"] == ""
+    assert not old_vault.exists()
+    assert manager._db_path == new_vault / "versions.db"
+    assert Path(config.get_version_vault_dir()) == new_vault
+    assert manager.get_version(first) is not None
+    fx.make_pptx(deck, [{"body": "after migration"}])
+    second = manager.snapshot_now(str(deck), notify=False)
+    assert second and second != first
+    assert (new_vault / "versions.db").is_file()
+    manager.stop()
+
+
+def test_live_manager_switch_keeps_old_vault_but_writes_only_new(tmp_path):
+    deck = tmp_path / "deck.pptx"
+    fx.make_pptx(deck, [{"body": "old vault"}])
+    manager = VersionManager(index_roots=[str(tmp_path)])
+    assert manager.snapshot_now(str(deck), notify=False)
+    old_vault = Path(manager._db_path).parent
+    new_vault = tmp_path / "empty-new-vault"
+
+    manager.switch_vault_dir(new_vault, config_value=str(new_vault))
+    fx.make_pptx(deck, [{"body": "new vault"}])
+    assert manager.snapshot_now(str(deck), notify=False)
+
+    assert old_vault.is_dir()
+    old_check = sqlite3.connect(str(old_vault / "versions.db"))
+    try:
+        assert old_check.execute("SELECT COUNT(*) FROM versions").fetchone()[0] == 1
+    finally:
+        old_check.close()
+    assert len(manager.list_docs()) == 1
+    assert manager._db_path == new_vault / "versions.db"
+    manager.stop()
+
+
+def test_live_migration_reconnect_failure_rolls_back_and_manager_stays_usable(
+    tmp_path,
+    monkeypatch,
+):
+    deck = tmp_path / "deck.pptx"
+    fx.make_pptx(deck, [{"body": "safe before failed move"}])
+    manager = VersionManager(index_roots=[str(tmp_path)])
+    first = manager.snapshot_now(str(deck), notify=False)
+    source = Path(manager._db_path).parent
+    destination = tmp_path / "bad-destination"
+    real_open = manager._open_vault_connections
+
+    def fail_new_vault(db_file):
+        if Path(db_file).parent == destination:
+            raise sqlite3.DatabaseError("injected reconnect failure")
+        return real_open(db_file)
+
+    monkeypatch.setattr(manager, "_open_vault_connections", fail_new_vault)
+
+    with pytest.raises(RuntimeError, match="已尝试回滚"):
+        manager.migrate_vault_dir(destination, config_value=str(destination))
+
+    assert source.is_dir()
+    assert not destination.exists()
+    assert config.get_version_vault_dir() == ""
+    assert manager.get_version(first) is not None
+    fx.make_pptx(deck, [{"body": "still usable after rollback"}])
+    assert manager.snapshot_now(str(deck), notify=False)
+    manager.stop()
+
+
+def test_live_migration_waits_for_inflight_snapshot_and_keeps_that_version(
+    tmp_path,
+    monkeypatch,
+):
+    """设置页迁库撞上 PowerPoint 保存时应排队，不能截走半份版本或死锁。"""
+    deck = tmp_path / "deck.pptx"
+    fx.make_pptx(deck, [{"body": "before concurrent move"}])
+    manager = VersionManager(index_roots=[str(tmp_path)])
+    first = manager.snapshot_now(str(deck), notify=False)
+    assert first
+    fx.make_pptx(deck, [{"body": "save must survive concurrent move"}])
+
+    objects_written = threading.Event()
+    release_snapshot = threading.Event()
+    migration_done = threading.Event()
+    snapshot_ids: list[str | None] = []
+    migration_results: list[dict] = []
+    real_dedup = vault._dedup_store
+
+    def pause_after_objects(doc_id, source_path):
+        result = real_dedup(doc_id, source_path)
+        objects_written.set()
+        assert release_snapshot.wait(5)
+        return result
+
+    monkeypatch.setattr(vault, "_dedup_store", pause_after_objects)
+    snapshot_thread = threading.Thread(
+        target=lambda: snapshot_ids.append(manager.snapshot_now(str(deck), notify=False))
+    )
+    destination = tmp_path / "moved-live-vault"
+    migration_thread = threading.Thread(
+        target=lambda: (
+            migration_results.append(
+                manager.migrate_vault_dir(destination, config_value=str(destination))
+            ),
+            migration_done.set(),
+        )
+    )
+
+    snapshot_thread.start()
+    assert objects_written.wait(3)
+    migration_thread.start()
+    time.sleep(0.15)
+    assert not migration_done.is_set()
+    release_snapshot.set()
+    snapshot_thread.join(8)
+    migration_thread.join(8)
+
+    assert not snapshot_thread.is_alive() and not migration_thread.is_alive()
+    assert snapshot_ids and snapshot_ids[0]
+    assert migration_results and migration_results[0]["source_backup"] == ""
+    assert manager._db_path == destination / "versions.db"
+    assert manager.get_version(str(snapshot_ids[0])) is not None
+    assert manager.audit_repository(deep=True)["ok"] is True
+    manager.stop()

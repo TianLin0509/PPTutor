@@ -12,6 +12,11 @@ import tempfile
 import time
 from pathlib import Path
 
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:  # noqa: BLE001
+    pass
+
 _tmp = tempfile.mkdtemp(prefix="pptxver_e2e_")
 os.environ["PPTX_FINDER_DATA_DIR"] = str(Path(_tmp) / "appdata")
 

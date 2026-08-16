@@ -4,12 +4,19 @@ from __future__ import annotations
 import datetime
 import logging
 import os
+import shutil
 import tempfile
 import threading
 from pathlib import Path
 
-from .. import renderer
-from ..config import PPTX_EXT, get_version_keep_per_doc, get_vault_max_mb
+from .. import actions, renderer
+from ..config import (
+    PPTX_EXT,
+    get_version_keep_per_doc,
+    get_version_vault_dir,
+    get_vault_max_mb,
+    set_version_vault_dir,
+)
 from ..path_policy import explicit_project_output_roots, is_project_output_path
 from ..scanner import iter_ppt_files
 from ..text_tokenize import build_fts_match_exact
@@ -145,6 +152,10 @@ class VersionManager:
         else:
             self._read_conn = conn
         self._lock = threading.RLock()
+        # Covers the complete stable-copy -> metadata/artifact commit window.
+        # A vault location move must not relocate ``_tmp`` between those two
+        # phases or one ordinary PowerPoint save can be lost mid-migration.
+        self._vault_location_lock = threading.RLock()
         self._watcher = None
         self._index_roots = tuple(index_roots or ())
         self._explicit_output_roots = explicit_project_output_roots(self._index_roots)
@@ -237,28 +248,29 @@ class VersionManager:
         if not os.path.exists(path):
             return None
         try:
-            with vault.stable_snapshot_source(path) as snapshot_source:
-                content_hash = vault.file_hash(snapshot_source)
-                with self._lock:
-                    doc_id, base_version, content_hash = self._snapshot_identity(
-                        path,
-                        content_hash=content_hash,
-                    )
-                    sid = self._session_id_for_doc(doc_id)
-                    vid = vault.snapshot(
-                        self._conn,
-                        path,
-                        sid,
-                        doc_id=doc_id,
-                        base_version=base_version,
-                        content_hash=content_hash,
-                        source_path=snapshot_source,
-                    )
-                    if vid:
-                        self._enforce_quota(
-                            doc_id,
-                            preserve_version_ids=preserve_version_ids,
+            with self._vault_location_lock:
+                with vault.stable_snapshot_source(path) as snapshot_source:
+                    content_hash = vault.file_hash(snapshot_source)
+                    with self._lock:
+                        doc_id, base_version, content_hash = self._snapshot_identity(
+                            path,
+                            content_hash=content_hash,
                         )
+                        sid = self._session_id_for_doc(doc_id)
+                        vid = vault.snapshot(
+                            self._conn,
+                            path,
+                            sid,
+                            doc_id=doc_id,
+                            base_version=base_version,
+                            content_hash=content_hash,
+                            source_path=snapshot_source,
+                        )
+                        if vid:
+                            self._enforce_quota(
+                                doc_id,
+                                preserve_version_ids=preserve_version_ids,
+                            )
             self._snapshot_last_error = ""
         except vault.SnapshotSourceError as exc:
             self._snapshot_failures += 1
@@ -551,68 +563,271 @@ class VersionManager:
             yield path
 
     # ---------- Queries ----------
+    @staticmethod
+    def _open_vault_connections(db_file: Path):
+        """Open and validate the writer/UI-reader pair for one vault."""
+        writer = store.connect(db_file)
+        reader = None
+        try:
+            store.init_db(writer)
+            reader = store.connect(db_file)
+            reader.isolation_level = None
+            # Force a real read before an old vault can be released.  Opening a
+            # SQLite handle alone does not prove that its schema is usable.
+            store.summary_stats(reader)
+            return writer, reader
+        except Exception:
+            VersionManager._close_vault_connections(writer, reader)
+            raise
+
+    @staticmethod
+    def _close_vault_connections(writer, reader) -> None:
+        seen: set[int] = set()
+        for conn in (reader, writer):
+            if conn is None or id(conn) in seen:
+                continue
+            seen.add(id(conn))
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                logging.getLogger(__name__).warning(
+                    "failed to close vault connection during relocation",
+                    exc_info=True,
+                )
+
+    @staticmethod
+    def _vault_setting_for_destination(destination: Path, config_value: str | None) -> str:
+        # Empty is the intentional config spelling for data_dir()/vault.  Any
+        # user-entered non-empty/relative spelling is persisted as the resolved
+        # absolute path so a future launcher cwd cannot silently redirect it.
+        if config_value is not None and not str(config_value).strip():
+            return ""
+        return str(destination)
+
+    def switch_vault_dir(
+        self,
+        destination: str | Path,
+        *,
+        config_value: str | None = None,
+    ) -> dict:
+        """Immediately switch to another vault without moving the old one.
+
+        Both connection pairs are live-tested before the persisted setting and
+        active manager are switched.  This avoids the old settings-dialog bug
+        where metadata continued going to the old DB while snapshot artifacts
+        followed the newly saved config directory.
+        """
+        if self._db_path is None:
+            raise RuntimeError("注入数据库连接的测试管理器不支持切换版本库")
+        destination = Path(os.path.abspath(str(destination)))
+        source = Path(self._db_path).parent
+        same = os.path.normcase(str(source)) == os.path.normcase(str(destination))
+        desired_setting = self._vault_setting_for_destination(destination, config_value)
+        if same:
+            set_version_vault_dir(desired_setting)
+            return {"files": 0, "bytes": 0, "source_backup": "", "switched": True}
+        if vault._paths_overlap(source, destination):
+            raise ValueError("当前版本库与新位置不能互相嵌套")
+
+        destination.mkdir(parents=True, exist_ok=True)
+        entries = list(destination.iterdir())
+        if entries and not (destination / "versions.db").is_file():
+            raise ValueError("目标目录非空且不是可识别的 PPT Doctor 版本库")
+
+        with self._vault_maintenance_lock:
+            with self._vault_location_lock:
+                with self._lock:
+                    new_db = destination / "versions.db"
+                    new_writer, new_reader = self._open_vault_connections(new_db)
+                    try:
+                        set_version_vault_dir(desired_setting)
+                    except Exception:
+                        self._close_vault_connections(new_writer, new_reader)
+                        raise
+                    old_writer, old_reader = self._conn, self._read_conn
+                    self._conn, self._read_conn = new_writer, new_reader
+                    self._db_path = new_db
+                    self._close_vault_connections(old_writer, old_reader)
+        return {"files": 0, "bytes": 0, "source_backup": "", "switched": True}
+
+    def migrate_vault_dir(
+        self,
+        destination: str | Path,
+        progress_cb=None,
+        *,
+        config_value: str | None = None,
+    ) -> dict:
+        """Move the live vault, verify it, reconnect, then release rollback data."""
+        if self._db_path is None:
+            raise RuntimeError("注入数据库连接的测试管理器不支持迁移版本库")
+        destination = Path(os.path.abspath(str(destination)))
+        source_db = Path(self._db_path)
+        source = source_db.parent
+        desired_setting = self._vault_setting_for_destination(destination, config_value)
+        old_setting = get_version_vault_dir()
+
+        with self._vault_maintenance_lock:
+            with self._vault_location_lock:
+                with self._lock:
+                    connections_closed = False
+
+                    def _close_before_source_move() -> None:
+                        nonlocal connections_closed
+                        self._close_vault_connections(self._conn, self._read_conn)
+                        connections_closed = True
+
+                    try:
+                        result = vault.migrate_vault_dir(
+                            source,
+                            destination,
+                            progress_cb,
+                            keep_source_backup=True,
+                            before_source_move=_close_before_source_move,
+                        )
+                    except Exception:
+                        if connections_closed:
+                            self._conn, self._read_conn = self._open_vault_connections(source_db)
+                        raise
+
+                    backup_raw = str(result.get("source_backup") or "")
+                    if not backup_raw:
+                        # keep_source_backup=True is a hard hand-off contract:
+                        # reconnect/config validation must finish before the
+                        # only rollback copy can be released.
+                        raise RuntimeError("迁移未返回源版本库回滚副本，拒绝切换")
+                    backup = Path(backup_raw)
+                    new_writer = new_reader = None
+                    try:
+                        new_db = destination / "versions.db"
+                        new_writer, new_reader = self._open_vault_connections(new_db)
+                        set_version_vault_dir(desired_setting)
+                    except Exception as exc:
+                        self._close_vault_connections(new_writer, new_reader)
+                        rollback_errors: list[str] = []
+                        try:
+                            set_version_vault_dir(old_setting)
+                        except Exception as config_exc:  # noqa: BLE001
+                            rollback_errors.append(f"设置回滚失败：{config_exc}")
+                        try:
+                            if backup.is_dir() and not source.exists():
+                                os.replace(backup, source)
+                        except OSError as move_exc:
+                            rollback_errors.append(f"源目录回滚失败：{move_exc}")
+                        if source.is_dir():
+                            try:
+                                self._conn, self._read_conn = self._open_vault_connections(
+                                    source_db
+                                )
+                                shutil.rmtree(destination, ignore_errors=True)
+                            except Exception as reopen_exc:  # noqa: BLE001
+                                rollback_errors.append(f"旧版本库重连失败：{reopen_exc}")
+                        detail = "；".join(rollback_errors)
+                        raise RuntimeError(
+                            f"新版本库重连失败，已尝试回滚：{exc}"
+                            + (f"（{detail}）" if detail else "")
+                        ) from exc
+
+                    self._conn, self._read_conn = new_writer, new_reader
+                    self._db_path = destination / "versions.db"
+                    retained = str(backup)
+                    try:
+                        shutil.rmtree(backup)
+                        retained = ""
+                    except OSError:
+                        logging.getLogger(__name__).warning(
+                            "vault migration succeeded; rollback backup retained: %s",
+                            backup,
+                        )
+                    result["source_backup"] = retained
+                    return result
+
     def list_docs(self):
-        return store.list_docs(self._read_conn)
+        with self._lock:
+            return store.list_docs(self._read_conn)
 
     def summary_stats(self) -> dict[str, int]:
         """Thread-safe KPI snapshot for dashboards and status surfaces."""
-        if self._db_path is None:
-            with self._lock:
+        with self._lock:
+            if self._db_path is None:
                 return store.summary_stats(self._conn)
-        conn = store.connect(self._db_path)
-        try:
-            conn.isolation_level = None
-            return store.summary_stats(conn)
-        finally:
-            conn.close()
+            conn = store.connect(self._db_path)
+            try:
+                conn.isolation_level = None
+                return store.summary_stats(conn)
+            finally:
+                conn.close()
+
+    def preview_ghost_cleanup(self) -> dict:
+        """Return the current manual-cleanup impact without racing a snapshot."""
+        with self._vault_maintenance_lock:
+            with self._vault_location_lock:
+                with self._lock:
+                    return vault.reap_ghost_docs(self._conn, dry_run=True)
+
+    def reap_ghost_docs_now(self) -> dict:
+        """Manually remove expired/missing documents under all vault locks.
+
+        GC must not inspect the object pool between a snapshot writing its
+        objects and committing the referencing DB row.  The old settings-page
+        implementation used an independent SQLite connection and could delete
+        those in-flight objects as apparent orphans.
+        """
+        with self._vault_maintenance_lock:
+            with self._vault_location_lock:
+                with self._lock:
+                    return vault.reap_ghost_docs(self._conn, dry_run=False)
 
     def list_docs_details(self) -> list[dict]:
-        if self._db_path is None:
-            with self._lock:
+        with self._lock:
+            if self._db_path is None:
                 return list(store.list_docs(self._conn))
-        conn = store.connect(self._db_path)
-        try:
-            conn.isolation_level = None
-            return list(store.list_docs(conn))
-        finally:
-            conn.close()
+            conn = store.connect(self._db_path)
+            try:
+                conn.isolation_level = None
+                return list(store.list_docs(conn))
+            finally:
+                conn.close()
 
     def get_doc(self, doc_id: str):
-        return store.get_doc(self._read_conn, doc_id)
+        with self._lock:
+            return store.get_doc(self._read_conn, doc_id)
 
     def get_version(self, version_id: str):
-        return store.get_version(self._read_conn, version_id)
+        with self._lock:
+            return store.get_version(self._read_conn, version_id)
 
     def list_versions(self, path: str):
-        doc_id = self._doc_id_for_path_on_conn(self._read_conn, path)
-        return self._effective_versions_on_conn(self._read_conn, doc_id)
+        with self._lock:
+            doc_id = self._doc_id_for_path_on_conn(self._read_conn, path)
+            return self._effective_versions_on_conn(self._read_conn, doc_id)
 
     def list_versions_details(self, path: str, limit: int | None = None) -> list[dict]:
-        if self._db_path is None:
-            with self._lock:
+        with self._lock:
+            if self._db_path is None:
                 doc_id = self._doc_id_for_path_on_conn(self._conn, path)
                 return self._list_versions_by_doc_details_on_conn(self._conn, doc_id, limit)
-        conn = store.connect(self._db_path)
-        try:
-            conn.isolation_level = None
-            doc_id = self._doc_id_for_path_on_conn(conn, path)
-            return self._list_versions_by_doc_details_on_conn(conn, doc_id, limit)
-        finally:
-            conn.close()
+            conn = store.connect(self._db_path)
+            try:
+                conn.isolation_level = None
+                doc_id = self._doc_id_for_path_on_conn(conn, path)
+                return self._list_versions_by_doc_details_on_conn(conn, doc_id, limit)
+            finally:
+                conn.close()
 
     def list_versions_by_doc(self, doc_id: str):
-        return self._effective_versions_on_conn(self._read_conn, doc_id)
+        with self._lock:
+            return self._effective_versions_on_conn(self._read_conn, doc_id)
 
     def list_versions_by_doc_details(self, doc_id: str, limit: int | None = None) -> list[dict]:
-        if self._db_path is None:
-            with self._lock:
+        with self._lock:
+            if self._db_path is None:
                 return self._list_versions_by_doc_details_on_conn(self._conn, doc_id, limit)
-        conn = store.connect(self._db_path)
-        try:
-            conn.isolation_level = None
-            return self._list_versions_by_doc_details_on_conn(conn, doc_id, limit)
-        finally:
-            conn.close()
+            conn = store.connect(self._db_path)
+            try:
+                conn.isolation_level = None
+                return self._list_versions_by_doc_details_on_conn(conn, doc_id, limit)
+            finally:
+                conn.close()
 
     @classmethod
     def _list_versions_by_doc_details_on_conn(cls, conn, doc_id: str, limit: int | None) -> list[dict]:
@@ -639,6 +854,15 @@ class VersionManager:
 
     def ensure_version_preview(self, version_id: str, page_no: int = 1, long_edge: int = 360) -> str | None:
         """Render and cache a small PNG preview for one historical version."""
+        with self._vault_location_lock:
+            return self._ensure_version_preview_current_vault(version_id, page_no, long_edge)
+
+    def _ensure_version_preview_current_vault(
+        self,
+        version_id: str,
+        page_no: int,
+        long_edge: int,
+    ) -> str | None:
         with self._lock:
             version = store.get_version(self._conn, version_id)
             if not version:
@@ -656,7 +880,12 @@ class VersionManager:
         )
         os.close(fd)
         try:
-            if not vault.rebuild_to(doc_id, version_id, tmp):
+            if not vault.rebuild_to(
+                doc_id,
+                version_id,
+                tmp,
+                expected_content_hash=str(version["content_hash"] or ""),
+            ):
                 return None
             page = max(1, int(page_no))
             png = renderer.render_page_once(
@@ -677,15 +906,16 @@ class VersionManager:
             vault._unlink_snapshot_tmp(tmp)
 
     def describe_version_diff(self, version_id: str) -> dict:
-        if self._db_path is None:
-            with self._lock:
-                return self._describe_version_diff_on_conn(self._conn, version_id)
-        conn = store.connect(self._db_path)
-        try:
-            conn.isolation_level = None
-            return self._describe_version_diff_on_conn(conn, version_id)
-        finally:
-            conn.close()
+        with self._vault_location_lock:
+            if self._db_path is None:
+                with self._lock:
+                    return self._describe_version_diff_on_conn(self._conn, version_id)
+            conn = store.connect(self._db_path)
+            try:
+                conn.isolation_level = None
+                return self._describe_version_diff_on_conn(conn, version_id)
+            finally:
+                conn.close()
 
     @staticmethod
     def _describe_version_diff_on_conn(conn, version_id: str) -> dict:
@@ -730,8 +960,16 @@ class VersionManager:
 
     def restore_to(self, path: str, version_id: str, dest: str | None = None) -> bool:
         self._restore_last_error = ""
+        with self._vault_location_lock:
+            return self._restore_to_current_vault(path, version_id, dest)
+
+    def _restore_to_current_vault(
+        self,
+        path: str,
+        version_id: str,
+        dest: str | None,
+    ) -> bool:
         with self._lock:
-            target = dest or path
             version = store.get_version(self._conn, version_id)
             if not version:
                 self._restore_last_error = vault.REBUILD_ERR_MISSING
@@ -739,33 +977,73 @@ class VersionManager:
             if "health" in version.keys() and str(version["health"] or "ok") != "ok":
                 self._restore_last_error = vault.REBUILD_ERR_CORRUPT
                 return False
-            if target == path and os.path.exists(path):
-                # Saving the current file before restore can itself cross the
-                # retention boundary. Keep the user's selected recovery point
-                # alive through that quota pass or the restore can delete its
-                # own source immediately before rebuilding it.
+            owner_doc_id = str(version["doc_id"])
+            expected_hash = str(version["content_hash"] or "")
+        target = dest or path
+        same_target = os.path.normcase(os.path.abspath(target)) == os.path.normcase(
+            os.path.abspath(path)
+        )
+        if same_target and os.path.exists(path):
+            if actions.presentation_open_state(path) is not False:
+                self._restore_last_error = vault.REBUILD_ERR_LOCKED
+                return False
+        if same_target and os.path.exists(path):
+            # Do not hold _lock while entering snapshot_now: snapshot's global
+            # order is location-lock -> DB-lock so live vault migration cannot
+            # deadlock against restore's pre-overwrite safety copy.
+            try:
                 self.snapshot_now(
                     path,
                     notify=False,
                     preserve_version_ids={version_id},
                 )
-            return vault.rebuild_to(
-                version["doc_id"], version_id, target,
-                on_error=self._note_restore_error,
-            )
+            except vault.InvalidSnapshotError:
+                # The main reason to restore can be that the current PPTX is
+                # already structurally broken.  Requiring that broken file to
+                # become a healthy recovery point makes recovery impossible.
+                logging.getLogger(__name__).warning(
+                    "current file is invalid; restoring healthy version without pre-snapshot: %s",
+                    path,
+                )
+        return vault.rebuild_to(
+            owner_doc_id,
+            version_id,
+            target,
+            on_error=self._note_restore_error,
+            expected_content_hash=expected_hash,
+            before_replace=lambda: actions.presentation_open_state(target) is False,
+        )
 
     def _note_restore_error(self, reason: str) -> None:
         self._restore_last_error = str(reason or "")
 
     def export(self, path: str, version_id: str, dest: str) -> bool:
         self._restore_last_error = ""
+        with self._vault_location_lock:
+            return self._export_from_current_vault(path, version_id, dest)
+
+    def _export_from_current_vault(self, path: str, version_id: str, dest: str) -> bool:
         with self._lock:
             version = store.get_version(self._conn, version_id)
-            if version and "health" in version.keys() and str(version["health"] or "ok") != "ok":
+            if not version:
+                self._restore_last_error = vault.REBUILD_ERR_MISSING
                 return False
-            owner_doc_id = version["doc_id"] if version else self._doc_id_for_path_on_conn(self._conn, path)
+            if "health" in version.keys() and str(version["health"] or "ok") != "ok":
+                self._restore_last_error = vault.REBUILD_ERR_CORRUPT
+                return False
+            owner_doc_id = version["doc_id"]
+            expected_hash = str(version["content_hash"] or "")
         return vault.rebuild_to(
-            owner_doc_id, version_id, dest, on_error=self._note_restore_error)
+            owner_doc_id,
+            version_id,
+            dest,
+            on_error=self._note_restore_error,
+            expected_content_hash=expected_hash,
+            before_replace=lambda: (
+                not os.path.exists(dest)
+                or actions.presentation_open_state(dest) is False
+            ),
+        )
 
     # ---------- Cross-version search ----------
     def search_history(self, query: str):
@@ -776,15 +1054,15 @@ class VersionManager:
         match = build_fts_match_exact(query)
         if not match:
             return {"query": query, "total": 0, "rows": []}
-        if self._db_path is None:
-            with self._lock:
+        with self._lock:
+            if self._db_path is None:
                 return self._search_history_details_on_conn(self._conn, query, match, limit)
-        conn = store.connect(self._db_path)
-        try:
-            conn.isolation_level = None
-            return self._search_history_details_on_conn(conn, query, match, limit)
-        finally:
-            conn.close()
+            conn = store.connect(self._db_path)
+            try:
+                conn.isolation_level = None
+                return self._search_history_details_on_conn(conn, query, match, limit)
+            finally:
+                conn.close()
 
     @staticmethod
     def _search_history_details_on_conn(conn, query: str, match: str, limit: int) -> dict:
@@ -860,6 +1138,7 @@ class VersionManager:
             return True
 
     def recover(self, doc_id: str, dest: str | None = None) -> bool:
+        self._restore_last_error = ""
         with self._lock:
             doc = store.get_doc(self._conn, doc_id)
             latest = next(
@@ -872,9 +1151,23 @@ class VersionManager:
                 None,
             )
             if not doc or not latest:
+                self._restore_last_error = vault.REBUILD_ERR_MISSING
                 return False
-            ok = vault.rebuild_to(latest["doc_id"], latest["version_id"], dest or doc["path"])
-            if ok and (dest is None or dest == doc["path"]):
+            ok = vault.rebuild_to(
+                latest["doc_id"],
+                latest["version_id"],
+                dest or doc["path"],
+                on_error=self._note_restore_error,
+                expected_content_hash=str(latest["content_hash"] or ""),
+                before_replace=lambda: (
+                    not os.path.exists(dest or str(doc["path"]))
+                    or actions.presentation_open_state(dest or str(doc["path"])) is False
+                ),
+            )
+            same_target = dest is None or os.path.normcase(os.path.abspath(dest)) == os.path.normcase(
+                os.path.abspath(str(doc["path"]))
+            )
+            if ok and same_target:
                 store.set_status(self._conn, doc_id, "active")
             return ok
 
@@ -951,6 +1244,7 @@ class VersionManager:
                 break
             keep_ids.add(str(version["version_id"]))
 
+        evictions: list[tuple[str, str]] = []
         for v in vers:
             # A copied document may inherit history through this exact parent
             # version. It is a live recovery root, not quota garbage.
@@ -958,13 +1252,20 @@ class VersionManager:
                 continue
             thumb_path = str(v["thumb_path"] or "")
             store.delete_version(self._conn, v["version_id"])
-            vault.delete_version_artifacts(doc_id, v["version_id"])
+            evictions.append((str(v["version_id"]), thumb_path))
+        if not evictions:
+            return
+        # Metadata-first deletion is crash-safe: after this commit an abrupt
+        # exit can leave only unreachable artifacts, never a live row pointing
+        # at a manifest that was already removed.
+        self._conn.commit()
+        for version_id, thumb_path in evictions:
+            vault.delete_version_artifacts(doc_id, version_id)
             if thumb_path:
                 try:
                     Path(thumb_path).unlink(missing_ok=True)
                 except OSError:
                     pass
-        self._conn.commit()
 
     def _purge_quarantined_overflow(self, doc_id: str, vers, branch_bases: set[str]) -> int:
         """隔离版本每 doc 封顶：只留最新若干个，超出的 purge（分支基继续豁免）。
@@ -983,17 +1284,20 @@ class VersionManager:
             and str(version["version_id"]) not in branch_bases
         ]
         overflow = quarantined_versions[limit:]
+        evictions: list[tuple[str, str]] = []
         for v in overflow:
             thumb_path = str(v["thumb_path"] or "")
             store.delete_version(self._conn, v["version_id"])
-            vault.delete_version_artifacts(doc_id, v["version_id"])
+            evictions.append((str(v["version_id"]), thumb_path))
+        if evictions:
+            self._conn.commit()
+        for version_id, thumb_path in evictions:
+            vault.delete_version_artifacts(doc_id, version_id)
             if thumb_path:
                 try:
                     Path(thumb_path).unlink(missing_ok=True)
                 except OSError:
                     pass
-        if overflow:
-            self._conn.commit()
         return len(overflow)
 
     # ---------- Watcher lifecycle ----------
@@ -1010,21 +1314,32 @@ class VersionManager:
         thread = self._vault_maintenance_thread
         if thread is not None and thread.is_alive():
             return
-        self._vault_maintenance_stop.clear()
+        stop_event = threading.Event()
+        self._vault_maintenance_stop = stop_event
         self._vault_maintenance_thread = threading.Thread(
             target=self._vault_maintenance_loop,
+            args=(stop_event,),
             name="PPTDoctorVaultMaintenance",
             daemon=True,
         )
         self._vault_maintenance_thread.start()
 
-    def _vault_maintenance_loop(self) -> None:
+    def _vault_maintenance_loop(self, stop_event=None) -> None:
         # 托盘常驻数周重维护也得能跑到：启动即跑一次，之后按重维护节流间隔
         # 周期触发；间隔内的重活仍由 _run_vault_maintenance_serialized 的账本节流。
+        event = stop_event or self._vault_maintenance_stop
         self.run_vault_maintenance()
         interval = self._vault_heavy_maintenance_interval_sec
-        while interval > 0 and not self._vault_maintenance_stop.wait(interval):
+        while interval > 0 and not event.wait(interval):
             self.run_vault_maintenance()
+
+    def _stop_vault_maintenance(self) -> None:
+        event = self._vault_maintenance_stop
+        event.set()
+        thread = self._vault_maintenance_thread
+        self._vault_maintenance_thread = None
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2)
 
     def run_vault_maintenance(self) -> dict:
         with self._vault_maintenance_lock:
@@ -1239,19 +1554,22 @@ class VersionManager:
         self._stop_reconcile_loop()
         if self._reconcile_interval_sec <= 0:
             return
-        self._reconcile_stop.clear()
+        stop_event = threading.Event()
+        self._reconcile_stop = stop_event
         self._reconcile_thread = threading.Thread(
             target=self._reconcile_loop,
+            args=(stop_event,),
             name="PPTDoctorVersionReconcile",
             daemon=True,
         )
         self._reconcile_thread.start()
 
-    def _reconcile_loop(self) -> None:
+    def _reconcile_loop(self, stop_event=None) -> None:
         # 启动即补一次离线期间漏拍；旧实现先睡 5 分钟，首屏看似受保护但
         # 刚开机的保存记录仍处于盲区。
+        event = stop_event or self._reconcile_stop
         self.reconcile_known_docs()
-        while not self._reconcile_stop.wait(self._reconcile_interval_sec):
+        while not event.wait(self._reconcile_interval_sec):
             self.reconcile_known_docs()
 
     def _stop_reconcile_loop(self) -> None:
@@ -1269,10 +1587,7 @@ class VersionManager:
     def stop(self) -> None:
         self._stop_reconcile_loop()
         self._stop_watcher()
-        self._vault_maintenance_stop.set()
-        thread = self._vault_maintenance_thread
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=2)
+        self._stop_vault_maintenance()
 
     def diagnostic_lines(self) -> list[str]:
         alive = self._reconcile_thread is not None and self._reconcile_thread.is_alive()

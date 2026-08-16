@@ -1,12 +1,12 @@
 ﻿; PPT Doctor 安装器（Inno Setup 6/7）
 ; 构建：scratchpad\innosetup\ISCC.exe tools\installer.iss（仓库根目录下执行）
-; 产物：artifacts\PPT-Doctor-Setup-v1.2.4.exe
+; 产物：artifacts\PPT-Doctor-Setup-v1.3.2.exe
 ; 设计约束：
 ;   - 装到 {localappdata}\Programs —— 免 UAC，且增量更新 helper 需要就地换文件的写权限
 ;   - 自启完全交给应用内设置（versioning/autostart.py），安装器不写 Run 项，避免双重注册
 ;   - 用户数据（index.db / vault）在 %LOCALAPPDATA%\pptx-finder，不在 {app}，卸载不触碰
 
-#define AppVersion "1.3.1"
+#define AppVersion "1.3.2"
 
 [Setup]
 AppId={{B7E2A8F3-5C4D-4E1F-9A2B-3D4C5E6F7A08}

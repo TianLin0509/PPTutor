@@ -456,7 +456,7 @@ def killer(doc_id, vid):
     orig(doc_id, vid)
     calls["n"] += 1
     if calls["n"] >= 5:
-        os._exit(42)  # 掉电：5 个版本 artifacts 已删、rows 未 commit
+        os._exit(42)  # 掉电：rows 已 commit；仅剩部分 orphan artifacts
 vault.delete_version_artifacts = killer
 vault.enforce_size_budget(conn, max_bytes=1)
 """
@@ -472,16 +472,20 @@ def test_kill_mid_eviction_consistency(tmp_path):
 
     conn = _conn()
     assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
-    # 崩溃窗口证据：5 个版本的 manifest 已删但 row 回滚残留 → GC 安全门中止（安全但降级）
+    # 元数据先提交：掉电只留下孤儿文件，所有仍存活的 row 都有完整恢复图。
     gc = vault.collect_garbage(conn, dry_run=True)
     print((f"\n[kill-eviction] post-crash GC: aborted={gc['aborted']} errors={gc['errors']}").encode('ascii','replace').decode())
-    assert gc["aborted"], "manifest 缺失应触发 GC 安全门"
-    # 恢复路径：重跑驱逐（残留 row 会再次被选中删除）后库恢复自洽
+    assert not gc["aborted"] and not gc["errors"]
+    assert conn.execute("SELECT COUNT(*) FROM versions").fetchone()[0] == 300
+    assert int(gc["manifests_removed"]) > 0 or int(gc["objects_removed"]) > 0
+    # 恢复路径：重跑容量维护先清孤儿，不再牺牲任何健康版本。
     res = vault.enforce_size_budget(conn, max_bytes=1)
     gc2 = vault.collect_garbage(conn, dry_run=True)
     assert not gc2["aborted"] and not gc2["errors"]
+    assert res["evicted_versions"] == 0
+    assert conn.execute("SELECT COUNT(*) FROM versions").fetchone()[0] == 300
     print(f"[kill-eviction] recovery: evicted={res['evicted_versions']} "
-          f"after={res['vault_bytes_after']}B gc_clean")
+           f"after={res['vault_bytes_after']}B gc_clean")
 
 
 _KILL_VACUUM_CHILD = r"""

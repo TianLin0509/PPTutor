@@ -16,8 +16,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from pptx_finder import __version__
-from pptx_finder.updater import MANIFEST_NAME, build_manifest
+from pptx_finder import __version__  # noqa: E402
+from pptx_finder.updater import MANIFEST_NAME, build_manifest  # noqa: E402
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8")  # Windows/CI may inherit cp1252.
+except Exception:  # noqa: BLE001 Console encoding must not block packaging.
+    pass
 
 DIST = ROOT / "dist" / "PPT Doctor"
 LEAK_EXTS = {".pptx", ".ppt", ".db", ".db-wal", ".db-shm"}

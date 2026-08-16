@@ -69,7 +69,6 @@ from ..config import (
     set_vault_max_mb,
     set_version_management_enabled,
     set_version_keep_per_doc,
-    set_version_vault_dir,
     validate_index_root,
     validate_version_vault_dir,
 )
@@ -501,29 +500,34 @@ class SettingsDialog(QDialog):
                 self._vault_dir_result.setText(f"✗ {err}")
                 return
         current = vault_mod.vault_dir()
-        new_eff = Path(raw) if raw else (data_dir() / "vault")
+        new_eff = Path(os.path.abspath(raw)) if raw else (data_dir() / "vault")
         same = os.path.normcase(os.path.abspath(str(new_eff))) == os.path.normcase(
             os.path.abspath(str(current))
         )
         if same:
-            set_version_vault_dir(raw)
+            try:
+                self._mgr.switch_vault_dir(new_eff, config_value=raw)
+            except Exception as e:  # noqa: BLE001
+                self._vault_dir_result.setText(f"✗ 保存失败：{e}")
+                return
             self._vault_dir_result.setText("已是该位置，设置已保存。")
             return
         has_content = current.is_dir() and (
             (current / "versions.db").exists()
             or any(p.is_dir() and p.name != "_tmp" for p in current.iterdir())
         )
-        note = "✓ 已保存。重启应用后版本库在新位置工作。"
+        note = "✓ 已立即切换到新版本库位置。"
         if has_content:
             box = QMessageBox(self)
             box.setWindowTitle("迁移版本库")
             box.setText(
                 f"当前版本库 {current} 已有数据。\n\n"
-                f"「迁移」：整体复制到 {new_eff}，校验文件数与字节后删除旧库（期间请勿使用版本功能）。\n"
-                f"「仅切换」：旧库保留原位但不再被读写，新位置从空库开始。"
+                f"「迁移」：复制到 {new_eff}，逐文件校验并重连成功后再释放旧库；"
+                "保存事件会自动排队。\n"
+                f"「仅切换」：旧库保留原位，新位置立即开始工作。"
             )
             mig = box.addButton("迁移", QMessageBox.AcceptRole)
-            box.addButton("仅切换", QMessageBox.DestructiveRole)
+            switch = box.addButton("仅切换", QMessageBox.DestructiveRole)
             box.addButton(QMessageBox.Cancel)
             box.exec()
             clicked = box.clickedButton()
@@ -541,26 +545,43 @@ class SettingsDialog(QDialog):
                         prog.setLabelText(f"正在迁移版本库… {done}/{total} 个文件")
                         QApplication.processEvents()
 
-                    result = vault_mod.migrate_vault_dir(current, new_eff, _cb)
+                    result = self._mgr.migrate_vault_dir(
+                        new_eff,
+                        _cb,
+                        config_value=raw,
+                    )
                 except Exception as e:  # noqa: BLE001
                     prog.close()
                     self._vault_dir_result.setText(f"✗ 迁移失败：{e}")
                     return
                 prog.close()
-                note = f"✓ 已迁移 {result['files']} 个文件（{result['bytes'] / 1048576:.0f} MB）并切换。重启应用后生效。"
-        set_version_vault_dir(raw)
+                retained = str(result.get("source_backup") or "")
+                note = (
+                    f"✓ 已迁移 {result['files']} 个文件"
+                    f"（{result['bytes'] / 1048576:.0f} MB）并已立即切换。"
+                )
+                if retained:
+                    note += f" 旧库回滚副本因占用未删除：{retained}"
+            elif clicked is switch:
+                try:
+                    self._mgr.switch_vault_dir(new_eff, config_value=raw)
+                except Exception as e:  # noqa: BLE001
+                    self._vault_dir_result.setText(f"✗ 切换失败：{e}")
+                    return
+                note = f"✓ 已立即切换；旧版本库仍保留在 {current}。"
+        else:
+            try:
+                self._mgr.switch_vault_dir(new_eff, config_value=raw)
+            except Exception as e:  # noqa: BLE001
+                self._vault_dir_result.setText(f"✗ 切换失败：{e}")
+                return
         self._vault_dir_result.setText(note)
 
     def _reap_ghost_docs(self) -> None:
         import sqlite3
 
-        from ..versioning import store as vstore
-        from ..versioning import vault as vault_mod
-
-        conn = vstore.connect(vault_mod.db_path())
         try:
-            vstore.init_db(conn)  # 老库补列（deleted_at 等），保证收割查询可用
-            dry = vault_mod.reap_ghost_docs(conn, dry_run=True)
+            dry = self._mgr.preview_ghost_cleanup()
             if not dry["ghost_docs"]:
                 self._vault_dir_result.setText("没有失效版本（所有登记路径仍存在）。")
                 return
@@ -572,7 +593,9 @@ class SettingsDialog(QDialog):
             )
             if ret != QMessageBox.Yes:
                 return
-            res = vault_mod.reap_ghost_docs(conn, dry_run=False)
+            # The source may have reappeared while the confirmation was open;
+            # the manager re-probes under the same locks used by snapshots.
+            res = self._mgr.reap_ghost_docs_now()
             gc = res.get("gc") or {}
             mb = int(gc.get("bytes_reclaimed", 0) or 0) / 1048576
             self._vault_dir_result.setText(
@@ -583,10 +606,7 @@ class SettingsDialog(QDialog):
         except sqlite3.OperationalError:
             # 与周维护并发时，第二连接 busy_timeout 8s 后抛 OperationalError——
             # 友好提示而不是让异常直接抛出 slot。
-            conn.rollback()
             self._vault_dir_result.setText("版本库正忙，请稍后重试。")
-        finally:
-            conn.close()
 
     def _apply_vault_max(self, _index: int) -> None:
         # 纯配置写入；下一次每周维护按新上限执行，不打扰运行中的版本管理器

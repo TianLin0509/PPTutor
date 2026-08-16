@@ -733,7 +733,11 @@ class VersionWindow(QWidget):
             self._finish_restore_prepare(prev_title)
             QMessageBox.warning(self, "恢复", "找不到该版本对应的文档路径")
             return
-        msg = f"用此版本恢复：\n{os.path.basename(path)}\n\n若当前文件存在，会先自动留一版，不会丢。"
+        msg = (
+            f"用此版本恢复：\n{os.path.basename(path)}\n\n"
+            "若当前文件可正常读取，会先自动留一版；若文件本身已损坏，"
+            "则直接用所选健康版本恢复。"
+        )
         diff = data.get("diff")
         if isinstance(diff, dict):
             lines = [str(x).strip() for x in (diff.get("lines") or []) if str(x).strip()]

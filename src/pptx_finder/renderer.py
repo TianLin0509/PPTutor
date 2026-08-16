@@ -943,6 +943,7 @@ def _audit_borrowed_hidden_presentation(
     expected_path: str,
     *,
     windows_before: int,
+    presentations_before: int,
     active_before: str | None,
 ) -> None:
     """Prove that borrowing did not create/activate a user-visible document window."""
@@ -967,6 +968,11 @@ def _audit_borrowed_hidden_presentation(
             problems.append("user window count changed")
     except Exception:  # noqa: BLE001
         problems.append("application window state unavailable")
+    try:
+        if int(app.Presentations.Count) != int(presentations_before) + 1:
+            problems.append("presentation collection changed unexpectedly")
+    except Exception:  # noqa: BLE001
+        problems.append("presentation collection state unavailable")
     active_after = _active_presentation_path(app)
     if active_before is not None and active_after != active_before:
         problems.append("active user presentation changed")
@@ -1016,6 +1022,7 @@ def _open_pres(app, path: str, cache_key: str):
         raise RuntimeError("previous preview presentation is still closing")
     borrowed = getattr(_state, "app_mode", None) == "borrowed"
     windows_before = 0
+    presentations_before = 0
     active_before = None
     if borrowed:
         try:
@@ -1024,7 +1031,22 @@ def _open_pres(app, path: str, cache_key: str):
             raise PowerPointSessionBusy(
                 "borrowed PowerPoint application windows cannot be audited"
             ) from None
+        try:
+            presentations_before = int(app.Presentations.Count)
+        except Exception:
+            raise PowerPointSessionBusy(
+                "borrowed PowerPoint presentation collection cannot be audited"
+            ) from None
         active_before = _active_presentation_path(app)
+        if presentations_before > 0 and active_before is None:
+            # Failing to read ActivePresentation used to be treated exactly
+            # like an empty user session.  We would then open into a process
+            # that was visibly editing a document but had no before-state to
+            # compare, so the most important non-interference audit failed
+            # open.  Missing proof in a user's PowerPoint must fail closed.
+            raise PowerPointSessionBusy(
+                "borrowed PowerPoint active presentation cannot be audited"
+            )
     pres = app.Presentations.Open(path, ReadOnly=1, WithWindow=0)
     if borrowed:
         try:
@@ -1033,6 +1055,7 @@ def _open_pres(app, path: str, cache_key: str):
                 pres,
                 path,
                 windows_before=windows_before,
+                presentations_before=presentations_before,
                 active_before=active_before,
             )
         except Exception:

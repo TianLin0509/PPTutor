@@ -8,7 +8,10 @@
 from __future__ import annotations
 
 import os
+import json
 import zipfile
+import threading
+import time
 
 import pytest
 
@@ -98,6 +101,28 @@ def test_verify_still_catches_a_missing_object(tmp_path):
     assert vault._verify(doc_id, names, parts) is False
 
 
+def test_unchanged_save_repairs_latest_version_with_missing_object(tmp_path):
+    """DB hash 相同也不能跳过：恢复点缺件时，当前健康文件必须能自动补一版。"""
+    deck = _deck(tmp_path, blob_kb=0)
+    mgr = VersionManager(index_roots=[str(deck.parent)])
+    first = mgr.snapshot_now(str(deck), notify=False)
+    assert first
+    version = mgr.get_version(first)
+    doc_id = str(version["doc_id"])
+    manifest = vault.manifest_for(doc_id, str(first))
+    victim_hash = next(iter(manifest["parts"].values()))
+    victim = vault._object_path(doc_id, str(victim_hash))
+    victim.unlink()
+    vault._verified_forget(str(victim))
+
+    repaired = mgr.snapshot_now(str(deck), notify=False)
+
+    assert repaired and repaired != first
+    assert vault._recovery_structure_available(doc_id, repaired)
+    assert vault.parse_pptx(str(deck)).status == "ok"
+    mgr.stop()
+
+
 # ---------- 内存：模块级缓存必须有上限 ----------
 
 def test_verified_object_cache_is_bounded(monkeypatch):
@@ -177,6 +202,281 @@ def test_successful_restore_clears_error(tmp_path):
     vid = mgr.snapshot_now(str(deck), notify=False)
     assert mgr.restore_to(str(deck), vid) is True
     assert mgr.last_restore_error() == ""
+    mgr.stop()
+
+
+def test_restore_refuses_target_reported_open_by_powerpoint(tmp_path, monkeypatch):
+    """共享写句柄可能成功；必须按 PowerPoint 文稿集合判断，而不是靠 open(r+b)。"""
+    import pptx_finder.versioning.manager as manager_mod
+
+    deck = _deck(tmp_path, blob_kb=0)
+    mgr = VersionManager(index_roots=[str(deck.parent)])
+    version_id = mgr.snapshot_now(str(deck), notify=False)
+    original = deck.read_bytes()
+    monkeypatch.setattr(
+        manager_mod.actions,
+        "presentation_open_state",
+        lambda _path: True,
+    )
+
+    assert mgr.restore_to(str(deck), version_id) is False
+    assert mgr.last_restore_error() == vault.REBUILD_ERR_LOCKED
+    assert deck.read_bytes() == original
+    mgr.stop()
+
+
+def test_restore_rechecks_powerpoint_immediately_before_atomic_replace(tmp_path, monkeypatch):
+    """用户可能在恢复重组期间打开稿件；最终 os.replace 前必须再过一次安全门。"""
+    import pptx_finder.versioning.manager as manager_mod
+
+    deck = _deck(tmp_path, blob_kb=0)
+    mgr = VersionManager(index_roots=[str(deck.parent)])
+    version_id = mgr.snapshot_now(str(deck), notify=False)
+    fx.make_pptx(deck, [{"body": "CURRENT_MUST_SURVIVE"}])
+    current = deck.read_bytes()
+    states = iter((False, True))
+    monkeypatch.setattr(
+        manager_mod.actions,
+        "presentation_open_state",
+        lambda _path: next(states),
+    )
+
+    assert mgr.restore_to(str(deck), version_id) is False
+    assert mgr.last_restore_error() == vault.REBUILD_ERR_LOCKED
+    assert deck.read_bytes() == current
+    mgr.stop()
+
+
+def test_restore_recovers_when_current_file_is_already_corrupt(tmp_path):
+    """恢复的首要场景就是当前稿已损坏，不能先强迫它通过健康留底。"""
+    deck = _deck(tmp_path, blob_kb=0)
+    mgr = VersionManager(index_roots=[str(deck.parent)])
+    version_id = mgr.snapshot_now(str(deck), notify=False)
+    assert version_id
+
+    deck.write_bytes(b"PK\x03\x04 broken current presentation")
+
+    assert mgr.restore_to(str(deck), version_id) is True
+    restored = vault.parse_pptx(str(deck))
+    assert restored.status == "ok"
+    assert "算力" in " ".join(page.raw_text for page in restored.pages)
+    assert mgr.last_restore_error() == ""
+    mgr.stop()
+
+
+def test_export_rejects_parseable_tampering_of_full_fallback(tmp_path, monkeypatch):
+    """全量兜底也必须有不可变哈希，不能拿被篡改的文件与自身比较。"""
+    deck = _deck(tmp_path, blob_kb=0)
+    mgr = VersionManager(index_roots=[str(deck.parent)])
+    monkeypatch.setattr(vault, "_verify", lambda *_args, **_kwargs: False)
+    version_id = mgr.snapshot_now(str(deck), notify=False)
+    assert version_id
+    version = mgr.get_version(version_id)
+    full = vault.version_file(str(version["doc_id"]), str(version_id))
+    fx.make_pptx(full, [{"body": "PARSEABLE_BUT_WRONG"}])
+
+    exported = tmp_path / "must-not-exist.pptx"
+    assert mgr.export(str(deck), str(version_id), str(exported)) is False
+    assert not exported.exists()
+    assert mgr.last_restore_error() == vault.REBUILD_ERR_CORRUPT
+    mgr.stop()
+
+
+def test_legacy_full_raw_hash_rejects_tampering_before_backfill(tmp_path, monkeypatch):
+    """旧 full 恢复点的 raw ZIP hash 仍有效，升级时不能先丢掉再自证。"""
+    deck = _deck(tmp_path, blob_kb=0)
+    mgr = VersionManager(index_roots=[str(deck.parent)])
+    monkeypatch.setattr(vault, "_verify", lambda *_args, **_kwargs: False)
+    version_id = mgr.snapshot_now(str(deck), notify=False)
+    version = mgr.get_version(version_id)
+    doc_id = str(version["doc_id"])
+    full = vault.version_file(doc_id, str(version_id))
+    legacy_raw = vault._raw_file_hash(str(full))
+    manifest_path = vault._manifest_path(doc_id, str(version_id))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.pop("content_hash", None)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    mgr._conn.execute(
+        "UPDATE versions SET content_hash=? WHERE version_id=?",
+        (legacy_raw, version_id),
+    )
+    mgr._conn.commit()
+
+    fx.make_pptx(full, [{"body": "PARSEABLE_LEGACY_TAMPERING"}])
+    out = tmp_path / "legacy-must-not-export.pptx"
+
+    assert mgr.export(str(deck), str(version_id), str(out)) is False
+    assert mgr.last_restore_error() == vault.REBUILD_ERR_CORRUPT
+    audit = mgr.audit_repository(deep=False)
+    assert str(version_id) in audit["invalid_versions"]
+    result = vault.backfill_content_hashes(mgr._conn)
+    assert result["errors"] == 1
+    stored = mgr._conn.execute(
+        "SELECT content_hash FROM versions WHERE version_id=?", (version_id,)
+    ).fetchone()[0]
+    assert stored == legacy_raw
+    mgr.stop()
+
+
+def test_legacy_full_raw_hash_backfills_only_after_exact_validation(tmp_path, monkeypatch):
+    """未损坏的旧 full 恢复点可导出，并在逐字节校验后升级为 canonical hash。"""
+    deck = _deck(tmp_path, blob_kb=0)
+    mgr = VersionManager(index_roots=[str(deck.parent)])
+    monkeypatch.setattr(vault, "_verify", lambda *_args, **_kwargs: False)
+    version_id = mgr.snapshot_now(str(deck), notify=False)
+    version = mgr.get_version(version_id)
+    doc_id = str(version["doc_id"])
+    full = vault.version_file(doc_id, str(version_id))
+    legacy_raw = vault._raw_file_hash(str(full))
+    manifest_path = vault._manifest_path(doc_id, str(version_id))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.pop("content_hash", None)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    mgr._conn.execute(
+        "UPDATE versions SET content_hash=? WHERE version_id=?",
+        (legacy_raw, version_id),
+    )
+    mgr._conn.commit()
+
+    out = tmp_path / "legacy-ok.pptx"
+    assert mgr.export(str(deck), str(version_id), str(out)) is True
+    result = vault.backfill_content_hashes(mgr._conn)
+    assert result == {"checked": 1, "updated": 1, "errors": 0}
+    stored = mgr._conn.execute(
+        "SELECT content_hash FROM versions WHERE version_id=?", (version_id,)
+    ).fetchone()[0]
+    assert str(stored).startswith("pkg:")
+    mgr.stop()
+
+
+def test_large_media_dedup_and_rebuild_never_use_whole_part_reads(tmp_path, monkeypatch):
+    """大媒体部件在保存与恢复时必须流式处理，避免与 PowerPoint 抢数百 MB RSS。"""
+    deck = _deck(tmp_path, blob_kb=4096)
+    doc_id = vault.doc_id_for(str(deck))
+
+    def forbidden_zip_read(*_args, **_kwargs):
+        raise AssertionError("ZipFile.read would materialize a complete media part")
+
+    def forbidden_path_read(*_args, **_kwargs):
+        raise AssertionError("Path.read_bytes would materialize a complete object")
+
+    monkeypatch.setattr(zipfile.ZipFile, "read", forbidden_zip_read)
+    monkeypatch.setattr(type(deck), "read_bytes", forbidden_path_read)
+    names, parts = vault._dedup_store(doc_id, str(deck))
+    rebuilt = tmp_path / "streamed.pptx"
+    vault._write_zip(str(rebuilt), doc_id, names, parts)
+
+    assert vault.file_hash(str(rebuilt)) == vault.file_hash(str(deck))
+
+
+def test_cross_volume_legacy_object_migration_streams_in_bounded_memory(
+    tmp_path,
+    monkeypatch,
+):
+    """旧对象池迁往另一块盘时 hard-link 会失败，回退也不能 read_bytes 整块吃内存。"""
+    import xxhash
+
+    source = tmp_path / "large-legacy-object"
+    source.write_bytes(os.urandom(4 * 1024 * 1024))
+    object_hash = vault._hash_path(source)
+    monkeypatch.setattr(vault.os, "link", lambda *_args: (_ for _ in ()).throw(OSError(18, "cross-device")))
+
+    def forbidden_read_bytes(*_args, **_kwargs):
+        raise AssertionError("legacy migration must not materialize the complete object")
+
+    monkeypatch.setattr(type(source), "read_bytes", forbidden_read_bytes)
+    installed, existed = vault._install_object_file(source, object_hash)
+
+    digest = xxhash.xxh64()
+    with installed.open("rb") as copied:
+        for chunk in iter(lambda: copied.read(1 << 20), b""):
+            digest.update(chunk)
+    assert existed is False
+    assert digest.hexdigest() == object_hash
+
+
+def test_reconcile_restart_does_not_revive_timed_out_old_thread(tmp_path, monkeypatch):
+    """stop/start 不能清掉旧线程的 stop Event，留下两个永久对账循环。"""
+    mgr = VersionManager(index_roots=[str(tmp_path)])
+    mgr._reconcile_interval_sec = 60.0
+    first_entered = __import__("threading").Event()
+    release_first = __import__("threading").Event()
+    calls: list[int] = []
+
+    def reconcile(*_args, **_kwargs):
+        ident = __import__("threading").get_ident()
+        calls.append(ident)
+        if not first_entered.is_set():
+            first_entered.set()
+            assert release_first.wait(5)
+        return {"checked": 0}
+
+    monkeypatch.setattr(mgr, "reconcile_known_docs", reconcile)
+    mgr._start_reconcile_loop()
+    assert first_entered.wait(2)
+    old_thread = mgr._reconcile_thread
+    assert old_thread is not None
+    monkeypatch.setattr(old_thread, "join", lambda timeout=None: None)
+
+    mgr._start_reconcile_loop()
+    deadline = __import__("time").time() + 2
+    while len(set(calls)) < 2 and __import__("time").time() < deadline:
+        __import__("time").sleep(0.01)
+    assert len(set(calls)) == 2
+
+    release_first.set()
+    deadline = __import__("time").time() + 2
+    while old_thread.is_alive() and __import__("time").time() < deadline:
+        __import__("time").sleep(0.01)
+    assert not old_thread.is_alive()
+    mgr.stop()
+
+
+def test_manual_ghost_gc_waits_for_inflight_snapshot_commit(tmp_path, monkeypatch):
+    """手动 GC 不能在“对象已写、DB 未提交”窗口把新对象当孤儿删除。"""
+    ghost = _deck(tmp_path, name="gone.pptx", blob_kb=0)
+    live = _deck(tmp_path, name="live.pptx", blob_kb=0)
+    fx.make_pptx(live, [{"body": "initial live document"}])
+    mgr = VersionManager(index_roots=[str(ghost.parent)])
+    assert mgr.snapshot_now(str(ghost), notify=False)
+    assert mgr.snapshot_now(str(live), notify=False)
+    ghost.unlink()
+    fx.make_pptx(live, [{"body": "new save racing cleanup"}])
+
+    objects_written = threading.Event()
+    release_snapshot = threading.Event()
+    cleanup_done = threading.Event()
+    snapshot_result: list[str | None] = []
+    real_dedup = vault._dedup_store
+
+    def pause_after_objects(doc_id, source_path):
+        result = real_dedup(doc_id, source_path)
+        objects_written.set()
+        assert release_snapshot.wait(5)
+        return result
+
+    monkeypatch.setattr(vault, "_dedup_store", pause_after_objects)
+
+    snapshot_thread = threading.Thread(
+        target=lambda: snapshot_result.append(mgr.snapshot_now(str(live), notify=False))
+    )
+    cleanup_result: list[dict] = []
+    cleanup_thread = threading.Thread(
+        target=lambda: (cleanup_result.append(mgr.reap_ghost_docs_now()), cleanup_done.set())
+    )
+    snapshot_thread.start()
+    assert objects_written.wait(3)
+    cleanup_thread.start()
+    time.sleep(0.15)
+    assert not cleanup_done.is_set()
+
+    release_snapshot.set()
+    snapshot_thread.join(5)
+    cleanup_thread.join(5)
+    assert not snapshot_thread.is_alive() and not cleanup_thread.is_alive()
+    assert snapshot_result and snapshot_result[0]
+    assert cleanup_result and cleanup_result[0]["ghost_docs"] == 1
+    assert mgr.audit_repository(deep=True)["ok"] is True
     mgr.stop()
 
 

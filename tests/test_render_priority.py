@@ -818,9 +818,11 @@ def test_explicit_preview_borrows_active_powerpoint_but_opens_only_hidden_readon
         class PresentationsImpl:
             def __init__(self, app):
                 self.app = app
+                self.Count = 1
 
             def Open(self, path, ReadOnly=1, WithWindow=0):
                 opened.append((path, ReadOnly, WithWindow))
+                self.Count += 1
                 return BorrowedPres(path)
 
     app = BorrowedApp()
@@ -884,9 +886,11 @@ def test_borrowed_snapshot_is_closed_if_powerpoint_creates_a_user_visible_window
         class PresentationsImpl:
             def __init__(self, app):
                 self.app = app
+                self.Count = 1
 
             def Open(self, path, ReadOnly=1, WithWindow=0):
                 self.app.Windows.Count = 2
+                self.Count += 1
                 return UnsafePres(path)
 
     app = UnsafeApp()
@@ -898,6 +902,38 @@ def test_borrowed_snapshot_is_closed_if_powerpoint_creates_a_user_visible_window
 
     assert closed == ["snapshot"]
     assert renderer._state.owned_presentations == []
+
+
+def test_borrowed_preview_fails_closed_when_active_user_document_cannot_be_audited(
+    tmp_path,
+):
+    opened = []
+
+    class BrokenActive:
+        @property
+        def FullName(self):
+            raise RuntimeError("RPC unavailable")
+
+    class Presentations:
+        Count = 1
+
+        def Open(self, *_args, **_kwargs):
+            opened.append(True)
+            raise AssertionError("unsafe borrowed document must never be opened")
+
+    app = types.SimpleNamespace(
+        Windows=types.SimpleNamespace(Count=1),
+        Presentations=Presentations(),
+        ActivePresentation=BrokenActive(),
+    )
+    renderer._state.app_mode = "borrowed"
+    renderer._state.pres = None
+    renderer._state.owned_presentations = []
+
+    with pytest.raises(renderer.PowerPointSessionBusy, match="cannot be audited"):
+        renderer._open_pres(app, str(tmp_path / "snapshot.pptx"), "unsafe-active")
+
+    assert opened == []
 
 
 def test_owned_session_is_demoted_before_reuse_if_user_window_appears(monkeypatch):

@@ -203,9 +203,23 @@ def validate_version_vault_dir(path: str) -> str | None:
             return f"不允许放在系统目录（{banned.strip(chr(92))}）下"
     if low in ("c:\\", "d:\\", "e:\\"):
         return "不允许直接放在盘符根目录，请选择其子文件夹"
+    candidate = Path(os.path.abspath(str(p)))
+    current_raw = get_version_vault_dir()
+    current = Path(
+        os.path.abspath(current_raw or str(data_dir() / "vault"))
+    )
+    candidate_key = os.path.normcase(str(candidate))
+    current_key = os.path.normcase(str(current))
+    if candidate_key != current_key:
+        try:
+            common = os.path.commonpath([candidate_key, current_key])
+        except ValueError:
+            common = ""  # different drives cannot be nested
+        if common in {candidate_key, current_key}:
+            return "新旧版本库不能互相嵌套，请选择独立目录"
     try:
-        p.mkdir(parents=True, exist_ok=True)
-        probe = p / ".pptdoctor-write-probe"
+        candidate.mkdir(parents=True, exist_ok=True)
+        probe = candidate / ".pptdoctor-write-probe"
         probe.write_text("ok", encoding="ascii")
         probe.unlink()
     except OSError as e:

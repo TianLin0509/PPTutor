@@ -40,7 +40,9 @@ _GLOBAL_OBJECTS_DIRNAME = "_objects"
 _VERIFIED_OBJECT_CAP = 4096
 _VERIFIED_OBJECT_PATHS: OrderedDict[str, None] = OrderedDict()
 _VERIFIED_LOCK = threading.Lock()
+_VAULT_MIGRATION_LOCK = threading.RLock()
 _STABLE_COPY_RETRY_DELAYS_SEC = (0.15, 0.4, 0.9)
+_STREAM_CHUNK_BYTES = 1 << 20
 
 
 def _verified_mark(key: str) -> None:
@@ -142,21 +144,33 @@ def _object_is_valid(path: Path, object_hash: str) -> bool:
     return True
 
 
-def _install_object_bytes(data: bytes, object_hash: str) -> Path:
-    """Crash-safe idempotent write into the shared object pool."""
+def _install_object_stream(source) -> str:
+    """Stream one ZIP part into the shared pool and return its content hash.
+
+    Real decks often contain one 100-500 MB media part.  ``ZipFile.read`` plus
+    ``Path.read_bytes`` used to materialize that whole part repeatedly during
+    every save, creating large RSS spikes beside the user's PowerPoint process.
+    The temporary object is content-addressed only after the streaming hash is
+    known; installation remains crash-safe and idempotent.
+    """
     objd = _global_objects_dir()
-    dest = objd / object_hash
-    if _object_is_valid(dest, object_hash):
-        return dest
     fd, tmp = tempfile.mkstemp(prefix=".object-", dir=objd)
+    object_hash = ""
     try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(data)
-            f.flush()
-            os.fsync(f.fileno())
+        h = xxhash.xxh64()
+        with os.fdopen(fd, "wb") as out:
+            for chunk in iter(lambda: source.read(_STREAM_CHUNK_BYTES), b""):
+                h.update(chunk)
+                out.write(chunk)
+            out.flush()
+            os.fsync(out.fileno())
+        object_hash = h.hexdigest()
+        dest = objd / object_hash
+        if _object_is_valid(dest, object_hash):
+            return object_hash
         os.replace(tmp, dest)
         _verified_mark(str(dest))
-        return dest
+        return object_hash
     finally:
         try:
             os.unlink(tmp)
@@ -169,15 +183,43 @@ def _install_object_file(src: Path, object_hash: str) -> tuple[Path, bool]:
     dest = _global_objects_dir() / object_hash
     if _object_is_valid(dest, object_hash):
         return dest, True
+    existed = dest.exists()
     try:
         os.link(src, dest)
+        _verified_mark(str(dest))
+        return dest, False
     except FileExistsError:
         if not _object_is_valid(dest, object_hash):
-            _install_object_bytes(src.read_bytes(), object_hash)
+            _copy_object_file_verified(src, dest, object_hash)
         return dest, True
     except OSError:
-        _install_object_bytes(src.read_bytes(), object_hash)
-    return dest, False
+        # Cross-volume vault moves cannot hard-link.  Never materialise a
+        # 100-500 MB media object with ``read_bytes`` beside the user's live
+        # PowerPoint process; stream, re-hash, fsync, then install atomically.
+        _copy_object_file_verified(src, dest, object_hash)
+        return dest, existed
+
+
+def _copy_object_file_verified(src: Path, dest: Path, object_hash: str) -> None:
+    """Crash-safe bounded-memory copy of one already-addressed object."""
+    fd, tmp = tempfile.mkstemp(prefix=".object-", dir=dest.parent)
+    try:
+        digest = xxhash.xxh64()
+        with src.open("rb") as source, os.fdopen(fd, "wb") as target:
+            for chunk in iter(lambda: source.read(_STREAM_CHUNK_BYTES), b""):
+                digest.update(chunk)
+                target.write(chunk)
+            target.flush()
+            os.fsync(target.fileno())
+        if digest.hexdigest() != object_hash:
+            raise ValueError(f"legacy object changed during migration: {src}")
+        os.replace(tmp, dest)
+        _verified_mark(str(dest))
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
 
 
 def _manifest_path(doc_id: str, version_id: str) -> Path:
@@ -272,10 +314,49 @@ def manifest_content_hash(doc_id: str, version_id: str | None) -> str:
     parts = dict(mf.get("parts") or {})
     if parts:
         return _package_content_hash_from_parts(parts)
+    # New full-fallback manifests carry the immutable hash captured from the
+    # stable source.  Older manifests did not; callers that have the DB row pass
+    # its hash explicitly to ``rebuild_to`` for the same protection.
+    recorded = str(mf.get("content_hash") or "")
+    if recorded.startswith(("pkg:", "file:")):
+        return recorded
     full = version_file(doc_id, version_id)
     if full.exists():
         return file_hash(str(full))
     return ""
+
+
+def _recovery_structure_available(doc_id: str, version_id: str | None) -> bool:
+    """Cheap proof that one recovery point still has every required artifact.
+
+    This intentionally does not re-hash object bytes; creation-time verification
+    and deep fsck own that expensive job.  It closes the common self-healing
+    hole where a manifest/object was deleted, but an unchanged live save was
+    skipped solely because the DB content hash still matched.
+    """
+    if not version_id:
+        return False
+    manifest = manifest_for(doc_id, version_id)
+    mode = manifest.get("mode")
+    if mode == "full":
+        return version_file(doc_id, version_id).is_file()
+    if mode != "dedup":
+        return False
+    names = manifest.get("names")
+    parts = manifest.get("parts")
+    if not isinstance(names, list) or not isinstance(parts, dict):
+        return False
+    if not all(isinstance(name, str) for name in names):
+        return False
+    if len(names) != len(set(names)) or set(names) != set(parts):
+        return False
+    for raw_hash in parts.values():
+        object_hash = str(raw_hash)
+        if not _OBJECT_HASH_RE.fullmatch(object_hash):
+            return False
+        if not _object_path(doc_id, object_hash).is_file():
+            return False
+    return True
 
 
 def file_hash(path: str) -> str:
@@ -432,7 +513,12 @@ def _write_zip(
     """
     with zipfile.ZipFile(dest, "w", compression) as z:
         for name in names:
-            z.writestr(name, _object_path(doc_id, parts[name]).read_bytes())
+            # Stream the object into the ZIP.  ``writestr(path.read_bytes())``
+            # retained the largest media part in memory and could make a save of
+            # a 300 MB deck contend with PowerPoint for hundreds of MB of RAM.
+            with _object_path(doc_id, parts[name]).open("rb") as source:
+                with z.open(name, "w", force_zip64=True) as target:
+                    shutil.copyfileobj(source, target, length=_STREAM_CHUNK_BYTES)
 
 
 def _dedup_store(doc_id: str, path: str) -> tuple[list[str], dict[str, str]]:
@@ -445,9 +531,8 @@ def _dedup_store(doc_id: str, path: str) -> tuple[list[str], dict[str, str]]:
             if info.is_dir():
                 continue
             name = info.filename
-            data = zf.read(name)
-            h = xxhash.xxh64(data).hexdigest()
-            _install_object_bytes(data, h)
+            with zf.open(info) as source:
+                h = _install_object_stream(source)
             names.append(name)
             parts[name] = h
     return names, parts
@@ -509,6 +594,24 @@ def backfill_content_hashes(conn) -> dict[str, int]:
             continue
         result["checked"] += 1
         try:
+            manifest = manifest_for(
+                str(row["doc_id"]),
+                str(row["version_id"]),
+            )
+            if current and manifest.get("mode") == "full":
+                # Before canonical package hashes existed, full-fallback rows
+                # stored the raw hash of the exact copied ZIP.  Unlike a dedup
+                # rebuild, that full file has never been repacked, so the old
+                # value remains a strong immutable checksum.  Validate it
+                # *before* replacing it; otherwise a parseable corrupted file
+                # would hash itself and be permanently blessed by backfill.
+                full = version_file(
+                    str(row["doc_id"]),
+                    str(row["version_id"]),
+                )
+                if not full.is_file() or _raw_file_hash(str(full)) != current:
+                    result["errors"] += 1
+                    continue
             canonical = manifest_content_hash(
                 str(row["doc_id"]),
                 str(row["version_id"]),
@@ -721,6 +824,9 @@ def audit_repository(conn, *, deep: bool = False) -> dict:
                 manifest_hash = _package_content_hash_from_parts(parts)
                 if stored_hash.startswith(("pkg:", "file:")) and stored_hash != manifest_hash:
                     raise ValueError("content hash mismatch between database and manifest")
+                recorded_hash = str(manifest.get("content_hash") or "")
+                if recorded_hash and recorded_hash != manifest_hash:
+                    raise ValueError("content hash mismatch inside manifest")
                 version_missing: list[str] = []
                 for raw_hash in parts.values():
                     object_hash = str(raw_hash)
@@ -749,9 +855,16 @@ def audit_repository(conn, *, deep: bool = False) -> dict:
                         f"({getattr(deck, 'error', '') or 'invalid PPTX'})"
                     )
                 stored_hash = str(row["content_hash"] or "")
+                recorded_hash = str(manifest.get("content_hash") or "")
+                if recorded_hash and stored_hash and recorded_hash != stored_hash:
+                    raise ValueError("content hash mismatch inside manifest")
                 full_hash = file_hash(str(full))
-                if stored_hash.startswith(("pkg:", "file:")) and stored_hash != full_hash:
-                    raise ValueError("content hash mismatch between database and full snapshot")
+                expected_hash = recorded_hash or stored_hash
+                if expected_hash.startswith(("pkg:", "file:")):
+                    if expected_hash != full_hash:
+                        raise ValueError("content hash mismatch between database and full snapshot")
+                elif expected_hash and _raw_file_hash(str(full)) != expected_hash:
+                    raise ValueError("legacy raw hash mismatch for full snapshot")
             else:
                 raise ValueError("unknown manifest mode")
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
@@ -870,6 +983,28 @@ def snapshot(
     content_hash: str | None = None,
     source_path: str | None = None,
 ) -> str | None:
+    """Serialize vault mutation against a whole-repository location move."""
+    with _VAULT_MIGRATION_LOCK:
+        return _snapshot_locked(
+            conn,
+            path,
+            session_id,
+            doc_id=doc_id,
+            base_version=base_version,
+            content_hash=content_hash,
+            source_path=source_path,
+        )
+
+
+def _snapshot_locked(
+    conn,
+    path: str,
+    session_id: str = "",
+    doc_id: str | None = None,
+    base_version=None,
+    content_hash: str | None = None,
+    source_path: str | None = None,
+) -> str | None:
     """对 path 当前内容拍快照（按页去重）；内容相对最新版未变则跳过（返回 None）。"""
     path = os.path.abspath(path)
     if source_path is None:
@@ -907,9 +1042,13 @@ def snapshot(
         # creation of a fresh healthy baseline in that case.
         latest = None
     latest_doc_id = (latest["doc_id"] if latest is not None and "doc_id" in latest.keys() else did)
-    if latest is not None and (
-        latest["content_hash"] == chash
-        or manifest_content_hash(latest_doc_id, latest["version_id"]) == chash
+    if (
+        latest is not None
+        and _recovery_structure_available(latest_doc_id, latest["version_id"])
+        and (
+            latest["content_hash"] == chash
+            or manifest_content_hash(latest_doc_id, latest["version_id"]) == chash
+        )
     ):
         store.upsert_doc(conn, did, path, datetime.datetime.now().timestamp())
         conn.commit()
@@ -938,7 +1077,19 @@ def snapshot(
     )
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as manifest_file:
-            json.dump({"mode": mode, "names": names, "parts": parts}, manifest_file)
+            json.dump(
+                {
+                    "mode": mode,
+                    "names": names,
+                    "parts": parts,
+                    # Full-fallback snapshots otherwise have no immutable
+                    # expected hash outside versions.db.  Without this field a
+                    # parseable, same-format corruption is compared with itself
+                    # during restore and can be accepted silently.
+                    "content_hash": chash,
+                },
+                manifest_file,
+            )
             manifest_file.flush()
             os.fsync(manifest_file.fileno())
         os.replace(manifest_tmp, manifest_path)
@@ -973,7 +1124,36 @@ REBUILD_ERR_CORRUPT = "recovery_corrupt"  # 重组出来的包解析不过或内
 REBUILD_ERR_IO = "io_error"
 
 
-def rebuild_to(doc_id: str, version_id: str, dest: str, *, on_error=None) -> bool:
+def rebuild_to(
+    doc_id: str,
+    version_id: str,
+    dest: str,
+    *,
+    on_error=None,
+    expected_content_hash: str | None = None,
+    before_replace=None,
+) -> bool:
+    """Serialize restore/export reads against a whole-vault location move."""
+    with _VAULT_MIGRATION_LOCK:
+        return _rebuild_to_locked(
+            doc_id,
+            version_id,
+            dest,
+            on_error=on_error,
+            expected_content_hash=expected_content_hash,
+            before_replace=before_replace,
+        )
+
+
+def _rebuild_to_locked(
+    doc_id: str,
+    version_id: str,
+    dest: str,
+    *,
+    on_error=None,
+    expected_content_hash: str | None = None,
+    before_replace=None,
+) -> bool:
     """把某版本原子重组/恢复到 dest。
 
     始终先在目标同目录生成并验证临时文件，最后用 ``os.replace`` 一次切换。
@@ -1019,9 +1199,29 @@ def rebuild_to(doc_id: str, version_id: str, dest: str, *, on_error=None) -> boo
         else:
             return _fail(REBUILD_ERR_CORRUPT)
 
-        expected = manifest_content_hash(doc_id, version_id)
+        supplied = str(expected_content_hash or "")
+        legacy_full_raw = supplied if mode == "full" and supplied and not supplied.startswith(
+            ("pkg:", "file:")
+        ) else ""
+        if supplied and not supplied.startswith(("pkg:", "file:")):
+            # Pre-canonical-hash databases stored a raw ZIP digest.  A rebuilt
+            # dedup container is byte-different by design, so that value cannot
+            # validate a dedup restore.  A full fallback is an exact byte copy,
+            # however, and its legacy digest remains authoritative.
+            supplied = ""
+        if legacy_full_raw and _raw_file_hash(tmp) != legacy_full_raw:
+            return _fail(REBUILD_ERR_CORRUPT)
+        expected = supplied or str(m.get("content_hash") or "") or manifest_content_hash(
+            doc_id, version_id
+        )
         if not expected or file_hash(tmp) != expected:
             return _fail(REBUILD_ERR_CORRUPT)
+        if before_replace is not None:
+            try:
+                if not bool(before_replace()):
+                    return _fail(REBUILD_ERR_LOCKED)
+            except Exception:  # noqa: BLE001 uncertainty must not widen overwrite authority
+                return _fail(REBUILD_ERR_LOCKED)
         try:
             os.replace(ext_path(tmp), ext_path(dest))
         except PermissionError:
@@ -1213,13 +1413,17 @@ def reap_ghost_docs(
     }
     if dry_run or not ghosts:
         return result
-    for g in ghosts:
-        store.delete_doc(conn, g["doc_id"])
-        d = vault_dir() / g["doc_id"]
+    doomed = [(str(g["doc_id"]), vault_dir() / str(g["doc_id"])) for g in ghosts]
+    for doc_id, _doc_dir in doomed:
+        store.delete_doc(conn, doc_id)
+    # Metadata is the recovery graph's source of truth. Commit it before
+    # touching artifacts: a crash can then leave only harmless orphans for GC,
+    # never live rows whose manifests have already disappeared.
+    conn.commit()
+    for _doc_id, d in doomed:
         if d.is_dir():
             shutil.rmtree(d, ignore_errors=True)
             result["removed_dirs"] += 1
-    conn.commit()
     result["gc"] = collect_garbage(conn, dry_run=False)
     return result
 
@@ -1356,10 +1560,13 @@ def budget_relevant_bytes() -> int:
 
 
 def _budget_relevant_bytes() -> int:
-    """容量上限计量口径：vault 总占用减去 versions.db 三件套。
+    """容量上限计量口径：只约束可驱逐的恢复数据。
 
     版本删除本身会写 WAL——把库文件算进预算会让驱逐对着一个越删越大的目标空转；
-    库文件体积由 maintain_db 的条件 VACUUM + WAL TRUNCATE 单独约束。
+    库文件体积由 maintain_db 的条件 VACUUM + WAL TRUNCATE 单独约束。``_tmp``
+    是在途稳定副本，``backups`` 是迁移回滚材料；两者都不能触发健康历史驱逐。
+    尤其大稿留底会先在锁外生成完整临时副本，重维护若恰好量到它，旧口径可能
+    为一个几分钟后自行消失的 500 MB 暂存删掉真实版本。
     """
     total = vault_size_bytes()
     root = _vault_dir_no_create()
@@ -1368,18 +1575,45 @@ def _budget_relevant_bytes() -> int:
             total -= (root / name).stat().st_size
         except OSError:
             pass
+    for name in ("_tmp", "backups"):
+        total -= _tree_size_bytes(root / name)
     return max(0, total)
 
 
+def _tree_size_bytes(root: Path) -> int:
+    """Return one subtree's file bytes without following directory links."""
+    if not root.is_dir():
+        return 0
+    total = 0
+    stack = [str(root)]
+    while stack:
+        try:
+            entries = list(os.scandir(stack.pop()))
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    stack.append(entry.path)
+                elif entry.is_file(follow_symlinks=False):
+                    total += os.stat(entry.path).st_size
+            except OSError:
+                continue
+    return total
+
+
 def survivor_version_ids(conn, keep_per_active_doc: int = _SIZE_BUDGET_KEEP_PER_ACTIVE_DOC):
-    """每个 active 文档最新 N 个版本的 version_id 集合——容量驱逐的保底线。
+    """每个尚未被明确收割的文档最新 N 个版本——容量驱逐的保底线。
 
     「源文件还在磁盘上、版本库里却一个可回滚版本都没有」是产品承诺的反面
     （README：改崩了一键回到任意健康历史版本）。全局 ts ASC 驱逐天然先吃最久
     没动过的文档，而那恰恰是最需要旧版的一类：近期文件还能靠 OneDrive/回收站
     找回，两年前的稿子不能。这里按 doc 保留最新 N 个，不受全局驱逐顺序影响。
 
-    已 deleted 的文档不在保底范围：其留底本就是幽灵收割的目标。
+    ``deleted`` 只表示当前路径暂时不存在，可能是 PowerPoint 原子替换、同步盘离线、
+    移动盘未挂载或应用关闭期间搬家。幽灵收割有 30 天宽限与固定盘可判定性门，
+    容量驱逐不能绕过这些门立即删掉最后一个找回点。真正确认到期的幽灵会先由
+    ``reap_ghost_docs`` 删除整条记录，之后自然不再占保底。
     """
     if keep_per_active_doc <= 0:
         return set()
@@ -1387,8 +1621,7 @@ def survivor_version_ids(conn, keep_per_active_doc: int = _SIZE_BUDGET_KEEP_PER_
     for row in conn.execute(
         """SELECT v.doc_id AS doc_id, v.version_id AS version_id, v.ts AS ts
            FROM versions AS v
-           JOIN managed_docs AS d ON d.doc_id=v.doc_id
-           WHERE d.status='active'"""
+           JOIN managed_docs AS d ON d.doc_id=v.doc_id"""
     ).fetchall():
         by_doc.setdefault(str(row["doc_id"]), []).append(
             (float(row["ts"] or 0), str(row["version_id"]))
@@ -1408,8 +1641,9 @@ def enforce_size_budget(
     """容量上限：超出时按 ts 从老到新驱逐健康版本，随后对象级 GC。
 
     只驱逐 health='ok'、非分支基、且不在每文档保底线内的版本：隔离版本可能可
-    修复、分支基是副本的恢复根、每个 active 文档最新 N 个版本是「源文件还在就
-    至少留得住一次回滚」的底线（见 survivor_version_ids），三者永不进驱逐候选。
+    修复、分支基是副本的恢复根、每个尚未被幽灵收割的文档最新 N 个版本是
+    「暂时离线也至少留得住一次找回」的底线（见 survivor_version_ids），三者
+    永不进驱逐候选。
     versions.size 是快照时源文件大小，只是占用估计；去重共享对象可能让实际回收
     小于估计，因此按轮循环直到达标或候选耗尽。
     GC 安全门一旦中止立即停止——不在结构存疑的库上继续删。
@@ -1430,6 +1664,8 @@ def enforce_size_budget(
         "converged": True,
         "floor_bytes": 0,
         "protected_versions": 0,
+        "aborted": False,
+        "preflight": None,
     }
     budget = int(max_bytes)
     if budget <= 0:
@@ -1439,6 +1675,29 @@ def enforce_size_budget(
     # 库约 2 秒），没有理由让 watcher 的留底排在它后面——重维护在进锁前先量。
     total = _budget_relevant_bytes() if measured_bytes is None else int(measured_bytes)
     result["vault_bytes_before"] = total
+    if total > budget:
+        # Structural gate must run before the first destructive DB/artifact
+        # change.  The old order deleted candidate versions first and only then
+        # called GC, so a missing manifest elsewhere could make GC abort after
+        # healthy history had already been irreversibly removed.
+        preflight = collect_garbage(conn, dry_run=True)
+        result["preflight"] = preflight
+        if bool(preflight.get("aborted", False)) or int(preflight.get("errors", 0) or 0):
+            result["aborted"] = True
+            result["vault_bytes_after"] = total
+            result["converged"] = False
+            return result
+        # Reclaim already-unreachable crash residue before sacrificing another
+        # healthy recovery point. The read-only gate above proves this pass
+        # cannot mistake a live artifact for garbage.
+        gc_result = collect_garbage(conn, dry_run=False)
+        result["gc"] = gc_result
+        if bool(gc_result.get("aborted", False)) or int(gc_result.get("errors", 0) or 0):
+            result["aborted"] = True
+            result["vault_bytes_after"] = total
+            result["converged"] = False
+            return result
+        total = _budget_relevant_bytes()
     if total > budget:
         # 豁免地板估计：全部可驱逐候选的 size 总和之外的部分永远降不下去。
         branch_bases = _branch_base_ids(conn)
@@ -1451,7 +1710,7 @@ def enforce_size_budget(
             if str(row["version_id"]) not in protected:
                 claimable += max(0, int(row["size"] or 0))
         result["floor_bytes"] = max(0, total - claimable)
-    gc_result: dict | None = None
+    gc_result: dict | None = result["gc"]
     for _ in range(_SIZE_BUDGET_MAX_ROUNDS):
         if total <= budget:
             break
@@ -1483,16 +1742,20 @@ def enforce_size_budget(
             break  # 只剩豁免版本：驱逐也降不下去，停
         if claimed < min_progress:
             break  # 估计口径无进展：整轮驱逐也收不到缺口的 5%，纯属损失健康历史
-        for vid, doc_id, thumb_path in candidates:
+        for vid, _doc_id, _thumb_path in candidates:
             store.delete_version(conn, vid)
+        # Commit all logical evictions first. If the process is killed during
+        # the following unlink pass, remaining files are merely orphans and a
+        # later GC can remove them; no surviving row loses its restore data.
+        conn.commit()
+        result["evicted_versions"] += len(candidates)
+        for vid, doc_id, thumb_path in candidates:
             delete_version_artifacts(doc_id, vid)
             if thumb_path:
                 try:
                     Path(thumb_path).unlink(missing_ok=True)
                 except OSError:
                     pass
-            result["evicted_versions"] += 1
-        conn.commit()
         gc_result = collect_garbage(conn, dry_run=False)
         new_total = _budget_relevant_bytes()
         progressed = total - new_total
@@ -1635,66 +1898,164 @@ def _copy_db_live(src_db: Path, dst_db: Path) -> None:
         src.close()
 
 
-def migrate_vault_dir(src: Path, dst: Path, progress_cb=None) -> dict:
-    """把版本库整体迁到新目录：复制 → 校验（文件数+字节）→ 删除源。失败回滚目标、保留源。
+def _migration_files(root: Path) -> list[Path]:
+    """Stable migration inventory, excluding SQLite's transient WAL/SHM pair."""
+    return sorted(
+        (
+            path
+            for path in root.rglob("*")
+            if path.is_file() and not path.name.startswith("versions.db-")
+        ),
+        # Copy versions.db last.  A direct caller that failed to pause writers
+        # then has the smallest possible race window, and the post-copy
+        # inventory check catches any new manifest/object created meanwhile.
+        key=lambda path: (path.name == "versions.db", str(path.relative_to(root))),
+    )
 
-    versions.db 走 sqlite backup（活跃连接下也一致）；WAL/SHM 随 checkpoint 并入新库不单独复制。
+
+def _same_file_bytes(left: Path, right: Path) -> bool:
+    """Byte-for-byte comparison with bounded memory (size equality is insufficient)."""
+    try:
+        if left.stat().st_size != right.stat().st_size:
+            return False
+        with left.open("rb") as a, right.open("rb") as b:
+            while True:
+                a_chunk = a.read(_STREAM_CHUNK_BYTES)
+                b_chunk = b.read(_STREAM_CHUNK_BYTES)
+                if a_chunk != b_chunk:
+                    return False
+                if not a_chunk:
+                    return True
+    except OSError:
+        return False
+
+
+def _paths_overlap(left: Path, right: Path) -> bool:
+    """Whether either directory is the same as or nested inside the other."""
+    a = os.path.normcase(os.path.abspath(str(left)))
+    b = os.path.normcase(os.path.abspath(str(right)))
+    try:
+        common = os.path.commonpath([a, b])
+    except ValueError:
+        return False  # different drives cannot be nested
+    return common in {a, b}
+
+
+def _migration_backup_path(src: Path) -> Path:
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    base = src.with_name(f"{src.name}.migration-backup-{stamp}-{os.getpid()}")
+    candidate = base
+    counter = 1
+    while candidate.exists():
+        candidate = base.with_name(f"{base.name}-{counter}")
+        counter += 1
+    return candidate
+
+
+def migrate_vault_dir(
+    src: Path,
+    dst: Path,
+    progress_cb=None,
+    *,
+    keep_source_backup: bool = False,
+    before_source_move=None,
+) -> dict:
+    """Safely move a complete vault to ``dst``.
+
+    The destination is verified byte-for-byte, then the source directory is
+    atomically renamed to a rollback backup.  A caller that also has to switch
+    configuration/reopen connections can retain that backup until those steps
+    succeed.  No recursive delete ever runs against the only known-good copy.
     """
-    src = Path(src)
-    dst = Path(dst)
+    src = Path(os.path.abspath(str(src)))
+    dst = Path(os.path.abspath(str(dst)))
     if not src.is_dir():
         raise ValueError(f"源目录不存在: {src}")
+    if _paths_overlap(src, dst):
+        raise ValueError("源目录与目标目录不能相同，也不能互相嵌套")
     dst.mkdir(parents=True, exist_ok=True)
     if any(dst.iterdir()):
         raise ValueError(f"目标目录非空: {dst}")
 
-    files = [f for f in src.rglob("*") if f.is_file()]
-    total = len(files)
-    copied = 0
-    for f in files:
-        rel = f.relative_to(src)
-        out = dst / rel
-        out.parent.mkdir(parents=True, exist_ok=True)
-        if f.name == "versions.db":
-            _copy_db_live(f, out)
-        elif f.name.startswith("versions.db-"):
-            continue  # WAL/SHM 不复制
-        else:
-            shutil.copy2(f, out)
-        copied += 1
-        if progress_cb and (copied % 50 == 0 or copied == total):
-            progress_cb(copied, total)
-
-    src_count = total - sum(1 for f in files if f.name.startswith("versions.db-"))
-    dst_files = [f for f in dst.rglob("*") if f.is_file()]
-    dst_bytes = sum(f.stat().st_size for f in dst_files)
-    if src_count != len(dst_files):
-        shutil.rmtree(dst, ignore_errors=True)
-        raise RuntimeError(f"迁移校验失败（文件数 {src_count}/{len(dst_files)}），已回滚目标目录")
-
-    # 逐文件字节校验：下一句就是 rmtree(src)，删掉的是用户全部 PPT 历史版本。
-    # 只比文件数不够——目标盘写满、网络/移动盘中途截断都可能留下「个数对、内容短」
-    # 的文件，而对象池是内容寻址的，短文件要等到用户真正回滚时才暴露成「恢复点损坏」。
-    # versions.db 走的是 sqlite backup（重建页面，体积本就与源不同），改为结构自检。
-    for f in files:
-        if f.name.startswith("versions.db-"):
-            continue
-        out = dst / f.relative_to(src)
-        if f.name == "versions.db":
-            if not _sqlite_readable(out):
-                shutil.rmtree(dst, ignore_errors=True)
-                raise RuntimeError("迁移校验失败（新版本库无法打开或缺表），已回滚目标目录")
-            continue
+    with _VAULT_MIGRATION_LOCK:
+        files = _migration_files(src)
+        source_rel = [str(path.relative_to(src)) for path in files]
+        total = len(files)
+        copied = 0
         try:
-            if out.stat().st_size != f.stat().st_size:
-                raise OSError("size mismatch")
-        except OSError:
+            for source in files:
+                rel = source.relative_to(src)
+                target = dst / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if source.name == "versions.db":
+                    _copy_db_live(source, target)
+                else:
+                    shutil.copy2(source, target)
+                copied += 1
+                if progress_cb and (copied % 50 == 0 or copied == total):
+                    progress_cb(copied, total)
+
+            current_rel = [str(path.relative_to(src)) for path in _migration_files(src)]
+            destination_files = _migration_files(dst)
+            destination_rel = [str(path.relative_to(dst)) for path in destination_files]
+            if source_rel != current_rel or source_rel != destination_rel:
+                raise RuntimeError(
+                    "迁移校验失败（复制期间源版本库发生变化），已回滚目标目录"
+                )
+
+            for source in files:
+                target = dst / source.relative_to(src)
+                if source.name == "versions.db":
+                    if not _sqlite_readable(target):
+                        raise RuntimeError(
+                            "迁移校验失败（新版本库无法打开或结构损坏），已回滚目标目录"
+                        )
+                    continue
+                if not _same_file_bytes(source, target):
+                    raise RuntimeError(
+                        "迁移校验失败（文件不完整或内容不一致："
+                        f"{source.relative_to(src)}），已回滚目标目录"
+                    )
+        except Exception:
+            shutil.rmtree(dst, ignore_errors=True)
+            raise
+
+        dst_bytes = sum(path.stat().st_size for path in destination_files)
+        backup = _migration_backup_path(src)
+        try:
+            # A live VersionManager keeps versions.db open.  Copying via the
+            # SQLite backup API is safe with those handles, but Windows cannot
+            # rename the source directory until they are closed.  Let the
+            # manager close them only after every byte and the copied database
+            # have passed verification, keeping the normal read path available
+            # throughout the slow copy phase.
+            if before_source_move is not None:
+                before_source_move()
+            os.replace(src, backup)
+        except OSError as exc:
             shutil.rmtree(dst, ignore_errors=True)
             raise RuntimeError(
-                f"迁移校验失败（文件内容不完整：{f.relative_to(src)}），已回滚目标目录"
-            ) from None
-    shutil.rmtree(src)
-    return {"files": src_count, "bytes": dst_bytes}
+                f"迁移无法安全封存源版本库，源数据未删除：{exc}"
+            ) from exc
+        except Exception:
+            shutil.rmtree(dst, ignore_errors=True)
+            raise
+
+        retained = str(backup)
+        if not keep_source_backup:
+            try:
+                shutil.rmtree(backup)
+                retained = ""
+            except OSError:
+                # Destination is already fully verified and source was moved
+                # atomically.  A locked backup is harmless and recoverable; do
+                # not turn success into a half-switched failure.
+                log.warning("verified vault migrated; source backup retained: %s", backup)
+        return {
+            "files": len(files),
+            "bytes": dst_bytes,
+            "source_backup": retained,
+        }
 
 
 def _sqlite_readable(db_file: Path) -> bool:

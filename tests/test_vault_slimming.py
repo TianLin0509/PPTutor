@@ -243,8 +243,8 @@ def test_enforce_size_budget_keeps_last_version_of_live_doc(tmp_path):
     assert res["protected_versions"] == 1
 
 
-def test_enforce_size_budget_evicts_all_versions_of_deleted_doc(tmp_path):
-    """已 deleted 的文档不在保底范围：留底本就是幽灵收割的目标。"""
+def test_enforce_size_budget_keeps_last_version_of_recently_deleted_doc(tmp_path):
+    """deleted 可能只是同步盘离线/原子替换，容量驱逐不能绕过 30 天宽限。"""
     conn = _conn()
     store.upsert_doc(conn, "gone", str(tmp_path / "gone.pptx"), 1.0)
     _add_full_version(conn, "gone", "g1", 1.0, b"w" * 4096)
@@ -252,8 +252,39 @@ def test_enforce_size_budget_evicts_all_versions_of_deleted_doc(tmp_path):
 
     res = vault.enforce_size_budget(conn, max_bytes=1)
 
-    assert res["evicted_versions"] == 1
-    assert store.list_versions(conn, "gone") == []
+    assert res["evicted_versions"] == 0
+    assert [row["version_id"] for row in store.list_versions(conn, "gone")] == ["g1"]
+    assert res["protected_versions"] == 1
+
+
+def test_budget_ignores_inflight_temps_and_migration_backups(tmp_path):
+    conn = _conn()
+    temp_dir = vault.vault_dir() / "_tmp"
+    backup_dir = vault.vault_dir() / "backups"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    (temp_dir / "500mb-inflight.pptx").write_bytes(b"t" * 1024 * 1024)
+    (backup_dir / "migration-copy.bin").write_bytes(b"b" * 1024 * 1024)
+
+    assert vault._budget_relevant_bytes() < 64 * 1024
+    assert vault.enforce_size_budget(conn, max_bytes=128 * 1024)["evicted_versions"] == 0
+
+
+def test_budget_aborts_before_deletion_when_recovery_graph_is_inconsistent(tmp_path):
+    conn = _conn()
+    store.upsert_doc(conn, "doc", str(tmp_path / "deck.pptx"), 1.0)
+    _add_full_version(conn, "doc", "v-old", 1.0, b"x" * 4096)
+    _add_full_version(conn, "doc", "v-new", 2.0, b"y" * 4096)
+    vault._manifest_path("doc", "v-new").unlink()
+
+    result = vault.enforce_size_budget(conn, max_bytes=1)
+
+    assert result["aborted"] is True
+    assert result["evicted_versions"] == 0
+    assert {row["version_id"] for row in store.list_versions(conn, "doc")} == {
+        "v-old",
+        "v-new",
+    }
 
 
 def test_enforce_size_budget_reclaims_shared_objects(tmp_path):

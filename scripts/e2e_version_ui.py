@@ -8,6 +8,11 @@ import tempfile
 import time
 from pathlib import Path
 
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:  # noqa: BLE001
+    pass
+
 _tmp = tempfile.mkdtemp(prefix="pptxver_ui_")
 os.environ["PPTX_FINDER_DATA_DIR"] = str(Path(_tmp) / "appdata")
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -92,7 +97,7 @@ def main() -> int:
     loop = QEventLoop()
     QTimer.singleShot(400, loop.quit)
     loop.exec()
-    out = Path.home() / "artifacts"
+    out = ROOT / "artifacts"
     out.mkdir(parents=True, exist_ok=True)
     version_shot = out / "ppt-doctor-v105-version-window.png"
     w.grab().save(str(version_shot))
@@ -109,6 +114,35 @@ def main() -> int:
     settings_shot = out / "ppt-doctor-v105-settings.png"
     dlg.grab().save(str(settings_shot))
     check("设置面板截图成功", settings_shot.exists())
+
+    # Both windows own one-shot QThreads.  A real MainWindow keeps them alive
+    # through shutdown; this standalone E2E has no parent, so it must drain the
+    # exact tasks it started before local widgets go out of scope.  Otherwise
+    # Qt aborts after every assertion has passed and hides real exit regressions.
+    def all_tasks_finished() -> bool:
+        version_tasks = sum(
+            (
+                list(getattr(w, name, []))
+                for name in (
+                    "_docs_tasks",
+                    "_search_tasks",
+                    "_version_tasks",
+                    "_version_preview_tasks",
+                    "_file_tasks",
+                )
+            ),
+            [],
+        )
+        return not any(task.isRunning() for task in [*version_tasks, *dlg._diag_tasks])
+
+    check("关闭前后台任务全部收敛", wait_until(app, all_tasks_finished, timeout=10.0))
+    dlg.close()
+    w.close()
+    # BackgroundTask deliberately defers deleteLater by one second so all
+    # Python finished slots drain safely under nested Qt event loops.
+    loop = QEventLoop()
+    QTimer.singleShot(1200, loop.quit)
+    loop.exec()
 
     ok = sum(1 for _, c in results if c)
     print(f"\n=== UI E2E: {ok}/{len(results)} 通过 ===")
