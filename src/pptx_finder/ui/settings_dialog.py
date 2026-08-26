@@ -1070,6 +1070,11 @@ class SettingsDialog(QDialog):
             except Exception as exc:  # noqa: BLE001
                 lines.append(f"versions: unavailable ({type(exc).__name__}: {exc})")
 
+        try:
+            from .. import imgtext_ocr
+            lines.append(imgtext_ocr.self_test())
+        except Exception as exc:  # noqa: BLE001 可选组件不该拖垮诊断
+            lines.append(f"imgtext_ocr: unavailable ({type(exc).__name__}: {exc})")
         for p in (data_dir(), cache_dir(), db_path()):
             lines.append(f"exists {Path(p).name}: {Path(p).exists()}")
         lines = _diagnostic_summary_lines(lines) + lines

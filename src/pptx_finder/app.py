@@ -176,6 +176,33 @@ def _open_version_window(owner, version_mgr, *, window_cls=None):
     return window
 
 
+def _open_imgtext_window(owner, *, window_cls=None):
+    """图片转可编辑文字：一次只留一个窗口，重复点击就把已开的那个带到前台。"""
+    existing = getattr(owner, "_imgtext_window", None)
+    if existing is not None:
+        try:
+            if _qt_is_valid(existing) and existing.isVisible():
+                existing.raise_()
+                existing.activateWindow()
+                return existing
+        except RuntimeError:
+            pass
+    if window_cls is None:
+        from .ui.imgtext_window import ImgTextWindow
+        window_cls = ImgTextWindow
+    window = window_cls(getattr(owner, "_tok", {}), owner)
+    owner._imgtext_window = window
+    try:
+        window.destroyed.connect(
+            lambda _=None: setattr(owner, "_imgtext_window", None))
+    except AttributeError:
+        pass
+    window.show()
+    window.raise_()
+    window.activateWindow()
+    return window
+
+
 def _open_settings_dialog(owner, version_mgr, *, dialog_cls=None):
     if dialog_cls is None:
         from .ui.settings_dialog import SettingsDialog
@@ -700,9 +727,14 @@ def main() -> int:
     def _open_settings() -> None:
         _open_settings_dialog(win, version_mgr)
 
+    def _open_imgtext() -> None:
+        _open_imgtext_window(win)
+
     act_versions = QAction("版本管理…", app)
     act_versions.triggered.connect(_open_version_mgr)
     act_versions.setEnabled(feature_runtime.version_enabled)
+    act_imgtext = QAction("图片转可编辑文字…", app)
+    act_imgtext.triggered.connect(_open_imgtext)
     act_settings = QAction("设置…", app)
     act_settings.triggered.connect(_open_settings)
     act_rescan = QAction("重新扫描全盘", app)
@@ -776,6 +808,7 @@ def main() -> int:
     menu.addSeparator()
     menu.addAction(act_rescan)
     menu.addAction(act_versions)
+    menu.addAction(act_imgtext)
     menu.addAction(act_settings)
     menu.addSeparator()
     menu.addAction(act_quit)
