@@ -154,10 +154,33 @@ def connect_readonly(
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    # 顺序有讲究：格式版本守门必须排在文件名索引回填之前。反过来（旧顺序）撞上
+    # INDEX_VERSION 升级时，会先把全表 name_norm + FTS 老老实实重建一遍，下一句
+    # 就 DELETE 清空——回填的活 100% 白干，还是在 GUI 线程上白干。
+    _migrate_index_version(conn)
     _ensure_filename_index(conn)
     _ensure_parse_retry_columns(conn)
-    _migrate_index_version(conn)
     conn.commit()
+
+
+def _rebuild_filename_fts(conn: sqlite3.Connection) -> None:
+    """整表重建文件名 FTS：一次清空 + 批量插入，O(n)。
+
+    绝不逐行 `DELETE FROM file_names_fts WHERE file_id=?`——file_id 是 FTS5 的
+    UNINDEXED 列，每次删都是全表扫，整体塌成 O(n²)。这正是 indexer 的盘点批量
+    写入当年踩过并修掉的同一个坑（见 _write_filename_only_batch 的注释），
+    此处是它漏网的另一半。实测旧实现：5k 行 2.3s / 1w 行 11s / 2w 行 41s /
+    4w 行 156s（4× 行数 → 67× 耗时），而 init_db 是在 MainWindow.__init__ 里
+    同步调用的，窗口还没 show 就已经假死。
+    """
+    conn.execute("DELETE FROM file_names_fts")
+    conn.executemany(
+        "INSERT INTO file_names_fts(content,file_id) VALUES(?,?)",
+        (
+            (tokenize(sqlite_safe_text(r["name"])), r["id"])
+            for r in conn.execute("SELECT id, name FROM files")
+        ),
+    )
 
 
 def _ensure_filename_index(conn: sqlite3.Connection) -> None:
@@ -170,17 +193,23 @@ def _ensure_filename_index(conn: sqlite3.Connection) -> None:
         "CREATE VIRTUAL TABLE IF NOT EXISTS file_names_fts USING fts5("
         "content, file_id UNINDEXED)"
     )
-    rows = conn.execute(
+    # name_norm 回填与 FTS 重建刻意解耦：name_norm 只参与命中后的字面复核，
+    # 且 search 侧本来就有 `row["name_norm"] or normalize(row["name"])` 兜底，
+    # 补它不需要动 FTS。旧实现把两件事绑在一起，于是「老库新增一列」这种纯元数据
+    # 迁移也要付一遍逐行 FTS 删除 = O(n²)。
+    stale = conn.execute(
         "SELECT id, name FROM files WHERE name_norm IS NULL OR name_norm=''"
     ).fetchall()
-    for r in rows:
-        _update_filename_index(conn, r["id"], r["name"])
+    if stale:
+        conn.executemany(
+            "UPDATE files SET name_norm=? WHERE id=?",
+            [(normalize(sqlite_safe_text(r["name"])), r["id"]) for r in stale],
+        )
+    # FTS 只在真的对不上（写入被中断过）时整表重建——O(n)，不是逐行修补。
     file_count = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
     fts_count = conn.execute("SELECT COUNT(*) FROM file_names_fts").fetchone()[0]
     if file_count and fts_count < file_count:
-        conn.execute("DELETE FROM file_names_fts")
-        for r in conn.execute("SELECT id, name FROM files").fetchall():
-            _update_filename_index(conn, r["id"], r["name"])
+        _rebuild_filename_fts(conn)
 
 
 def _ensure_parse_retry_columns(conn: sqlite3.Connection) -> None:
