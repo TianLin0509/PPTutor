@@ -12,6 +12,21 @@ from PySide6.QtWidgets import QApplication, QLineEdit
 from pptx_finder.ui import theme
 
 
+def _color_scheme_supported(app) -> bool:
+    """当前 QPA 插件是否真的实现 setColorScheme。
+
+    offscreen 插件不实现，读回恒为 Unknown——这条断言会在任何 headless 跑法下
+    （CI、smoke 脚本）稳定变红，而原生 Windows 下是绿的。按「平台名」跳过不够准，
+    直接探一次能力：探不到就只验 palette（那部分与 QPA 无关，仍是本用例的主证据）。
+    """
+    before = app.styleHints().colorScheme()
+    try:
+        app.styleHints().setColorScheme(Qt.ColorScheme.Light)
+        return app.styleHints().colorScheme() == Qt.ColorScheme.Light
+    finally:
+        app.styleHints().setColorScheme(before)
+
+
 def _contrast(c1, c2) -> float:
     def lum(c):
         def chan(v):
@@ -25,16 +40,19 @@ def _contrast(c1, c2) -> float:
 def test_apply_to_app_pins_color_scheme_and_palette(qtbot):
     app = QApplication.instance()
     old_scheme, old_pal, old_qss = app.styleHints().colorScheme(), app.palette(), app.styleSheet()
+    scheme_supported = _color_scheme_supported(app)
     try:
         theme.apply_to_app(app, "atelier")       # 静白（light）
-        assert app.styleHints().colorScheme() == Qt.ColorScheme.Light
+        if scheme_supported:
+            assert app.styleHints().colorScheme() == Qt.ColorScheme.Light
         pal = app.palette()
         t = theme.tok("atelier")
         assert pal.color(QPalette.Window).name() == t["win"].lower()
         assert pal.color(QPalette.Text).name() == t["ink1"].lower()
 
         theme.apply_to_app(app, "aurora")        # 深色玻璃
-        assert app.styleHints().colorScheme() == Qt.ColorScheme.Dark
+        if scheme_supported:
+            assert app.styleHints().colorScheme() == Qt.ColorScheme.Dark
         pal = app.palette()
         t = theme.tok("aurora")
         assert pal.color(QPalette.Window).name() == t["win"].lower()

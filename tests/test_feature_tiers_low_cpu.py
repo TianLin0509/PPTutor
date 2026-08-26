@@ -788,8 +788,12 @@ def test_feature_runtime_reports_version_backend_start_failure(monkeypatch, tmp_
 
     runtime.start()
     assert attempted.wait(timeout=1)
-    deadline = time.monotonic() + 1
-    while config.get_version_management_enabled() and time.monotonic() < deadline:
+    # 等最后一个可观测事件（回落通知），而不是等中间的配置落盘：
+    # _version_transition_loop 的顺序是 stop → version_enabled=False → 写配置 → emit。
+    # 盯着配置轮询，等于在「配置已变、emit 还没发」的窗口里断言 bridge——配置改成
+    # 原子写（tmp+fsync+replace）后这个窗口从微秒级变成毫秒级，本用例随即变成抖的。
+    deadline = time.monotonic() + 5
+    while not bridge.feature_states and time.monotonic() < deadline:
         time.sleep(0.01)
 
     assert any("version database broken" in line for line in runtime.diagnostic_lines())

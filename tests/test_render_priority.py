@@ -17,9 +17,16 @@ from pptx_finder import renderer
 
 @pytest.fixture(autouse=True)
 def _no_user_powerpoint(monkeypatch):
-    """隔离本机真实 PowerPoint：后台渲染安全闸（_powerpoint_active 为真即拒绝渲染）
-    会让这些用例在本机开着 PowerPoint 时误失败。默认无活动实例；专门用例自行覆盖。"""
+    """隔离本机真实 PowerPoint：默认「本机一个 PowerPoint 都没开」；专门用例自行覆盖。
+
+    这个 fixture 原来只挡住 _powerpoint_active。v1.0.15 给 _app_for_render 加了
+    进程级 ownership 审计（_powerpoint_process_ids）之后没同步过来，于是只要开发者
+    自己开着 PowerPoint，_app_for_render 就在 _get_app 之前抛 PowerPointSessionBusy——
+    而这些用例 monkeypatch 的正是 _get_app。表现为「本机开着 PPT 就红 4 个」，
+    更糟的是它们其实**什么都没验到**（渲染根本没发生）。两个闸必须一起钉住。
+    """
     monkeypatch.setattr(renderer, "_powerpoint_active", lambda **_kwargs: False)
+    monkeypatch.setattr(renderer, "_powerpoint_process_ids", lambda: set())
 
 
 def test_pid_for_app_accepts_powerpoint_hwnd_as_callable(monkeypatch):
