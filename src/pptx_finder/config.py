@@ -2,10 +2,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import sys
+import threading
 from pathlib import Path
+
+_log = logging.getLogger(__name__)
 
 APP_NAME = "pptx-finder"
 DEFAULT_THEME = "atelier"
@@ -118,32 +122,88 @@ GLOBAL_HOTKEY = "Alt+F"
 
 
 # ---------- UI 偏好（ui.json：主题 / 热键 等，读-改-写保留其它键） ----------
+# ui.json 不是"界面偏好"那么轻：version_vault_dir / index_roots /
+# version_management_enabled 都住在这里。丢一次的后果是「版本库指向漂回默认位置、
+# 程序开一个全新空库继续留底」——用户在别处的历史还在，却再也接不上。
+# 因此这里必须同时挡住两件事：
+#   1) 写到一半崩溃/断电 → 旧实现是 write_text（先截断再写），残文件解析失败后
+#      load 静默返回 {}，全部设置一次性清零。改成 tmp + fsync + os.replace 原子替换，
+#      并留一份 .bak：主文件读不出来时回退，且**出声**（原来连日志都没有）。
+#   2) 并发读-改-写丢更新 → 全仓 20+ 处调用分布在 GUI 线程、FeatureRuntime 线程和
+#      BackgroundTask 上（如 app.py 关版本管理、settings_dialog 改开关）。实测双线程
+#      各写各的键，30 轮里 8 轮有一个键被整份覆盖掉。进程内用一把锁串起临界区。
+# 读路径不加锁：os.replace 是原子的，读者只会看到旧的或新的完整内容，不会看到半截。
+_UI_LOCK = threading.RLock()
+
+
 def _ui_settings_path() -> Path:
     return data_dir() / "ui.json"
 
 
-def load_ui_settings() -> dict:
-    """读 ui.json，损坏/缺失返回 {}。"""
+def _ui_settings_backup_path() -> Path:
+    return data_dir() / "ui.json.bak"
+
+
+def _read_ui_settings_file(path: Path) -> dict | None:
+    """读一个候选配置文件；不存在/损坏/不是 dict 都返回 None。"""
     try:
-        p = _ui_settings_path()
-        if p.exists():
-            data = json.loads(p.read_text("utf-8"))
-            if isinstance(data, dict):
-                return data
+        if not path.exists():
+            return None
+        data = json.loads(path.read_text("utf-8"))
     except Exception:  # noqa: BLE001 配置损坏不能拖垮启动
-        pass
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def load_ui_settings() -> dict:
+    """读 ui.json；主文件损坏时回退 .bak；都读不出来才返回 {}。"""
+    data = _read_ui_settings_file(_ui_settings_path())
+    if data is not None:
+        return data
+    backup = _read_ui_settings_file(_ui_settings_backup_path())
+    if backup is not None:
+        # 静默回退等于把「设置全没了」伪装成「你没设过」。至少留一条日志和一次自愈写回。
+        _log.warning("ui.json 不可读，已回退上一份可用备份 ui.json.bak")
+        try:
+            _atomic_write_json(_ui_settings_path(), backup)
+        except OSError:
+            pass
+        return backup
     return {}
+
+
+def _atomic_write_json(path: Path, data: dict) -> None:
+    """tmp + fsync + os.replace：要么是完整的旧内容，要么是完整的新内容。"""
+    payload = json.dumps(data, ensure_ascii=False)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def update_ui_settings(**changes) -> None:
     """合并写 ui.json：保留未涉及的键（改主题不清掉热键，反之亦然）。"""
-    data = load_ui_settings()
-    data.update(changes)
-    try:
-        _ui_settings_path().write_text(
-            json.dumps(data, ensure_ascii=False), encoding="utf-8")
-    except Exception:  # noqa: BLE001
-        pass
+    with _UI_LOCK:
+        data = load_ui_settings()
+        data.update(changes)
+        try:
+            _atomic_write_json(_ui_settings_path(), data)
+        except (OSError, TypeError, ValueError):  # noqa: BLE001 落盘失败不能拖垮界面
+            _log.warning("ui.json 写入失败，本次设置未持久化", exc_info=True)
+            return
+        try:
+            _atomic_write_json(_ui_settings_backup_path(), data)
+        except (OSError, TypeError, ValueError):  # noqa: BLE001 备份是兜底，失败不影响主文件
+            _log.debug("ui.json.bak 备份写入失败", exc_info=True)
 
 
 def get_theme(default: str = DEFAULT_THEME) -> str:
