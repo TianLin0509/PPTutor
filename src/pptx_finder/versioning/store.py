@@ -65,7 +65,19 @@ def init_db(conn: sqlite3.Connection) -> None:
     # 幽灵收割宽限期锚点：首次确认所有路径缺失的时刻（reconcile/扫描标记 deleted 时写入）
     _ensure_column(conn, "managed_docs", "deleted_at", "REAL DEFAULT 0")
     # Backfill path aliases for existing vaults created before doc_paths existed.
+    # 这是一次性迁移，可旧实现无条件全量重跑：每份受管文档 3 条 SQL，真实库
+    # （3999 份文档）每次开库白付约 45 ms 并把 4000 行重新写脏一遍 WAL——而
+    # VersionManager 构造、版本库切换、库体检各会开一次库。只补真正缺登记的文档；
+    # 判据精确到 (doc_id, path_key)，因此「主路径变了但 doc_paths 没跟上」仍会被修。
+    covered = {
+        (str(row["doc_id"]), str(row["path_key"]))
+        for row in conn.execute(
+            "SELECT doc_id, path_key FROM doc_paths WHERE status='current'"
+        ).fetchall()
+    }
     for row in conn.execute("SELECT doc_id, path, created_at, updated_at FROM managed_docs").fetchall():
+        if (str(row["doc_id"]), path_key(row["path"])) in covered:
+            continue
         ts = row["updated_at"] or row["created_at"] or 0
         record_path(conn, row["doc_id"], row["path"], ts, "current")
     conn.commit()
