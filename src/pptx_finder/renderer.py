@@ -1411,6 +1411,7 @@ def abort_inflight() -> bool:
 
 
 def shutdown() -> None:
+    """退出 PowerPoint 实例并释放 COM。应用退出 / 渲染线程结束时调用。"""
     if _ipc_enabled():
         try:
             from . import render_client
@@ -1418,7 +1419,6 @@ def shutdown() -> None:
             render_client.shutdown()
         except Exception:  # noqa: BLE001
             pass
-    """退出 PowerPoint 实例并释放 COM。应用退出 / 渲染线程结束时调用。"""
     _close_pres()  # 关掉保持打开的 Presentation
     app = getattr(_state, "app", None)
     if app is None:

@@ -23,6 +23,8 @@ dist-*/
 # pptx-finder demo data & screenshots
 demo_decks/
 artifacts/
+output/
+scratchpad/
 
 # pptx-finder runtime / cache / test artifacts
 *.db

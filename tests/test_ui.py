@@ -1628,23 +1628,6 @@ def test_large_index_async_search_streams_without_ui_slow_gap(qtbot, monkeypatch
         win.close()
 
 
-def test_stream_rendering_uses_positive_yield_between_batches(qtbot, monkeypatch, tmp_path):
-    conn = _index(tmp_path)
-    win = MainWindow(conn=conn, render_worker=StubRender(), do_index=False)
-    qtbot.addWidget(win)
-    scheduled: list[int] = []
-
-    def fake_single_shot(delay_ms: int, _callback):
-        scheduled.append(delay_ms)
-
-    monkeypatch.setattr(main_window_mod.QTimer, "singleShot", fake_single_shot)
-
-    win._stream_plan_rest([("i", i, r) for i, r in enumerate(_fake_results(20))], 0, "", win._render_gen)
-
-    assert scheduled
-    assert scheduled[0] >= 1
-
-
 def test_ui_loop_diagnostics_records_max_gap(qtbot, tmp_path):
     conn = _index(tmp_path)
     win = MainWindow(conn=conn, render_worker=StubRender(), do_index=False)

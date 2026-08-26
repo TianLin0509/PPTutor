@@ -444,7 +444,7 @@ def _highlight(snippet: str, hlcss: str) -> str:
 
 
 def _fmt_mtime(ts: float) -> str:
-    """淇敼鏃堕棿锛氬悓骞?'MM-DD HH:MM'锛岃法骞?'YYYY-MM-DD'銆?"""
+    """修改时间：同年 'MM-DD HH:MM'，跨年 'YYYY-MM-DD'。"""
     try:
         dt = datetime.datetime.fromtimestamp(ts)
     except (OSError, OverflowError, ValueError):
@@ -455,7 +455,7 @@ def _fmt_mtime(ts: float) -> str:
 
 
 def _fmt_size(n: int) -> str:
-    """瀛楄妭鏁拌浆浜虹被鍙锛?2.3 MB' / '456 KB' / '18 B'銆?"""
+    """字节数转人类可读：'2.3 MB' / '456 KB' / '18 B'。"""
     if not n or n <= 0:
         return ""
     f = float(n)
@@ -785,7 +785,6 @@ class MainWindow(QMainWindow):
     _RECENT_CACHE_MS = 1000
     _LIVE_FLUSH_BATCH = 64
     _LIVE_FLUSH_YIELD_MS = 1
-    _DEFERRED_LIVE_SEARCH_YIELD_MS = 1
     _LIVE_REFRESH_DEBOUNCE_MS = 2500
     _LIVE_STATUS_REFRESH_MS = 1500
     _DETAIL_UPDATE_DELAY_MS = 80
@@ -828,8 +827,8 @@ class MainWindow(QMainWindow):
             app_icon = QIcon(_asset_path("app.ico"))
         self.setWindowIcon(app_icon)
         self.resize(1180, 760)
-        self._title_h = 52  # 鑷粯鐜荤拑鏍囬鏍忛珮搴︼紙nativeEvent 鎷栧姩鍖?缂╂斁杈瑰垽瀹氱敤锛?
-        self.setWindowFlag(Qt.FramelessWindowHint, True)  # 鏃犺竟妗?鈫?鑷粯鐜荤拑鏍囬鏍?
+        self._title_h = 52  # 自绘玻璃标题栏高度（nativeEvent 拖动区 / 缩放边判定用）
+        self.setWindowFlag(Qt.FramelessWindowHint, True)  # 无边框 → 自绘玻璃标题栏
 
         self._theme = _load_theme()
         self._tok = theme.tok(self._theme)
@@ -977,9 +976,9 @@ class MainWindow(QMainWindow):
 
         # ``thumb_worker`` remains a compatibility argument for callers on the
         # previous API. Result cards are text-only, so it is never started or used.
-        self._version_mgr = version_mgr  # 鐗堟湰绠＄悊锛坅pp.py 娉ㄥ叆锛岃鎯呴潰鏉跨敤锛涘彲 None锛?
+        self._version_mgr = version_mgr  # 版本管理（app.py 注入，详情面板用；可 None）
         self._version_backend = version_mgr
-        self._facet_filters: dict[str, set] = {}  # 褰撳墠 facet 绛涢€夛紙08锛?
+        self._facet_filters: dict[str, set] = {}  # 当前 facet 筛选（08）
 
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
@@ -1258,13 +1257,13 @@ class MainWindow(QMainWindow):
 
     # ---------- UI ----------
     def _build_ui(self) -> None:
-        central = AuroraCentral(self)  # 鑷粯鏋佸厜搴曪紙璇?self._tok锛夛紝objectName 浠?"central"
+        central = AuroraCentral(self)  # 自绘极光底（读 self._tok），objectName 为 "central"
         self._central = central
         root = QVBoxLayout(central)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        root.addWidget(self._build_glass_title())  # 鏃犺竟妗嗙獥鍙ｇ殑鑷粯鐜荤拑鏍囬鏍?
+        root.addWidget(self._build_glass_title())  # 无边框窗口的自绘玻璃标题栏
 
         # 合一工具栏后，topBar 仅承载搜索语法提示行（hint 隐藏时高度为 0）
         top = QWidget()
@@ -1714,7 +1713,7 @@ class MainWindow(QMainWindow):
         self.image_label.installEventFilter(self)
         bl.addWidget(self.scroll, 1)
 
-        # 鍛戒腑椤电缉鐣ュ浘鏉?
+        # 命中页缩略图条
         self.thumb_row = QHBoxLayout()
         self.thumb_row.setSpacing(7)
         self.thumb_row.setAlignment(Qt.AlignCenter)
@@ -1767,7 +1766,7 @@ class MainWindow(QMainWindow):
         self._set_ops_enabled(False)
         return panel
 
-    # ---------- 鐜荤拑鏍囬鏍忥紙鏃犺竟妗嗙獥鍙ｈ嚜缁橈級 ----------
+    # ---------- 玻璃标题栏（无边框窗口自绘） ----------
     def _mk_title_icon_btn(self, tip: str, checkable: bool = False) -> QPushButton:
         """合一工具栏的 32px 方形图标按钮：图标色由 _apply_theme 统一刷新。"""
         b = QPushButton()
@@ -1899,7 +1898,7 @@ class MainWindow(QMainWindow):
             style = u.GetWindowLongW(hwnd, GWL_STYLE)
             u.SetWindowLongW(hwnd, GWL_STYLE,
                              style | WS_THICKFRAME | WS_MAXIMIZEBOX | WS_MINIMIZEBOX)
-            # DWMWA_WINDOW_CORNER_PREFERENCE=33, value 2=ROUND锛圵in11锛涙棫绯荤粺闈欓粯澶辫触锛?
+            # DWMWA_WINDOW_CORNER_PREFERENCE=33, value 2=ROUND（Win11；旧系统静默失败）
             ctypes.windll.dwmapi.DwmSetWindowAttribute(
                 hwnd, 33, ctypes.byref(ctypes.c_int(2)), 4)
         except Exception:  # noqa: BLE001
@@ -2112,7 +2111,7 @@ class MainWindow(QMainWindow):
             parts.append(f"修改于 {tm}")
         self.meta_label.setText("　·　".join(parts))
 
-    # ---------- 涓婚 ----------
+    # ---------- 主题 ----------
     def showEvent(self, e):  # noqa: N802
         super().showEvent(e)
         self._start_ui_loop_monitor()
@@ -2135,14 +2134,14 @@ class MainWindow(QMainWindow):
         super().hideEvent(e)
 
     def _apply_titlebar_theme(self) -> None:
-        """Windows 绯荤粺鏍囬鏍忔繁娴呰窡闅忛鏍硷紙娣辫壊椋庢牸鈫掓繁鑹叉爣棰樻爮锛屾秷闄ょ櫧鏉″壊瑁傦級銆?"""
+        """Windows 系统标题栏深浅跟随主题（深色主题 → 深色标题栏，消除白条割裂）。"""
         try:
             import ctypes
             # 跟随主题明暗（修复：旧硬编码清单含不存在的 "raycast"、漏了 ocean/cyber 等深色主题，
             # 导致深海极光等的系统标题栏没深色化）。统一用 token 的 is_light 标志判定。
             dark = not self._tok.get("is_light", False)
             val = ctypes.c_int(1 if dark else 0)
-            # DWMWA_USE_IMMERSIVE_DARK_MODE = 20锛圵in10 20H1+锛?
+            # DWMWA_USE_IMMERSIVE_DARK_MODE = 20（Win10 20H1+）
             ctypes.windll.dwmapi.DwmSetWindowAttribute(
                 int(self.winId()), 20, ctypes.byref(val), ctypes.sizeof(val))
         except Exception:  # 非 Windows / 旧系统静默跳过
@@ -2194,7 +2193,7 @@ class MainWindow(QMainWindow):
         self._refresh_rail_icons()
 
     def _show_theme_menu(self) -> None:
-        """椤舵爮椋庢牸鎸夐挳 鈫?寮瑰嚭椋庢牸鑿滃崟锛堝綋鍓嶉鏍兼墦鍕撅級銆?"""
+        """顶栏主题按钮 → 弹出主题菜单（当前主题打勾）。"""
         menu = QMenu(self)
         for name, label in theme.THEMES:
             act = menu.addAction(label)
@@ -2209,7 +2208,7 @@ class MainWindow(QMainWindow):
         i = names.index(self._theme) if self._theme in names else 0
         self._apply_theme(names[(i + 1) % len(names)])
 
-    # ---------- 鎼滅储 ----------
+    # ---------- 搜索 ----------
     def _refresh_history_model(self) -> None:
         self._history_model.setStringList(history.load_history(limit=10))
 
@@ -2851,7 +2850,7 @@ class MainWindow(QMainWindow):
         task.start()
 
     def _build_empty_hint(self, parent_layout) -> None:
-        """闆剁粨鏋滃紩瀵奸潰鏉匡紙榛樿闅愯棌锛岄浂缁撴灉鏃惰鐩栫粨鏋滃垪琛ㄤ綅缃級銆?"""
+        """零结果引导面板（默认隐藏，零结果时覆盖结果列表位置）。"""
         self.empty_hint = QWidget()
         self.empty_hint.setObjectName("emptyHint")
         v = QVBoxLayout(self.empty_hint)
@@ -3519,7 +3518,6 @@ class MainWindow(QMainWindow):
     _RENDER_FIRST = 12
     _RENDER_CHUNK = 12
     _HIT_NAV_MAX = 12
-    _RENDER_YIELD_MS = 1
     _PREVIEW_MIN_EDGE = 1920
     _PREVIEW_MAX_EDGE = 2560
     _PREFETCH_EDGE = 1920
@@ -3667,27 +3665,6 @@ class MainWindow(QMainWindow):
                 self._add_result_item(idx, r, hlcss, ginfo)
         return min(end, len(plan))
 
-    def _stream_plan_rest(self, plan: list, pos: int, hlcss: str, gen: int) -> None:
-        """剩余条目分批流入：每个事件循环 tick 补一批，UI 保持可交互、结果逐条浮现。"""
-        state = {"pos": pos}
-
-        def step() -> None:
-            if gen != self._render_gen:
-                return  # 已被新一次搜索 / 排序 / 关闭作废
-            try:
-                state["pos"] = self._flush_plan(
-                    plan, state["pos"], state["pos"] + self._RENDER_CHUNK, hlcss)
-            except RuntimeError as e:
-                # 仅「窗口/控件 C++ 对象已析构」是预期内良性中断；其余 RuntimeError
-                # 可能是真 bug（会让结果列表静默截断），记日志再停，绝不无声吞掉。
-                if "already deleted" not in str(e).lower():
-                    _log.error("娴佸紡娓叉煋寮傚父涓柇锛岀粨鏋滃彲鑳戒笉瀹屾暣", exc_info=True)
-                return
-            if state["pos"] < len(plan):
-                QTimer.singleShot(self._RENDER_YIELD_MS, step)
-
-        QTimer.singleShot(self._RENDER_YIELD_MS, step)
-
     def _should_group_by_time(self) -> bool:
         """时间分组只在「时间序」下生效：按最近修改排序，或空查询的默认视图。"""
         key = self._sort_key()
@@ -3830,7 +3807,7 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, lambda: setattr(self, "_suppress_select_preview", False))
         return True
 
-    # ---------- 閫夋嫨 / 棰勮 ----------
+    # ---------- 选择 / 预览 ----------
     def _cancel_auto_preview(self) -> None:
         self._auto_preview_token += 1
         self._auto_preview_timer.stop()
@@ -3898,10 +3875,6 @@ class MainWindow(QMainWindow):
         self._request_preview()
         self._schedule_detail_update()
         self._schedule_detail_dot_refresh()
-
-    def _relayout_split(self) -> None:
-        avail = max(560, self.width() - 24)
-        self._split.setSizes([int(avail * 0.44), int(avail * 0.56)])
 
     def _toggle_facet(self) -> None:
         """「+ 筛选」chip 呼出/收起 facet 浮层（Qt.Popup：点外面自动关闭）。"""
@@ -5342,7 +5315,7 @@ class MainWindow(QMainWindow):
         except RuntimeError:
             pass
 
-    # ---------- 鐗堟湰绠＄悊瀛樺湪鎰燂紙P0-1锛氭棩甯搁潤榛樼浘鐗?+ 浠呴娆″憡鐭ワ級 ----------
+    # ---------- 版本管理存在感（P0-1：日常静默盾牌 + 仅首次告知） ----------
     def refresh_version_shield(self) -> None:
         """状态栏「版本保护」盾牌：显示已守护文件数，日常静默的存在感。"""
         if getattr(self, "version_shield", None) is None or self._version_mgr is None:
@@ -5544,7 +5517,7 @@ class MainWindow(QMainWindow):
             "在这里输入你 PPT 里写过的字 ↵\n"
             "记得哪页写过什么，就能搜出它在哪个文件、第几页。")
 
-    # ---------- 绱㈠紩 ----------
+    # ---------- 索引 ----------
     def _index_is_empty(self) -> bool:
         try:
             return db.stats(self._conn, exts=self._enabled_index_exts())["file_count"] == 0
@@ -6272,7 +6245,7 @@ class MainWindow(QMainWindow):
         self.status_dot.hide()
         self.status_label.setText(f"数据库读取异常：{error}")
 
-    # ---------- 鐢熷懡鍛ㄦ湡 ----------
+    # ---------- 生命周期 ----------
     def force_quit(self) -> None:
         """真正退出（绕过托盘最小化），让更新 helper 接管文件替换 + 重启。
 
