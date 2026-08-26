@@ -7,6 +7,8 @@ datas = [
     ('assets/ui-chevron-dark.svg', 'assets'),
     ('assets/ui-chevron-light.svg', 'assets'),
     ('assets/ui-check.svg', 'assets'),
+    # 图片转可编辑文字的空白母版：注入背景图与文本框的底板（28 KB）
+    ('assets/blank_16x9.pptx', 'assets'),
 ]
 binaries = []
 hiddenimports = []
