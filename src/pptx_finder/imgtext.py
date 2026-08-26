@@ -40,7 +40,7 @@ import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from PySide6.QtGui import QColor, QFont, QFontMetricsF, QImage
+from PySide6.QtGui import QFont, QFontMetricsF, QImage
 
 from .config import resource_path
 
