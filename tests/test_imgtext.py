@@ -553,3 +553,36 @@ def test_analyse_keeps_a_normal_two_character_run(qtbot):
     rows = [{"text": "AB", "box": [36, 86, 110, 130], "score": 0.98}]
     result = imgtext.analyse(image, rows, slide_width_in=13.3333)
     assert [r.text for r in result.runs] == ["AB"]
+
+
+def test_median_filter_drops_isolated_bad_samples(qtbot):
+    """向外找干净背景时会撞上相邻一行的抗锯齿边缘，那种半灰像素照样「平滑」
+    且离字色够远，怎么调门槛都拦不住——但它是孤立的单列，中值滤波正好对症。"""
+    flat = [(243, 243, 242)] * 9
+    flat[4] = (226, 226, 225)
+    assert imgtext._median_filter(flat, 9) == [(243, 243, 242)] * 9
+
+
+def test_median_filter_preserves_a_smooth_gradient(qtbot):
+    """真渐变沿 x 平滑，中值滤波近乎恒等——不许把渐变抹平。"""
+    ramp = [(100 + i, 100 + i, 100 + i) for i in range(40)]
+    out = imgtext._median_filter(ramp, 9)
+    assert out[20] == ramp[20]
+    assert max(abs(a[0] - b[0]) for a, b in zip(out, ramp)) <= 4
+
+
+def test_paint_out_leaves_a_flat_background_perfectly_flat(qtbot):
+    """两行紧挨着时，上一行的字会污染下一行的采样，画出一根根细竖线。"""
+    image = _blank(600, 300, color=(243, 243, 242))
+    _draw_text(image, "first line of text", 40, 120, 26, color=(89, 89, 89))
+    _draw_text(image, "second line of text", 40, 158, 26, color=(89, 89, 89))
+    rows = [{"text": "first line of text", "box": [36, 96, 320, 128], "score": 0.99},
+            {"text": "second line of text", "box": [36, 134, 340, 166], "score": 0.99}]
+    result = imgtext.analyse(image, rows, slide_width_in=13.3333)
+    assert len(result.runs) == 2
+    cleaned = imgtext.paint_out(image, result.runs)
+    px = imgtext._Pixels(cleaned)
+    run = result.runs[1]
+    y = (run.box[1] + run.box[3]) // 2
+    colours = {px.get(x, y) for x in range(run.box[0], run.box[2])}
+    assert colours == {(243, 243, 242)}

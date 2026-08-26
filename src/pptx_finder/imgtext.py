@@ -58,10 +58,13 @@ TEMPLATE_ASSET = ("assets", "blank_16x9.pptx")
 #: （1600px 渲染 = 120 DPI），阈值设 9.0 会一次砍掉 41/58 处真实正文。
 #: 被跳过的文字原样留在背景图里，不会丢失，只是不可编辑。
 DEFAULT_MIN_PT = 6.0
-#: OCR 置信度低于此值直接丢弃。刻意设得低：本地模型在清晰稿上普遍 >0.93，而
-#: 少数正文（公式里的单个字母、页码）会掉到 0.72~0.85，宁可多出一个可以一键删掉的
-#: 文本框，也不要把真实内容判没。
-DEFAULT_MIN_SCORE = 0.50
+#: OCR 置信度低于此值直接丢弃。本地模型在清晰稿上普遍 >0.93，而少数真实正文
+#: （公式里的单个字母、页码）会掉到 0.72~0.85——门槛必须留在那条线以下。
+#: 取 0.60 而不是更低：**误检不是免费的**。多认出来的一处不只是「多一个可以一键
+#: 删掉的文本框」，它还会把那块原始像素一起擦掉，删了框就留下一个洞。实测大学校徽
+#: 上被凭空认出 '同同'(0.51)、'可可'(0.57)，照排就把校徽盖掉了。
+#: 966 处实测：0.60 以下只有 5 处（0.5%），其中 4 处是明显的幻觉。
+DEFAULT_MIN_SCORE = 0.60
 #: 墨迹占紧致框的比例超过这个值 -> 被当成「墨」的其实是一整块实心色（圆圈底、色块），
 #: 也就是墨与底判反了。此时**既不排字也不补洞**，原样保留。
 #: 判反怎么发生的：检测框略微越过色块边界时，环外采样拿到的是色块外面的白，于是
@@ -387,6 +390,13 @@ def _smooth_sample(px: _Pixels, x: int, start_y: int, step: int,
 #: 采样色与本处底色的平方距离超过这个值，就当它越过了一条硬色边。
 #: 约等于每通道 41，纵向渐变在一行文字的高度上根本走不了这么远。
 EDGE_DIST = 5000
+#: 逐列采样结果沿 x 做中值滤波的窗口宽度（必须是奇数）。
+#: 为什么需要：向外找干净背景时，会撞上**相邻一行的抗锯齿边缘**——那种半灰像素
+#: 沿列方向同样平滑，离字色也足够远（实测 226 对字色 89、底色 243，距离比 0.79，
+#: 怎么调「远离字色」的门槛都拦不住），于是被当成背景，插值出来是一根根细竖线。
+#: 这类污染是**孤立的单列**，中值滤波正好对症；而真渐变沿 x 平滑，中值滤波近乎
+#: 恒等变换，不会被抹平。
+SAMPLE_MEDIAN_WINDOW = 9
 
 
 def _drop_sample_across_edge(c_top, c_bottom, run_bg):
@@ -445,6 +455,19 @@ def background_jitter(px: _Pixels, run, *, pad: int = 2, band: int = 3,
     return diffs[len(diffs) // 2]
 
 
+def _median_filter(samples: list, window: int) -> list:
+    """沿序列做逐通道中值滤波，用来剔除孤立的坏采样。窗口不足时按现有邻居取。"""
+    if len(samples) <= 2:
+        return samples
+    half = window // 2
+    out = []
+    for i in range(len(samples)):
+        lo, hi = max(0, i - half), min(len(samples), i + half + 1)
+        chunk = samples[lo:hi]
+        out.append(tuple(sorted(c[k] for c in chunk)[len(chunk) // 2] for k in range(3)))
+    return out
+
+
 def paint_out(image: QImage, runs, *, pad: int = 2, band: int = 3,
               guard: int = 2) -> QImage:
     """把每处文字抹平：按列在上下两侧各找一段干净背景，再垂直插值填充。
@@ -469,19 +492,27 @@ def paint_out(image: QImage, runs, *, pad: int = 2, band: int = 3,
             continue
         height = y1 - y0
         reject = _sq_dist(ink, run_bg) * 0.30
-        fallback = run_bg
         reach = min(_SMOOTH_MAX_SEARCH, max(12, height * 2))
+        tops: list[tuple[int, int, int]] = []
+        bottoms: list[tuple[int, int, int]] = []
         for x in range(x0, x1):
             c_top = _smooth_sample(src, x, y0 - guard, -1, band, reach, ink, reject)
             c_bottom = _smooth_sample(src, x, y1 + guard, 1, band, reach, ink, reject)
             if c_top is None and c_bottom is None:
-                c_top = c_bottom = fallback
+                c_top = c_bottom = run_bg
             elif c_top is None:
                 c_top = c_bottom
             elif c_bottom is None:
                 c_bottom = c_top
             else:
                 c_top, c_bottom = _drop_sample_across_edge(c_top, c_bottom, run_bg)
+            tops.append(c_top)
+            bottoms.append(c_bottom)
+        # 先把逐列采样整体滤一遍再画，见 SAMPLE_MEDIAN_WINDOW
+        tops = _median_filter(tops, SAMPLE_MEDIAN_WINDOW)
+        bottoms = _median_filter(bottoms, SAMPLE_MEDIAN_WINDOW)
+        for i, x in enumerate(range(x0, x1)):
+            c_top, c_bottom = tops[i], bottoms[i]
             for y in range(y0, y1):
                 t = (y - y0) / height if height else 0.0
                 px.set(x, y, (
