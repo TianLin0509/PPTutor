@@ -313,3 +313,430 @@ def test_convert_leaves_source_image_untouched(qtbot, tmp_path):
     before = src.read_bytes()
     imgtext.convert(str(src), str(dest), rows)
     assert src.read_bytes() == before
+
+
+# ---------- 行归段 ----------
+def _run(text, box, size=12.0, bold=False):
+    return imgtext.TextRun(text=text, box=box, ink=(0, 0, 0),
+                           background=(255, 255, 255), point_size=size, bold=bold)
+
+
+def test_group_blocks_merges_stacked_lines_into_one_box(qtbot):
+    """同一段的多行必须合成一个文本框——OCR 按视觉行给结果，不合段的话
+    「彩色块里的多行居中文字」会散成几行各自定位、各自定字号的碎片。"""
+    runs = [_run("Support in making", (100, 100, 300, 120)),
+            _run("data FAIR", (145, 138, 255, 158))]
+    blocks = imgtext.group_blocks(runs, 0.6)
+    assert len(blocks) == 1
+    assert [line.text for line in blocks[0].lines] == ["Support in making", "data FAIR"]
+    assert blocks[0].box == (100, 100, 300, 158)
+
+
+def test_group_blocks_infers_centre_alignment(qtbot):
+    runs = [_run("Comply with", (200, 100, 300, 120)),
+            _run("university, funder &", (160, 138, 340, 158)),
+            _run("journal", (230, 176, 270, 196))]
+    assert imgtext.group_blocks(runs, 0.6)[0].align == "ctr"
+
+
+def test_group_blocks_infers_left_alignment(qtbot):
+    runs = [_run("first line here", (100, 100, 300, 120)),
+            _run("second", (100, 138, 190, 158))]
+    assert imgtext.group_blocks(runs, 0.6)[0].align == "l"
+
+
+def test_group_blocks_keeps_side_by_side_columns_apart(qtbot):
+    """并排两栏不能因为 y 接近就被并成一段。"""
+    runs = [_run("left column", (100, 100, 300, 120)),
+            _run("right column", (700, 100, 900, 120))]
+    assert len(imgtext.group_blocks(runs, 0.6)) == 2
+
+
+def test_group_blocks_splits_on_large_vertical_gap(qtbot):
+    runs = [_run("heading", (100, 100, 300, 120)),
+            _run("body far below", (100, 400, 300, 420))]
+    assert len(imgtext.group_blocks(runs, 0.6)) == 2
+
+
+def test_group_blocks_splits_title_from_body(qtbot):
+    """字号差一大截就不是一段，哪怕挨着。否则正文会被标题的字号带飞。"""
+    runs = [_run("TITLE", (100, 100, 400, 150), size=32.0),
+            _run("body text", (100, 156, 300, 168), size=9.0)]
+    assert len(imgtext.group_blocks(runs, 0.6)) == 2
+
+
+def test_group_blocks_gives_one_size_to_the_whole_block(qtbot):
+    """同段共用一个字号：各行墨高本就有差（有无降部字母），逐行定字号会忽大忽小。"""
+    runs = [_run("acemn", (100, 100, 300, 114)),
+            _run("Anygq", (100, 138, 300, 160))]
+    block = imgtext.group_blocks(runs, 0.6)[0]
+    assert block.point_size > 0
+    assert all(line is not None for line in block.lines)
+
+
+def test_convert_emits_one_shape_per_block_with_explicit_breaks(qtbot, tmp_path):
+    """多行段落用显式 <a:br/> 换行，不靠自动折行——原稿的断行位置一个字都不能变。"""
+    image = _blank(600, 300)
+    # 基线相差 32px = 1.23 倍字号，就是真实幻灯片上的常见行距
+    _draw_text(image, "Support in making", 20, 40, 26)
+    _draw_text(image, "data FAIR", 20, 72, 26)
+    src = tmp_path / "block.png"
+    image.save(str(src))
+    rows = [{"text": "Support in making", "box": [16, 16, 300, 44], "score": 0.99},
+            {"text": "data FAIR", "box": [16, 48, 180, 76], "score": 0.99}]
+    dest = tmp_path / "block.pptx"
+    result = imgtext.convert(str(src), str(dest), rows)
+    assert len(result.runs) == 2 and len(result.blocks) == 1
+    with zipfile.ZipFile(dest) as z:
+        xml = z.read("ppt/slides/slide1.xml").decode("utf-8")
+    assert xml.count("<p:sp>") == 1
+    assert xml.count("<a:br/>") == 1
+    assert "Support in making" in xml and "data FAIR" in xml
+
+
+def test_group_blocks_keeps_light_and_dark_text_apart(qtbot):
+    """字色差一大截就不是一段。表格的蓝底白字表头紧挨着白底黑字的首行数据，
+    几何上完全符合同段，合错了整段会按白色排字，白底上的黑字直接消失。"""
+    white = imgtext.TextRun(text="Independence Ratio", box=(700, 100, 900, 124),
+                            ink=(255, 255, 255), background=(0, 76, 185), point_size=12.0)
+    black = imgtext.TextRun(text="Instructive", box=(720, 140, 880, 164),
+                            ink=(0, 0, 0), background=(255, 255, 255), point_size=11.0)
+    assert len(imgtext.group_blocks([white, black], 0.6)) == 2
+
+
+def test_block_ink_is_the_median_not_the_first_line(qtbot):
+    runs = [_run("a", (100, 100, 200, 120)), _run("b", (100, 138, 200, 158)),
+            _run("c", (100, 176, 200, 196))]
+    runs[0].ink = (40, 0, 0)
+    runs[1].ink = (0, 0, 0)
+    runs[2].ink = (0, 0, 0)
+    assert imgtext.group_blocks(runs, 0.6)[0].ink == (0, 0, 0)
+
+
+# ---------- 抹字：跨色边与花底 ----------
+def test_drop_sample_across_edge_keeps_the_one_matching_the_local_background(qtbot):
+    """色块常在文字下方几像素处就结束，向下采样会拿到色块外面的颜色。"""
+    blue, white = (0, 76, 185), (255, 255, 255)
+    top, bottom = imgtext._drop_sample_across_edge(blue, white, blue)
+    assert top == bottom == blue
+
+
+def test_drop_sample_across_edge_leaves_a_real_gradient_alone(qtbot):
+    """两端都离众数色不远 -> 是真的纵向渐变，插值仍然是最优解，不许瞎改。"""
+    a, b = (200, 200, 200), (215, 215, 215)
+    assert imgtext._drop_sample_across_edge(a, b, (208, 208, 208)) == (a, b)
+
+
+def test_background_jitter_is_zero_on_a_flat_background(qtbot):
+    image = _blank(400, 200)
+    _draw_text(image, "hello world", 40, 100, 28)
+    px = imgtext._Pixels(image)
+    run = imgtext.TextRun(text="hello world", box=(38, 78, 240, 104), ink=(20, 20, 20),
+                          background=(255, 255, 255), point_size=14.0)
+    assert imgtext.background_jitter(px, run) < 1.0
+
+
+def test_analyse_skips_text_sitting_on_a_photo(qtbot):
+    """底是照片时抹不干净，只能整块填单色——那是在破坏画面，比不抹更糟。
+
+    这里刻意造「虚化照片」而不是随机噪点：虚化的照片**局部是平滑的**，早先那版
+    「能不能找到平滑的一段」的判据在实拍图上一路给满分，一个都拦不住。真正能分开
+    的是**横向**是否连续，所以这里让颜色逐列缓慢起伏。
+    """
+    import math
+    image = _blank(600, 300)
+    px = imgtext._Pixels(image)
+    for x in range(600):
+        base = (128 + int(60 * math.sin(x / 7.0)), 120, 110 + int(50 * math.cos(x / 5.0)))
+        for y in range(300):
+            px.set(x, y, base)
+    _draw_text(image, "photo caption", 60, 150, 28, color=(0, 0, 0))
+    # 检测框留足余量：环外取色的采样带要落在干净背景上，压到降部就会把字色当成底色
+    rows = [{"text": "photo caption", "box": [50, 118, 400, 168], "score": 0.99}]
+    result = imgtext.analyse(image, rows, slide_width_in=13.3333)
+    assert result.runs == []
+    assert result.skipped_busy == ["photo caption"]
+
+
+def test_analyse_keeps_text_on_a_vertical_gradient(qtbot):
+    """纵向渐变是横向连续的，垂直插值能精确还原——不许被上面那条守卫误伤。"""
+    image = _blank(600, 300)
+    px = imgtext._Pixels(image)
+    for y in range(300):
+        c = (40 + y // 3, 60 + y // 4, 120)
+        for x in range(600):
+            px.set(x, y, c)
+    _draw_text(image, "gradient caption", 60, 150, 28, color=(255, 255, 255))
+    rows = [{"text": "gradient caption", "box": [50, 118, 420, 168], "score": 0.99}]
+    result = imgtext.analyse(image, rows, slide_width_in=13.3333)
+    assert [r.text for r in result.runs] == ["gradient caption"]
+    assert result.skipped_busy == []
+
+
+# ---------- 落点 ----------
+def test_shape_uses_absolute_line_spacing_matching_the_measured_pitch(qtbot):
+    """行距给绝对值（spcPts），不给相对单倍行距的百分比——单倍行距是字号的多少倍
+    由字体度量决定，猜错了多行段落会整体错位二十多像素。"""
+    runs = [_run("first line", (100, 100, 400, 124)),
+            _run("second line", (100, 140, 400, 164))]
+    block = imgtext.group_blocks(runs, 0.6)[0]
+    emu_per_px = imgtext.EMU_PER_INCH * 13.3333 / 1600
+    xml = imgtext._shape_xml(0, block, emu_per_px)
+    assert "spcPct" not in xml
+    pitch_pt = block.line_pitch * (13.3333 * 72) / 1600
+    assert f'<a:spcPts val="{int(round(pitch_pt * 100))}"/>' in xml
+
+
+def test_shape_left_edge_follows_the_alignment(qtbot):
+    """左对齐对左边、右对齐对右边——早先一律 left = x0 - pad，每段都左偏一个 pad。"""
+    import re
+    emu_per_px = imgtext.EMU_PER_INCH * 13.3333 / 1600
+
+    def geometry(block):
+        xml = imgtext._shape_xml(0, block, emu_per_px)
+        off = int(re.search(r'<a:off x="(\d+)"', xml).group(1))
+        cx = int(re.search(r'<a:ext cx="(\d+)"', xml).group(1))
+        return off / emu_per_px, cx / emu_per_px
+
+    left, _ = geometry(imgtext.group_blocks([_run("only line", (300, 100, 700, 124))], 0.6)[0])
+    assert abs(left - 300) < 1.0
+
+    block = imgtext.group_blocks(
+        [_run("aaaa", (500, 100, 700, 124)), _run("bb", (620, 140, 700, 164))], 0.6)[0]
+    assert block.align == "r"
+    left, width = geometry(block)
+    assert abs((left + width) - 700) < 1.0          # 右边缘回到原位
+
+    block = imgtext.group_blocks(
+        [_run("wide line", (400, 100, 800, 124)), _run("mid", (550, 140, 650, 164))], 0.6)[0]
+    assert block.align == "ctr"
+    left, width = geometry(block)
+    assert abs((left + width / 2) - 600) < 1.0      # 中线回到原位
+
+
+def test_block_bold_needs_a_majority_not_a_single_line(qtbot):
+    """单行的字重误判不能放大成整段。
+
+    实测：一页 12 行的常规正文里只有一行短句被 assign_bold 误标，用 any() 就把
+    整段 12 行全排成了粗体——「零误判」是字重这块唯一不让步的指标。
+    """
+    lines = [_run(f"line {i}", (100, 100 + i * 38, 500, 124 + i * 38)) for i in range(6)]
+    lines[2].bold = True
+    assert imgtext.group_blocks(lines, 0.6)[0].bold is False
+    for line in lines[:4]:
+        line.bold = True
+    assert imgtext.group_blocks(lines, 0.6)[0].bold is True
+
+
+def test_single_line_block_keeps_its_own_weight(qtbot):
+    """单行段落的行为与合段之前完全一致——那是 381 条对照验证过的路径。"""
+    line = _run("Title", (100, 100, 400, 140), bold=True)
+    assert imgtext.group_blocks([line], 0.6)[0].bold is True
+
+
+def test_analyse_skips_a_box_taller_than_it_is_wide(qtbot):
+    """OCR 会把竖着排的几项并成一「行」——序号 1)2)3)4) 实测被返回成单个
+    36x111 的竖框、文字 "234"，照排就成了横着的一串。整处原样保留。"""
+    image = _blank(300, 400)
+    for i, ch in enumerate("234"):
+        _draw_text(image, ch, 40, 120 + i * 60, 34)
+    rows = [{"text": "234", "box": [36, 86, 74, 200], "score": 0.98}]
+    result = imgtext.analyse(image, rows, slide_width_in=13.3333)
+    assert result.runs == []
+    assert result.skipped_shape == ["234"]
+
+
+def test_analyse_keeps_a_normal_two_character_run(qtbot):
+    """两字的横排短串不许被上面那条误伤。"""
+    image = _blank(300, 200)
+    _draw_text(image, "AB", 40, 120, 34)
+    rows = [{"text": "AB", "box": [36, 86, 110, 130], "score": 0.98}]
+    result = imgtext.analyse(image, rows, slide_width_in=13.3333)
+    assert [r.text for r in result.runs] == ["AB"]
+
+
+def test_median_filter_drops_isolated_bad_samples(qtbot):
+    """向外找干净背景时会撞上相邻一行的抗锯齿边缘，那种半灰像素照样「平滑」
+    且离字色够远，怎么调门槛都拦不住——但它是孤立的单列，中值滤波正好对症。"""
+    flat = [(243, 243, 242)] * 9
+    flat[4] = (226, 226, 225)
+    assert imgtext._median_filter(flat, 9) == [(243, 243, 242)] * 9
+
+
+def test_median_filter_preserves_a_smooth_gradient(qtbot):
+    """真渐变沿 x 平滑，中值滤波近乎恒等——不许把渐变抹平。"""
+    ramp = [(100 + i, 100 + i, 100 + i) for i in range(40)]
+    out = imgtext._median_filter(ramp, 9)
+    assert out[20] == ramp[20]
+    assert max(abs(a[0] - b[0]) for a, b in zip(out, ramp)) <= 4
+
+
+def test_paint_out_leaves_a_flat_background_perfectly_flat(qtbot):
+    """两行紧挨着时，上一行的字会污染下一行的采样，画出一根根细竖线。"""
+    image = _blank(600, 300, color=(243, 243, 242))
+    _draw_text(image, "first line of text", 40, 120, 26, color=(89, 89, 89))
+    _draw_text(image, "second line of text", 40, 158, 26, color=(89, 89, 89))
+    rows = [{"text": "first line of text", "box": [36, 96, 320, 128], "score": 0.99},
+            {"text": "second line of text", "box": [36, 134, 340, 166], "score": 0.99}]
+    result = imgtext.analyse(image, rows, slide_width_in=13.3333)
+    assert len(result.runs) == 2
+    cleaned = imgtext.paint_out(image, result.runs)
+    px = imgtext._Pixels(cleaned)
+    run = result.runs[1]
+    y = (run.box[1] + run.box[3]) // 2
+    colours = {px.get(x, y) for x in range(run.box[0], run.box[2])}
+    assert colours == {(243, 243, 242)}
+
+
+# ---------- 公式：整处保留原样 ----------
+def test_has_math_spots_greek_operators_and_scripts(qtbot):
+    assert imgtext.has_math("σ²I")
+    assert imgtext.has_math("max ∑ Ui(Ri)")
+    assert imgtext.has_math("x̂ = y")          # 组合帽子，独立码点
+    assert not imgtext.has_math("About the Course")
+    assert not imgtext.has_math("存储压缩比3.2×")     # × 是「倍」，不是数学符号
+    assert not imgtext.has_math("·要点1")            # 中文项目符号
+
+
+def test_find_formula_runs_spreads_along_the_same_line(qtbot):
+    """公式常被 OCR 切成好几段，往往只有一段带得动数学字符。"""
+    left = _run("h=RMSGSH", (890, 566, 1057, 606))
+    right = _run("SR S+σ²I", (1077, 569, 1313, 601))
+    below = _run("y:Follower 实时稀疏 SRS", (827, 615, 1052, 640))
+    marked = imgtext.find_formula_runs([left, right, below])
+    assert marked == {0, 1}          # 同一行的两段都算，下面一行不算
+
+
+def test_find_formula_runs_does_not_cross_a_wide_gap(qtbot):
+    seed = _run("σ²", (100, 100, 140, 140))
+    far = _run("正常文字", (600, 100, 900, 140))
+    assert imgtext.find_formula_runs([seed, far]) == {0}
+
+
+def test_analyse_leaves_formula_pixels_untouched(qtbot):
+    """公式排不出来是结构性的（上下标是二维排版），所以整处不排字也不补洞。"""
+    image = _blank(600, 300)
+    _draw_text(image, "σ² + x", 60, 150, 30)
+    rows = [{"text": "σ² + x", "box": [50, 118, 260, 168], "score": 0.95}]
+    result = imgtext.analyse(image, rows, slide_width_in=13.3333)
+    assert result.runs == []
+    assert result.skipped_formula == ["σ² + x"]
+    # 跳过 = 不补洞：paint_out 拿到空列表，像素一个都不动
+    cleaned = imgtext.paint_out(image, result.runs)
+    a, b = imgtext._Pixels(image), imgtext._Pixels(cleaned)
+    assert all(a.get(x, y) == b.get(x, y)
+               for y in range(118, 168, 3) for x in range(50, 260, 3))
+
+
+def test_analyse_keeps_formulas_when_the_switch_is_off(qtbot):
+    image = _blank(600, 300)
+    _draw_text(image, "σ² + x", 60, 150, 30)
+    rows = [{"text": "σ² + x", "box": [50, 118, 260, 168], "score": 0.95}]
+    result = imgtext.analyse(image, rows, slide_width_in=13.3333, skip_formula=False)
+    assert [r.text for r in result.runs] == ["σ² + x"]
+    assert result.skipped_formula == []
+
+
+# ---------- 抹除框沿边扩张 ----------
+def test_grow_erase_box_covers_ink_clipped_outside_the_box(qtbot):
+    """OCR 的框会切掉标点的尾巴——中文全角逗号「，」的尾巴常拖在框外，
+    框外那一截我们从来不看，画面上就留下一小撮毛刺。"""
+    image = _blank(400, 200)
+    _fill(image, (100, 60, 300, 100), (200, 0, 0))      # 框内的「字」
+    _fill(image, (150, 100, 160, 112), (200, 0, 0))     # 拖到框外的尾巴
+    px = imgtext._Pixels(image)
+    grown = imgtext.grow_erase_box(px, (100, 60, 300, 100), (200, 0, 0), (255, 255, 255))
+    assert grown[3] >= 112                               # 下边扩到把尾巴包进去
+    assert grown[1] == 60 and grown[0] == 100            # 其余三边不动
+
+
+def test_grow_erase_box_stops_at_a_neighbouring_line(qtbot):
+    """相邻一行的墨量会占满整个框宽，那是撞上邻行，不能吞。"""
+    image = _blank(400, 200)
+    _fill(image, (100, 60, 300, 90), (0, 0, 0))
+    _fill(image, (100, 96, 300, 126), (0, 0, 0))        # 紧挨着的下一行
+    px = imgtext._Pixels(image)
+    grown = imgtext.grow_erase_box(px, (100, 60, 300, 90), (0, 0, 0), (255, 255, 255))
+    assert grown[3] < 96
+
+
+def test_grow_erase_box_refuses_to_grow_inside_dense_graphics(qtbot):
+    """扩到上限还没干净 = 身处一片密集图形里，扩下去会啃掉图形，那一侧就不扩。"""
+    image = _blank(400, 200, color=(0, 0, 0))           # 整张全是「墨」
+    px = imgtext._Pixels(image)
+    box = (100, 60, 300, 100)
+    assert imgtext.grow_erase_box(px, box, (0, 0, 0), (255, 255, 255)) == box
+
+
+def test_group_blocks_needs_the_lines_to_share_an_edge(qtbot):
+    """一段文字总是沿某条边码齐；三条边都对不上就不是一段。
+
+    实测这条挡的是：图表的顶部居中标题被并进右侧图例——那一对在另外四个判据上
+    全部刚好擦边通过，合完整段判成右对齐，标题被拉到右边还缩了字号。
+    """
+    title = _run("典型用户切换期BLER波动（示例）", (351, 26, 1242, 83), size=34.9)
+    legend = _run("频繁切换(现网初始化)", (1116, 148, 1457, 186), size=22.9)
+    assert len(imgtext.group_blocks([title, legend], 0.6)) == 2
+
+
+def test_group_blocks_tolerates_an_indented_continuation_line(qtbot):
+    """项目符号的续行会缩进一个行高左右，那仍是同一段，不许被上面那条误伤。"""
+    first = _run("·The findings highlight the importance", (100, 100, 700, 130))
+    cont = _run("exploitation rate in forward-looking", (136, 140, 700, 170))
+    assert len(imgtext.group_blocks([first, cont], 0.6)) == 1
+
+
+# ---------- 相邻行墨迹框重叠 ----------
+def test_resolve_vertical_overlaps_splits_at_the_midline(qtbot):
+    """行距紧的版式上，OCR 的框会连带框住上下行的笔画，量出的字高被撑大两三成，
+    字号跟着放大，排出来行行叠在一起。重叠区对半分。"""
+    a = _run("上面这一行", (100, 100, 500, 146))
+    b = _run("下面这一行", (100, 139, 500, 185))
+    n = imgtext.resolve_vertical_overlaps([a, b], 0.6)
+    assert n == 1
+    assert a.box[3] == b.box[1]          # 切在中线上，不再重叠
+    assert a.box[1] == 100 and b.box[3] == 185
+
+
+def test_resolve_vertical_overlaps_leaves_side_by_side_columns_alone(qtbot):
+    a = _run("左栏", (100, 100, 300, 146))
+    b = _run("右栏", (700, 139, 900, 185))
+    assert imgtext.resolve_vertical_overlaps([a, b], 0.6) == 0
+    assert a.box == (100, 100, 300, 146)
+
+
+def test_resolve_vertical_overlaps_refuses_a_deep_overlap(qtbot):
+    """重叠过半说明不是「吃到邻行」，乱切会切掉真正的笔画。"""
+    a = _run("甲", (100, 100, 500, 150))
+    b = _run("乙", (100, 105, 500, 155))
+    assert imgtext.resolve_vertical_overlaps([a, b], 0.6) == 0
+
+
+def test_resolve_vertical_overlaps_recomputes_the_point_size(qtbot):
+    a = _run("上面这一行", (100, 100, 500, 146))
+    b = _run("下面这一行", (100, 139, 500, 185))
+    before = a.point_size
+    imgtext.resolve_vertical_overlaps([a, b], 0.6)
+    assert a.point_size != before        # 字高变了，字号必须跟着重算
+
+
+# ---------- 同一块像素的重复检测 ----------
+def test_drop_nested_duplicates_removes_a_substring_box(qtbot):
+    whole = _run("推理token", (100, 100, 300, 131))
+    part = _run("推理", (100, 108, 160, 120))
+    kept = imgtext.drop_nested_duplicates([whole, part])
+    assert [r.text for r in kept] == ["推理token"]
+
+
+def test_drop_nested_duplicates_keeps_the_higher_confidence_one(qtbot):
+    a = _run("Score1st", (100, 100, 300, 140)); a.score = 0.86
+    b = _run("测填score1note", (105, 105, 305, 145)); b.score = 0.97
+    kept = imgtext.drop_nested_duplicates([a, b])
+    assert [r.text for r in kept] == ["测填score1note"]
+
+
+def test_drop_nested_duplicates_keeps_merely_touching_boxes(qtbot):
+    """相邻两行只轻微相交，是正常版式，不能当成重复丢掉。"""
+    a = _run("上面这一行", (100, 100, 500, 146))
+    b = _run("下面这一行", (100, 142, 500, 188))
+    assert len(imgtext.drop_nested_duplicates([a, b])) == 2
