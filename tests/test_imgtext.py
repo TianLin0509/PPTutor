@@ -684,3 +684,59 @@ def test_group_blocks_tolerates_an_indented_continuation_line(qtbot):
     first = _run("·The findings highlight the importance", (100, 100, 700, 130))
     cont = _run("exploitation rate in forward-looking", (136, 140, 700, 170))
     assert len(imgtext.group_blocks([first, cont], 0.6)) == 1
+
+
+# ---------- 相邻行墨迹框重叠 ----------
+def test_resolve_vertical_overlaps_splits_at_the_midline(qtbot):
+    """行距紧的版式上，OCR 的框会连带框住上下行的笔画，量出的字高被撑大两三成，
+    字号跟着放大，排出来行行叠在一起。重叠区对半分。"""
+    a = _run("上面这一行", (100, 100, 500, 146))
+    b = _run("下面这一行", (100, 139, 500, 185))
+    n = imgtext.resolve_vertical_overlaps([a, b], 0.6)
+    assert n == 1
+    assert a.box[3] == b.box[1]          # 切在中线上，不再重叠
+    assert a.box[1] == 100 and b.box[3] == 185
+
+
+def test_resolve_vertical_overlaps_leaves_side_by_side_columns_alone(qtbot):
+    a = _run("左栏", (100, 100, 300, 146))
+    b = _run("右栏", (700, 139, 900, 185))
+    assert imgtext.resolve_vertical_overlaps([a, b], 0.6) == 0
+    assert a.box == (100, 100, 300, 146)
+
+
+def test_resolve_vertical_overlaps_refuses_a_deep_overlap(qtbot):
+    """重叠过半说明不是「吃到邻行」，乱切会切掉真正的笔画。"""
+    a = _run("甲", (100, 100, 500, 150))
+    b = _run("乙", (100, 105, 500, 155))
+    assert imgtext.resolve_vertical_overlaps([a, b], 0.6) == 0
+
+
+def test_resolve_vertical_overlaps_recomputes_the_point_size(qtbot):
+    a = _run("上面这一行", (100, 100, 500, 146))
+    b = _run("下面这一行", (100, 139, 500, 185))
+    before = a.point_size
+    imgtext.resolve_vertical_overlaps([a, b], 0.6)
+    assert a.point_size != before        # 字高变了，字号必须跟着重算
+
+
+# ---------- 同一块像素的重复检测 ----------
+def test_drop_nested_duplicates_removes_a_substring_box(qtbot):
+    whole = _run("推理token", (100, 100, 300, 131))
+    part = _run("推理", (100, 108, 160, 120))
+    kept = imgtext.drop_nested_duplicates([whole, part])
+    assert [r.text for r in kept] == ["推理token"]
+
+
+def test_drop_nested_duplicates_keeps_the_higher_confidence_one(qtbot):
+    a = _run("Score1st", (100, 100, 300, 140)); a.score = 0.86
+    b = _run("测填score1note", (105, 105, 305, 145)); b.score = 0.97
+    kept = imgtext.drop_nested_duplicates([a, b])
+    assert [r.text for r in kept] == ["测填score1note"]
+
+
+def test_drop_nested_duplicates_keeps_merely_touching_boxes(qtbot):
+    """相邻两行只轻微相交，是正常版式，不能当成重复丢掉。"""
+    a = _run("上面这一行", (100, 100, 500, 146))
+    b = _run("下面这一行", (100, 142, 500, 188))
+    assert len(imgtext.drop_nested_duplicates([a, b])) == 2

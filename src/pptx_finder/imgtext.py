@@ -84,6 +84,11 @@ MAX_BACKGROUND_JITTER = 4.0
 #: 跳过即原样保留——竖排内容留在背景图里，看起来和原稿一模一样。
 MIN_ASPECT_RATIO = 1.0
 
+#: 两行的墨迹框竖直重叠超过较矮者的这个比例，就不当成「吃到邻行」处理。
+#: 真正的「吃到邻行」只会啃掉一点点（实测 7~12px，占行高两三成）；重叠过半
+#: 说明是别的情况（叠字、贴在图形上），那时乱切会切掉真正的笔画。
+OVERLAP_TRIM_MAX = 0.5
+
 #: 出现这些字符基本就是公式——它们在普通 PPT 正文里几乎不出现。
 #: 公式排不出来是**结构性**的：上标、下标、帽子、根号是二维排版，而这条链路
 #: 只会把一行字排在一条基线上。OCR 又会把 σ 读成 o、I 读成 1、上下标拍平，
@@ -661,6 +666,14 @@ def analyse(image: QImage, ocr_rows, *, slide_width_in: float,
                                    score=score))
         stroke_ratios.append(stroke / ink_h if ink_h else 0.0)
 
+    # 必须在归段与判粗之前：字号被撑大会连带影响归段时的「字号相近」判断。
+    kept = drop_nested_duplicates(result.runs)
+    if len(kept) != len(result.runs):
+        drop = {id(r) for r in result.runs} - {id(r) for r in kept}
+        stroke_ratios = [x for r, x in zip(result.runs, stroke_ratios) if id(r) not in drop]
+        result.runs = kept
+    resolve_vertical_overlaps(result.runs, pt_per_px, font_name=font_name)
+
     if skip_formula:
         marked = find_formula_runs(result.runs)
         if marked:
@@ -674,6 +687,89 @@ def analyse(image: QImage, ocr_rows, *, slide_width_in: float,
     if detect_weight:
         assign_bold(result.runs, stroke_ratios)
     return result
+
+
+#: 两个框相交的面积占较小框的这个比例以上，就认定它们指的是同一块像素——
+#: 同一块像素不可能同时是两段不同的文字，两个都排出来就是**原地叠两遍字**。
+#: 5801 处实测：相交的只有 36 对，超过 0.6 的 12 对，其余都在 0.07 以下，
+#: 阈值落在这个大空档里。丢弃是安全的：被丢掉的那处不排字也不补洞，原始像素
+#: 原样留在背景图里，看得见、只是不可编辑。
+DUP_OVERLAP = 0.6
+
+
+def drop_nested_duplicates(runs) -> list:
+    """丢掉指向同一块像素的重复检测。
+
+    OCR 偶尔会对同一块区域给两个框：一个是整行 '推理token'，一个只框了里面的
+    '推理'；或者两个不同的读法压在一起（'Score1st' 与 '测填score1note'）。
+    两个都排就是**同一处叠两遍字**，很难看。
+
+    判据分两档：
+      · 文字是子串且几乎被完全包住 -> 一定是重复，丢短的
+      · 相交面积超过较小框的 DUP_OVERLAP -> 指的是同一块像素，留置信度高的；
+        置信度相同就留框大的（框大的通常包含更完整的文字）
+    """
+    drop = set()
+    order = sorted(range(len(runs)),
+                   key=lambda k: (-runs[k].score,
+                                  -(runs[k].box[2] - runs[k].box[0]) * (runs[k].box[3] - runs[k].box[1])))
+    for i in order:
+        if i in drop:
+            continue
+        a = runs[i]
+        for j in order:
+            if j == i or j in drop:
+                continue
+            b = runs[j]
+            x = min(a.box[2], b.box[2]) - max(a.box[0], b.box[0])
+            y = min(a.box[3], b.box[3]) - max(a.box[1], b.box[1])
+            if x <= 0 or y <= 0:
+                continue
+            small = max(1, (b.box[2] - b.box[0]) * (b.box[3] - b.box[1]))
+            share = x * y / small
+            nested = len(b.text) < len(a.text) and b.text in a.text and share >= 0.9
+            if nested or share >= DUP_OVERLAP:
+                drop.add(j)
+    return [r for k, r in enumerate(runs) if k not in drop]
+
+
+def resolve_vertical_overlaps(runs, pt_per_px: float,
+                             font_name: str = DEFAULT_FONT) -> int:
+    """相邻两行的墨迹框竖直重叠时，各让一半，并重算字号。返回修正的对数。
+
+    行距紧的版式（密集要点列表）上，OCR 的检测框会连带框住上下行的笔画，量出来的
+    墨迹高度就被撑大两三成。字号是按墨迹高度反解的，于是整段字被放大，排出来
+    **行行叠在一起**——这是肉眼一眼能看出来的坏。
+
+    100 张真实幻灯片实测：5802 处文字里有 65 对重叠（1.1%），但**波及 24/100 张**，
+    一旦发生就很难看，所以值得修。切在重叠区的中线上：重叠意味着这段像素到底
+    属于上一行还是下一行本来就分不清，对半分是唯一公平的取法。
+
+    只修「切一点点」的情况，见 OVERLAP_TRIM_MAX。
+    抹除范围不受影响：paint_out 给每个框留了 pad，上下两个框的抹除区在中线附近
+    仍然连续，不会在中间留一条没抹干净的缝。
+    """
+    ordered = sorted(runs, key=lambda r: r.box[1])
+    fixed = []
+    for i, a in enumerate(ordered):
+        for b in ordered[i + 1:]:
+            if b.box[1] >= a.box[3]:
+                break                      # 已按上边界排序，后面的只会更靠下
+            if min(a.box[2], b.box[2]) <= max(a.box[0], b.box[0]):
+                continue                   # 水平不相交：并排两栏，不是上下两行
+            over = a.box[3] - b.box[1]
+            if over <= 0 or over > min(a.height, b.height) * OVERLAP_TRIM_MAX:
+                continue
+            mid = (a.box[3] + b.box[1]) // 2
+            a.box = (a.box[0], a.box[1], a.box[2], mid)
+            b.box = (b.box[0], mid, b.box[2], b.box[3])
+            fixed.append(a)
+            fixed.append(b)
+    for run in fixed:
+        run.point_size = round(
+            fit_point_size(run.text, run.height, run.width, pt_per_px,
+                           bold=run.bold, font_name=font_name), 1)
+    return len(fixed) // 2
 
 
 def has_math(text: str) -> bool:
