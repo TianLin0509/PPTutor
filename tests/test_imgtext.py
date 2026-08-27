@@ -586,3 +586,52 @@ def test_paint_out_leaves_a_flat_background_perfectly_flat(qtbot):
     y = (run.box[1] + run.box[3]) // 2
     colours = {px.get(x, y) for x in range(run.box[0], run.box[2])}
     assert colours == {(243, 243, 242)}
+
+
+# ---------- 公式：整处保留原样 ----------
+def test_has_math_spots_greek_operators_and_scripts(qtbot):
+    assert imgtext.has_math("σ²I")
+    assert imgtext.has_math("max ∑ Ui(Ri)")
+    assert imgtext.has_math("x̂ = y")          # 组合帽子，独立码点
+    assert not imgtext.has_math("About the Course")
+    assert not imgtext.has_math("存储压缩比3.2×")     # × 是「倍」，不是数学符号
+    assert not imgtext.has_math("·要点1")            # 中文项目符号
+
+
+def test_find_formula_runs_spreads_along_the_same_line(qtbot):
+    """公式常被 OCR 切成好几段，往往只有一段带得动数学字符。"""
+    left = _run("h=RMSGSH", (890, 566, 1057, 606))
+    right = _run("SR S+σ²I", (1077, 569, 1313, 601))
+    below = _run("y:Follower 实时稀疏 SRS", (827, 615, 1052, 640))
+    marked = imgtext.find_formula_runs([left, right, below])
+    assert marked == {0, 1}          # 同一行的两段都算，下面一行不算
+
+
+def test_find_formula_runs_does_not_cross_a_wide_gap(qtbot):
+    seed = _run("σ²", (100, 100, 140, 140))
+    far = _run("正常文字", (600, 100, 900, 140))
+    assert imgtext.find_formula_runs([seed, far]) == {0}
+
+
+def test_analyse_leaves_formula_pixels_untouched(qtbot):
+    """公式排不出来是结构性的（上下标是二维排版），所以整处不排字也不补洞。"""
+    image = _blank(600, 300)
+    _draw_text(image, "σ² + x", 60, 150, 30)
+    rows = [{"text": "σ² + x", "box": [50, 118, 260, 168], "score": 0.95}]
+    result = imgtext.analyse(image, rows, slide_width_in=13.3333)
+    assert result.runs == []
+    assert result.skipped_formula == ["σ² + x"]
+    # 跳过 = 不补洞：paint_out 拿到空列表，像素一个都不动
+    cleaned = imgtext.paint_out(image, result.runs)
+    a, b = imgtext._Pixels(image), imgtext._Pixels(cleaned)
+    assert all(a.get(x, y) == b.get(x, y)
+               for y in range(118, 168, 3) for x in range(50, 260, 3))
+
+
+def test_analyse_keeps_formulas_when_the_switch_is_off(qtbot):
+    image = _blank(600, 300)
+    _draw_text(image, "σ² + x", 60, 150, 30)
+    rows = [{"text": "σ² + x", "box": [50, 118, 260, 168], "score": 0.95}]
+    result = imgtext.analyse(image, rows, slide_width_in=13.3333, skip_formula=False)
+    assert [r.text for r in result.runs] == ["σ² + x"]
+    assert result.skipped_formula == []

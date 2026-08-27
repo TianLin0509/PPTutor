@@ -84,6 +84,26 @@ MAX_BACKGROUND_JITTER = 4.0
 #: 跳过即原样保留——竖排内容留在背景图里，看起来和原稿一模一样。
 MIN_ASPECT_RATIO = 1.0
 
+#: 出现这些字符基本就是公式——它们在普通 PPT 正文里几乎不出现。
+#: 公式排不出来是**结构性**的：上标、下标、帽子、根号是二维排版，而这条链路
+#: 只会把一行字排在一条基线上。OCR 又会把 σ 读成 o、I 读成 1、上下标拍平，
+#: 于是排出来是一串谁也看不懂的字符，还把原来的公式擦掉了。
+#: 这类整处保留原样——留在背景图里，看起来和原稿一模一样，只是不可编辑。
+#:
+#: 为什么用字符而不是别的：基线几何、OCR 置信度、墨迹密度、行分布匹配度这四个
+#: 信号都实测过，全部与正常文字重叠（置信度尤其反直觉——0.80~0.99 区间的读对率
+#: 是 83%/69%/55%/57%/58%，几乎不相关）。只有字符这条是干净的：925 处实测命中
+#: 5 处，4 处是真公式，1 处是把 "MEC" 读成 "ΛEC" 的错行（跳过它也对）。
+MATH_CHARS = frozenset(
+    "αβγδεζηθικλμνξπρστυφχψωΓΔΘΛΞΠΣΦΨΩ"           # 希腊字母
+    "∑∏∫√∂∞≈≠≤≥±∓⊂⊃⊆⊇∈∉∪∩∀∃∇∝⊥∠"                  # 运算与关系
+    "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁽⁾ⁿ₀₁₂₃₄₅₆₇₈₉₊₌₍₎ₐₑₒₓ"            # 上下标
+)
+#: 公式常被 OCR 切成好几段，只有一段带得动数学字符。命中之后沿同一视觉行
+#: 向左右传播这个倍数的行高，把整条公式一起圈进来。
+#: 实测正是这条把 'h=RMSGSH' 和它右边的 'SRscS+o²1）-1' 认成了同一条公式。
+FORMULA_GAP_FACTOR = 1.5
+
 
 @dataclass
 class TextRun:
@@ -115,6 +135,7 @@ class Conversion:
     skipped_blank: list[str] = field(default_factory=list)
     skipped_shape: list[str] = field(default_factory=list)
     skipped_busy: list[str] = field(default_factory=list)
+    skipped_formula: list[str] = field(default_factory=list)
     skipped_small: list[str] = field(default_factory=list)
     skipped_score: list[str] = field(default_factory=list)
     image_size: tuple[int, int] = (0, 0)
@@ -126,6 +147,7 @@ class Conversion:
             f"跳过：无可读墨迹 {len(self.skipped_blank)}、"
             f"疑似图形或竖排 {len(self.skipped_shape)}、"
             f"底为图像 {len(self.skipped_busy)}、"
+            f"公式 {len(self.skipped_formula)}、"
             f"字号过小 {len(self.skipped_small)}、"
             f"识别存疑 {len(self.skipped_score)}"
         )
@@ -528,7 +550,8 @@ def analyse(image: QImage, ocr_rows, *, slide_width_in: float,
             min_point_size: float = DEFAULT_MIN_PT,
             min_score: float = DEFAULT_MIN_SCORE,
             font_name: str = DEFAULT_FONT,
-            detect_weight: bool = True) -> Conversion:
+            detect_weight: bool = True,
+            skip_formula: bool = True) -> Conversion:
     """ocr_rows: [{"text": str, "box": (x0,y0,x1,y1), "score": float}, ...]"""
     px = _Pixels(image)
     pt_per_px = (slide_width_in * POINTS_PER_INCH) / max(1, image.width())
@@ -569,9 +592,54 @@ def analyse(image: QImage, ocr_rows, *, slide_width_in: float,
                                    score=score))
         stroke_ratios.append(stroke / ink_h if ink_h else 0.0)
 
+    if skip_formula:
+        marked = find_formula_runs(result.runs)
+        if marked:
+            # 必须在 assign_bold 之前剔除，两个列表是按下标对齐的。
+            # 从 runs 里拿掉就等于「不排字也不补洞」——原始像素原样保留。
+            result.skipped_formula = [result.runs[i].text for i in sorted(marked)]
+            keep = [i for i in range(len(result.runs)) if i not in marked]
+            result.runs = [result.runs[i] for i in keep]
+            stroke_ratios = [stroke_ratios[i] for i in keep]
+
     if detect_weight:
         assign_bold(result.runs, stroke_ratios)
     return result
+
+
+def has_math(text: str) -> bool:
+    """这行是否带公式特征字符。组合重音（帽子 x̂、横杠 x̄）单独判——它们是
+    独立码点，跟在基字母后面。"""
+    return any(c in MATH_CHARS or 0x0300 <= ord(c) <= 0x036F for c in text)
+
+
+def find_formula_runs(runs) -> set[int]:
+    """挑出属于公式的 run：先按数学字符找种子，再沿同一视觉行左右传播。
+
+    传播是必需的：OCR 会把一条公式切成好几段，往往只有一段带得动数学字符。
+    """
+    marked = {i for i, run in enumerate(runs) if has_math(run.text)}
+    if not marked:
+        return marked
+    changed = True
+    while changed:
+        changed = False
+        for i, a in enumerate(runs):
+            if i in marked:
+                continue
+            for j in marked:
+                b = runs[j]
+                # 同一视觉行：竖直重叠超过较矮者的一半
+                if min(a.box[3], b.box[3]) - max(a.box[1], b.box[1]) <= 0.5 * min(a.height, b.height):
+                    continue
+                gap = max(a.box[0] - b.box[2], b.box[0] - a.box[2])
+                if gap <= FORMULA_GAP_FACTOR * max(a.height, b.height):
+                    marked.add(i)
+                    changed = True
+                    break
+            if changed:
+                break
+    return marked
 
 
 # ---------- 四点五、行归段 ----------
@@ -868,12 +936,14 @@ def convert(image_path, dest, ocr_rows, *, slide_width_in: float = 13.3333,
             min_point_size: float = DEFAULT_MIN_PT,
             min_score: float = DEFAULT_MIN_SCORE,
             font_name: str = DEFAULT_FONT,
-            detect_weight: bool = True) -> Conversion:
+            detect_weight: bool = True,
+            skip_formula: bool = True) -> Conversion:
     """一张图 + 一份 OCR 结果 -> 一页文字可编辑的 PPTX。"""
     image = load_rgb(image_path)
     result = analyse(image, ocr_rows, slide_width_in=slide_width_in,
                      min_point_size=min_point_size, min_score=min_score,
-                     font_name=font_name, detect_weight=detect_weight)
+                     font_name=font_name, detect_weight=detect_weight,
+                     skip_formula=skip_formula)
     cleaned = paint_out(image, result.runs)
     pt_per_px = (slide_width_in * POINTS_PER_INCH) / max(1, image.width())
     blocks = group_blocks(result.runs, pt_per_px, font_name=font_name)

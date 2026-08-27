@@ -245,6 +245,8 @@ class ImgTextWindow(QWidget):
             extra += f"；{len(result.skipped_shape)} 处疑似图形未改动"
         if result.skipped_busy:
             extra += f"；{len(result.skipped_busy)} 处压在照片上的文字保留原样（改了会糊掉照片）"
+        if result.skipped_formula:
+            extra += f"；{len(result.skipped_formula)} 处公式保留原样（上下标排不出来，动了反而更差）"
         # 一段多行会合成一个文本框，所以框数不等于行数——两个都报，免得用户
         # 数着行数以为少了。
         lines = "" if len(result.runs) == len(result.blocks) else f"（共 {len(result.runs)} 行）"
