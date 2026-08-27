@@ -11,7 +11,7 @@ datas = [
     ('assets/blank_16x9.pptx', 'assets'),
 ]
 binaries = []
-hiddenimports = []
+hiddenimports = ["pptx_finder.imgtext_cli", "pptx_finder.imgtext", "pptx_finder.imgtext_ocr"]
 # OpenCC 繁简转换：必须打包它的 .ocd2/.json 词典 + opencc_clib .pyd，
 # 否则 frozen 下 OpenCC("t2s") 找不到词典 → 繁简归一化静默失效（搜「软件」漏掉「軟件」）。
 tmp_ret = collect_all('opencc')

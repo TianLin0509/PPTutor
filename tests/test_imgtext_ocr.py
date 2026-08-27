@@ -184,3 +184,48 @@ def test_install_can_be_cancelled_without_leaving_partial_component(local_compon
     with pytest.raises(InterruptedError):
         imgtext_ocr.install(manifest, cancel=lambda: True)
     assert not target.exists()
+
+
+# ---------- 组件下载的备用源 ----------
+def test_component_base_urls_has_a_github_fallback():
+    """主源不可达时下载按钮不能变成死的——GitHub Release 是同仓库的官方分发位。"""
+    urls = imgtext_ocr.component_base_urls()
+    assert len(urls) >= 2
+    assert urls[0].endswith("/ocr")
+    assert "github.com" in urls[-1]
+
+
+def test_fetch_component_manifest_falls_back_to_the_next_source(monkeypatch):
+    import io
+    import json as _json
+    seen = []
+
+    def fake_urlopen(req, timeout=0):
+        url = req.full_url if hasattr(req, "full_url") else str(req)
+        seen.append(url)
+        if "github.com" not in url:
+            raise OSError("primary down")
+        payload = _json.dumps({"version": "9.9.9", "files": {"a": {"hash": "x"}}})
+        return io.BytesIO(payload.encode("utf-8"))
+
+    class _CM(io.BytesIO):
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    def wrapped(req, timeout=0):
+        raw = fake_urlopen(req, timeout)
+        return _CM(raw.read())
+
+    monkeypatch.setattr("urllib.request.urlopen", wrapped)
+    manifest = imgtext_ocr.fetch_component_manifest()
+    assert manifest["version"] == "9.9.9"
+    assert "github.com" in manifest["_base"]      # 记住是哪个源，装的时候从同一处取包
+    assert len(seen) == 2
+
+
+def test_fetch_component_manifest_raises_when_all_sources_fail(monkeypatch):
+    def boom(req, timeout=0):
+        raise OSError("no network")
+    monkeypatch.setattr("urllib.request.urlopen", boom)
+    with pytest.raises(imgtext_ocr.OcrUnavailable):
+        imgtext_ocr.fetch_component_manifest()

@@ -137,19 +137,47 @@ def recognize_one(image) -> list[dict]:
 COMPONENT_MANIFEST = "component.json"
 
 
-def component_base_url() -> str:
+#: 主源之外的备用地址：GitHub Release 上的同名资产。
+#: 为什么要备用源：识别组件 80 MB，托管在自建更新源上；那台机器不可达（或还没传）
+#: 时，下载按钮就是死的。GitHub Release 是同一个仓库的官方分发位，不需要额外凭据，
+#: 拿来做兜底最省事。两个源用的是同一份清单、同一套两层 sha256 校验，安全性一致。
+COMPONENT_FALLBACK_URL = (
+    "https://github.com/TianLin0509/PPTutor/releases/download/ocr-v1.0.0")
+
+
+def component_base_urls() -> list[str]:
     from .config import update_base_url
-    return update_base_url().rstrip("/") + "/ocr"
+    primary = update_base_url().rstrip("/") + "/ocr"
+    return [primary, COMPONENT_FALLBACK_URL]
+
+
+def component_base_url() -> str:
+    return component_base_urls()[0]
 
 
 def fetch_component_manifest(timeout: float = 8.0) -> dict:
+    """按顺序试各个源，第一个能取到清单的就用它。
+
+    清单里会带上 `_base`，让 install() 从**同一个源**取压缩包——不能出现
+    「清单来自 A、包来自 B」的混搭，那样哈希校验的语义就散了。
+    """
     import json as _json
     import urllib.request
 
-    url = component_base_url() + "/" + COMPONENT_MANIFEST
-    req = urllib.request.Request(url, headers={"Cache-Control": "no-cache"})
-    with urllib.request.urlopen(req, timeout=timeout) as response:
-        return _json.loads(response.read().decode("utf-8"))
+    last = None
+    for base in component_base_urls():
+        try:
+            req = urllib.request.Request(base + "/" + COMPONENT_MANIFEST,
+                                         headers={"Cache-Control": "no-cache"})
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                data = _json.loads(response.read().decode("utf-8"))
+            if isinstance(data, dict) and data.get("files"):
+                data["_base"] = base
+                return data
+        except Exception as exc:      # noqa: BLE001 逐个源试，最后一个失败才抛
+            last = exc
+            log.info("识别组件清单取不到（%s）：%s", base, exc)
+    raise OcrUnavailable(f"识别组件清单不可达：{last}")
 
 
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
@@ -192,7 +220,8 @@ def install(manifest: dict | None = None, *, progress=None, cancel=None) -> str:
         bundle = staging / "component.zip"
         hasher = hashlib.sha256()
         done = 0
-        url = component_base_url() + "/" + archive_name
+        base = str(manifest.get("_base") or component_base_url())
+        url = base + "/" + archive_name
         with urllib.request.urlopen(url, timeout=60) as src, open(bundle, "wb") as out:
             while True:
                 chunk = src.read(1 << 18)

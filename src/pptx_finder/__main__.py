@@ -34,6 +34,13 @@ if __name__ == "__main__":
         from pptx_finder.render_service import main as render_worker_main
         raise SystemExit(render_worker_main(sys.argv))
 
+    # 图片转可编辑文字的无界面入口：
+    #   `PPT Doctor.exe --imgtext <图片> <输出.pptx>`
+    # 既方便批量转换，也是打包后验证这条链路的唯一手段——GUI 里点不出退出码。
+    if "--imgtext" in sys.argv:
+        from pptx_finder.imgtext_cli import run_imgtext
+        raise SystemExit(run_imgtext(sys.argv))
+
     from pptx_finder.app import main
 
     raise SystemExit(main())
