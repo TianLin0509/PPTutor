@@ -635,3 +635,52 @@ def test_analyse_keeps_formulas_when_the_switch_is_off(qtbot):
     result = imgtext.analyse(image, rows, slide_width_in=13.3333, skip_formula=False)
     assert [r.text for r in result.runs] == ["σ² + x"]
     assert result.skipped_formula == []
+
+
+# ---------- 抹除框沿边扩张 ----------
+def test_grow_erase_box_covers_ink_clipped_outside_the_box(qtbot):
+    """OCR 的框会切掉标点的尾巴——中文全角逗号「，」的尾巴常拖在框外，
+    框外那一截我们从来不看，画面上就留下一小撮毛刺。"""
+    image = _blank(400, 200)
+    _fill(image, (100, 60, 300, 100), (200, 0, 0))      # 框内的「字」
+    _fill(image, (150, 100, 160, 112), (200, 0, 0))     # 拖到框外的尾巴
+    px = imgtext._Pixels(image)
+    grown = imgtext.grow_erase_box(px, (100, 60, 300, 100), (200, 0, 0), (255, 255, 255))
+    assert grown[3] >= 112                               # 下边扩到把尾巴包进去
+    assert grown[1] == 60 and grown[0] == 100            # 其余三边不动
+
+
+def test_grow_erase_box_stops_at_a_neighbouring_line(qtbot):
+    """相邻一行的墨量会占满整个框宽，那是撞上邻行，不能吞。"""
+    image = _blank(400, 200)
+    _fill(image, (100, 60, 300, 90), (0, 0, 0))
+    _fill(image, (100, 96, 300, 126), (0, 0, 0))        # 紧挨着的下一行
+    px = imgtext._Pixels(image)
+    grown = imgtext.grow_erase_box(px, (100, 60, 300, 90), (0, 0, 0), (255, 255, 255))
+    assert grown[3] < 96
+
+
+def test_grow_erase_box_refuses_to_grow_inside_dense_graphics(qtbot):
+    """扩到上限还没干净 = 身处一片密集图形里，扩下去会啃掉图形，那一侧就不扩。"""
+    image = _blank(400, 200, color=(0, 0, 0))           # 整张全是「墨」
+    px = imgtext._Pixels(image)
+    box = (100, 60, 300, 100)
+    assert imgtext.grow_erase_box(px, box, (0, 0, 0), (255, 255, 255)) == box
+
+
+def test_group_blocks_needs_the_lines_to_share_an_edge(qtbot):
+    """一段文字总是沿某条边码齐；三条边都对不上就不是一段。
+
+    实测这条挡的是：图表的顶部居中标题被并进右侧图例——那一对在另外四个判据上
+    全部刚好擦边通过，合完整段判成右对齐，标题被拉到右边还缩了字号。
+    """
+    title = _run("典型用户切换期BLER波动（示例）", (351, 26, 1242, 83), size=34.9)
+    legend = _run("频繁切换(现网初始化)", (1116, 148, 1457, 186), size=22.9)
+    assert len(imgtext.group_blocks([title, legend], 0.6)) == 2
+
+
+def test_group_blocks_tolerates_an_indented_continuation_line(qtbot):
+    """项目符号的续行会缩进一个行高左右，那仍是同一段，不许被上面那条误伤。"""
+    first = _run("·The findings highlight the importance", (100, 100, 700, 130))
+    cont = _run("exploitation rate in forward-looking", (136, 140, 700, 170))
+    assert len(imgtext.group_blocks([first, cont], 0.6)) == 1

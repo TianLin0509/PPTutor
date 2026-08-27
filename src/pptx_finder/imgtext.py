@@ -236,37 +236,45 @@ def measure_run(px: _Pixels, det_box):
         return None, (0, 0, 0), (255, 255, 255), 0.0, 0.0
 
     background = _ring_background(px, (x0, y0, x1, y1))
+    # 每个像素只取一次、离底色的距离只算一次，下面两处都复用——这个框可能有
+    # 八万多个像素（一行大标题），重复取像素和重复算距离是这里最大的开销。
     inside = [px.get(x, y) for y in range(y0, y1) for x in range(x0, x1)]
     if not inside:
         return None, (0, 0, 0), background, 0.0, 0.0
+    br, bg_, bb = background
+    dists = [(c[0] - br) ** 2 + (c[1] - bg_) ** 2 + (c[2] - bb) ** 2 for c in inside]
 
     # 字色 = 「离底色足够远」的那批像素的中位数。阈值由距离分布自己决定，不能像
     # 早先那样固定取「最远的 1/8」——那等于假设墨迹至少占检测框 12.5%。真实 OCR
     # 的框较紧（覆盖率 25~35%）所以一直没暴露，但框一松（或文字稀疏）时，那 1/8
     # 里大半是底色，中位数就退化成底色，整处被误判成「没有文字」。
-    ordered = sorted(inside, key=lambda c: -_sq_dist(c, background))
-    far = _sq_dist(ordered[len(ordered) // 100], background)   # 99 分位距离，抗孤立噪点
-    core = [c for c in ordered if _sq_dist(c, background) >= far * 0.5]
-    ink = _median_rgb(core or ordered[:1], (0, 0, 0))
+    far = sorted(dists)[len(dists) - 1 - len(dists) // 100]     # 99 分位距离，抗孤立噪点
+    cut = far * 0.5
+    core = [c for c, d in zip(inside, dists) if d >= cut]
+    if not core:
+        core = [inside[max(range(len(dists)), key=dists.__getitem__)]]
+    ink = _median_rgb(core, (0, 0, 0))
     span = _sq_dist(ink, background)
     if span < 900:                      # 字色与底色几乎同色：这块没有可读文字
         return None, ink, background, 0.0, 0.0
 
     ink_threshold = span * 0.30
+    width = x1 - x0
     cols: list[int] = []
     rows: list[int] = []
     stroke_runs: list[int] = []
+    i = 0
     for y in range(y0, y1):
         run = 0
         for x in range(x0, x1):
-            if _sq_dist(px.get(x, y), background) >= ink_threshold:
+            if dists[i] >= ink_threshold:
                 cols.append(x)
                 rows.append(y)
                 run += 1
-            else:
-                if run:
-                    stroke_runs.append(run)
+            elif run:
+                stroke_runs.append(run)
                 run = 0
+            i += 1
         if run:
             stroke_runs.append(run)
 
@@ -412,6 +420,12 @@ def _smooth_sample(px: _Pixels, x: int, start_y: int, step: int,
 #: 采样色与本处底色的平方距离超过这个值，就当它越过了一条硬色边。
 #: 约等于每通道 41，纵向渐变在一行文字的高度上根本走不了这么远。
 EDGE_DIST = 5000
+#: 抹除框沿四边最多往外扩这么多（相对行高）。扩张必须**自然停在干净边界上**，
+#: 撞到上限就说明这一侧根本没有干净边界（多半身处一片密集图形里），那一侧就不扩。
+GROW_MAX_RATIO = 0.35
+#: 边界那一行的墨量超过框宽的这个比例就停——那是撞上了相邻一行，不能吞。
+GROW_MAX_ROW = 0.15
+
 #: 逐列采样结果沿 x 做中值滤波的窗口宽度（必须是奇数）。
 #: 为什么需要：向外找干净背景时，会撞上**相邻一行的抗锯齿边缘**——那种半灰像素
 #: 沿列方向同样平滑，离字色也足够远（实测 226 对字色 89、底色 243，距离比 0.79，
@@ -477,6 +491,53 @@ def background_jitter(px: _Pixels, run, *, pad: int = 2, band: int = 3,
     return diffs[len(diffs) // 2]
 
 
+def grow_erase_box(px: _Pixels, box, ink, background):
+    """把要抹的框沿四边扩到边界干净为止，返回新框。
+
+    为什么需要：OCR 的检测框有时会切掉标点的尾巴或字母的降部——中文全角逗号
+    「，」的尾巴就常拖在框外。框外那一截我们从来不看、也就永远抹不掉，画面上
+    留下的就是一小撮红色毛刺（实测：标题框底边 y=96，逗号尾巴一直到 y=105）。
+
+    只扩**抹除**的范围，不动 TextRun.box——后者要用来定字号，把逗号尾巴算进去
+    会让整行字号偏大。
+
+    两道闸：扩到上限还没干净就整个方向不扩（说明身处密集图形，扩下去会啃掉图形）；
+    边界那一行的墨量超过框宽 15% 也停（撞上相邻一行了）。
+    945 处实测：66% 一点不用扩，99% 分位 9px，最大 23px。
+    """
+    x0, y0, x1, y1 = box
+    if x1 <= x0 or y1 <= y0:
+        return box
+
+    def is_ink(x, y):
+        c = px.get(x, y)
+        return _sq_dist(c, ink) < _sq_dist(c, background)
+
+    height, width = y1 - y0, x1 - x0
+    cap = max(2, int(height * GROW_MAX_RATIO))
+    row_limit = width * GROW_MAX_ROW
+    col_limit = height * 0.6
+
+    def run_out(probe, limit):
+        k = 0
+        while k < cap:
+            n = probe(k)
+            if n is None or n == 0 or n > limit:
+                break
+            k += 1
+        return 0 if k >= cap else k
+
+    down = run_out(lambda k: (sum(1 for x in range(x0, x1) if is_ink(x, y1 + k))
+                              if y1 + k < px.height else None), row_limit)
+    up = run_out(lambda k: (sum(1 for x in range(x0, x1) if is_ink(x, y0 - 1 - k))
+                            if y0 - 1 - k >= 0 else None), row_limit)
+    right = run_out(lambda k: (sum(1 for y in range(y0, y1) if is_ink(x1 + k, y))
+                               if x1 + k < px.width else None), col_limit)
+    left = run_out(lambda k: (sum(1 for y in range(y0, y1) if is_ink(x0 - 1 - k, y))
+                              if x0 - 1 - k >= 0 else None), col_limit)
+    return (x0 - left, y0 - up, x1 + right, y1 + down)
+
+
 def _median_filter(samples: list, window: int) -> list:
     """沿序列做逐通道中值滤波，用来剔除孤立的坏采样。窗口不足时按现有邻居取。"""
     if len(samples) <= 2:
@@ -505,7 +566,8 @@ def paint_out(image: QImage, runs, *, pad: int = 2, band: int = 3,
     px = _Pixels(out)
     src = _Pixels(image)
     for run in runs:
-        box, ink, run_bg = run.box, run.ink, run.background
+        ink, run_bg = run.ink, run.background
+        box = grow_erase_box(src, run.box, ink, run_bg)
         x0 = max(0, int(box[0]) - pad)
         y0 = max(0, int(box[1]) - pad)
         x1 = min(px.width, int(math.ceil(box[2])) + pad)
@@ -533,15 +595,22 @@ def paint_out(image: QImage, runs, *, pad: int = 2, band: int = 3,
         # 先把逐列采样整体滤一遍再画，见 SAMPLE_MEDIAN_WINDOW
         tops = _median_filter(tops, SAMPLE_MEDIAN_WINDOW)
         bottoms = _median_filter(bottoms, SAMPLE_MEDIAN_WINDOW)
+        # 同一对上下采样色只算一次色带。纯色底上所有列的采样色都一样（中值滤波
+        # 之后更是如此），逐像素重算插值纯属浪费。
+        ramps: dict[tuple, list] = {}
         for i, x in enumerate(range(x0, x1)):
-            c_top, c_bottom = tops[i], bottoms[i]
-            for y in range(y0, y1):
-                t = (y - y0) / height if height else 0.0
-                px.set(x, y, (
-                    int(round(c_top[0] + (c_bottom[0] - c_top[0]) * t)),
-                    int(round(c_top[1] + (c_bottom[1] - c_top[1]) * t)),
-                    int(round(c_top[2] + (c_bottom[2] - c_top[2]) * t)),
-                ))
+            key = (tops[i], bottoms[i])
+            ramp = ramps.get(key)
+            if ramp is None:
+                c_top, c_bottom = key
+                ramp = [(
+                    int(round(c_top[0] + (c_bottom[0] - c_top[0]) * k / height)),
+                    int(round(c_top[1] + (c_bottom[1] - c_top[1]) * k / height)),
+                    int(round(c_top[2] + (c_bottom[2] - c_top[2]) * k / height)),
+                ) for k in range(height)] if height else []
+                ramps[key] = ramp
+            for k, y in enumerate(range(y0, y1)):
+                px.set(x, y, ramp[k])
     return out
 
 
@@ -658,6 +727,16 @@ BLOCK_OVERLAP = 0.35
 #: ——整段按第一行的白色排字，于是白底上的黑字全变成白底白字，肉眼直接消失。
 #: 阈值 3000 约等于每通道 32，宽到容得下取色抖动，窄到挡得住黑白/深浅对调。
 BLOCK_INK_DIST = 3000
+#: 同段的两行必须至少共享一条对齐边（左/中/右三者取最近的一条），距离不得超过
+#: 这个倍数的行高。一段文字总是沿某条边码齐的；三条边都对不上就不是一段。
+#:
+#: 这条挡的是这样一类误合：图表的**顶部居中标题**和右侧的**图例第一项**——它们在
+#: 另外四个判据上全部「刚好擦边通过」（间距 1.14 对上限 1.15、水平重叠 0.37 对
+#: 门槛 0.35、字号比 1.52 对上限 1.60），合成一段之后整段被判为右对齐，标题就被
+#: 拉到右边还缩了字号，三条图例线也跟着错位配错标签。
+#: 293 组实际配对实测：中位 0.03、99% 分位 1.77、最差的正常配对 2.00（首行缩进的
+#: 项目符号续行），而上面那一对是 3.77。阈值取在这个空档里。
+BLOCK_EDGE_TOLERANCE = 2.5
 
 
 @dataclass
@@ -695,6 +774,14 @@ def _overlap_ratio(a, b) -> float:
         return 0.0
     narrow = min(a[2] - a[0], b[2] - b[0])
     return (right - left) / narrow if narrow else 0.0
+
+
+def _shares_an_edge(a, b) -> bool:
+    """两行是否至少沿一条边（左/中/右）码齐。见 BLOCK_EDGE_TOLERANCE。"""
+    limit = max(1, max(a.height, b.height)) * BLOCK_EDGE_TOLERANCE
+    return min(abs(a.box[0] - b.box[0]),
+               abs(a.box[2] - b.box[2]),
+               abs((a.box[0] + a.box[2]) / 2 - (b.box[0] + b.box[2]) / 2)) <= limit
 
 
 def _infer_align(lines) -> str:
@@ -738,7 +825,8 @@ def group_blocks(runs: list[TextRun], pt_per_px: float,
             similar = (max(last.point_size, run.point_size)
                        <= min(last.point_size, run.point_size) * BLOCK_SIZE_RATIO)
             same_ink = _sq_dist(last.ink, run.ink) <= BLOCK_INK_DIST
-            if same_column and close and similar and same_ink:
+            aligned = _shares_an_edge(last, run)
+            if same_column and close and similar and same_ink and aligned:
                 group.append(run)
                 placed = True
                 break
