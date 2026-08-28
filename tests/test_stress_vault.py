@@ -172,10 +172,8 @@ def test_budget_eviction_large_mixed_vault_reconciliation(tmp_path):
     # 存活版本引用对象零丢失（全量对账）+ 抽样逐字节 reassemble
     referenced, survivors = _live_manifest_parts(conn)
     objdir = vault._global_objects_dir()
-    on_disk = {
-        p.name for p in objdir.iterdir()
-        if p.is_file() and not p.name.startswith(".object-")
-    }
+    # _object_hash_of 顺带滤掉 .object-* 暂存，并把 <hash>.z 归回它的内容哈希
+    on_disk = {h for p in objdir.iterdir() if p.is_file() and (h := vault._object_hash_of(p))}
     assert referenced <= on_disk, "存活版本引用的对象被误删"
     assert on_disk <= referenced, "GC 漏删：磁盘对象已无任何存活版本引用"
     sample = [s for s in survivors if s[2] == "dedup"][:40]
@@ -407,7 +405,7 @@ def test_concurrent_snapshots_and_heavy_maintenance(tmp_path, monkeypatch):
     assert not gc["aborted"] and not gc["errors"], f"终态 GC 安全门未过: {gc}"
     referenced, survivors = _live_manifest_parts(manager._conn)
     objdir = vault._global_objects_dir()
-    on_disk = {p.name for p in objdir.iterdir() if p.is_file() and not p.name.startswith(".object-")}
+    on_disk = {h for p in objdir.iterdir() if p.is_file() and (h := vault._object_hash_of(p))}
     assert referenced <= on_disk
     assert survivors, "并发+驱逐后不应一个版本都不剩（预算只为刻意收紧，非零）"
     n_rebuilt = 0

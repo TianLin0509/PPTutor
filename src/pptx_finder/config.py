@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -20,12 +21,15 @@ DEFAULT_VERSION_MANAGEMENT_ENABLED = False
 DEFAULT_DOCUMENT_SEARCH_ENABLED = False
 DEFAULT_SMART_GROUPING_ENABLED = False
 # Everything 式文件名搜索：只登记文件名（status=filename_only），不解析内容。
-# 默认关（2026-08-15 从默认开改回）：真机实测固定盘共 202 万个文件，其中 PPT /
-# Word / PDF 只有 1934 个——1000:1。噪音的大头是 .py 39.9 万、.h 15.8 万、.png
-# 15.8 万这类源码树产物，为它们把 index.db 从 138MB 撑到约 500MB、首次启动多花
-# 数分钟，对「PPT 小助教」的默认体验是净亏。功能保留，设置里一键可开。
-# 与 v1.0.12 立下的默认轻量原则一致：高阶能力一律用户主动选择。
-DEFAULT_INDEX_ALL_FILES = False
+# 默认开、且不再有开关（2026-08-28）。此前默认关的理由是体积，而且真实代价比当年
+# 注释里写的「约 500MB」贵得多：2026-08-28 复测，按现行剪枝规则要登记 1,750,775 个
+# 文件（内容类型只有 2,155 个，813:1），单行 731 字节 → 索引库 **+1.19 GB**。
+# 即便如此也要默认开——藏在设置里的开关，用户找不到、也不知道要先等一轮全盘重扫，
+# 于是「装了 Everything 能力却搜不到任意文件」，这正是被反馈的现象。
+# 现在的口径：能力常在，选择权交给搜索框右侧的范围选择器（PPT / Word / PDF /
+# 全部文件）。想要轻量的人选 PPT，什么都不会变慢；想找任意文件的人一键就有。
+# 磁盘换来的是「用户不必知道有这么个开关」，这笔账划算。
+DEFAULT_INDEX_ALL_FILES = True
 
 
 def resource_path(*parts: str) -> Path:
@@ -408,13 +412,15 @@ def index_feature_signature(
     )
 
 
-def get_index_all_files(default: bool = DEFAULT_INDEX_ALL_FILES) -> bool:
-    """Everything 式全盘文件名盘点开关（默认开；只登记文件名，不解析内容）。"""
-    return _get_bool_setting("index_all_files", default)
+def get_index_all_files() -> bool:
+    """Everything 式全盘文件名盘点：常开，没有开关。
 
-
-def set_index_all_files(enabled: bool) -> None:
-    update_ui_settings(index_all_files=bool(enabled))
+    刻意不读 ui.json 里的旧键。开关已经撤掉了，再去认那个值只会留下一个死结——
+    从前手滑关过一次的用户升级后永远开不回来，而界面上已经没有地方能让他开回来。
+    需要走关闭路径的地方（purge / 对账，以及测试）照旧用 index_all_files=False
+    显式传参，那条代码路径本身没有作废。
+    """
+    return DEFAULT_INDEX_ALL_FILES
 
 
 def feature_signature_needs_rescan(completed: str, current: str) -> bool:
@@ -499,8 +505,14 @@ def set_hotkey(spec: str) -> None:
     update_ui_settings(hotkey=spec)
 
 
-# 界面字体：font_family 空串 = 跟随内置字族；font_scale 只接受下面的合法档位
+# 界面字体：font_family 空串 = 跟随内置字族。
+# font_scale 三个预设档位保留（一键即得），另外允许 0.50~2.00 之间任意值自定义。
+# 上下限不是拍脑袋：0.5 以下 13px 基准字号会掉到 6px、2.0 以上侧栏与卡片开始互相挤，
+# 两端都已经不是「能用」的界面了，所以在入口处夹死而不是让用户自己踩坑。
 FONT_SCALES = (0.9, 1.0, 1.15)
+FONT_SCALE_MIN = 0.5
+FONT_SCALE_MAX = 2.0
+FONT_SCALE_STEP = 0.05
 
 # 字族名会被拼进 QSS（ui/theme.py 的 * font-family 规则）：引号/反斜杠/控制字符/
 # 花括号/分号可突围注入任意样式，甚至让 Qt 拒收整表——入库前一律剥掉并限长。
@@ -525,21 +537,31 @@ def set_font_family(family: str) -> None:
     update_ui_settings(font_family=sanitize_font_family(family))
 
 
+def clamp_font_scale(scale: float) -> float:
+    """把任意输入夹进 [FONT_SCALE_MIN, FONT_SCALE_MAX] 并吸附到 0.01 网格。
+
+    NaN / inf 也要挡下来：它们会一路流进 QSS 的 font-size 计算，
+    生成 `font-size: nanpx` 这种 Qt 拒收的整表，而配置已经落盘 → 每次启动都裸奔。
+    """
+    try:
+        v = float(scale)
+    except (TypeError, ValueError):
+        return 1.0
+    if not math.isfinite(v):
+        return 1.0
+    return round(min(FONT_SCALE_MAX, max(FONT_SCALE_MIN, v)), 2)
+
+
 def get_font_scale(default: float = 1.0) -> float:
-    """界面字号倍率：非法/非档位值回默认。"""
+    """界面字号倍率：合法值原样返回（含自定义），非法值回默认。"""
     v = load_ui_settings().get("font_scale")
     if isinstance(v, (int, float)) and not isinstance(v, bool):
-        for s in FONT_SCALES:
-            if abs(float(v) - s) < 1e-9:
-                return s
-    return float(default)
+        return clamp_font_scale(v)
+    return clamp_font_scale(default)
 
 
 def set_font_scale(scale: float) -> None:
-    v = float(scale)
-    if not any(abs(v - s) < 1e-9 for s in FONT_SCALES):
-        v = 1.0
-    update_ui_settings(font_scale=v)
+    update_ui_settings(font_scale=clamp_font_scale(scale))
 
 # 增量自动更新：清单 + 内容寻址块的根地址。E2E/灰度可用 PPTX_FINDER_UPDATE_URL 覆盖（如指 localhost）
 _DEFAULT_UPDATE_URL = "https://me.lt-stockpartner.tech/pptutor"

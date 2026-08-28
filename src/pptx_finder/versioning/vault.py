@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import datetime
+import gzip
 import threading
 from collections import OrderedDict
 from contextlib import contextmanager
@@ -19,6 +20,7 @@ import sqlite3
 import tempfile
 import time
 import zipfile
+import zlib
 from pathlib import Path
 
 import xxhash
@@ -43,6 +45,23 @@ _VERIFIED_LOCK = threading.Lock()
 _VAULT_MIGRATION_LOCK = threading.RLock()
 _STABLE_COPY_RETRY_DELAYS_SEC = (0.15, 0.4, 0.9)
 _STREAM_CHUNK_BYTES = 1 << 20
+
+# 对象池压缩存储（2026-08-28 加）。设计约束：只加不改。
+#   · 对象文件名永远是「未压缩内容」的 xxh64 —— manifest、去重、GC 引用集、
+#     深度体检的口径一个字都没变，压缩件只是多了个 .z 后缀的存放形态。
+#   · 存量对象一个不动：读取按 <hash> → <hash>.z → 旧的每文档池顺序解析，
+#     已经存在的原始件永远命中第一条，既不重写也不迁移。
+#   · 只压 .xml / .rels 这类文本 part。真机抽样 600 个：11.6 MB → 1.3 MB（11%），
+#     而媒体 part 本身已是 PNG/JPEG，压了也只是白烧 CPU。
+#   · 上限 8 MB：超过就放弃压缩，不为一个 300 MB 媒体 part 在内存里攒压缩缓冲。
+#   · 压完必须解压回来逐字节比对才允许落盘；对不上就退回存原始件。
+#   · 小 part 走内存路径，只落一次盘。先写原始件再写压缩件的话，一份稿子几百个
+#     xml/rels 等于把留底写盘次数翻倍——真稿实测会让 12 份稿从 12.6 s 涨到 16.4 s。
+_OBJECT_Z_SUFFIX = ".z"
+_COMPRESS_PART_SUFFIXES = (".xml", ".rels")
+_COMPRESS_MAX_BYTES = 8 << 20
+_COMPRESS_MIN_GAIN = 0.75
+_COMPRESS_LEVEL = 6
 
 
 def _verified_mark(key: str) -> None:
@@ -123,11 +142,52 @@ def _hash_path(path: Path) -> str:
     return h.hexdigest()
 
 
+def _is_packed(path: Path) -> bool:
+    return path.name.endswith(_OBJECT_Z_SUFFIX)
+
+
+def _object_hash_of(path: Path) -> str:
+    """对象文件名 → 内容哈希；不是对象（.object-* 暂存、杂项）返回空串。"""
+    name = path.name
+    if name.endswith(_OBJECT_Z_SUFFIX):
+        name = name[: -len(_OBJECT_Z_SUFFIX)]
+    return name if _OBJECT_HASH_RE.fullmatch(name) else ""
+
+
+@contextmanager
+def _open_object(path: Path):
+    """打开一个对象，压缩件透明解压——调用方拿到的永远是未压缩内容流。"""
+    with path.open("rb") as raw:
+        if _is_packed(path):
+            with gzip.GzipFile(fileobj=raw, mode="rb") as stream:
+                yield stream
+        else:
+            yield raw
+
+
+def _hash_object_file(path: Path) -> str:
+    """对象的内容哈希：压缩件先解压再算，与「文件名 = 未压缩内容哈希」口径一致。"""
+    if not _is_packed(path):
+        return _hash_path(path)
+    h = xxhash.xxh64()
+    with _open_object(path) as stream:
+        for chunk in iter(lambda: stream.read(_STREAM_CHUNK_BYTES), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def _object_path(doc_id: str, object_hash: str) -> Path:
-    """Resolve new global objects first, then the legacy per-document pool."""
-    shared = _global_objects_dir() / object_hash
+    """Resolve new global objects first, then the legacy per-document pool.
+
+    原始件优先于压缩件：升级前存下的对象一律走第一条分支，行为与旧版逐字节相同。
+    """
+    objects = _global_objects_dir()
+    shared = objects / object_hash
     if shared.exists():
         return shared
+    packed = objects / (object_hash + _OBJECT_Z_SUFFIX)
+    if packed.exists():
+        return packed
     return vault_dir() / doc_id / "objects" / object_hash
 
 
@@ -138,13 +198,112 @@ def _object_is_valid(path: Path, object_hash: str) -> bool:
         return False
     if _verified_hit(key):
         return True
-    if _hash_path(path) != object_hash:
+    try:
+        if _hash_object_file(path) != object_hash:
+            return False
+    except (gzip.BadGzipFile, EOFError, zlib.error):
+        # 压缩件被截断或损坏＝这个对象不可用。其余 OSError 照旧向上抛：
+        # 「文件被占用」和「内容坏了」是两回事，不能混成同一个结论。
         return False
     _verified_mark(key)
     return True
 
 
-def _install_object_stream(source) -> str:
+def _compressible_part(part_name: str) -> bool:
+    return part_name.casefold().endswith(_COMPRESS_PART_SUFFIXES)
+
+
+class _HeadThenStream:
+    """把已经读进内存的开头接回原流：给「先探一段再决定怎么存」用。"""
+
+    def __init__(self, head: bytes, rest) -> None:
+        self._head = head
+        self._rest = rest
+
+    def read(self, n: int = -1) -> bytes:
+        if self._head:
+            if n is None or n < 0 or n >= len(self._head):
+                out, self._head = self._head, b""
+                return out
+            out, self._head = self._head[:n], self._head[n:]
+            return out
+        return self._rest.read(n)
+
+
+def _existing_object(objects: Path, object_hash: str) -> bool:
+    """池里已经有这个内容了吗？两种形态都认。
+
+    升级前存下的原始件必须原地复用，绝不能被重写成压缩件——
+    「存量零件一个不动」这条承诺就落在这里。
+    """
+    return any(
+        _object_is_valid(objects / name, object_hash)
+        for name in (object_hash, object_hash + _OBJECT_Z_SUFFIX)
+    )
+
+
+def _pack(data: bytes) -> bytes | None:
+    """试压一段文本 part；省得不够多就返回 None（按原始件存）。
+
+    产出 gzip 流（zlib + 16 位 wbits），mtime 恒为 0，同样的输入永远得到同样的
+    字节——对内容寻址的存储来说，可复现比省那十几字节的头部重要。
+    """
+    co = zlib.compressobj(_COMPRESS_LEVEL, zlib.DEFLATED, 16 + zlib.MAX_WBITS)
+    blob = co.compress(data) + co.flush()
+    if not data or len(blob) > len(data) * _COMPRESS_MIN_GAIN:
+        return None
+    return blob
+
+
+def _write_object_atomic(objects: Path, filename: str, data: bytes) -> None:
+    """崩溃安全地落一个已内容寻址的小对象：临时文件 → fsync → 原子改名。"""
+    fd, tmp = tempfile.mkstemp(prefix=".object-", dir=objects)
+    try:
+        with os.fdopen(fd, "wb") as out:
+            out.write(data)
+            out.flush()
+            os.fsync(out.fileno())
+        dest = objects / filename
+        os.replace(tmp, dest)
+        tmp = ""
+        _verified_mark(str(dest))
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+def _install_small_object(objects: Path, data: bytes, *, packable: bool) -> str:
+    """小 part 走内存路径：只写一次盘。
+
+    文本 part 占了对象池里绝大多数的**个数**（一份稿子几百个 xml/rels，媒体只有几个）。
+    如果先把原始件写盘、再写一份压缩件，等于把留底的写盘次数翻倍——真稿实测这会让
+    12 份稿的首次留底从 12.6 s 涨到 16.4 s。所以压不压先在内存里定，定完只落一次盘。
+    """
+    object_hash = xxhash.xxh64(data).hexdigest()
+    if _existing_object(objects, object_hash):
+        return object_hash
+    blob = _pack(data) if packable else None
+    if blob is not None:
+        # 安全闸：解压回来必须与原文逐字节相同才允许存成压缩件。校验在内存里做，
+        # 与原始件路径「边写边算哈希」是同一级别的保证，不额外读一次盘。
+        try:
+            if gzip.decompress(blob) != data:
+                raise ValueError("packed bytes do not round-trip")
+        except (gzip.BadGzipFile, EOFError, zlib.error, ValueError):
+            log.warning("packed object failed round-trip check, storing raw instead",
+                        exc_info=True)
+            blob = None
+    if blob is not None:
+        _write_object_atomic(objects, object_hash + _OBJECT_Z_SUFFIX, blob)
+    else:
+        _write_object_atomic(objects, object_hash, data)
+    return object_hash
+
+
+def _install_object_stream(source, *, part_name: str = "") -> str:
     """Stream one ZIP part into the shared pool and return its content hash.
 
     Real decks often contain one 100-500 MB media part.  ``ZipFile.read`` plus
@@ -152,10 +311,18 @@ def _install_object_stream(source) -> str:
     every save, creating large RSS spikes beside the user's PowerPoint process.
     The temporary object is content-addressed only after the streaming hash is
     known; installation remains crash-safe and idempotent.
+
+    返回的哈希始终是未压缩内容的哈希，与是否落成压缩件无关。
     """
-    objd = _global_objects_dir()
-    fd, tmp = tempfile.mkstemp(prefix=".object-", dir=objd)
-    object_hash = ""
+    objects = _global_objects_dir()
+    if _compressible_part(part_name):
+        # 多读一个字节就能分辨「正好等于上限」和「超过上限」
+        head = source.read(_COMPRESS_MAX_BYTES + 1)
+        if len(head) <= _COMPRESS_MAX_BYTES:
+            return _install_small_object(objects, head, packable=True)
+        # 罕见的巨型 xml：接回流式路径，绝不为它在内存里攒压缩缓冲
+        source = _HeadThenStream(head, source)
+    fd, tmp = tempfile.mkstemp(prefix=".object-", dir=objects)
     try:
         h = xxhash.xxh64()
         with os.fdopen(fd, "wb") as out:
@@ -165,9 +332,9 @@ def _install_object_stream(source) -> str:
             out.flush()
             os.fsync(out.fileno())
         object_hash = h.hexdigest()
-        dest = objd / object_hash
-        if _object_is_valid(dest, object_hash):
+        if _existing_object(objects, object_hash):
             return object_hash
+        dest = objects / object_hash
         os.replace(tmp, dest)
         _verified_mark(str(dest))
         return object_hash
@@ -516,7 +683,7 @@ def _write_zip(
             # Stream the object into the ZIP.  ``writestr(path.read_bytes())``
             # retained the largest media part in memory and could make a save of
             # a 300 MB deck contend with PowerPoint for hundreds of MB of RAM.
-            with _object_path(doc_id, parts[name]).open("rb") as source:
+            with _open_object(_object_path(doc_id, parts[name])) as source:
                 with z.open(name, "w", force_zip64=True) as target:
                     shutil.copyfileobj(source, target, length=_STREAM_CHUNK_BYTES)
 
@@ -532,7 +699,7 @@ def _dedup_store(doc_id: str, path: str) -> tuple[list[str], dict[str, str]]:
                 continue
             name = info.filename
             with zf.open(info) as source:
-                h = _install_object_stream(source)
+                h = _install_object_stream(source, part_name=name)
             names.append(name)
             parts[name] = h
     return names, parts
@@ -677,9 +844,11 @@ def collect_garbage(conn, *, dry_run: bool = True) -> dict[str, int | bool]:
     referenced: set[str] = set()
     root = vault_dir()
     shared_by_hash = {
-        path.name: path
-        for path in _global_objects_dir().iterdir()
-        if path.is_file() and _OBJECT_HASH_RE.fullmatch(path.name)
+        object_hash: path
+        for path, object_hash in (
+            (p, _object_hash_of(p)) for p in _global_objects_dir().iterdir()
+        )
+        if object_hash and path.is_file()
     }
 
     missing_branch_bases = conn.execute(
@@ -790,9 +959,11 @@ def audit_repository(conn, *, deep: bool = False) -> dict:
     ).fetchall()
     root = vault_dir()
     shared = {
-        p.name: p
-        for p in _global_objects_dir().iterdir()
-        if p.is_file() and _OBJECT_HASH_RE.fullmatch(p.name)
+        object_hash: path
+        for path, object_hash in (
+            (p, _object_hash_of(p)) for p in _global_objects_dir().iterdir()
+        )
+        if object_hash and path.is_file()
     }
     object_paths = dict(shared)
     referenced: set[str] = set()
@@ -877,9 +1048,14 @@ def audit_repository(conn, *, deep: bool = False) -> dict:
         for object_hash, path in object_paths.items():
             try:
                 bytes_checked += path.stat().st_size
-                if _hash_path(path) != object_hash:
+                if _hash_object_file(path) != object_hash:
                     hash_errors.append(object_hash)
                     _verified_forget(str(path))
+            except (gzip.BadGzipFile, EOFError, zlib.error):
+                # 压缩件解不开＝这个零件的内容坏了，不是「文件读不到」。归入哈希不符，
+                # 用户看到的结论才是准的。必须排在 OSError 前面：BadGzipFile 是它的子类。
+                hash_errors.append(object_hash)
+                _verified_forget(str(path))
             except OSError:
                 read_errors.append(object_hash)
                 _verified_forget(str(path))

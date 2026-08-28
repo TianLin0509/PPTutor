@@ -184,10 +184,12 @@ def test_reconcile_dir_skips_unchanged_rows(tmp_path):
     conn.close()
 
 
-# ---------- 默认值回退：关掉「索引所有文件」不该触发全盘重扫 ----------
+# ---------- 默认值：全文件盘点常开；关闭路径仍不该触发全盘重扫 ----------
 
-def test_index_all_files_defaults_off():
-    assert config.DEFAULT_INDEX_ALL_FILES is False
+def test_index_all_files_defaults_on():
+    """2026-08-28 改为常开：开关撤掉了，能力必须默认就在。"""
+    assert config.DEFAULT_INDEX_ALL_FILES is True
+    assert config.get_index_all_files() is True
 
 
 def test_feature_signature_any_file_downgrade_needs_no_rescan():

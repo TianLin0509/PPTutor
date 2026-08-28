@@ -11,7 +11,7 @@ from pptx_finder.models import FileResult
 from pptx_finder.scanner import iter_ppt_files
 from pptx_finder.ui import search_worker as search_worker_mod
 from pptx_finder.ui import theme
-from pptx_finder.ui.main_window import MainWindow, ResultItem
+from pptx_finder.ui.main_window import ALL_FILES_SCOPE_LABEL, MainWindow, ResultItem
 from pptx_finder.ui.search_worker import SearchWorker
 
 
@@ -312,28 +312,46 @@ def _win(qtbot, tmp_path, *, index_all_files_enabled):
     return win
 
 
-def test_mode_combo_any_filename_wiring(qtbot, tmp_path):
+def test_all_files_scope_is_always_offered(qtbot, tmp_path):
+    """Everything 档不再挂在任何开关下——搜索范围里永远有它。"""
     win = _win(qtbot, tmp_path, index_all_files_enabled=True)
-    items = [win.mode.itemText(i) for i in range(win.mode.count())]
-    assert items == ["全部", "仅文件名", "仅内容", "任意文件名"]
+    items = [win.type_filter.itemText(i) for i in range(win.type_filter.count())]
+    assert items == ["PPT", ALL_FILES_SCOPE_LABEL]
 
-    win.mode.setCurrentText("任意文件名")
+    win.apply_feature_flags(document_search_enabled=True)
+    items = [win.type_filter.itemText(i) for i in range(win.type_filter.count())]
+    assert items == ["PPT", "Word", "PDF", "全部文档", ALL_FILES_SCOPE_LABEL]
+    assert items[-1] == ALL_FILES_SCOPE_LABEL, "全部文件必须在最后，不抢 PPT 的默认位"
+
+
+def test_all_files_scope_wiring(qtbot, tmp_path):
+    win = _win(qtbot, tmp_path, index_all_files_enabled=True)
+    assert win.type_filter.currentText() == "PPT"      # 默认仍是 PPT
+    assert win._mode_key() == "all"
+
+    win.type_filter.setCurrentText(ALL_FILES_SCOPE_LABEL)
     assert win._mode_key() == "any_filename"
-    assert win._search_exts() is None
+    assert win._search_exts() is None                  # 不按扩展名过滤
+    # 这个范围只登记了文件名，给「仅内容」这种选择只会误导
+    assert win.mode.isEnabled() is False
 
+    win.type_filter.setCurrentText("PPT")
+    assert win.mode.isEnabled() is True
     win.mode.setCurrentText("仅内容")
     assert win._mode_key() == "content"
     assert win._search_exts() == (".pptx", ".ppt")
 
 
-def test_mode_combo_hides_any_filename_when_disabled(qtbot, tmp_path):
-    win = _win(qtbot, tmp_path, index_all_files_enabled=False)
-    items = [win.mode.itemText(i) for i in range(win.mode.count())]
-    assert items == ["全部", "仅文件名", "仅内容"]
-    assert win._mode_key() == "all"
+def test_all_files_scope_overrides_a_stale_mode_selection(qtbot, tmp_path):
+    """先选了「仅内容」再切到全部文件：口径必须以范围为准，不能去搜不存在的内容。"""
+    win = _win(qtbot, tmp_path, index_all_files_enabled=True)
+    win.mode.setCurrentText("仅内容")
+    win.type_filter.setCurrentText(ALL_FILES_SCOPE_LABEL)
+    assert win._mode_key() == "any_filename"
 
 
-def test_apply_feature_flags_toggle_off_hides_mode_and_purges(qtbot, tmp_path):
+def test_apply_feature_flags_toggle_off_still_purges(qtbot, tmp_path):
+    """关闭路径已经不在界面上了，但代码还活着：传 False 仍要清干净盘点行。"""
     win = _win(qtbot, tmp_path, index_all_files_enabled=True)
     db.upsert_file(
         win._conn, path="C:/inv/report.zzz", name="report.zzz", ext=".zzz",
@@ -341,20 +359,12 @@ def test_apply_feature_flags_toggle_off_hides_mode_and_purges(qtbot, tmp_path):
         status="filename_only", error="", indexed_at=1.0,
     )
     win._conn.commit()
-    win.mode.setCurrentText("任意文件名")
 
     win.apply_feature_flags(index_all_files_enabled=False)
 
-    items = [win.mode.itemText(i) for i in range(win.mode.count())]
-    assert "任意文件名" not in items
-    assert win._mode_key() == "all"  # 当前项被移除后回退「全部」
     qtbot.waitUntil(lambda: not win._bg_tasks, timeout=5000)
     row = win._conn.execute("SELECT id FROM files WHERE ext='.zzz'").fetchone()
     assert row is None
-
-    win.apply_feature_flags(index_all_files_enabled=True)
-    items = [win.mode.itemText(i) for i in range(win.mode.count())]
-    assert items[-1] == "任意文件名"
 
 
 def test_filename_only_badge_uses_real_ext(qtbot):
@@ -386,38 +396,29 @@ def test_filename_only_badge_keeps_ppt_wording(qtbot):
 
 # ---------- config：开关与特征签名 ----------
 
-def test_index_all_files_config_roundtrip(monkeypatch, tmp_path):
+def test_index_all_files_is_always_on(monkeypatch, tmp_path):
+    """常开能力，不认 ui.json 里的旧键——否则从前关过的人升级后永远开不回来。"""
     monkeypatch.setenv("PPTX_FINDER_DATA_DIR", str(tmp_path / "cfg"))
-    # 默认关（2026-08-15）：真机实测 202 万个文件里内容类型只有 1934 个，
-    # 默认为它们建库对「PPT 小助教」是净亏，改成用户主动开启
-    assert config.get_index_all_files() is False
-    assert config.index_feature_signature().endswith("any_file=0")
-    config.set_index_all_files(True)
     assert config.get_index_all_files() is True
     assert config.index_feature_signature().endswith("any_file=1")
-    config.set_index_all_files(False)
-    assert config.index_feature_signature().endswith("any_file=0")
-    # 显式传参优先于持久化
+
+    config.update_ui_settings(index_all_files=False)     # 老版本留下的值
+    assert config.get_index_all_files() is True
+    assert config.index_feature_signature().endswith("any_file=1")
+
+    # 显式传参仍然优先：关闭路径（purge / 对账）靠它，测试也靠它
     assert config.index_feature_signature(False, False, False).endswith("any_file=0")
 
 
-def test_settings_dialog_all_files_toggle(monkeypatch, qtbot, tmp_path):
+def test_settings_dialog_has_no_all_files_toggle(monkeypatch, qtbot, tmp_path):
+    """开关已经撤掉：用户不必先找到它、再等一轮全盘重扫才能用上全文件搜索。"""
     monkeypatch.setenv("PPTX_FINDER_DATA_DIR", str(tmp_path / "cfg"))
     from pptx_finder.ui.settings_dialog import SettingsDialog
     from pptx_finder.versioning.manager import VersionManager
 
-    calls = []
-    dlg = SettingsDialog(
-        VersionManager(),
-        on_feature_change=lambda key, enabled: calls.append((key, enabled)),
-    )
+    dlg = SettingsDialog(VersionManager())
     qtbot.addWidget(dlg)
-    assert dlg.all_files_feature.isChecked() is False  # 默认关
-
-    dlg.all_files_feature.setChecked(True)
-    assert config.get_index_all_files() is True
-    assert ("index_all_files", True) in calls
-
-    dlg.all_files_feature.setChecked(False)
-    assert config.get_index_all_files() is False
-    assert ("index_all_files", False) in calls
+    assert getattr(dlg, "all_files_feature", None) is None
+    # 顺带确认没把别的功能开关误删
+    assert dlg.document_feature is not None
+    assert dlg.grouping_feature is not None

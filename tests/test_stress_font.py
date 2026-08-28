@@ -306,16 +306,26 @@ def test_config_font_fallbacks(monkeypatch, tmp_path):
     assert config.get_font_family() == ""
     assert config.get_font_scale() == 1.0
 
-    config.update_ui_settings(font_scale=7.7)      # ui.json 手改非法档
-    assert config.get_font_scale() == 1.0
+    # 超范围的数值夹到边界，不再一律砸回 1.0——用户要的是「更大」，给他最大的合法值
+    config.update_ui_settings(font_scale=7.7)
+    assert config.get_font_scale() == config.FONT_SCALE_MAX
+    config.update_ui_settings(font_scale=0.01)
+    assert config.get_font_scale() == config.FONT_SCALE_MIN
+    # 但根本不是数的值仍然回落标准档
     config.update_ui_settings(font_scale=True)     # bool 不算合法数字
     assert config.get_font_scale() == 1.0
     config.update_ui_settings(font_scale="1.15")   # 字符串非法
+    assert config.get_font_scale() == 1.0
+    config.update_ui_settings(font_scale=float("nan"))
+    assert config.get_font_scale() == 1.0
+    config.update_ui_settings(font_scale=float("inf"))
     assert config.get_font_scale() == 1.0
     config.update_ui_settings(font_scale=0.9)
     assert config.get_font_scale() == 0.9
     config.update_ui_settings(font_scale=1)        # int 1 视同 1.0
     assert config.get_font_scale() == 1.0
+    config.update_ui_settings(font_scale=1.37)     # 自定义倍率原样保留
+    assert config.get_font_scale() == 1.37
 
     config.update_ui_settings(font_family=123)     # 非字符串
     assert config.get_font_family() == ""
@@ -323,8 +333,10 @@ def test_config_font_fallbacks(monkeypatch, tmp_path):
     assert config.get_font_family() == ""
     config.set_font_family("  LXGW WenKai  ")      # 写入去空白
     assert config.get_font_family() == "LXGW WenKai"
-    config.set_font_scale(7.7)                     # setter 侧直接钳回 1.0
-    assert config.get_font_scale() == 1.0
+    config.set_font_scale(7.7)                     # setter 侧夹到上限
+    assert config.get_font_scale() == config.FONT_SCALE_MAX
+    config.set_font_scale(1.25)
+    assert config.get_font_scale() == 1.25
 
 
 # ---------------------------------------------------------------- 设置对话框回落
@@ -338,14 +350,56 @@ def test_dialog_uninstalled_saved_family_falls_back(qtbot, mgr, monkeypatch, tmp
     assert dlg._font_family.currentIndex() == 0
 
 
-def test_dialog_invalid_scale_echoes_standard(qtbot, mgr, monkeypatch, tmp_path):
-    """ui.json 手改 7.7 → get 回落 1.0 → 对话框回显标准档。"""
+def test_dialog_non_numeric_scale_echoes_standard(qtbot, mgr, monkeypatch, tmp_path):
+    """ui.json 手改成字符串 → get 回落 1.0 → 对话框回显标准档。"""
     monkeypatch.setenv("PPTX_FINDER_DATA_DIR", str(tmp_path / "cfg"))
-    config.update_ui_settings(font_scale=7.7)
+    config.update_ui_settings(font_scale="huge")
     dlg = SettingsDialog(mgr)
     qtbot.addWidget(dlg)
     assert dlg._font_scale.currentData() == 1.0
     assert dlg._font_scale.currentIndex() == 1
+
+
+def test_dialog_custom_scale_roundtrip(qtbot, mgr, monkeypatch, tmp_path):
+    """自定义倍率：落在「自定义」项上回显原值，应用后原样存回。"""
+    monkeypatch.setenv("PPTX_FINDER_DATA_DIR", str(tmp_path / "cfg"))
+    config.set_font_scale(1.4)
+    dlg = SettingsDialog(mgr)
+    qtbot.addWidget(dlg)
+    assert dlg._font_scale.currentData() is None          # 「自定义…」项
+    assert dlg._font_scale_custom.value() == pytest.approx(1.4)
+    assert dlg._font_scale_custom.isEnabled() is True
+
+    dlg._font_scale_custom.setValue(1.75)
+    dlg._apply_font()
+    assert config.get_font_scale() == pytest.approx(1.75)
+
+
+def test_dialog_preset_disables_the_custom_spinbox(qtbot, mgr, monkeypatch, tmp_path):
+    """选了预设档，倍率框置灰并同步显示该档数值——不给两个互相打架的输入。"""
+    monkeypatch.setenv("PPTX_FINDER_DATA_DIR", str(tmp_path / "cfg"))
+    dlg = SettingsDialog(mgr)
+    qtbot.addWidget(dlg)
+    dlg._font_scale.setCurrentIndex(2)                    # 大（115%）
+    assert dlg._font_scale_custom.isEnabled() is False
+    assert dlg._font_scale_custom.value() == pytest.approx(1.15)
+    dlg._apply_font()
+    assert config.get_font_scale() == 1.15
+
+    dlg._font_scale.setCurrentIndex(dlg._font_scale.count() - 1)   # 自定义…
+    assert dlg._font_scale_custom.isEnabled() is True
+
+
+def test_dialog_custom_spinbox_cannot_leave_the_supported_range(qtbot, mgr, monkeypatch, tmp_path):
+    """两端在控件上就夹死：0.5 以下字号会糊，2.0 以上界面开始互相挤。"""
+    monkeypatch.setenv("PPTX_FINDER_DATA_DIR", str(tmp_path / "cfg"))
+    dlg = SettingsDialog(mgr)
+    qtbot.addWidget(dlg)
+    dlg._font_scale.setCurrentIndex(dlg._font_scale.count() - 1)
+    dlg._font_scale_custom.setValue(99.0)
+    assert dlg._selected_font_scale() == config.FONT_SCALE_MAX
+    dlg._font_scale_custom.setValue(0.01)
+    assert dlg._selected_font_scale() == config.FONT_SCALE_MIN
 
 
 def test_dialog_apply_writes_config_and_offline_text(qtbot, mgr, monkeypatch, tmp_path):
@@ -358,3 +412,73 @@ def test_dialog_apply_writes_config_and_offline_text(qtbot, mgr, monkeypatch, tm
     assert config.get_font_family() == ""
     assert config.get_font_scale() == 1.0
     assert "重启后生效" in dlg._font_result.text()
+
+
+# ---------------------------------------------------------------- 搜索行随字号伸缩
+
+
+def _search_bar_window(qtbot, tmp_path):
+    from PySide6.QtCore import QObject, Signal
+
+    from pptx_finder import db
+    from pptx_finder.ui.main_window import MainWindow
+
+    class _StubRender(QObject):
+        rendered = Signal(int, str)
+
+        def request(self, req_id, path, page_no, cache_key=None):
+            self.rendered.emit(req_id, "")
+
+    conn = db.connect(tmp_path / "i.db")
+    db.init_db(conn)
+    win = MainWindow(conn=conn, render_worker=_StubRender(), do_index=False)
+    qtbot.addWidget(win)
+    return win
+
+
+def test_search_bar_never_clips_text_at_any_supported_scale(qtbot, monkeypatch, tmp_path):
+    """0.5~2.0 全程：搜索框与两个下拉都得装得下自己的字。
+
+    这三个控件原本是写死的 34 / 30 / 30 像素。字号倍率一放开，写死的高度就会把字
+    切掉半截——所以自定义倍率这个功能不能只改 config，UI 也得跟着长。
+    """
+    from PySide6.QtGui import QFontMetrics
+
+    monkeypatch.setenv("PPTX_FINDER_DATA_DIR", str(tmp_path / "cfg"))
+    win = _search_bar_window(qtbot, tmp_path)
+    widgets = (win.search_box, win.type_filter, win.mode)
+
+    for scale in (config.FONT_SCALE_MIN, 0.9, 1.0, 1.15, 1.5, config.FONT_SCALE_MAX):
+        config.set_font_scale(scale)
+        win._apply_font()
+        for w in widgets:
+            assert w.height() >= QFontMetrics(w.font()).height(), (
+                f"倍率 {scale} 下 {w.objectName() or type(w).__name__} 装不下自己的字"
+            )
+
+
+def test_search_bar_geometry_unchanged_at_or_below_standard_scale(qtbot, monkeypatch, tmp_path):
+    """100% 及以下必须逐像素还是老样子——绝大多数人不会去改这个设置。"""
+    monkeypatch.setenv("PPTX_FINDER_DATA_DIR", str(tmp_path / "cfg"))
+    win = _search_bar_window(qtbot, tmp_path)
+
+    for scale in (config.FONT_SCALE_MIN, 0.9, 1.0):
+        config.set_font_scale(scale)
+        win._apply_font()
+        assert win.search_box.height() == 34, scale
+        assert win.type_filter.height() == 30, scale
+        assert win.mode.height() == 30, scale
+
+
+def test_search_bar_grows_with_a_large_custom_scale(qtbot, monkeypatch, tmp_path):
+    """放大时确实长高了——否则上面那条「装得下」可能只是因为字根本没变大。"""
+    monkeypatch.setenv("PPTX_FINDER_DATA_DIR", str(tmp_path / "cfg"))
+    win = _search_bar_window(qtbot, tmp_path)
+
+    config.set_font_scale(1.0)
+    win._apply_font()
+    small = win.search_box.height()
+    config.set_font_scale(config.FONT_SCALE_MAX)
+    win._apply_font()
+    assert win.search_box.height() > small
+    assert win.type_filter.height() > 30

@@ -44,7 +44,8 @@ def test_rebuild_failure_keeps_existing_destination_byte_for_byte(tmp_path):
     did = vault.doc_id_for(str(p))
     manifest = vault.manifest_for(did, vid)
     missing_hash = next(iter(manifest["parts"].values()))
-    (vault._global_objects_dir() / missing_hash).unlink()
+    # 按哈希解析路径而不是拼文件名：文本 part 可能以压缩件（<hash>.z）形态存放
+    vault._object_path(did, missing_hash).unlink()
 
     dest = tmp_path / "current.pptx"
     original = b"CURRENT USER FILE MUST SURVIVE"

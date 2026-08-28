@@ -210,11 +210,15 @@ def test_dedup_verification_rejects_parseable_but_hash_mismatched_object(tmp_pat
     slide_name = next(
         name for name in names if name.startswith("ppt/slides/slide1.xml")
     )
-    object_path = vault._global_objects_dir() / parts[slide_name]
-    original = object_path.read_bytes()
+    object_path = vault._object_path(doc_id, parts[slide_name])
+    with vault._open_object(object_path) as fh:
+        original = fh.read()
     mutated = original.replace(b"ORIGINAL_TEXT", b"MUTATED_TEXT")
     assert mutated != original
-    object_path.write_bytes(mutated)
+    # 改成未压缩形态写回：包仍是合法 OpenXML、仍能解析，只是内容与哈希对不上——
+    # 这条用例要的正是这个「读得出来但不是原件」的场景，不是「文件坏了读不出」。
+    object_path.unlink()
+    (vault._global_objects_dir() / parts[slide_name]).write_bytes(mutated)
 
     # The package remains valid OpenXML and parseable, but no longer matches
     # the manifest's content-addressed hash map.

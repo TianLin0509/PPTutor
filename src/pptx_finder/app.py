@@ -767,16 +767,6 @@ def main() -> int:
                     win._current_index_feature_signature()
                 )
             return
-        if key == "index_all_files":
-            # 开启 → 特征签名变化触发一次全量盘点；关闭 → 不重建，由主窗后台清理盘点行
-            win.apply_feature_flags(index_all_files_enabled=enabled)
-            if enabled:
-                _request_feature_rescan()
-            else:
-                set_completed_index_feature_signature(
-                    win._current_index_feature_signature()
-                )
-            return
         if key == "smart_grouping":
             feature_runtime.set_smart_grouping_enabled(enabled)
             win.apply_feature_flags(smart_grouping_enabled=enabled)

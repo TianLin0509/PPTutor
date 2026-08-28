@@ -13,7 +13,7 @@ from pptx_finder import scanner
 from pptx_finder import app as app_mod
 from pptx_finder.ui import main_window as main_window_mod
 from pptx_finder.ui.index_worker import IndexWorker
-from pptx_finder.ui.main_window import MainWindow
+from pptx_finder.ui.main_window import ALL_FILES_SCOPE_LABEL, MainWindow
 from pptx_finder.ui.settings_dialog import SettingsDialog
 from pptx_finder.versioning.manager import VersionManager
 from pptx_finder.versioning.watcher import _Handler
@@ -239,7 +239,11 @@ def test_main_window_defaults_to_ppt_only(monkeypatch, qtbot, tmp_path):
     win = MainWindow(conn=conn, render_worker=_StubRender(), do_index=False)
     qtbot.addWidget(win)
 
-    assert [win.type_filter.itemText(i) for i in range(win.type_filter.count())] == ["PPT"]
+    # 默认档只有 PPT 一个内容类型；「全部文件」是常开的文件名能力，不算内容档位
+    assert [win.type_filter.itemText(i) for i in range(win.type_filter.count())] == [
+        "PPT", ALL_FILES_SCOPE_LABEL,
+    ]
+    assert win.type_filter.currentText() == "PPT"
     assert win._search_exts() == (".pptx", ".ppt")
     assert win._enabled_index_exts() == (".pptx", ".ppt")
 

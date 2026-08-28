@@ -1165,7 +1165,7 @@ def test_font_apply_invokes_parent_callback(qtbot, mgr, monkeypatch, tmp_path):
 
 
 def test_font_family_default_persists_empty(qtbot, mgr, monkeypatch, tmp_path):
-    """字族留在「默认（内置字体）」时存空串 = 跟随内置；非法倍率回落默认。"""
+    """字族留在「默认（内置字体）」时存空串 = 跟随内置；超范围倍率夹到边界。"""
     monkeypatch.setenv("PPTX_FINDER_DATA_DIR", str(tmp_path / "cfg"))
 
     dlg = SettingsDialog(mgr)
@@ -1174,5 +1174,5 @@ def test_font_family_default_persists_empty(qtbot, mgr, monkeypatch, tmp_path):
     assert config.get_font_family() == ""
     assert config.get_font_scale() == 1.0
 
-    config.set_font_scale(2.5)  # 非合法档位
-    assert config.get_font_scale() == 1.0
+    config.set_font_scale(2.5)  # 超出支持范围
+    assert config.get_font_scale() == config.FONT_SCALE_MAX

@@ -16,7 +16,7 @@ import sys
 import time
 
 from PySide6.QtCore import QEvent, QMimeData, QObject, QPoint, QPropertyAnimation, QSize, Qt, QStringListModel, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QCursor, QDrag, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap, QShortcut
+from PySide6.QtGui import QColor, QCursor, QDrag, QFontMetrics, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QCompleter, QDialog, QFrame, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMainWindow, QMenu, QProgressBar, QPushButton, QScrollArea,
@@ -491,6 +491,16 @@ _TYPE_BUCKETS: tuple[tuple[str, tuple[str, ...], str], ...] = (
     ("Word", (DOCX_EXT,), "#2B6CB0"),
     ("PDF", (PDF_EXT,), "#E04A3F"),
 )
+
+# 搜索范围里的 Everything 档。标签自带「仅文件名」四个字：这个范围下内容搜不了，
+# 与其等用户搜不到再去帮助里找原因，不如把限制写在他做选择的那一刻。
+ALL_FILES_SCOPE_LABEL = "全部文件（仅文件名）"
+
+# 搜索行控件的（高度下限, 行高补白）。下限是从前写死的值，补白由 100% 倍率下的实测
+# 行高倒推：19px 行高 + 15 = 34（搜索框）、+ 11 = 30（两个下拉），所以 100% 及以下
+# 逐像素还是老样子，只有放大时才跟着长高。
+_SEARCH_BOX_METRICS = (34, 15)
+_SEARCH_CTRL_METRICS = (30, 11)
 
 
 class _TypeBar(QWidget):
@@ -1812,7 +1822,7 @@ class MainWindow(QMainWindow):
         self.search_box.setToolTip(
             '多词完整短语优先；空格 = 同时含；"引号" = 只搜短语'
         )
-        self.search_box.setFixedHeight(34)
+        self.search_box.setFixedHeight(_SEARCH_BOX_METRICS[0])  # 见 _sync_search_bar_metrics
         self.search_box.setMaximumWidth(680)
         self.search_box.addAction(_icon_search(), QLineEdit.LeadingPosition)
         self._clear_act = self.search_box.addAction(_icon_clear(), QLineEdit.TrailingPosition)
@@ -1841,25 +1851,22 @@ class MainWindow(QMainWindow):
 
         self.type_filter = QComboBox()
         self.type_filter.setObjectName("typeFilter")
-        self.type_filter.setToolTip("选择要搜索的文件类型（默认 PPT）")
-        type_options = [("PPT", (".pptx", ".ppt"))]
-        if self._document_search_enabled:
-            type_options.extend((
-                ("Word", (".docx",)),
-                ("PDF", (".pdf",)),
-                ("全部", self._enabled_index_exts()),
-            ))
-        for _label, _exts in type_options:
-            self.type_filter.addItem(_label, _exts)
-        self.type_filter.setCurrentIndex(0)  # 默认 PPT，保住产品焦点
-        self.type_filter.currentIndexChanged.connect(lambda _=0: self._do_search())
-        self.type_filter.setFixedHeight(30)
+        self.type_filter.setToolTip(
+            "搜索范围（默认 PPT）。\n"
+            "PPT / Word / PDF：搜文件名，也搜里面的内容。\n"
+            f"{ALL_FILES_SCOPE_LABEL}：全盘任意文件，只按文件名找。"
+        )
+        self._rebuild_type_filter()
+        self.type_filter.currentIndexChanged.connect(self._on_scope_changed)
+        self.type_filter.setFixedHeight(_SEARCH_CTRL_METRICS[0])
         lay.addWidget(self.type_filter)
         self.mode = QComboBox()
-        self._rebuild_mode_filter()  # 「任意文件名」项跟随索引所有文件开关
-        self.mode.setFixedHeight(30)
+        self._rebuild_mode_filter()
+        self.mode.setFixedHeight(_SEARCH_CTRL_METRICS[0])
         self.mode.currentIndexChanged.connect(self._do_search)
         lay.addWidget(self.mode)
+        self._sync_mode_for_scope()
+        self._sync_search_bar_metrics()  # 大字号下不让搜索行把字切掉半截
         lay.addSpacing(2)
 
         # —— 右侧：低频功能一律图标化（悬停出说明），视觉主次让位给搜索 ——
@@ -2180,6 +2187,29 @@ class MainWindow(QMainWindow):
         app = QApplication.instance()
         if app is not None:
             theme.apply_to_app(app, self._theme, get_font_family(), get_font_scale())
+        self._sync_search_bar_metrics()
+
+    def _sync_search_bar_metrics(self) -> None:
+        """搜索行的高度跟着字号走。
+
+        原来这三个控件是写死的 34 / 30 / 30 像素——字号倍率开到 2.0 时字直接被切掉半截。
+        改成按控件实测行高 + 内边距，并保留原来的下限，所以 100% 及以下的观感与从前
+        逐像素一致，只有放大时才会长高。
+
+        必须量**控件自己**的 fontMetrics 而不是 app.font()：倍率是通过重写 QSS 里的
+        font-size 生效的，除非用户另设了字族，否则应用级 QFont 根本不变——照 app.font()
+        量会得到一个恒定值，等于这个方法什么都没做。
+        """
+        for widget, (floor, pad) in (
+            (getattr(self, "search_box", None), _SEARCH_BOX_METRICS),
+            (getattr(self, "type_filter", None), _SEARCH_CTRL_METRICS),
+            (getattr(self, "mode", None), _SEARCH_CTRL_METRICS),
+        ):
+            if widget is None:
+                continue
+            widget.ensurePolished()   # QSS 刚换过，先让控件把字体解析出来
+            line = QFontMetrics(widget.font()).height()
+            widget.setFixedHeight(max(floor, line + pad))
 
     def _refresh_toolbar_icons(self) -> None:
         """合一工具栏与导航轨图标色跟随主题（ink3 静默灰），checked/hover 色由 QSS 承担。"""
@@ -2254,16 +2284,23 @@ class MainWindow(QMainWindow):
         finally:
             self._history_detach_inflight = False
 
+    def _all_files_scope(self) -> bool:
+        """当前是否选中「全部文件」范围（Everything 式全盘文件名）。"""
+        tf = getattr(self, "type_filter", None)
+        return tf is not None and tf.currentText() == ALL_FILES_SCOPE_LABEL
+
     def _mode_key(self) -> str:
-        # 按文案映射而非下标：「任意文件名」项随开关动态增删，下标会漂
+        # 「全部文件」范围只登记了文件名、没有内容，模式选什么都只能按名字找。
+        if self._all_files_scope():
+            return "any_filename"
+        # 按文案映射而非下标：下拉项会随功能开关增删，下标会漂
         return {
             "仅文件名": "filename",
             "仅内容": "content",
-            "任意文件名": "any_filename",
         }.get(self.mode.currentText(), "all")
 
     def _rebuild_mode_filter(self) -> None:
-        """重建搜索模式下拉；「任意文件名」项跟随「索引所有文件」开关增删。"""
+        """重建搜索模式下拉（范围选择器负责选类型，这里只管名字/内容的口径）。"""
         mode = getattr(self, "mode", None)
         if mode is None:
             return
@@ -2272,12 +2309,26 @@ class MainWindow(QMainWindow):
         try:
             mode.clear()
             mode.addItems(["全部", "仅文件名", "仅内容"])
-            if self._index_all_files_enabled:
-                mode.addItem("任意文件名")
             idx = mode.findText(previous)
             mode.setCurrentIndex(idx if idx >= 0 else 0)
         finally:
             mode.blockSignals(blocked)
+
+    def _sync_mode_for_scope(self) -> None:
+        """「全部文件」范围下把模式下拉置灰：那里只有文件名可搜，给选择只会误导。"""
+        mode = getattr(self, "mode", None)
+        if mode is None:
+            return
+        all_files = self._all_files_scope()
+        mode.setEnabled(not all_files)
+        mode.setToolTip(
+            f"「{ALL_FILES_SCOPE_LABEL}」范围下只登记了文件名，没有内容可搜。"
+            if all_files else "搜索口径：文件名、内容，或两者都要。"
+        )
+
+    def _on_scope_changed(self, _index: int = 0) -> None:
+        self._sync_mode_for_scope()
+        self._do_search()
 
     def _update_query_hint(self, query: str) -> None:
         if not query:
@@ -2312,6 +2363,7 @@ class MainWindow(QMainWindow):
         )
 
     def _rebuild_type_filter(self) -> None:
+        """重建搜索范围下拉：PPT 常在，Word/PDF 跟随文档搜索开关，全部文件永远兜底。"""
         tf = getattr(self, "type_filter", None)
         if tf is None:
             return
@@ -2319,15 +2371,18 @@ class MainWindow(QMainWindow):
         blocked = tf.blockSignals(True)
         try:
             tf.clear()
-            tf.addItem("PPT", PPT_EXTS)
+            tf.addItem("PPT", PPT_EXTS)          # 默认第 0 项，保住产品焦点
             if self._document_search_enabled:
                 tf.addItem("Word", (DOCX_EXT,))
                 tf.addItem("PDF", (PDF_EXT,))
-                tf.addItem("全部", self._enabled_index_exts())
+                tf.addItem("全部文档", self._enabled_index_exts())
+            # exts=None：不按扩展名过滤，覆盖全盘所有已登记文件
+            tf.addItem(ALL_FILES_SCOPE_LABEL, None)
             idx = tf.findText(previous)
             tf.setCurrentIndex(idx if idx >= 0 else 0)
         finally:
             tf.blockSignals(blocked)
+        self._sync_mode_for_scope()
         for label, bar in getattr(self, "_type_bars", {}).items():
             bar.setVisible(label == "PPT" or self._document_search_enabled)
 
@@ -2498,8 +2553,8 @@ class MainWindow(QMainWindow):
             note()
 
     def _search_exts(self) -> tuple[str, ...] | None:
-        """当前文件类型过滤；即使选“全部”也只覆盖用户已开启的类型。
-        「任意文件名」模式返回 None：不按扩展名过滤，覆盖全盘所有已登记文件。"""
+        """当前搜索范围的扩展名过滤；即使选“全部文档”也只覆盖用户已开启的类型。
+        「全部文件」范围返回 None：不按扩展名过滤，覆盖全盘所有已登记文件。"""
         if self._mode_key() == "any_filename":
             return None
         tf = getattr(self, "type_filter", None)

@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
+    QDoubleSpinBox,
     QFileDialog,
     QFontComboBox,
     QHBoxLayout,
@@ -41,7 +42,12 @@ from .. import db
 from ..config import (
     APP_NAME,
     EXCLUDE_DIR_NAMES,
+    FONT_SCALE_MAX,
+    FONT_SCALE_MIN,
+    FONT_SCALE_STEP,
+    FONT_SCALES,
     cache_dir,
+    clamp_font_scale,
     data_dir,
     db_path,
     enabled_index_exts,
@@ -50,7 +56,6 @@ from ..config import (
     get_font_family,
     get_font_scale,
     get_hotkey,
-    get_index_all_files,
     get_index_roots,
     get_smart_grouping_enabled,
     get_vault_max_mb,
@@ -63,7 +68,6 @@ from ..config import (
     set_font_family,
     set_font_scale,
     set_hotkey,
-    set_index_all_files,
     set_index_roots,
     set_smart_grouping_enabled,
     set_vault_max_mb,
@@ -77,6 +81,7 @@ from . import bg_task
 from .bg_task import BackgroundTask
 
 _MOD_NAMES = ("Ctrl", "Alt", "Shift", "Win")
+FONT_SCALE_CUSTOM_LABEL = "自定义…"
 
 
 def _diag_number(line: str, key: str) -> float:
@@ -264,20 +269,8 @@ class SettingsDialog(QDialog):
         )
         lay.addWidget(self.document_feature)
 
-        self.all_files_feature = QCheckBox("索引所有文件（Everything 式文件名搜索）")
-        self.all_files_feature.setChecked(get_index_all_files())
-        self.all_files_feature.setToolTip(
-            "开启后登记全盘所有文件的名字（不解析内容），搜索模式里可选「任意文件名」；"
-            "关闭后停止收录并在后台清理盘点数据。\n"
-            "新建与删除的文件约一分钟内进出搜索结果（按目录增量对账）。\n"
-            "代价：本机实测固定盘共约 200 万个文件，首轮盘点耗时明显长于普通建库，"
-            "索引库也会显著变大——只在你确实需要按文件名找任意文件时开启。"
-        )
-        self.all_files_feature.toggled.connect(
-            lambda on: self._toggle_feature("index_all_files", on)
-        )
-        lay.addWidget(self.all_files_feature)
-
+        # 「索引所有文件」的开关已经撤掉（2026-08-28）：全盘文件名盘点现在是常开能力，
+        # 用不用由搜索框右边的范围选择器当场决定，不必先来设置里找一个开关、再等一轮重扫。
         self.grouping_feature = QCheckBox("相似稿 / 重复稿智能归组")
         self.grouping_feature.setChecked(get_smart_grouping_enabled())
         self.grouping_feature.setToolTip(
@@ -405,17 +398,31 @@ class SettingsDialog(QDialog):
         self._font_family.setCurrentIndex(idx if idx > 0 else 0)
         font_row.addWidget(self._font_family, 1)
         font_row.addWidget(QLabel("字号："))
+        # 三个预设一键即得；预设不合口味时选「自定义」，右边的倍率框接管。
+        # 档位值只在 config.FONT_SCALES 定义一次，这里只负责起中文名。
         self._font_scale = QComboBox()
-        for label, value in (
-            ("小（90%）", 0.9),
-            ("标准（100%）", 1.0),
-            ("大（115%）", 1.15),
-        ):
-            self._font_scale.addItem(label, value)
+        for name, value in zip(("小", "标准", "大"), FONT_SCALES):
+            self._font_scale.addItem(f"{name}（{value * 100:g}%）", value)
+        self._font_scale.addItem(FONT_SCALE_CUSTOM_LABEL, None)
+        self._font_scale_custom = QDoubleSpinBox()
+        self._font_scale_custom.setDecimals(2)
+        self._font_scale_custom.setRange(FONT_SCALE_MIN, FONT_SCALE_MAX)
+        self._font_scale_custom.setSingleStep(FONT_SCALE_STEP)
+        self._font_scale_custom.setSuffix(" ×")
+        self._font_scale_custom.setToolTip(
+            f"自定义倍率，{FONT_SCALE_MIN:g}~{FONT_SCALE_MAX:g}。"
+            "1.00 = 标准字号；再往两端走界面会开始挤或糊，所以在这里夹死。"
+        )
         saved_scale = get_font_scale()
+        self._font_scale_custom.setValue(saved_scale)
         idx = self._font_scale.findData(saved_scale)
-        self._font_scale.setCurrentIndex(idx if idx >= 0 else 1)
+        # 存的是自定义值（不等于任何预设）时，直接落在「自定义」项上回显原值
+        self._font_scale.setCurrentIndex(
+            idx if idx >= 0 else self._font_scale.count() - 1)
+        self._font_scale.currentIndexChanged.connect(self._sync_font_scale_custom)
+        self._sync_font_scale_custom()
         font_row.addWidget(self._font_scale)
+        font_row.addWidget(self._font_scale_custom)
         font_apply = QPushButton("应用")
         font_apply.clicked.connect(self._apply_font)
         font_row.addWidget(font_apply)
@@ -739,7 +746,6 @@ class SettingsDialog(QDialog):
             "version_management": set_version_management_enabled,
             "document_search": set_document_search_enabled,
             "smart_grouping": set_smart_grouping_enabled,
-            "index_all_files": set_index_all_files,
         }
         setters[key](bool(enabled))
         self._sync_feature_controls()
@@ -764,7 +770,6 @@ class SettingsDialog(QDialog):
             "version_management": getattr(self, "version_feature", None),
             "document_search": getattr(self, "document_feature", None),
             "smart_grouping": getattr(self, "grouping_feature", None),
-            "index_all_files": getattr(self, "all_files_feature", None),
         }
         control = controls.get(str(key))
         if control is None:
@@ -795,6 +800,20 @@ class SettingsDialog(QDialog):
         else:
             self._hotkey_result.setText(f"已保存：{spec}（重启后生效）")
 
+    def _selected_font_scale(self) -> float:
+        """当前选中的倍率：预设取档位值，「自定义」取右边倍率框。"""
+        preset = self._font_scale.currentData()
+        raw = self._font_scale_custom.value() if preset is None else preset
+        return clamp_font_scale(raw)
+
+    def _sync_font_scale_custom(self, _index: int = 0) -> None:
+        """只有选了「自定义」倍率框才可编辑；切回预设时同步显示该档位的数值。"""
+        preset = self._font_scale.currentData()
+        self._font_scale_custom.setEnabled(preset is None)
+        if preset is not None:
+            with QSignalBlocker(self._font_scale_custom):
+                self._font_scale_custom.setValue(float(preset))
+
     def _apply_font(self) -> None:
         # QFontComboBox 可编辑（用户能手输任意文本）：入库前过 config 的同一道清洗，
         # 剥掉可注入 QSS 的字符；不存在的字体名允许保存（QSS 回退链兜底）
@@ -802,7 +821,7 @@ class SettingsDialog(QDialog):
             "" if self._font_family.currentIndex() == 0
             else sanitize_font_family(self._font_family.currentFont().family())
         )
-        scale = float(self._font_scale.currentData())
+        scale = self._selected_font_scale()
         set_font_family(family)
         set_font_scale(scale)
         apply_cb = getattr(self._diagnostic_parent, "_apply_font", None)  # 主窗口注入的热应用回调

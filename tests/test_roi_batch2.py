@@ -195,7 +195,11 @@ def test_global_object_pool_deduplicates_identical_parts_across_documents(tmp_pa
     hashes = set(vault.manifest_for(d1, v1)["parts"].values())
     hashes.update(vault.manifest_for(d2, v2)["parts"].values())
 
-    global_objects = {p.name for p in vault._global_objects_dir().iterdir() if p.is_file()}
+    # 池里的文件名可能是 <hash> 也可能是 <hash>.z；对账口径永远是「未压缩内容的哈希」
+    global_objects = {
+        vault._object_hash_of(p)
+        for p in vault._global_objects_dir().iterdir() if p.is_file()
+    }
     assert global_objects == hashes
     assert not list(vault._objects_dir(d1).iterdir())
     assert not list(vault._objects_dir(d2).iterdir())
@@ -260,7 +264,7 @@ def test_gc_aborts_without_deleting_orphans_when_live_recovery_graph_is_broken(t
     vid = vault.snapshot(conn, str(p))
     did = vault.doc_id_for(str(p))
     referenced_hash = next(iter(vault.manifest_for(did, vid)["parts"].values()))
-    (vault._global_objects_dir() / referenced_hash).unlink()
+    vault._object_path(did, referenced_hash).unlink()
     orphan = vault._global_objects_dir() / ("e" * 16)
     orphan.write_bytes(b"do not touch during aborted pass")
 
