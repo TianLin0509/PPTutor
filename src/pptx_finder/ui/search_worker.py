@@ -7,12 +7,13 @@ query and lets the main window ignore stale completions by request id.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 
 from PySide6.QtCore import QThread, Signal
 
-from .. import db, search as search_mod
+from .. import db, namestore, search as search_mod
 
 log = logging.getLogger(__name__)
 
@@ -32,6 +33,8 @@ class SearchWorker(QThread):
         self._stop = False
         self._active_conn = None
         self._cancel_active = False
+        self._name_store_obj = None
+        self._name_stamp = None
         self._diag_lock = threading.Lock()
         self._diag = {
             "total": 0,
@@ -90,6 +93,46 @@ class SearchWorker(QThread):
             conn.interrupt()
         except Exception:  # noqa: BLE001 中断是加速路径，失败不应影响后续请求入队
             log.debug("failed to interrupt active search connection", exc_info=True)
+
+    def _name_store(self):
+        """按需打开平铺文件名索引，并在建库重写它之后自动换新。
+
+        建库每轮写一个新名字的数据文件、再拨指针（Windows 不让替换正在被 mmap 的
+        文件）。所以「该不该换新」看的是指针指向哪个文件——比 stat 内容更直接，
+        也天然免疫「同名文件被就地改写」这种在 Windows 上根本不会发生的情况。
+        """
+        path = namestore.current_data_path()
+        if path is None:
+            self._close_name_store()
+            return None
+        stamp = str(path)
+        if self._name_store_obj is not None and self._name_stamp == stamp:
+            return self._name_store_obj
+        self._close_name_store()
+        try:
+            self._name_store_obj = namestore.NameStore(path)
+            self._name_stamp = stamp
+        except namestore.NameStoreError as exc:
+            # 缺失 / 版本不符 / 损坏：这个范围暂时没有结果，但绝不能影响 PPT 搜索
+            log.info("name index unavailable: %s", exc)
+            self._name_store_obj = None
+        return self._name_store_obj
+
+    def _close_name_store(self) -> None:
+        if self._name_store_obj is not None:
+            try:
+                self._name_store_obj.close()
+            except Exception:  # noqa: BLE001
+                pass
+        self._name_store_obj = None
+        self._name_stamp = None
+
+    def _search_names(self, query: str, exts, case_sensitive: bool) -> list:
+        store = self._name_store()
+        if store is None:
+            return []
+        return search_mod.search_names(
+            store, query, exts=exts, case_sensitive=case_sensitive)
 
     @staticmethod
     def _apply_mode(results: list, mode_key: str) -> list:
@@ -177,42 +220,42 @@ class SearchWorker(QThread):
                 error = None
                 results = []
                 try:
-                    if conn is None:
-                        if not self._db_path:
-                            raise RuntimeError("missing db path")
-                        # Connect lazily for the request. A transient startup
-                        # lock/path failure must be reported to the UI, not kill
-                        # this QThread and leave every later query on “searching”.
-                        # Interactive search is read-only and must fail fast
-                        # behind a rare schema/VACUUM lock. The normal writer
-                        # connection waits up to eight seconds and also issues
-                        # journal-mode PRAGMAs, which used to leave the UI on
-                        # “searching” for ~7.4 seconds in the reproduced case.
-                        own_conn = db.connect_readonly(
-                            self._db_path,
-                            busy_timeout_ms=self._READ_BUSY_TIMEOUT_MS,
-                        )
-                        conn = own_conn
-                        with self._cv:
-                            if self._stop or self._cancel_active or self._pending is not None:
-                                raise RuntimeError("interrupted")
-                            self._active_conn = conn
-                    search_kwargs = {"exts": exts}
-                    # 任意文件名模式：放宽文件名 FTS 候选截断（全盘盘点后 3000 不够）；
-                    # 结果只保留文件名命中，内容召回纯空转，传标记跳过 pages_fts 全库白召
                     if mode_key == "any_filename":
-                        search_kwargs["name_limit"] = search_mod.ANY_FILE_NAME_LIMIT
-                        search_kwargs["name_only"] = True
-                    # Keep the default call shape backward-compatible with test/fake
-                    # search functions and older integrations; only opt in explicitly.
-                    if case_sensitive:
-                        search_kwargs["case_sensitive"] = True
-                    if not group_similar:
-                        search_kwargs["group_similar"] = False
-                    results = self._apply_mode(
-                        search_mod.search(conn, query, **search_kwargs),
-                        mode_key,
-                    )
+                        # 「全部文件」范围走平铺文件名索引，整段绕开 SQLite——那 180 万个
+                        # 文件的名字根本不在库里了，连读连接都不必开（顺带不与建库抢锁）。
+                        results = self._search_names(query, exts, case_sensitive)
+                    else:
+                        if conn is None:
+                            if not self._db_path:
+                                raise RuntimeError("missing db path")
+                            # Connect lazily for the request. A transient startup
+                            # lock/path failure must be reported to the UI, not kill
+                            # this QThread and leave every later query on “searching”.
+                            # Interactive search is read-only and must fail fast
+                            # behind a rare schema/VACUUM lock. The normal writer
+                            # connection waits up to eight seconds and also issues
+                            # journal-mode PRAGMAs, which used to leave the UI on
+                            # “searching” for ~7.4 seconds in the reproduced case.
+                            own_conn = db.connect_readonly(
+                                self._db_path,
+                                busy_timeout_ms=self._READ_BUSY_TIMEOUT_MS,
+                            )
+                            conn = own_conn
+                            with self._cv:
+                                if self._stop or self._cancel_active or self._pending is not None:
+                                    raise RuntimeError("interrupted")
+                                self._active_conn = conn
+                        search_kwargs = {"exts": exts}
+                        # Keep the default call shape backward-compatible with test/fake
+                        # search functions and older integrations; only opt in explicitly.
+                        if case_sensitive:
+                            search_kwargs["case_sensitive"] = True
+                        if not group_similar:
+                            search_kwargs["group_similar"] = False
+                        results = self._apply_mode(
+                            search_mod.search(conn, query, **search_kwargs),
+                            mode_key,
+                        )
                 except Exception as exc:  # noqa: BLE001
                     error = f"{type(exc).__name__}: {exc}"
                     if "interrupted" in str(exc).lower():
@@ -245,5 +288,6 @@ class SearchWorker(QThread):
                     continue
                 self.searched.emit(req_id, query, results, elapsed_ms, error)
         finally:
+            self._close_name_store()   # 释放 mmap，否则索引文件在 Windows 上删不掉
             if own_conn is not None:
                 own_conn.close()

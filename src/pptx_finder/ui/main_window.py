@@ -628,7 +628,7 @@ class ResultItem(QWidget):
             row.addWidget(nh, 0)
         if r.status == "filename_only":
             # 按真实扩展名显示：.ppt 旧格式 / 任意文件盘点都走这个 badge
-            ext = QLabel((r.ext or "").lower() or "?")
+            ext = QLabel("文件夹" if r.is_dir else ((r.ext or "").lower() or "?"))
             ext.setStyleSheet(f"font-size:10px;color:{tok['ink4']};border:1px solid {tok['bd2']};border-radius:5px;padding:1px 6px;background:transparent;")
             row.addWidget(ext, 0)
         if r.hits and r.status not in ("ok", "filename_only"):
@@ -669,7 +669,9 @@ class ResultItem(QWidget):
             sn.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
             lay.addWidget(sn)
         elif r.status == "filename_only":
-            if (r.ext or "").lower() == ".ppt":
+            if r.is_dir:
+                sub = QLabel("\u6587\u4ef6\u5939 \u00b7 \u53cc\u51fb\u5728\u8d44\u6e90\u7ba1\u7406\u5668\u4e2d\u6253\u5f00")
+            elif (r.ext or "").lower() == ".ppt":
                 sub = QLabel("\u8001\u683c\u5f0f \u00b7 \u4ec5\u6587\u4ef6\u540d\u641c\u7d22\u4e0e\u9884\u89c8")
             else:
                 sub = QLabel("仅文件名收录 · 未解析内容")
@@ -5246,6 +5248,12 @@ class MainWindow(QMainWindow):
         if q:
             history.add_history(q)
             self._refresh_history_model()
+        if self._cur.is_dir:
+            # 文件夹结果：双击的自然含义是「进到这个文件夹里」，不是拿它当文档跳页。
+            # os.startfile 对目录就是在资源管理器里打开它（Everything 也是这个行为）；
+            # 「打开文件夹」按钮走的 _open_folder_path 是 /select，会停在父目录并选中它。
+            self._open_file_path(self._cur.path)
+            return
         if (self._cur.ext or os.path.splitext(self._cur.path)[1]).lower() not in PPT_EXTS:
             kind = "Word" if (self._cur.ext or "").lower() == DOCX_EXT else "PDF"
             self._open_file_path(self._cur.path)
@@ -5747,11 +5755,10 @@ class MainWindow(QMainWindow):
         self._startup_index_check_last_files = file_count
         self._startup_index_check_last_pages = page_count
         self._startup_index_check_last_pending = pending_count
-        if (
-            not self._index_all_files_enabled
-            and int(stats.get("inventory_leftover_count", 0) or 0) > 0
-        ):
-            # 启动自愈：上次「扫描进行中关开关」竞态残留的盘点行，后台补一次清理
+        if int(stats.get("inventory_leftover_count", 0) or 0) > 0:
+            # 迁移 + 自愈：全盘文件名已经搬到平铺索引，SQLite 里的盘点行一律是历史包袱
+            # （老版本开过「索引所有文件」的用户会带着几十万行升上来）。后台清掉，
+            # 这正是那 1.19 GB 的来源。内容类型的行不在清理范围内，PPT 一行不动。
             self._purge_inventory_rows()
         if not isinstance(payload, dict):
             self._startup_index_check_error = "stats_unavailable"
@@ -5817,7 +5824,9 @@ class MainWindow(QMainWindow):
                 self._conn,
                 path,
                 explicit_output_roots=self._explicit_output_roots,
-                index_all_files=self._index_all_files_enabled,
+                # 单文件实时并入只管内容索引；文件名索引是整份重建的，
+                # 单个文件的增删由下一轮扫描收拢（见 _reconcile_inventory_dir）
+                index_all_files=False,
             )
         except Exception:  # noqa: BLE001
             _log.warning("live index failed %s", path, exc_info=True)
@@ -5911,7 +5920,10 @@ class MainWindow(QMainWindow):
             supported_exts=self._enabled_index_exts(),
             compute_groups=self._smart_grouping_enabled,
             feature_signature=self._current_index_feature_signature(),
-            index_all_files=self._index_all_files_enabled,
+            # 全盘文件名从此走平铺索引，不再往 SQLite 写盘点行——那 175 万行是
+            # 1.19 GB 的来源。index_all_files 这条旧路留着但不再启用。
+            index_all_files=False,
+            build_name_index=self._index_all_files_enabled,
         )
         self._indexer.progress.connect(self._on_index_progress)
         self._indexer.finished_index.connect(self._on_index_done)

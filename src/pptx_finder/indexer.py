@@ -659,11 +659,18 @@ def update_index(
     max_pending_factor: int = 4,
     index_all_files: bool = False,
     index_all_files_provider: Callable[[], bool] | None = None,
+    name_sink: Callable[[str, int, float], None] | None = None,
+    dir_sink: Callable[[str], None] | None = None,
 ) -> dict[str, int]:
     """增量更新：流式扫描 → 即时登记文件名 → 并行解析补全内容。
 
     progress_cb(done, total, cur)：total<0 = 扫描阶段（文件名渐进可搜），
     total>=0 = 内容解析阶段（done/total）。
+    name_sink(path, size, mtime)：全盘文件名索引的收料口。扫到的**每一个**文件
+    都会回调一次（含内容类型、含未变化的），由调用方攒起来整份重建平铺索引——
+    这条路不入 SQLite，那 175 万行盘点数据从此不再进库。
+    dir_sink(path)：同上，但收的是**文件夹本身**（剪枝之后每个目录恰好一次）。
+    Everything 能按名字搜到文件夹，我们也要能。
     index_all_files_provider：「索引所有文件」开关的实时读取器；扫描收尾时复检——
     本轮带着 index_all_files=True 扫描、期间开关被关闭时（设置页的即时 purge 清不掉
     在途扫描之后写入的行），对本类盘点行补一次 purge。
@@ -734,7 +741,10 @@ def update_index(
             supported_exts=allowed_exts,
             scan_progress_cb=scan_heartbeat,
             scan_error_cb=scan_error,
-            inventory_all=index_all_files,
+            # 「枚举全部文件」和「把它们写进 SQLite」是两件事，必须分开。
+            # 平铺索引要的是前者；后者（index_all_files）是被它取代的旧路径。
+            inventory_all=index_all_files or name_sink is not None,
+            dir_cb=dir_sink,
         )
     )
 
@@ -871,6 +881,12 @@ def update_index(
                 st = p.stat()
             except OSError:
                 continue
+            if name_sink is not None:
+                # 全盘文件名索引在这里收料：必须**先于**下面所有 continue，
+                # 因为它是整份重建，要的是"这次扫到的全部文件"，而不是
+                # "内容有变化的那些"。内容类型也一并收——「全部文件」范围里
+                # PPT 同样要能按名字搜到。
+                name_sink(sp, int(st.st_size), float(st.st_mtime))
             if _is_cloud_placeholder(p, st):
                 unchanged_placeholder = (
                     row is not None

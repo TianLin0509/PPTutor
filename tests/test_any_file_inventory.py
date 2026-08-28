@@ -6,7 +6,7 @@ from PySide6.QtWidgets import QLabel
 
 import fixtures_gen as fx
 
-from pptx_finder import config, db, indexer, search
+from pptx_finder import config, db, indexer, namestore, search
 from pptx_finder.models import FileResult
 from pptx_finder.scanner import iter_ppt_files
 from pptx_finder.ui import search_worker as search_worker_mod
@@ -236,58 +236,111 @@ def test_search_name_limit_relaxes_filename_recall(tmp_path):
     conn.close()
 
 
-# ---------- SearchWorker：any_filename 模式接线 ----------
+# ---------- SearchWorker：any_filename 走平铺文件名索引 ----------
 
-def test_search_worker_any_filename_passes_name_limit(monkeypatch, qtbot, tmp_path):
+def test_search_worker_any_filename_never_touches_sqlite(monkeypatch, qtbot, tmp_path):
+    """「全部文件」范围整段绕开 SQLite——那些文件的名字根本不在库里了。
+
+    顺带的好处：这个范围的搜索不再与后台建库抢数据库锁。
+    """
+    monkeypatch.setenv("PPTX_FINDER_DATA_DIR", str(tmp_path / "appdata"))
     conn = _conn(tmp_path)
-    seen = {}
 
-    def fake_search(_conn, _query, exts=None, name_limit=None, **kw):
-        seen["exts"] = exts
-        seen["name_limit"] = name_limit
-        seen["name_only"] = kw.get("name_only")
-        return []
+    def boom(*_a, **_kw):
+        raise AssertionError("any_filename 不该再走 SQLite 搜索")
 
-    monkeypatch.setattr(search_worker_mod.search_mod, "search", fake_search)
+    monkeypatch.setattr(search_worker_mod.search_mod, "search", boom)
+
+    real = tmp_path / "report.zzz"
+    real.write_text("x", encoding="utf-8")
+    b = namestore.NameStoreBuilder()
+    b.add(str(real), 10, 1_700_000_000)
+    b.write()
+
     worker = SearchWorker(conn=conn)
     worker.start()
     try:
-        with qtbot.waitSignal(worker.searched, timeout=3000):
-            worker.request(1, "abc", "any_filename")
+        with qtbot.waitSignal(worker.searched, timeout=3000) as blocker:
+            worker.request(1, "report", "any_filename")
+        _req, _q, results, _ms, error = blocker.args
     finally:
         worker.stop()
         worker.wait(3000)
-    assert seen["exts"] is None
-    assert seen["name_limit"] == search.ANY_FILE_NAME_LIMIT
-    assert seen["name_only"] is True  # 内容召回空转由 name_only 标记跳过
+    assert error is None
+    assert [r.name for r in results] == ["report.zzz"]
     conn.close()
 
 
-def test_search_worker_any_filename_filters_to_name_hits(qtbot, tmp_path):
-    docs = _build_docs(tmp_path)
+def test_search_worker_any_filename_degrades_when_index_missing(qtbot, tmp_path, monkeypatch):
+    """索引还没建好时这个范围空手而归——但绝不能报错，更不能影响 PPT 搜索。"""
+    monkeypatch.setenv("PPTX_FINDER_DATA_DIR", str(tmp_path / "appdata"))
     conn = _conn(tmp_path)
-    indexer.update_index(
-        conn, [str(docs)], workers=1,
-        supported_exts=(".pptx", ".ppt"), index_all_files=True,
-    )
     worker = SearchWorker(conn=conn)
     worker.start()
     try:
         with qtbot.waitSignal(worker.searched, timeout=3000) as blocker:
-            worker.request(2, "算力", "any_filename")
+            worker.request(1, "report", "any_filename")
         _req, _q, results, _ms, error = blocker.args
-        assert error is None
-        # a.pptx 命中在内容（算力），不在文件名 → any_filename 模式被过滤掉
-        assert results == []
-
-        with qtbot.waitSignal(worker.searched, timeout=3000) as blocker:
-            worker.request(3, "report", "any_filename")
-        _req, _q, results, _ms, error = blocker.args
-        assert error is None
-        assert [(r.name, r.name_hit) for r in results] == [("report.zzz", True)]
     finally:
         worker.stop()
         worker.wait(3000)
+    assert error is None
+    assert results == []
+    conn.close()
+
+
+def test_search_worker_picks_up_a_rebuilt_index(qtbot, tmp_path, monkeypatch):
+    """建库重写索引之后，下一次搜索必须看到新内容，而不是一直用旧 mmap。"""
+    monkeypatch.setenv("PPTX_FINDER_DATA_DIR", str(tmp_path / "appdata"))
+    conn = _conn(tmp_path)
+    before = tmp_path / "before.zzz"
+    before.write_text("x", encoding="utf-8")
+    b = namestore.NameStoreBuilder()
+    b.add(str(before), 10, 1_700_000_000)
+    b.write()
+
+    worker = SearchWorker(conn=conn)
+    worker.start()
+    try:
+        with qtbot.waitSignal(worker.searched, timeout=3000) as blocker:
+            worker.request(1, "zzz", "any_filename")
+        assert [r.name for r in blocker.args[2]] == ["before.zzz"]
+
+        after = tmp_path / "after.zzz"
+        after.write_text("x", encoding="utf-8")
+        b2 = namestore.NameStoreBuilder()
+        b2.add(str(after), 10, 1_700_000_500)
+        b2.write()
+
+        with qtbot.waitSignal(worker.searched, timeout=3000) as blocker:
+            worker.request(2, "zzz", "any_filename")
+        assert [r.name for r in blocker.args[2]] == ["after.zzz"]
+    finally:
+        worker.stop()
+        worker.wait(3000)
+    conn.close()
+
+
+def test_ppt_content_search_is_unaffected_by_the_new_engine(qtbot, tmp_path, monkeypatch):
+    """硬约束：PPT 相关的一切行为不受影响。内容搜索照旧走 SQLite。"""
+    monkeypatch.setenv("PPTX_FINDER_DATA_DIR", str(tmp_path / "appdata"))
+    docs = _build_docs(tmp_path)
+    conn = _conn(tmp_path)
+    indexer.update_index(
+        conn, [str(docs)], workers=1, supported_exts=(".pptx", ".ppt"))
+    worker = SearchWorker(conn=conn)
+    worker.start()
+    try:
+        with qtbot.waitSignal(worker.searched, timeout=5000) as blocker:
+            worker.request(1, "算力", "all")
+        _req, _q, results, _ms, error = blocker.args
+    finally:
+        worker.stop()
+        worker.wait(3000)
+    assert error is None
+    assert [r.name for r in results] == ["a.pptx"]
+    assert results[0].hits          # 内容命中还在
+    assert results[0].file_id > 0   # 仍是真实的库内 id
     conn.close()
 
 

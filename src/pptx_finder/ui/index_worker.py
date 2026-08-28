@@ -8,7 +8,7 @@ import time
 
 from PySide6.QtCore import QThread, Signal
 
-from .. import db, indexer
+from .. import db, indexer, namestore
 
 log = logging.getLogger(__name__)
 
@@ -47,6 +47,9 @@ class IndexWorker(QThread):
         interaction_pause_sec: float = 0.8,
         feature_signature: str = "",
         index_all_files: bool = False,
+        # 默认关：只有主窗口那条真实建库路径需要它。默认开会让每一个 IndexWorker
+        # （含测试里的假 update_index）都去攒并写出一份 130 MB 的索引。
+        build_name_index: bool = False,
     ):
         super().__init__(parent)
         self._db_path = db_path
@@ -58,6 +61,7 @@ class IndexWorker(QThread):
         self._interaction_pause_sec = max(0.0, float(interaction_pause_sec))
         self._feature_signature = str(feature_signature or "")
         self._index_all_files = bool(index_all_files)
+        self._build_name_index = bool(build_name_index)
         self._activity_lock = threading.Lock()
         self._pause_until = 0.0
         self._stop = threading.Event()
@@ -102,6 +106,7 @@ class IndexWorker(QThread):
             return
         last_emit_at = 0.0
         last_phase: str | None = None
+        name_builder = None
 
         def emit_progress(done: int, total: int, current: str) -> None:
             nonlocal last_emit_at, last_phase
@@ -131,6 +136,13 @@ class IndexWorker(QThread):
                     index_kwargs["supported_exts"] = self._supported_exts
                 if self._index_all_files:
                     index_kwargs["index_all_files"] = True
+                if self._build_name_index:
+                    # 全盘文件名索引：扫描期间只在内存里攒，扫干净了才落盘。
+                    # 峰值约 200 MB（180 万文件真机实测），只在建库时出现。
+                    name_builder = namestore.NameStoreBuilder()
+                    index_kwargs["name_sink"] = (
+                        lambda p, size, mtime: name_builder.add(p, size, mtime))
+                    index_kwargs["dir_sink"] = name_builder.add_dir
                 if not self._compute_groups:
                     index_kwargs["compute_content_hash"] = False
                 if self._background_priority:
@@ -145,6 +157,18 @@ class IndexWorker(QThread):
             except Exception as e:  # noqa: BLE001 索引线程兜底，不让异常杀进程
                 self.finished_index.emit({"error": str(e)})
                 return
+            if name_builder is not None and not int(summary.get("cancelled", 0) or 0):
+                # 只有扫干净了才落盘。半份索引会让「全部文件」少掉一半结果，
+                # 而且**不报错**——比干脆没有索引更难发现。
+                try:
+                    dest = name_builder.write()
+                    summary["name_index_entries"] = len(name_builder)
+                    log.info("name index rebuilt: %d entries -> %s",
+                             len(name_builder), dest)
+                except Exception as e:  # noqa: BLE001 落盘失败不该拖垮整轮建库
+                    log.warning("name index write failed: %s", e)
+                    summary["name_index_error"] = f"{type(e).__name__}: {e}"
+            name_builder = None      # 200 MB 的攒料尽早还给系统
             if int(summary.get("cancelled", 0) or 0):
                 # A user-requested stop must stay cheap. Grouping/FTS optimize/
                 # VACUUM can take minutes on a large database and would make

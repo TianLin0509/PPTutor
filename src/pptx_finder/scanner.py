@@ -71,6 +71,7 @@ def iter_ppt_files(
     scan_progress_cb: Callable[[int, str], None] | None = None,
     scan_error_cb: Callable[[OSError], None] | None = None,
     inventory_all: bool = False,
+    dir_cb: Callable[[str], None] | None = None,
 ) -> Iterator[Path]:
     """遍历 roots，产出受支持的演示文稿路径，剪枝排除目录与临时锁文件。"""
     # inventory_all=True 时不按扩展名过滤、产出全部文件（Everything 式文件名盘点），
@@ -123,6 +124,11 @@ def iter_ppt_files(
                     )
                 )
             ]
+            if dir_cb is not None:
+                # 文件夹本身也要能按名字搜到（Everything 的行为）。放在剪枝之后，
+                # 所以被排除的目录不会混进来；也在 yield 文件之前，顺序不重要但
+                # 保证每个走到这里的目录都恰好上报一次。
+                dir_cb(dirpath)
             for fn in filenames:
                 if fn.startswith("~$"):  # Office 临时锁文件
                     continue

@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import sqlite3
 import unicodedata
 from collections import defaultdict
+from collections.abc import Callable
 from difflib import SequenceMatcher
 from functools import lru_cache
 
@@ -664,3 +666,116 @@ def _collapse_exact_duplicates(results: list[FileResult]) -> list[FileResult]:
         r.duplicate_paths = [x.path for x in ordered]
         collapsed.append(r)
     return collapsed
+
+
+# ---------------------------------------------------------------- 全盘文件名（namestore）
+
+def search_names(store, query: str, *, limit: int = 200,
+                 recall_limit: int = ANY_FILE_NAME_LIMIT,
+                 scope: str | None = None,
+                 exts: tuple[str, ...] | None = None,
+                 case_sensitive: bool = False,
+                 exists: Callable[[str], bool] = os.path.exists) -> list[FileResult]:
+    """「全部文件」范围的搜索：只认文件名，数据来自平铺索引而不是 SQLite。
+
+    刻意长在 search.py 里而不是单开一个模块：打分要素（name_bonus、match_kind、
+    case_exact、relevance_components 的排序口径）必须与内容搜索**逐条一致**，
+    抄一份到别处的结局一定是两边慢慢漂开。这里直接复用上面那些私有函数。
+
+    file_id 给的是「按名次递减的负数」。三个理由，缺一不可：
+      · 负数 → 那两处 `WHERE file_id=?` 的查询（页标题、复制本页文字）必然查空，
+        而不是撞上某个真实 PPT 的行、把别人的内容显示成这个文件的；
+      · 每条不同 → search.py 与 ui/result_utils.py 都拿 f"s{file_id}" 当归组桶键，
+        全体共用一个 id 会让所有文件名结果塌进同一个桶、被整体提到首条的位置，
+        排序当场作废；
+      · 不入库、不持久化 → 全应用没有任何地方存过 file_id，用完即弃是安全的。
+    """
+    terms, phrases = parse_query(query)
+    words = [w for w in (terms + phrases) if w.strip()]
+    if not words:
+        return []
+
+    ordinals = store.search(words, limit=max(1, int(recall_limit)),
+                            scope=scope or "")
+    if not ordinals:
+        return []
+
+    ext_filter = {e.lower() for e in exts} if exts else None
+    # 这个范围里什么扩展名都有，所以去扩展名要按「最后一个点」来，不能用内容搜索
+    # 那个只认 .pptx/.ppt 的 _stem_name——否则搜 report 时 report.txt 永远评不到
+    # 「完全匹配」档，会被一个更新的 report-2026.txt 压在下面。而按名字找文件的
+    # 场景里，「名字就是它」本来就该排第一。
+    q_norm = normalize(query, case_sensitive=case_sensitive).strip()
+    q_stem = os.path.splitext(q_norm)[0] or q_norm
+    full_phrase = _full_query_phrase(terms, phrases, case_sensitive=case_sensitive)
+    query_exact = _compact_normalized(query, case_sensitive=case_sensitive)
+    case_needles = _case_rank_needles(query)
+    has_case_signal = bool(case_needles)
+
+    rows = []
+    for i in ordinals:
+        path, name, size, mtime, is_dir = store.entry(i)
+        # 文件夹没有扩展名概念，按扩展名过滤时（选了 Word/PDF 之类）要整体排除，
+        # 否则「只看 PDF」会莫名其妙冒出一堆目录
+        ext = "" if is_dir else os.path.splitext(name)[1].lower()
+        if ext_filter is not None and (is_dir or ext not in ext_filter):
+            continue
+        rows.append((path, name, ext, size, float(mtime), is_dir))
+    if not rows:
+        return []
+
+    mtimes = [r[4] for r in rows]
+    mmin, mmax = min(mtimes), max(mtimes)
+
+    def rec_norm(m: float) -> float:
+        return 1.0 if mmax == mmin else (m - mmin) / (mmax - mmin)
+
+    results: list[FileResult] = []
+    for path, name, ext, size, mtime, is_dir in rows:
+        normalized_name = normalize(name, case_sensitive=case_sensitive)
+        stem = os.path.splitext(normalized_name)[0] or normalized_name
+        case_preserved_name = unicodedata.normalize("NFKC", name)
+        # 连名带扩展名打全（report.txt）和只打名字（report）都算「就是它」
+        if q_norm and (normalized_name == q_norm or stem == q_stem):
+            bonus = 2.0
+        elif q_norm and (normalized_name.startswith(q_norm) or stem.startswith(q_stem)):
+            bonus = 1.0
+        else:
+            bonus = NAME_BONUS
+        if query_exact and _COMPACT_RE.sub("", stem) == query_exact:
+            match_kind = "filename_exact"
+        elif _contains_full_phrase(stem, full_phrase):
+            match_kind = "filename_phrase"
+        else:
+            match_kind = "partial"
+        case_exact = True if not has_case_signal else bool(
+            case_needles and all(n in case_preserved_name for n in case_needles))
+        results.append(FileResult(
+            file_id=0, path=path, name=name, ext=ext, mtime=mtime, size=size,
+            page_count=0, status="filename_only",
+            score=W_RECENCY * rec_norm(mtime) + bonus,
+            name_hit=True, hits=[], match_kind=match_kind, case_exact=case_exact,
+            is_dir=is_dir,
+        ))
+
+    results.sort(key=lambda r: (
+        *relevance_components(r),
+        -r.mtime,
+        r.name.casefold(),
+    ))
+
+    # 平铺索引是整份重建的，两次重建之间删掉的文件仍留在里面。与其为删除单独维护
+    # 一套增量账本，不如在**要显示的那几条**上顺手 stat 一下：只对排序后的前 N 条
+    # 生效（通常正好 200 次 stat，几毫秒），却能保证结果里不会出现已经不存在的文件。
+    # 边过滤边取够 limit，而不是先截断再过滤——后者会平白少给用户几条。
+    keep = max(1, int(limit))
+    alive: list[FileResult] = []
+    for r in results:
+        if exists(r.path):
+            alive.append(r)
+            if len(alive) >= keep:
+                break
+    # 排完序再发 id：名次即身份，既保证互不相同，也让它稳定可复现
+    for rank, r in enumerate(alive, start=1):
+        r.file_id = -rank
+    return alive
