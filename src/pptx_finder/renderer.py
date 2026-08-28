@@ -58,7 +58,12 @@ _RENDER_CACHE_PATTERN = re.compile(
     r"^[0-9a-f]{16}_(?:\d+_\d+|safe_\d+_\d+)\.png$",
     re.IGNORECASE,
 )
-_RENDER_CACHE_MAX_BYTES = 2 * 1024 * 1024 * 1024
+#: 预览缓存上限。原来是 2 GB —— 对一个定位「轻量」的工具太宽了。
+#: 真机实测：1548 个缓存文件才 103 MB，其中 174 个 2560px 大图占了 72 MB；
+#: 也就是说体积主要由大图数量决定，2 GB 这条线实际上等于「不限」。
+#: 收到 512 MB：没命中就重渲一次，约 1 秒，而且只会落在很久没看过的文件上；
+#: 常用文件的预览照样秒开。拿偶发的 1 秒换 1.5 GB 的上限空间，划算。
+_RENDER_CACHE_MAX_BYTES = 512 * 1024 * 1024
 _RENDER_CACHE_MAX_FILES = 2000
 _RENDER_CACHE_TRIM_RATIO = 0.8
 _RENDER_CACHE_GENERATION = "com-only-v1"

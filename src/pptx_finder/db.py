@@ -15,8 +15,21 @@ from .text_tokenize import normalize, tokenize
 
 log = logging.getLogger(__name__)
 
+#: 空闲空间达到这个绝对量就整理（不看占比）——大库上「25% 空闲」可能已经是好几个 G。
 DEFAULT_VACUUM_MIN_FREE_BYTES = 256 * 1024 * 1024
+#: 或者空闲占比达到这个比例也整理，但至少要有 DEFAULT_VACUUM_FLOOR_BYTES 那么多，
+#: 免得为了几百 KB 去 VACUUM 一个刚建好的小库。
 DEFAULT_VACUUM_MIN_FREE_RATIO = 0.25
+#: 走「占比」这条路时的绝对下限。
+#: 为什么要有这条：原来两个门槛是**与**的关系，于是一个 132 MB 的库无论怎么膨胀
+#: 都到不了「空闲 256 MB」，VACUUM 一次都不会跑。真机实测就是这样——索引格式
+#: 迁移把旧数据清空之后，132 MB 里 86%（114 MB）是空闲页，白占着磁盘。
+#: 改成「或」之后这台机器上实测：VACUUM 132 MB -> 18 MB，耗时 0.2 秒。
+DEFAULT_VACUUM_FLOOR_BYTES = 32 * 1024 * 1024
+#: WAL 超过这个大小就在维护时截断。WAL 只有在没有读者时才能收缩，平时的
+#: PASSIVE checkpoint 只会把内容搬进主库、不还给磁盘，于是文件一直长着。
+#: 真机实测：32 MB 的 WAL，TRUNCATE 一次 0.13 秒就归零。
+WAL_TRUNCATE_BYTES = 8 * 1024 * 1024
 
 # 索引格式版本：分词器/切词规则改版即与旧库不兼容（如词级 jieba → 字级），
 # 启动发现版本不符就清空内容、走全量重建——否则「原文里有、却怎么都搜不到」。
@@ -460,11 +473,24 @@ def type_counts(conn: sqlite3.Connection) -> dict[str, tuple[int, int]]:
     return out
 
 
+def _wal_bytes(conn: sqlite3.Connection) -> int:
+    """当前主库对应的 -wal 文件有多大；内存库或取不到时返回 0。"""
+    try:
+        for _seq, name, filename in conn.execute("PRAGMA database_list"):
+            if name == "main" and filename:
+                return os.path.getsize(str(filename) + "-wal")
+    except (sqlite3.DatabaseError, OSError):
+        pass
+    return 0
+
+
 def maintain(
     conn: sqlite3.Connection,
     *,
     min_free_bytes: int = DEFAULT_VACUUM_MIN_FREE_BYTES,
     min_free_ratio: float = DEFAULT_VACUUM_MIN_FREE_RATIO,
+    floor_bytes: int = DEFAULT_VACUUM_FLOOR_BYTES,
+    wal_truncate_bytes: int = WAL_TRUNCATE_BYTES,
 ) -> dict:
     """Run bounded SQLite maintenance after indexing.
 
@@ -484,6 +510,9 @@ def maintain(
         "free_ratio_before": 0.0,
         "page_count_after": 0,
         "free_pages_after": 0,
+        "wal_bytes_before": 0,
+        "wal_bytes_after": 0,
+        "wal_truncated": False,
         "error": "",
     }
     try:
@@ -508,10 +537,12 @@ def maintain(
             "free_ratio_before": free_ratio,
         })
 
-        should_vacuum = (
-            free_pages > 0
-            and free_bytes >= max(0, int(min_free_bytes))
-            and free_ratio >= max(0.0, float(min_free_ratio))
+        # 「或」而不是「与」：两个门槛各自成立即可。原来是「与」，结果一个 132 MB
+        # 的库永远够不到「空闲 256 MB」，VACUUM 一次都不会跑（实测 86% 是空闲页）。
+        should_vacuum = free_pages > 0 and (
+            free_bytes >= max(0, int(min_free_bytes))
+            or (free_ratio >= max(0.0, float(min_free_ratio))
+                and free_bytes >= max(0, int(floor_bytes)))
         )
         if should_vacuum:
             try:
@@ -526,12 +557,19 @@ def maintain(
                 result["error"] = f"{type(exc).__name__}: {exc}"
                 log.warning("sqlite vacuum skipped: %s", exc)
 
+        # WAL 只有 TRUNCATE 才会把文件还给磁盘；PASSIVE 只是把内容搬进主库，
+        # 文件照样一直长着。刚 VACUUM 过、或者 WAL 已经攒得够大，就截断一次。
+        wal_bytes = _wal_bytes(conn)
+        result["wal_bytes_before"] = wal_bytes
         try:
-            checkpoint_mode = "TRUNCATE" if result["vacuumed"] else "PASSIVE"
-            row = conn.execute(f"PRAGMA wal_checkpoint({checkpoint_mode})").fetchone()
+            truncate = result["vacuumed"] or wal_bytes >= max(0, int(wal_truncate_bytes))
+            row = conn.execute(
+                f"PRAGMA wal_checkpoint({'TRUNCATE' if truncate else 'PASSIVE'})").fetchone()
             result["checkpointed"] = row is None or int(row[0]) == 0
+            result["wal_truncated"] = bool(truncate)
         except sqlite3.DatabaseError as exc:
             log.debug("wal checkpoint skipped: %s", exc)
+        result["wal_bytes_after"] = _wal_bytes(conn)
         conn.commit()
 
         result["page_count_after"] = int(conn.execute("PRAGMA page_count").fetchone()[0])
