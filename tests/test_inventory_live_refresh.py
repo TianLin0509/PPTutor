@@ -11,7 +11,7 @@ import os
 
 import fixtures_gen as fx
 
-from pptx_finder import config, db, indexer, search
+from pptx_finder import config, db, indexer, namestore, search
 from pptx_finder.versioning import store, vault
 from pptx_finder.versioning.watcher import _Handler
 
@@ -351,11 +351,20 @@ def test_main_window_dirty_dir_queue_and_reconcile(qtbot, tmp_path, monkeypatch)
         win.note_inventory_dir_dirty(str(docs))
     assert win._dirty_inventory_dirs == {str(docs)}
 
-    # 内存库场景（_sqlite_file_path 为空）不会起后台任务，直接验同步对账语义
-    res = MainWindow._reconcile_inventory_dirs_sync(
-        str(tmp_path / "ui.db"), (str(docs),), (".pptx", ".ppt"), ())
+    # 直接验同步对账语义：结果进的是平铺增量层，不再写 SQLite
+    monkeypatch.setenv("PPTX_FINDER_DATA_DIR", str(tmp_path / "appdata"))
+    res = MainWindow._reconcile_inventory_dirs_sync((str(docs),))
+    assert res.get("error") is None
     assert res["added"] == 1 and res["dirs"] == 1
-    assert [r.name for r in search.search(conn, "note", exts=None)] == ["note.zzz"]
+    stores = [s for s in (namestore.open_store(k) for k in namestore.KINDS) if s]
+    try:
+        assert [r.name for r in search.search_names(stores, "note")] == ["note.zzz"]
+    finally:
+        for s in stores:
+            s.close()
+    # 盘点行一行都不该进 SQLite——那正是被换掉的 1.19 GB
+    assert conn.execute(
+        "SELECT COUNT(*) FROM files WHERE lower(ext)='.zzz'").fetchone()[0] == 0
 
     # 开关关掉后：不再入队，脏目录清空，定时器停
     win.apply_feature_flags(index_all_files_enabled=False)

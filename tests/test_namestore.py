@@ -256,7 +256,7 @@ def test_rebuild_succeeds_while_a_reader_holds_the_old_index(tmp_path):
     # 老读者退出后，下一次重建把陈旧文件顺手清掉
     _build([(r"C:\new\again.txt", 1, 1_700_000_000)])
     stale = [p.name for p in (tmp_path / "appdata").iterdir()
-             if p.name.startswith(namestore.DATA_PREFIX)]
+             if p.name.startswith("names-")]
     assert len(stale) == 1
 
 
@@ -435,3 +435,178 @@ def test_scan_dir_cb_respects_pruning(tmp_path):
     assert "keep" in names
     assert "node_modules" not in names
     assert "pkg" not in names
+
+
+# ---------------------------------------------------------------- 增量层（实时更新）
+
+def test_overlay_is_a_second_index_of_the_same_format(tmp_path):
+    """新文件先进增量层，搜索时与全量一起扫。
+
+    Everything 拿不到 NTFS 变更日志时走的就是这条路（目录变更通知 → 重列该目录）。
+    我们不提权，所以照搬它这套备用机制。
+    """
+    b = namestore.NameStoreBuilder()
+    b.add(r"C:\a\old.txt", 1, 1_700_000_000)
+    b.write()
+    o = namestore.NameStoreBuilder()
+    o.add(r"C:\a\brand-new.txt", 1, 1_700_000_900)
+    o.write(kind=namestore.OVERLAY)
+
+    main = namestore.open_store(namestore.MAIN)
+    overlay = namestore.open_store(namestore.OVERLAY)
+    try:
+        assert main.count == 1 and overlay.count == 1
+        assert _paths(main, main.search(["brand-new"])) == []      # 全量里还没有
+        assert _paths(overlay, overlay.search(["brand-new"])) == [r"C:\a\brand-new.txt"]
+    finally:
+        main.close()
+        overlay.close()
+
+
+def test_overlay_and_main_use_separate_pointers(tmp_path):
+    """两套索引各有各的指针，重建其中一套不能把另一套指没了。"""
+    namestore.NameStoreBuilder().write()
+    namestore.NameStoreBuilder().write(kind=namestore.OVERLAY)
+    main_before = namestore.current_data_path(namestore.MAIN)
+    overlay_before = namestore.current_data_path(namestore.OVERLAY)
+    assert main_before and overlay_before and main_before != overlay_before
+
+    namestore.NameStoreBuilder().write(kind=namestore.OVERLAY)
+    assert namestore.current_data_path(namestore.MAIN) == main_before
+    assert namestore.current_data_path(namestore.OVERLAY) != overlay_before
+
+
+def test_main_rebuild_does_not_delete_the_overlay_file(tmp_path):
+    r"""names- 是 names-overlay- 的前缀。清理陈旧全量文件时不能把增量层顺手删了
+    ——那会让刚发现的新文件凭空消失，而且不报错。"""
+    namestore.NameStoreBuilder().write(kind=namestore.OVERLAY)
+    overlay = namestore.current_data_path(namestore.OVERLAY)
+    for _ in range(2):
+        namestore.NameStoreBuilder().write()
+    assert overlay.is_file()
+    assert namestore.current_data_path(namestore.OVERLAY) == overlay
+
+
+def test_discard_removes_a_kind_entirely(tmp_path):
+    """全量刷新后要把增量层作废——它记的变化已经并进全量了。"""
+    namestore.NameStoreBuilder().write()
+    namestore.NameStoreBuilder().write(kind=namestore.OVERLAY)
+    namestore.discard(namestore.OVERLAY)
+    assert namestore.current_data_path(namestore.OVERLAY) is None
+    assert namestore.current_data_path(namestore.MAIN) is not None
+    assert namestore.open_store(namestore.OVERLAY) is None
+
+
+def test_open_store_returns_none_instead_of_raising(tmp_path):
+    """降级要安静：没有索引就是没结果，不能变成异常打到搜索线程。"""
+    assert namestore.open_store(namestore.MAIN) is None
+    assert namestore.open_store(namestore.OVERLAY) is None
+
+
+def test_reconcile_pipeline_makes_a_new_file_searchable(tmp_path, monkeypatch):
+    """端到端：目录被标脏 → 对账重建增量层 → 新文件立刻能搜到、删掉的立刻消失。
+
+    对账逻辑就是 Everything 的备用机制：重列这个目录，而不是去改那份只读的全量索引。
+    """
+    from pptx_finder import search as search_mod
+    from pptx_finder.ui.main_window import MainWindow
+
+    monkeypatch.setenv("PPTX_FINDER_DATA_DIR", str(tmp_path / "appdata"))
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    stale = docs / "was-here.txt"
+    stale.write_text("x", encoding="utf-8")
+
+    b = namestore.NameStoreBuilder()
+    b.add(str(stale), 1, 1_700_000_000)
+    b.write()
+
+    fresh = docs / "appeared-just-now.txt"
+    fresh.write_text("x", encoding="utf-8")
+    subdir = docs / "new-folder"
+    subdir.mkdir()
+
+    totals = MainWindow._reconcile_inventory_dirs_sync((str(docs),))
+    assert totals["dirs"] == 1
+    assert totals["added"] >= 2          # 新文件 + 新文件夹
+
+    stores = [s for s in (namestore.open_store(k) for k in namestore.KINDS) if s]
+    try:
+        names = {r.name for r in search_mod.search_names(stores, "appeared")}
+        assert names == {"appeared-just-now.txt"}
+        folders = search_mod.search_names(stores, "new-folder")
+        assert [r.is_dir for r in folders] == [True]
+        # 全量里的老文件仍在
+        assert {r.name for r in search_mod.search_names(stores, "was-here")} == {
+            "was-here.txt"}
+    finally:
+        for s in stores:
+            s.close()
+
+
+def test_reconcile_drops_overlay_entries_whose_file_vanished(tmp_path, monkeypatch):
+    """增量层不能只涨不消：重建时顺手把已经不存在的条目扔掉。"""
+    from pptx_finder.ui.main_window import MainWindow
+
+    monkeypatch.setenv("PPTX_FINDER_DATA_DIR", str(tmp_path / "appdata"))
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    doomed = docs / "temporary.txt"
+    doomed.write_text("x", encoding="utf-8")
+
+    MainWindow._reconcile_inventory_dirs_sync((str(docs),))
+    overlay = namestore.open_store(namestore.OVERLAY)
+    try:
+        assert overlay.count >= 1
+    finally:
+        overlay.close()
+
+    doomed.unlink()
+    MainWindow._reconcile_inventory_dirs_sync((str(docs),))
+    overlay = namestore.open_store(namestore.OVERLAY)
+    try:
+        assert all(overlay.entry(i)[1] != "temporary.txt"
+                   for i in range(overlay.count))
+    finally:
+        overlay.close()
+
+
+def test_reconcile_survives_a_directory_that_disappeared(tmp_path, monkeypatch):
+    """目录本身刚被删掉：跳过即可，不能让整批对账抛异常。"""
+    from pptx_finder.ui.main_window import MainWindow
+
+    monkeypatch.setenv("PPTX_FINDER_DATA_DIR", str(tmp_path / "appdata"))
+    totals = MainWindow._reconcile_inventory_dirs_sync(
+        (str(tmp_path / "never-existed"),))
+    assert totals["dirs"] == 0
+
+
+def test_header_has_room_for_every_section(tmp_path):
+    """头部必须装得下所有段的偏移表。
+
+    装不下时 `header[:len(packed)] = packed` 会把 bytearray 撑长，头部悄悄盖掉
+    第一个段的开头——**不报错**，只是所有偏移都错位、搜出来的东西是乱的。
+    加段的时候最容易踩，所以钉一条。
+    """
+    assert namestore._HEADER_STRUCT.size <= namestore.HEADER_SIZE
+    path = _build(SAMPLE)
+    raw = path.read_bytes()
+    # 第一个段必须正好从头部之后开始，中间不许有重叠
+    with namestore.NameStore(path) as store:
+        first = min(off for off, _ in store._span.values())
+        assert first >= namestore.HEADER_SIZE
+        assert len(raw) == max(off + ln for off, ln in store._span.values())
+
+
+def test_directory_norms_are_precomputed_at_build_time(tmp_path):
+    """目录的归一化形式存在索引里，查询时不再跑 NFKC/OpenCC。
+
+    放到查询时算的话，25 万个目录每次都要现算一遍——真机实测头一条路径查询
+    要为此多花约 2.7 秒。
+    """
+    path = _build([(r"C:\Work\軟體開發\Deck.pptx", 1, 1_700_000_000)])
+    with namestore.NameStore(path) as store:
+        # 繁体转简体 + 小写 + 反斜杠统一成正斜杠，全部在建库时完成
+        assert store.dir_norm(0) == "c:/work/软体开发"
+        assert store._dirs_matching("软体开发") == {0}
+        assert store._dirs_matching("nope") == set()

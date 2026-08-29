@@ -101,38 +101,33 @@ class SearchWorker(QThread):
         文件）。所以「该不该换新」看的是指针指向哪个文件——比 stat 内容更直接，
         也天然免疫「同名文件被就地改写」这种在 Windows 上根本不会发生的情况。
         """
-        path = namestore.current_data_path()
-        if path is None:
-            self._close_name_store()
-            return None
-        stamp = str(path)
-        if self._name_store_obj is not None and self._name_stamp == stamp:
+        stamp = tuple(str(namestore.current_data_path(k)) for k in namestore.KINDS)
+        if self._name_stamp == stamp:
             return self._name_store_obj
         self._close_name_store()
-        try:
-            self._name_store_obj = namestore.NameStore(path)
-            self._name_stamp = stamp
-        except namestore.NameStoreError as exc:
-            # 缺失 / 版本不符 / 损坏：这个范围暂时没有结果，但绝不能影响 PPT 搜索
-            log.info("name index unavailable: %s", exc)
-            self._name_store_obj = None
+        # 全量 + 增量两份一起开。增量层放在后面：同一个路径两边都有时以它为准，
+        # 因为它记的是刚刚发生的变化，大小/时间比全量里的新。
+        stores = [s for s in (namestore.open_store(k) for k in namestore.KINDS)
+                  if s is not None]
+        self._name_store_obj = stores or None
+        self._name_stamp = stamp
         return self._name_store_obj
 
     def _close_name_store(self) -> None:
-        if self._name_store_obj is not None:
+        for store in (self._name_store_obj or ()):
             try:
-                self._name_store_obj.close()
+                store.close()
             except Exception:  # noqa: BLE001
                 pass
         self._name_store_obj = None
         self._name_stamp = None
 
     def _search_names(self, query: str, exts, case_sensitive: bool) -> list:
-        store = self._name_store()
-        if store is None:
+        stores = self._name_store()
+        if not stores:
             return []
         return search_mod.search_names(
-            store, query, exts=exts, case_sensitive=case_sensitive)
+            stores, query, exts=exts, case_sensitive=case_sensitive)
 
     @staticmethod
     def _apply_mode(results: list, mode_key: str) -> list:

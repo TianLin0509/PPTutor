@@ -31,7 +31,9 @@ Everything 还有第三招我们学不了：直接读 NTFS 的 MFT。那要管�
     [NORM]         归一化后的文件名，'\n' 分隔，按记录顺序     ← 搜索扫这一段
     [NAME]         原始文件名，'\n' 分隔，按记录顺序
     [DIRS]         目录全路径，'\n' 分隔，去重后
+    [DIRNORM]      目录全路径的归一化形式，与 DIRS 一一对应   ← 路径匹配扫这一段
     [DIROFF]       u32 × dir_count      DIRS 段内每个目录的起始偏移
+    [DIRNORMOFF]   u32 × dir_count      DIRNORM 段内每个目录的起始偏移
     [NORMOFF]      u32 × count          NORM 段内每条记录的起始偏移（供二分反查）
     [RECS]         每条 20 字节：dir_id u32 / name_off u32 / size u32 / mtime u32 / flags u32
 
@@ -54,6 +56,7 @@ import time
 from array import array
 from pathlib import Path
 
+from . import namequery
 from .config import data_dir
 from .db import sqlite_safe_text
 from .text_tokenize import normalize
@@ -61,53 +64,102 @@ from .text_tokenize import normalize
 log = logging.getLogger(__name__)
 
 MAGIC = b"PPTDNAM\x01"
-FORMAT_VERSION = 1
-HEADER_SIZE = 128
+FORMAT_VERSION = 2
+#: 头部预留大小。留足余量：每加一个段就多 16 字节，装不下的话
+#: `header[:len(packed)] = packed` 会把 bytearray 撑长，于是头部悄悄盖掉第一个段
+#: 的开头、所有偏移全错——不报错，只是搜出来的东西是乱的。下面有断言兜底。
+HEADER_SIZE = 256
 RECORD_SIZE = 20
 SIZE_CAP = 0xFFFFFFFF
 FLAG_DIR = 1 << 0
 
 # 段顺序固定，Header 里逐段记 (offset, length)
-_SECTIONS = ("norm", "name", "dirs", "diroff", "normoff", "recs")
+_SECTIONS = ("norm", "name", "dirs", "dirnorm", "diroff", "dirnormoff",
+             "normoff", "recs")
 _HEADER_STRUCT = struct.Struct("<8sIIQ" + "QQ" * len(_SECTIONS))
+assert _HEADER_STRUCT.size <= HEADER_SIZE, (
+    f"头部装不下了：需要 {_HEADER_STRUCT.size} 字节，只预留了 {HEADER_SIZE}")
 
 
-POINTER_NAME = "names.idx"
-DATA_PREFIX = "names-"
 DATA_SUFFIX = ".idx"
+# 两套索引共用一模一样的格式与代码：
+#   main    —— 每轮全盘扫描整份重建，是绝大多数结果的来源
+#   overlay —— 目录监听发现变化后按目录重建的增量层，体积很小
+# Everything 在拿不到 NTFS 变更日志时走的也是目录监听这条路，我们照搬。
+MAIN = "names"
+OVERLAY = "names-overlay"
+KINDS = (MAIN, OVERLAY)
 
 
-def pointer_path() -> Path:
+def pointer_path(kind: str = MAIN) -> Path:
     """指针文件：内容是当前数据文件的文件名。它自己很小，永远不会被 mmap。"""
-    return data_dir() / POINTER_NAME
+    return data_dir() / f"{kind}{DATA_SUFFIX}"
 
 
-def current_data_path() -> Path | None:
+def _data_prefix(kind: str) -> str:
+    return f"{kind}-"
+
+
+def current_data_path(kind: str = MAIN) -> Path | None:
     """跟着指针找到当前的数据文件；指针不存在或指空返回 None。"""
     try:
-        name = pointer_path().read_text(encoding="utf-8").strip()
+        name = pointer_path(kind).read_text(encoding="utf-8").strip()
     except OSError:
         return None
     if not name or "/" in name or "\\" in name or name in (".", ".."):
         return None                      # 指针只允许写同目录下的文件名
+    if not name.startswith(_data_prefix(kind)):
+        return None
     candidate = data_dir() / name
     return candidate if candidate.is_file() else None
 
 
-def _sweep_old_data_files(keep: Path) -> None:
+def open_store(kind: str = MAIN):
+    """打开某一套索引；没有就返回 None（调用方据此降级，不当异常处理）。"""
+    path = current_data_path(kind)
+    if path is None:
+        return None
+    try:
+        return NameStore(path)
+    except NameStoreError as exc:
+        log.info("name index (%s) unavailable: %s", kind, exc)
+        return None
+
+
+def discard(kind: str) -> None:
+    """作废某一套索引：先撤指针，再尽力删数据文件。
+
+    全盘重建之后必须把增量层撤掉——它记的是「上一份全量之后的变化」，
+    留着只会让已经并入全量的条目重复出现（虽然按路径去重了，但纯属浪费）。
+    """
+    try:
+        pointer_path(kind).unlink()
+    except OSError:
+        pass
+    _sweep_old_data_files(None, kind)
+
+
+def _sweep_old_data_files(keep: Path | None, kind: str = MAIN) -> None:
     """清掉不再被指向的旧数据文件。
 
     删不掉是常态而不是异常：还开着的搜索线程仍 mmap 着上一份，Windows 不让删。
     下次重建再扫一遍就好——所以这里失败一律咽掉，绝不能影响建库结果。
     """
+    prefix = _data_prefix(kind)
     try:
         entries = list(data_dir().iterdir())
     except OSError:
         return
     for p in entries:
-        if p == keep or not p.name.startswith(DATA_PREFIX):
+        if p == keep or not p.is_file():
             continue
-        if not p.name.endswith(DATA_SUFFIX) or not p.is_file():
+        # 只认 <前缀><纯数字>.idx。不能只看前缀——"names-" 同时是 "names-overlay-"
+        # 和指针文件 "names-overlay.idx" 的前缀，按前缀删会把增量层连指针一起抹掉
+        # （新文件当场从搜索里消失，而且不报错）。
+        stem = p.name[len(prefix): -len(DATA_SUFFIX)]
+        if not p.name.startswith(prefix) or not p.name.endswith(DATA_SUFFIX):
+            continue
+        if not stem.isdigit():
             continue
         try:
             p.unlink()
@@ -133,7 +185,9 @@ class NameStoreBuilder:
     def __init__(self) -> None:
         self._dir_ids: dict[str, int] = {}
         self._dirs = bytearray()
+        self._dirnorm = bytearray()
         self._diroff = array("I")
+        self._dirnormoff = array("I")
         self._norm = bytearray()
         self._normoff = array("I")
         self._name = bytearray()
@@ -149,7 +203,15 @@ class NameStoreBuilder:
             dir_id = len(self._dir_ids)
             self._dir_ids[directory] = dir_id
             self._diroff.append(len(self._dirs))
-            self._dirs += _sanitize(directory).encode("utf-8", "surrogatepass") + b"\n"
+            self._dirnormoff.append(len(self._dirnorm))
+            clean = _sanitize(directory)
+            self._dirs += clean.encode("utf-8", "surrogatepass") + b"\n"
+            # 目录的归一化形式在**建库时**算好存进去。放到查询时算的话，25 万个目录
+            # 每次都要现跑一遍 NFKC + OpenCC——真机实测头一条路径查询要为此多花约
+            # 2.7 秒。存进来只多占 13% 体积，而且路径匹配可以直接在这一段上做
+            # C 速度的子串扫描，连解码都省了。
+            self._dirnorm += normalize(sqlite_safe_text(clean)).replace(
+                "\\", "/").encode("utf-8", "surrogatepass") + b"\n"
         return dir_id
 
     def add_dir(self, path: str, mtime: float = 0.0) -> None:
@@ -188,7 +250,7 @@ class NameStoreBuilder:
         )
         self._count += 1
 
-    def write(self, dest: Path | None = None) -> Path:
+    def write(self, dest: Path | None = None, *, kind: str = MAIN) -> Path:
         """原子落盘，返回数据文件路径。半个索引比没有索引更糟。
 
         dest 为空时走「版本化文件 + 指针」：每次重建写一个新名字的数据文件，
@@ -199,14 +261,17 @@ class NameStoreBuilder:
         """
         versioned = dest is None
         if versioned:
-            dest = data_dir() / f"{DATA_PREFIX}{int(time.time() * 1000):013d}{DATA_SUFFIX}"
+            dest = (data_dir()
+                    / f"{_data_prefix(kind)}{int(time.time() * 1000):013d}{DATA_SUFFIX}")
         dest = Path(dest)
         dest.parent.mkdir(parents=True, exist_ok=True)
         blocks = {
             "norm": bytes(self._norm),
             "name": bytes(self._name),
             "dirs": bytes(self._dirs),
+            "dirnorm": bytes(self._dirnorm),
             "diroff": self._diroff.tobytes(),
+            "dirnormoff": self._dirnormoff.tobytes(),
             "normoff": self._normoff.tobytes(),
             "recs": bytes(self._recs),
         }
@@ -240,19 +305,19 @@ class NameStoreBuilder:
                 except OSError:
                     pass
         if versioned:
-            _write_pointer(dest.name)
-            _sweep_old_data_files(dest)
+            _write_pointer(dest.name, kind)
+            _sweep_old_data_files(dest, kind)
         return dest
 
 
-def _write_pointer(data_name: str) -> None:
+def _write_pointer(data_name: str, kind: str = MAIN) -> None:
     fd, tmp = tempfile.mkstemp(prefix=".ptr-", dir=str(data_dir()))
     try:
         with os.fdopen(fd, "wb") as out:
             out.write(data_name.encode("utf-8"))
             out.flush()
             os.fsync(out.fileno())
-        os.replace(tmp, pointer_path())
+        os.replace(tmp, pointer_path(kind))
         tmp = ""
     finally:
         if tmp:
@@ -273,9 +338,9 @@ class NameStore:
     操作系统换出去，而不是一直压在进程的私有内存里。
     """
 
-    def __init__(self, path: Path | None = None) -> None:
+    def __init__(self, path: Path | None = None, *, kind: str = MAIN) -> None:
         if path is None:
-            resolved = current_data_path()
+            resolved = current_data_path(kind)
             if resolved is None:
                 raise NameStoreError("还没有可用的文件名索引")
             path = resolved
@@ -285,6 +350,7 @@ class NameStore:
         self._span: dict[str, tuple[int, int]] = {}
         self._norm_offsets = array("I")
         self._dir_offsets = array("I")
+        self._dirnorm_offsets = array("I")
         self.count = 0
         self.built_at = 0
         self._open()
@@ -332,6 +398,9 @@ class NameStore:
         off, length = self._span["diroff"]
         self._dir_offsets = array("I")
         self._dir_offsets.frombytes(mm[off: off + length])
+        off, length = self._span["dirnormoff"]
+        self._dirnorm_offsets = array("I")
+        self._dirnorm_offsets.frombytes(mm[off: off + length])
 
     def close(self) -> None:
         if self._mm is not None:
@@ -401,50 +470,250 @@ class NameStore:
         hit = self._mm.find(needle, off + start_rel, off + length)
         return -1 if hit < 0 else hit - off
 
-    def search(self, terms: list[str], *, limit: int = 100_000,
-               scope: str = "") -> list[int]:
-        """返回命中记录的序号。多个词是「与」的关系，与 SQLite 那条路口径一致。
+    def dir_norm(self, dir_id: int) -> str:
+        """某个目录的归一化路径。建库时已经算好，这里只是切一段出来。"""
+        return self._slice_until_newline(
+            "dirnorm", self._dirnorm_offsets[dir_id]).decode("utf-8", "surrogatepass")
 
-        做法就是 Everything 的做法：拿最长的那个词在归一化名字块里线性扫，
-        扫到的每个位置二分回查是第几条记录，再用剩下的词逐条复核。
-        用最长的词起手是因为它命中最少——候选集越小，后面复核越省。
+    def _dirs_matching(self, needle: str) -> set[int]:
+        """归一化路径里含 needle 的目录 id。
 
-        limit 是**召回上限**，不是最终条数：命中先全收（上限内），排序和截断交给
-        调用方，否则截断出来的就是磁盘遍历顺序里靠前的那些，跟相关度毫无关系。
+        直接在 DIRNORM 段上做 C 速度的子串扫描，一个目录字符串都不解码——
+        25 万个目录逐个 decode 再比对是查询延迟的大头。
         """
-        needles = [normalize(sqlite_safe_text(t)).encode("utf-8", "surrogatepass")
-                   for t in terms if t and t.strip()]
-        needles = [n for n in needles if n]
-        if not needles or self.count == 0:
-            return []
-        needles.sort(key=len, reverse=True)
-        primary, rest = needles[0], needles[1:]
-
-        offsets = self._norm_offsets
-        scope_norm = os.path.normcase(scope) if scope else ""
-        out: list[int] = []
-        seen_last = -1
-        pos = self._find_in_norm(primary, 0)
+        off, length = self._span["dirnorm"]
+        assert self._mm is not None
+        encoded = needle.encode("utf-8", "surrogatepass")
+        offsets = self._dirnorm_offsets
+        out: set[int] = set()
+        pos = self._mm.find(encoded, off, off + length)
         while pos >= 0:
-            # 同一条记录里出现多次只算一条；find 是单调前进的，所以同一条的
-            # 多次命中必然相邻，比一次 seen_last 就够，不必开集合
-            i = bisect.bisect_right(offsets, pos) - 1
-            if i >= 0 and i != seen_last:
-                seen_last = i
-                if self._matches(i, rest, scope_norm):
-                    out.append(i)
-                    if len(out) >= limit:
-                        break
-            pos = self._find_in_norm(primary, pos + 1)
+            out.add(bisect.bisect_right(offsets, pos - off) - 1)
+            pos = self._mm.find(encoded, pos + 1, off + length)
         return out
 
-    def _matches(self, i: int, rest: list[bytes], scope_norm: str) -> bool:
-        if rest:
-            name = self._slice_until_newline("norm", self._norm_offsets[i])
-            if not all(n in name for n in rest):
-                return False
+    def record_for(self, i: int) -> "_LazyRecord":
+        """第 i 条 → 判定用的记录。字段全部惰性求值：查询用不到的字段不解码。"""
+        return _LazyRecord(self, i)
+
+    def search(self, query, *, limit: int = 100_000, scope: str = "") -> list[int]:
+        """返回命中记录的序号。
+
+        两段式，与 Everything 一样：
+        ① **预筛**——从查询里抠出「必然出现在名字里的字面串」，拿最长的那个在归一化
+           名字块里线性扫（`bytes.find`，C 速度），扫到的位置二分回查是第几条记录。
+        ② **复核**——只对预筛出来的候选跑完整判定（通配符、大小、日期、非、正则）。
+
+        抠不出字面串时（比如只写了 `size:>1gb`）退化成逐条全扫。这条路慢得多，
+        所以能抠就抠——`*.pdf` 抠得出 `.pdf`，`ext:docx` 抠得出 `.docx`。
+
+        limit 是**召回上限**，不是最终条数：排序和截断交给调用方，否则截出来的
+        就是磁盘遍历顺序里靠前的那些，跟相关度毫无关系。
+        """
+        if isinstance(query, (list, tuple)):
+            query = namequery.from_terms(query)
+        if not query or self.count == 0:
+            return []
+        scope_norm = os.path.normcase(scope) if scope else ""
+        branches = query.prefilter()
+        if branches is None:
+            return self._scan_all(query, limit, scope_norm)
+        return self._scan_prefiltered(query, branches, limit, scope_norm)
+
+    def _accept(self, i: int, query, scope_norm: str) -> bool:
         if scope_norm:
             directory = self.directory(self._record(i)[0])
             if not os.path.normcase(directory).startswith(scope_norm):
                 return False
-        return True
+        return query.match(self.record_for(i))
+
+    def _scan_prefiltered(self, query, branches, limit, scope_norm) -> list[int]:
+        offsets = self._norm_offsets
+        found: set[int] = set()
+        out: list[int] = []
+        for needles in branches:
+            encoded = [n.encode("utf-8", "surrogatepass") for n in needles if n]
+            if not encoded:
+                return self._scan_all(query, limit, scope_norm)
+            # 用最长的那个起手：它命中最少，候选集越小后面复核越省
+            primary = max(encoded, key=len)
+            seen_last = -1
+            pos = self._find_in_norm(primary, 0)
+            while pos >= 0:
+                # find 单调前进，所以同一条记录的多次命中必然相邻，比一次就够
+                i = bisect.bisect_right(offsets, pos) - 1
+                if i >= 0 and i != seen_last:
+                    seen_last = i
+                    if i not in found and self._accept(i, query, scope_norm):
+                        found.add(i)
+                        out.append(i)
+                        if len(out) >= limit:
+                            return sorted(out)
+                pos = self._find_in_norm(primary, pos + 1)
+        return sorted(out)
+
+    def _scan_all(self, query, limit, scope_norm) -> list[int]:
+        if not scope_norm and query.needs() <= namequery.Query.METADATA_ONLY:
+            return self._scan_metadata_only(query, limit)
+        candidates = self._path_candidates(query)
+        source = range(self.count) if candidates is None else candidates
+        out: list[int] = []
+        for i in source:
+            if self._accept(i, query, scope_norm):
+                out.append(i)
+                if len(out) >= limit:
+                    break
+        return out
+
+    def _path_candidates(self, query) -> list[int] | None:
+        """靠目录表把路径查询的候选先压小；压不动就返回 None（老老实实全扫）。
+
+        路径 = 目录 + '/' + 名字，而目录只有 25 万个、被 200 万个文件共享。
+        先在目录里找，再按三种情形收候选：
+          ① 目录本身就含这个串 → 该目录下所有文件都算候选；
+          ② 串里带 '/'（明显在描述位置）→ 只可能跨边界，即「目录以 head 结尾
+             且 名字以 tail 开头」，按这个条件收；
+          ③ 串里不带 '/' → 还可能整个落在文件名里，用名字块的快扫补上。
+        实测 `src/pptx_finder` 4.7 秒 → 见下方压测。
+        """
+        literals = query.path_literals()
+        if not literals:
+            return None
+        needle = max(literals, key=len)
+        hit_dirs = self._dirs_matching(needle)
+
+        head, sep, tail = needle.rpartition("/")
+        boundary: dict[int, str] = {}
+        if sep and tail:
+            # 「目录以 head 结尾」＝ DIRNORM 段里含 "/head\n"（每条都以换行收尾），
+            # 于是这一步同样是一次 C 速度的扫描，不必逐个目录取出来比
+            for d in self._dirs_matching("/" + head + "\n"):
+                if d not in hit_dirs:
+                    boundary[d] = tail
+
+        out: list[int] = []
+        off, length = self._span["recs"]
+        assert self._mm is not None
+        raw = self._mm[off: off + length]
+        for i, (dir_id, _n, _s, _m, _f) in enumerate(struct.iter_unpack("<IIIII", raw)):
+            if dir_id in hit_dirs:
+                out.append(i)
+            elif dir_id in boundary and self.norm_name(i).startswith(boundary[dir_id]):
+                out.append(i)
+        if not sep:
+            # 串整个落在文件名里的情形，用名字块快扫补齐（'/' 不可能出现在文件名里，
+            # 所以带分隔符时这一步没有意义）
+            seen = set(out)
+            for i in self._name_hits(needle):
+                if i not in seen:
+                    out.append(i)
+            out.sort()
+        return out
+
+    def _name_hits(self, needle: str) -> list[int]:
+        encoded = needle.encode("utf-8", "surrogatepass")
+        offsets = self._norm_offsets
+        out: list[int] = []
+        seen_last = -1
+        pos = self._find_in_norm(encoded, 0)
+        while pos >= 0:
+            i = bisect.bisect_right(offsets, pos) - 1
+            if i >= 0 and i != seen_last:
+                seen_last = i
+                out.append(i)
+            pos = self._find_in_norm(encoded, pos + 1)
+        return out
+
+    def _scan_metadata_only(self, query, limit) -> list[int]:
+        """只看大小/时间/是否目录的查询：直接遍历 20 字节定长记录，一个字符串都不解码。
+
+        `size:` `dm:` `folder:` 这类查询抠不出任何名字片段，只能全扫；但它们
+        根本不需要名字。真机 200 万条实测 6.4 秒 → 0.3 秒。
+        """
+        off, length = self._span["recs"]
+        assert self._mm is not None
+        raw = self._mm[off: off + length]
+        root = query.root
+        out: list[int] = []
+        for i, (_dir_id, _name_off, size, mtime, flags) in enumerate(
+                struct.iter_unpack("<IIIII", raw)):
+            if root.match(_MetaRecord(size, mtime, bool(flags & FLAG_DIR))):
+                out.append(i)
+                if len(out) >= limit:
+                    break
+        return out
+
+
+class _MetaRecord:
+    """只带元数据的记录：给「不碰名字」的查询用，省掉全部字符串解码。"""
+
+    __slots__ = ("size", "mtime", "is_dir")
+
+    def __init__(self, size: int, mtime: int, is_dir: bool) -> None:
+        self.size = size
+        self.mtime = mtime
+        self.is_dir = is_dir
+
+
+class _LazyRecord:
+    """按需解码的记录。全扫时大部分字段根本用不到，提前算就是白算。"""
+
+    __slots__ = ("_store", "_i", "_rec", "_name", "_name_norm", "_path", "_path_norm")
+
+    def __init__(self, store: "NameStore", i: int) -> None:
+        self._store = store
+        self._i = i
+        self._rec = None
+        self._name = None
+        self._name_norm = None
+        self._path = None
+        self._path_norm = None
+
+    @property
+    def _record(self):
+        if self._rec is None:
+            self._rec = self._store._record(self._i)
+        return self._rec
+
+    @property
+    def size(self) -> int:
+        return self._record[2]
+
+    @property
+    def mtime(self) -> int:
+        return self._record[3]
+
+    @property
+    def is_dir(self) -> bool:
+        return bool(self._record[4] & FLAG_DIR)
+
+    @property
+    def name(self) -> str:
+        if self._name is None:
+            self._name = self._store.raw_name(self._i)
+        return self._name
+
+    @property
+    def name_norm(self) -> str:
+        if self._name_norm is None:
+            self._name_norm = self._store.norm_name(self._i)
+        return self._name_norm
+
+    @property
+    def path(self) -> str:
+        if self._path is None:
+            directory = self._store.directory(self._record[0])
+            self._path = os.path.join(directory, self.name) if directory else self.name
+        return self._path
+
+    @property
+    def path_norm(self) -> str:
+        """整条路径的归一化形式，用「目录归一化（已缓存）+ 名字归一化」拼出来。
+
+        直接 normalize(path) 会对每条记录跑一遍 NFKC + OpenCC——200 万条 27 秒。
+        目录部分被大量共享，算一次存着即可。
+        """
+        if self._path_norm is None:
+            d = self._store.dir_norm(self._record[0])
+            self._path_norm = f"{d}/{self.name_norm}" if d else self.name_norm
+        return self._path_norm

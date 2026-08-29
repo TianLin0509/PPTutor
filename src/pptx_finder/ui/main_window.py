@@ -30,7 +30,7 @@ try:
 except Exception:  # noqa: BLE001
     _WIN = False
 
-from .. import actions, db, history, indexer as indexer_mod, renderer as renderer_mod, search as search_mod, updater, __version__
+from .. import actions, db, history, indexer as indexer_mod, namestore, renderer as renderer_mod, search as search_mod, updater, __version__
 from ..config import (
     DOCX_EXT, PDF_EXT, PPTX_EXT, PPT_EXTS, SUPPORTED_EXTS, db_path as cfg_db_path,
     enabled_index_exts as cfg_enabled_index_exts, ext_path,
@@ -496,6 +496,12 @@ _TYPE_BUCKETS: tuple[tuple[str, tuple[str, ...], str], ...] = (
 # 与其等用户搜不到再去帮助里找原因，不如把限制写在他做选择的那一刻。
 ALL_FILES_SCOPE_LABEL = "全部文件（仅文件名）"
 
+#: 排序下拉的中文标签 → result_utils 的键。「不叠加」不在表里 → 取到 None = 不叠加。
+_SORT_LABELS = {
+    "相关度": "relevance", "最近修改": "recent", "文件名": "name",
+    "大小": "size", "路径": "path",
+}
+
 # 搜索行控件的（高度下限, 行高补白）。下限是从前写死的值，补白由 100% 倍率下的实测
 # 行高倒推：19px 行高 + 15 = 34（搜索框）、+ 11 = 30（两个下拉），所以 100% 及以下
 # 逐像素还是老样子，只有放大时才跟着长高。
@@ -678,8 +684,17 @@ class ResultItem(QWidget):
             sub.setStyleSheet(f"font-size:11.5px;color:{tok['ink4']};background:transparent;")
             lay.addWidget(sub)
 
-        # 第 3 行：修改时间（显式体现新旧）
+        # 第 3 行：修改时间 · 大小 · 所在位置
+        # Everything 的结果表里这三列一直都在。只给文件名和时间的话，「找到了但不知道
+        # 在哪、多大」——尤其在「全部文件」范围里，同名文件散落在十几个目录是常态。
         tm = _fmt_mtime(r.mtime)
+        meta = [tm] if tm else []
+        if not r.is_dir and r.size > 0:
+            meta.append(_fmt_size(r.size))
+        location = os.path.dirname(r.path)
+        if location:
+            meta.append(_elide_middle(location, 52))
+        tm = " · ".join(meta)
         if tm:
             if len(dup_paths) > 1:
                 tm = f"{tm} · 同一文件 · {len(dup_paths)} 个位置"
@@ -687,7 +702,8 @@ class ResultItem(QWidget):
             t.setStyleSheet(
                 f"font-size:11px;color:{tok['ink4']};background:transparent;"
                 'font-family:"Consolas","Microsoft YaHei UI";')
-            t.setToolTip("\n".join(dup_paths) if len(dup_paths) > 1 else "")
+            # 位置那段是省略过的，悬停给完整路径（多副本时列全部位置）
+            t.setToolTip("\n".join(dup_paths) if len(dup_paths) > 1 else r.path)
             lay.addWidget(t)
         if len(dup_paths) > 1:
             primary_path = dup_paths[0]
@@ -1321,16 +1337,25 @@ class MainWindow(QMainWindow):
         hr.addWidget(self.result_count, 1)
         self.sort_combo = QComboBox()
         self.sort_combo.setObjectName("sortCombo")
-        self.sort_combo.addItems(["相关度", "最近修改", "文件名"])
+        self.sort_combo.addItems(["相关度", "最近修改", "文件名", "大小", "路径"])
         self.sort_combo.setToolTip("第一排序条件")
         self.sort_combo.currentIndexChanged.connect(self._on_sort_changed)
         hr.addWidget(self.sort_combo, 0)
         self.sort_secondary = QComboBox()
         self.sort_secondary.setObjectName("sortSecondary")
-        self.sort_secondary.addItems(["不叠加", "最近修改", "文件名", "相关度"])
+        self.sort_secondary.addItems(
+            ["不叠加", "最近修改", "文件名", "相关度", "大小", "路径"])
         self.sort_secondary.setToolTip("第二排序条件；例如先按文件名，再按最近修改")
         self.sort_secondary.currentIndexChanged.connect(self._on_sort_changed)
         hr.addWidget(self.sort_secondary, 0)
+        self.sort_desc_btn = QPushButton("↓")
+        self.sort_desc_btn.setObjectName("chip")
+        self.sort_desc_btn.setCheckable(True)
+        self.sort_desc_btn.setAccessibleName("反向排序")
+        self.sort_desc_btn.setToolTip("反向排序（把当前顺序整个倒过来）")
+        self.sort_desc_btn.setFixedWidth(30)
+        self.sort_desc_btn.toggled.connect(self._on_sort_direction_changed)
+        hr.addWidget(self.sort_desc_btn, 0)
         self.case_sensitive_btn = QPushButton("Aa 大小写")
         self.case_sensitive_btn.setObjectName("chip")
         self.case_sensitive_btn.setCheckable(True)
@@ -2451,10 +2476,7 @@ class MainWindow(QMainWindow):
         ):
             return
         if self._indexer is not None and self._indexer.isRunning():
-            return  # 全盘扫描本身就在覆盖这些目录，不重复劳动也不抢写锁
-        conn_path = _sqlite_file_path(self._conn)
-        if not conn_path:
-            return  # 内存库（测试）没有独立连接可用，交由显式调用驱动
+            return  # 全盘扫描本身就在覆盖这些目录，不重复劳动
         batch = [
             self._dirty_inventory_dirs.pop()
             for _ in range(min(self._INVENTORY_DIRS_PER_ROUND, len(self._dirty_inventory_dirs)))
@@ -2462,11 +2484,8 @@ class MainWindow(QMainWindow):
         if not batch:
             return
         self._inventory_reconcile_inflight = True
-        exts = self._enabled_index_exts()
-        roots = tuple(self.index_roots())
         task = BackgroundTask(
-            lambda p=conn_path, dirs=tuple(batch), e=exts, r=roots:
-            self._reconcile_inventory_dirs_sync(p, dirs, e, r),
+            lambda dirs=tuple(batch): self._reconcile_inventory_dirs_sync(dirs),
             "inventory-dir-reconcile",
         )
         self._bg_tasks.append(task)
@@ -2475,29 +2494,75 @@ class MainWindow(QMainWindow):
             lambda task=task: self._finish_inventory_reconcile(task))
         task.start()
 
+    #: 增量层的条目上限。超了就不再收新的，交给下一轮全盘扫描统一并入——
+    #: 浏览器缓存这类目录一分钟能 churn 几千个文件，不封顶的话增量层会越滚越大，
+    #: 而每轮对账都要把它整份重扫一遍。
+    _OVERLAY_MAX_ENTRIES = 50_000
+
     @staticmethod
-    def _reconcile_inventory_dirs_sync(conn_path: str, dirs, exts, roots=()) -> dict:
-        own = db.connect(conn_path)
-        totals = {"added": 0, "removed": 0, "dirs": 0}
+    def _reconcile_inventory_dirs_sync(dirs) -> dict:
+        """把变化的目录重新列一遍，并入「增量层」索引。
+
+        这就是 Everything 在拿不到 NTFS 变更日志时走的那条路（目录变更通知 →
+        重列该目录）。日志那条路要管理员权限，本程序不提权，所以照搬它的备用机制。
+
+        实现上不去改那份 mmap 的全量索引——它是只读、整份重建的。而是维护第二份
+        同格式的小索引，搜索时两份一起扫、按路径去重。删除不用管：结果在显示前会
+        逐条 stat，已经不存在的自然消失。
+        """
+        totals = {"added": 0, "dirs": 0}
         try:
+            builder = namestore.NameStoreBuilder()
+            seen: set[str] = set()
+            # 先把上一版增量层原样搬过来，否则这一轮只保留本批目录的内容，
+            # 上一批刚发现的新文件会当场消失
+            previous = namestore.open_store(namestore.OVERLAY)
+            if previous is not None:
+                try:
+                    for i in range(previous.count):
+                        path, _name, size, mtime, is_dir = previous.entry(i)
+                        key = os.path.normcase(path)
+                        if key in seen or not os.path.exists(path):
+                            continue      # 顺手把已经删掉的条目扔掉，别让增量层只涨不消
+                        seen.add(key)
+                        (builder.add_dir(path, mtime) if is_dir
+                         else builder.add(path, size, mtime))
+                finally:
+                    previous.close()
             for directory in dirs:
                 try:
-                    res = indexer_mod.reconcile_inventory_dir(
-                        own, directory, allowed_exts=exts, index_roots=roots)
-                except Exception:  # noqa: BLE001 单目录失败不拖垮整批
-                    _log.debug("inventory dir reconcile failed %s", directory, exc_info=True)
-                    continue
-                totals["added"] += int(res.get("added", 0))
-                totals["removed"] += int(res.get("removed", 0))
+                    entries = list(os.scandir(directory))
+                except OSError:
+                    continue              # 目录本身刚被删/无权限：跳过，不算失败
                 totals["dirs"] += 1
-        finally:
-            own.close()
+                for entry in entries:
+                    if len(seen) >= MainWindow._OVERLAY_MAX_ENTRIES:
+                        break
+                    try:
+                        key = os.path.normcase(entry.path)
+                        if key in seen or entry.name.startswith("~$"):
+                            continue
+                        seen.add(key)
+                        st = entry.stat()
+                        if entry.is_dir(follow_symlinks=False):
+                            builder.add_dir(entry.path, st.st_mtime)
+                        else:
+                            builder.add(entry.path, st.st_size, st.st_mtime)
+                        totals["added"] += 1
+                    except OSError:
+                        continue
+            builder.write(kind=namestore.OVERLAY)
+        except Exception as exc:  # noqa: BLE001 增量层是尽力而为，坏了也不能影响主索引
+            # 用 warning 而不是 debug：这里一旦坏掉，表现是「新文件永远搜不到」，
+            # 没有任何报错——只能靠日志发现。totals 也记一笔，方便体检面板看到。
+            _log.warning("overlay rebuild failed", exc_info=True)
+            totals["error"] = f"{type(exc).__name__}: {exc}"
         return totals
 
     def _on_inventory_reconciled(self, payload: object) -> None:
         if not isinstance(payload, dict):
             return
-        if int(payload.get("added", 0)) or int(payload.get("removed", 0)):
+        if int(payload.get("added", 0)) or int(payload.get("dirs", 0)):
             self._index_status_cache = None
             self._refresh_status()
 
@@ -3540,24 +3605,24 @@ class MainWindow(QMainWindow):
         return self._start_indexing(None, None)
 
     def _sort_key(self) -> str:
-        return {"相关度": "relevance", "最近修改": "recent", "文件名": "name"}.get(
-            self.sort_combo.currentText(), "relevance")
+        return _SORT_LABELS.get(self.sort_combo.currentText(), "relevance")
 
     def _sort_keys(self) -> tuple[str, ...]:
         primary = self._sort_key()
-        secondary = {
-            "最近修改": "recent",
-            "文件名": "name",
-            "相关度": "relevance",
-        }.get(self.sort_secondary.currentText())
+        secondary = _SORT_LABELS.get(self.sort_secondary.currentText())
         return tuple(dict.fromkeys(k for k in (primary, secondary) if k))
 
     def _apply_sort_render(self) -> None:
         base = self._results_raw
         if self._facet_filters:
             base = facet_filter(base, self._facet_filters, datetime.datetime.now().timestamp())
-        self._results = _sort_results(base, self._sort_keys())
+        self._results = _sort_results(
+            base, self._sort_keys(), descending=self.sort_desc_btn.isChecked())
         self._render_results(self._results)
+
+    def _on_sort_direction_changed(self, descending: bool) -> None:
+        self.sort_desc_btn.setText("↑" if descending else "↓")
+        self._on_sort_changed()
 
     def _on_sort_changed(self) -> None:
         if self._search_pending_req is not None:

@@ -20,6 +20,12 @@ def empty_suggestions(query: str, mode: str) -> list[str]:
     return suggestion_keys(query, mode_key_from_text(mode))
 
 
+#: 可选的排序键。Everything 的结果表能按大小、路径、时间、名字排，还能反向；
+#: 只给「相关度 / 最近修改 / 文件名」三档、方向还写死，在「全部文件」范围里
+#: 明显不够用——按大小找出占地方的大文件是这类工具最常见的用法之一。
+SORT_KEYS = ("relevance", "recent", "name", "size", "path")
+
+
 def _sort_key_for(r, keys: tuple[str, ...]) -> tuple:
     out: list = []
     for key in keys:
@@ -27,6 +33,10 @@ def _sort_key_for(r, keys: tuple[str, ...]) -> tuple:
             out.append(-float(r.mtime or 0.0))
         elif key == "name":
             out.append(str(r.name or "").casefold())
+        elif key == "size":
+            out.append(-int(getattr(r, "size", 0) or 0))     # 默认从大到小
+        elif key == "path":
+            out.append(str(r.path or "").casefold())
         else:  # relevance
             out.extend(relevance_components(r))
     # Deterministic fallback. Recency is already a soft part of score, while an
@@ -49,13 +59,20 @@ def _regroup_relevance(ordered: list) -> list:
     return [r for key in order for r in grouped[key]]
 
 
-def sort_results(results: list, key: str | tuple[str, ...] | list[str]) -> list:
+def sort_results(results: list, key: str | tuple[str, ...] | list[str],
+                 *, descending: bool = False) -> list:
+    """排序。descending 把整个顺序反过来（Everything 的列头点第二下）。
+
+    反向不是逐键取反，而是整体倒置——用户点「反向」时期望的就是「现在这个列表
+    倒过来」，逐键取反在多键排序下会得出一个谁也预料不到的顺序。
+    """
     keys = (key,) if isinstance(key, str) else tuple(key)
-    keys = tuple(dict.fromkeys(k for k in keys if k in {"relevance", "recent", "name"}))
+    keys = tuple(dict.fromkeys(k for k in keys if k in SORT_KEYS))
     if not keys:
         keys = ("relevance",)
     ordered = sorted(results, key=lambda r: _sort_key_for(r, keys))
-    return _regroup_relevance(ordered) if keys[0] == "relevance" else ordered
+    ordered = _regroup_relevance(ordered) if keys[0] == "relevance" else ordered
+    return list(reversed(ordered)) if descending else ordered
 
 
 def time_bucket(mtime: float, now_ts: float) -> str:

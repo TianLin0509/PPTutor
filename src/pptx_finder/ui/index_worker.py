@@ -162,6 +162,9 @@ class IndexWorker(QThread):
                 # 而且**不报错**——比干脆没有索引更难发现。
                 try:
                     dest = name_builder.write()
+                    # 全量刚刷新过，增量层记的那些「上一份全量之后的变化」已经
+                    # 全部并进来了，留着只是重复劳动（每轮对账都要整份重扫）
+                    namestore.discard(namestore.OVERLAY)
                     summary["name_index_entries"] = len(name_builder)
                     log.info("name index rebuilt: %d entries -> %s",
                              len(name_builder), dest)

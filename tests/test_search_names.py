@@ -305,3 +305,69 @@ def test_folders_that_no_longer_exist_are_filtered_too(tmp_path):
         assert len(_search_mod.search_names(store, "vanishing")) == 1
         d.rmdir()
         assert _search_mod.search_names(store, "vanishing") == []
+
+
+# ---------------------------------------------------------------- 实时更新（增量层）
+
+def test_new_file_is_findable_via_the_overlay(tmp_path):
+    """全量索引之后新建的文件，靠增量层立刻能搜到。
+
+    这就是 Everything 拿不到 NTFS 变更日志时的做法：目录变更通知 → 重列该目录。
+    没有这一层的话，新文件要等下一轮全盘扫描（最坏一周）才进得了结果。
+    """
+    old = tmp_path / "already-indexed.txt"
+    old.write_text("x", encoding="utf-8")
+    b = namestore.NameStoreBuilder()
+    b.add(str(old), 1, BASE_T)
+    b.write()
+
+    fresh = tmp_path / "just-created.txt"
+    fresh.write_text("x", encoding="utf-8")
+    o = namestore.NameStoreBuilder()
+    o.add(str(fresh), 1, BASE_T + 900)
+    o.write(kind=namestore.OVERLAY)
+
+    stores = [namestore.open_store(k) for k in namestore.KINDS]
+    try:
+        got = {r.name for r in _search_mod.search_names(stores, ".txt")}
+    finally:
+        for s in stores:
+            s.close()
+    assert got == {"already-indexed.txt", "just-created.txt"}
+
+
+def test_a_file_in_both_layers_appears_once(tmp_path):
+    """同一个文件同时在全量和增量层里时只能出一条，且用增量层里的新数据。"""
+    f = tmp_path / "edited.txt"
+    f.write_text("x", encoding="utf-8")
+    b = namestore.NameStoreBuilder()
+    b.add(str(f), 111, BASE_T)
+    b.write()
+    o = namestore.NameStoreBuilder()
+    o.add(str(f), 999, BASE_T + 500)
+    o.write(kind=namestore.OVERLAY)
+
+    stores = [namestore.open_store(k) for k in namestore.KINDS]
+    try:
+        got = _search_mod.search_names(stores, "edited")
+    finally:
+        for s in stores:
+            s.close()
+    assert len(got) == 1
+    assert got[0].size == 999            # 增量层在后，覆盖全量里的旧值
+    assert got[0].mtime == BASE_T + 500
+
+
+def test_overlay_alone_works_when_there_is_no_full_index(tmp_path):
+    """还没建过全量索引时，增量层自己也要能用（首次启动的窗口期）。"""
+    f = tmp_path / "solo.txt"
+    f.write_text("x", encoding="utf-8")
+    o = namestore.NameStoreBuilder()
+    o.add(str(f), 1, BASE_T)
+    o.write(kind=namestore.OVERLAY)
+    stores = [s for s in (namestore.open_store(k) for k in namestore.KINDS) if s]
+    try:
+        assert [r.name for r in _search_mod.search_names(stores, "solo")] == ["solo.txt"]
+    finally:
+        for s in stores:
+            s.close()

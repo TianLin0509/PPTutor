@@ -11,7 +11,7 @@ from collections.abc import Callable
 from difflib import SequenceMatcher
 from functools import lru_cache
 
-from . import cluster
+from . import cluster, namequery
 from .models import FileResult, SearchHit
 from .ranking import relevance_components
 from .text_tokenize import SEPARATOR_CLASS, char_match, normalize, parse_query
@@ -690,14 +690,28 @@ def search_names(store, query: str, *, limit: int = 200,
         排序当场作废；
       · 不入库、不持久化 → 全应用没有任何地方存过 file_id，用完即弃是安全的。
     """
-    terms, phrases = parse_query(query)
-    words = [w for w in (terms + phrases) if w.strip()]
-    if not words:
+    # 这个范围用 Everything 那套语法（通配符 / ext: / size: / dm: / | / !），
+    # 而不是 PPT 内容搜索的 parse_query——两者的用户习惯完全不同。
+    # 语法写错时当零结果处理，不能让搜索线程抛异常。
+    try:
+        parsed = namequery.parse(query)
+    except namequery.QueryError as exc:
+        log.info("bad all-files query %r: %s", query, exc)
         return []
+    if not parsed:
+        return []
+    terms, phrases = parse_query(query)
 
-    ordinals = store.search(words, limit=max(1, int(recall_limit)),
-                            scope=scope or "")
-    if not ordinals:
+    # 可以传一个 store，也可以传一串。传一串时后面的覆盖前面的同名路径——
+    # 增量层放在后面，这样刚改过的文件用的是新的大小/时间，而不是全量里的旧值。
+    stores = [store] if not isinstance(store, (list, tuple)) else list(store)
+    hits: list[tuple[object, int]] = []
+    for st in stores:
+        if st is None:
+            continue
+        for i in st.search(parsed, limit=max(1, int(recall_limit)), scope=scope or ""):
+            hits.append((st, i))
+    if not hits:
         return []
 
     ext_filter = {e.lower() for e in exts} if exts else None
@@ -712,15 +726,18 @@ def search_names(store, query: str, *, limit: int = 200,
     case_needles = _case_rank_needles(query)
     has_case_signal = bool(case_needles)
 
-    rows = []
-    for i in ordinals:
-        path, name, size, mtime, is_dir = store.entry(i)
+    by_path: dict[str, tuple] = {}
+    for st, i in hits:
+        path, name, size, mtime, is_dir = st.entry(i)
         # 文件夹没有扩展名概念，按扩展名过滤时（选了 Word/PDF 之类）要整体排除，
         # 否则「只看 PDF」会莫名其妙冒出一堆目录
         ext = "" if is_dir else os.path.splitext(name)[1].lower()
         if ext_filter is not None and (is_dir or ext not in ext_filter):
             continue
-        rows.append((path, name, ext, size, float(mtime), is_dir))
+        # 同一个文件可能同时出现在全量和增量层里；按大小写无关的路径去重，
+        # 否则用户会看到两条一模一样的结果
+        by_path[os.path.normcase(path)] = (path, name, ext, size, float(mtime), is_dir)
+    rows = list(by_path.values())
     if not rows:
         return []
 
