@@ -186,3 +186,39 @@ def test_known_gaps_are_declared_not_hidden():
     """没做的 Everything 功能逐条写在 KNOWN_GAPS 里，不假装支持。"""
     assert namequery.KNOWN_GAPS
     assert all(isinstance(g, str) and g for g in namequery.KNOWN_GAPS)
+
+
+# ---------------------------------------------------------------- 变音符号
+
+def test_diacritics_are_ignored(tmp_path, monkeypatch):
+    """Everything 有「Ignore Diacritics」：打 resume 要能找到 résumé。"""
+    monkeypatch.setenv("PPTX_FINDER_DATA_DIR", str(tmp_path / "appdata"))
+    for name in ("résumé.pdf", "Ünïcödé.txt", "plain.txt"):
+        (tmp_path / name).write_text("x", encoding="utf-8")
+    entries = [(str(tmp_path / n), 10, BASE_T)
+               for n in ("résumé.pdf", "Ünïcödé.txt", "plain.txt")]
+    with _store(entries) as store:
+        assert [r.name for r in search.search_names(store, "resume")] == ["résumé.pdf"]
+        assert [r.name for r in search.search_names(store, "unicode")] == ["Ünïcödé.txt"]
+        # 反过来也要成立：带变音符号去搜同样命中
+        assert [r.name for r in search.search_names(store, "résumé")] == ["résumé.pdf"]
+
+
+def test_diacritic_folding_keeps_exact_match_ranking(tmp_path, monkeypatch):
+    """匹配时折了，评「完全匹配」时也得折，否则命中了却评不到最高档。"""
+    monkeypatch.setenv("PPTX_FINDER_DATA_DIR", str(tmp_path / "appdata"))
+    for name in ("résumé.pdf", "my-resume-backup.pdf"):
+        (tmp_path / name).write_text("x", encoding="utf-8")
+    entries = [(str(tmp_path / "résumé.pdf"), 10, BASE_T),
+               (str(tmp_path / "my-resume-backup.pdf"), 10, BASE_T + 99999)]
+    with _store(entries) as store:
+        got = [r.name for r in search.search_names(store, "resume")]
+    assert got[0] == "résumé.pdf"          # 完全匹配压过更新的部分匹配
+
+
+def test_ppt_content_search_still_distinguishes_diacritics(tmp_path):
+    """折变音符号只加在文件搜索这一层。PPT 内容搜索的归一化口径没变。"""
+    from pptx_finder.text_tokenize import normalize
+
+    assert normalize("résumé") == "résumé"      # 通用 normalize 不折
+    assert namequery.fold("résumé") == "resume"  # 文件搜索这一层才折

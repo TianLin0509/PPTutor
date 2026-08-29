@@ -38,6 +38,7 @@ import calendar
 import datetime as _dt
 import fnmatch
 import re
+import unicodedata
 from dataclasses import dataclass, field
 
 from .db import sqlite_safe_text
@@ -50,6 +51,31 @@ KNOWN_GAPS = (
 )
 
 _MAX_REGEX_LEN = 500
+
+#: 变音符号（Unicode 的 Mn 类：组合用重音、变音点等）
+_COMBINING = "Mn"
+
+
+def fold(text: str, *, case_sensitive: bool = False) -> str:
+    """按名字找文件专用的归一化：在通用 normalize 之上再去掉变音符号。
+
+    Everything 有「Ignore Diacritics」，打 `resume` 要能找到 `résumé`。通用的
+    `normalize`（NFKC + 繁简 + 大小写）**不能**加这一步——它同时服务 PPT 内容
+    搜索，改了就会改变 PPT 的搜索行为，而那是不能碰的。所以只在这一层加。
+
+    索引与查询必须调同一个函数，否则两边口径不一致就等于搜不到。
+
+    case_sensitive=True 保留大小写但**照样折变音符号**：排序时要判断「用户打的
+    大小写是否与文件名一致」，那一步如果拿没折过的名字去比，`resume` 会被判成
+    「与 résumé.pdf 大小写不符」，于是明明是完全匹配却被降档压到后面。
+    """
+    base = normalize(sqlite_safe_text(text), case_sensitive=case_sensitive)
+    if base.isascii():
+        return base                      # 绝大多数文件名走这条捷径，不进 NFD
+    decomposed = unicodedata.normalize("NFD", base)
+    stripped = "".join(
+        ch for ch in decomposed if unicodedata.category(ch) != _COMBINING)
+    return unicodedata.normalize("NFC", stripped)
 
 # 命名大小档，取值与 Everything 一致（字节）
 _NAMED_SIZES = {
@@ -151,7 +177,7 @@ class Record:
     @property
     def path_norm(self) -> str:
         if self._path_norm is None:
-            self._path_norm = normalize(sqlite_safe_text(self.path))
+            self._path_norm = fold(self.path)
         return self._path_norm
 
 
@@ -245,14 +271,14 @@ class _Term(_Node):
             # 加了 \Z，起点要靠 match() 来锚——用 search() 的话 `report*` 会
             # 命中 my-report.pdf，「以…开头」就废了。
             pattern = fnmatch.translate(
-                text if self.case_sensitive else normalize(text))
+                text if self.case_sensitive else fold(text))
             self._rx = re.compile(pattern)
             self._anchored = True
         elif self.whole_word:
-            body = re.escape(text if self.case_sensitive else normalize(text))
+            body = re.escape(text if self.case_sensitive else fold(text))
             self._rx = re.compile(rf"(?<![0-9A-Za-z]){body}(?![0-9A-Za-z])")
         else:
-            self._needle = text if self.case_sensitive else normalize(text)
+            self._needle = text if self.case_sensitive else fold(text)
 
     def _subject(self, rec: Record) -> str:
         if self.on_path:
@@ -372,6 +398,25 @@ class Query:
     def needs(self) -> frozenset[str]:
         """这条查询读哪些字段。全扫时据此选快路。"""
         return frozenset() if self.root is None else self.root.needs()
+
+    def regex_candidates(self):
+        """「与」链上那个正则，用于在名字块上一次性扫出候选。
+
+        正则得逐条拿名字比，200 万条要 2 秒。但名字块本身是 '\\n' 分隔的，用
+        MULTILINE 在整块上跑一遍，`^`/`$` 的含义与「对单个名字跑」完全一致
+        （`.` 本来就不跨行），于是可以一次扫完再回查是第几条。
+        扫出来的是候选，仍会逐条复核，所以即使某个模式跨行匹配也不会出错。
+        """
+        node = self.root
+        if isinstance(node, _And):
+            node = next((p for p in node.parts if isinstance(p, _Regex)), None)
+        if not isinstance(node, _Regex):
+            return None
+        try:
+            return re.compile(node.pattern.encode("utf-8", "surrogatepass"),
+                              re.IGNORECASE | re.MULTILINE)
+        except (re.error, UnicodeEncodeError):
+            return None
 
     def path_literals(self) -> list[str]:
         """「与」链上那些拿完整路径匹配的字面串。

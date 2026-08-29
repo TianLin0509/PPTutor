@@ -2343,10 +2343,23 @@ class MainWindow(QMainWindow):
 
     def _sync_mode_for_scope(self) -> None:
         """「全部文件」范围下把模式下拉置灰：那里只有文件名可搜，给选择只会误导。"""
+        all_files = self._all_files_scope()
+        box = getattr(self, "search_box", None)
+        if box is not None:
+            # 换范围就换提示语。`ext:pdf` `size:>10mb` 这些能力藏着不说等于没做，
+            # 输入框本身是最自然的说明位置。
+            box.setPlaceholderText(
+                "按文件名找任意文件 / 文件夹，支持 *.pdf、ext:docx、size:>10mb…"
+                if all_files else "搜索 PPT 内容 / 文件名…")
+            box.setToolTip(
+                "Everything 式语法：*.pdf 通配符 · ext:pdf;docx 扩展名 · "
+                "size:>10mb 大小 · dm:today 修改时间 · a|b 或 · !b 排除 · "
+                "folder: 只看文件夹 · 写 \\ 或 / 时按完整路径找"
+                if all_files
+                else '多词完整短语优先；空格 = 同时含；"引号" = 只搜短语')
         mode = getattr(self, "mode", None)
         if mode is None:
             return
-        all_files = self._all_files_scope()
         mode.setEnabled(not all_files)
         mode.setToolTip(
             f"「{ALL_FILES_SCOPE_LABEL}」范围下只登记了文件名，没有内容可搜。"

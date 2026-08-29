@@ -11,8 +11,15 @@ from pathlib import Path
 from .config import EXCLUDE_DIR_NAMES, SUPPORTED_EXTS, data_dir
 from .path_policy import explicit_project_output_roots, is_project_output_path
 
+DRIVE_REMOVABLE = 2
 DRIVE_FIXED = 3
-SCAN_POLICY_VERSION = "5"  # v5: consistent project-output policy + explicit-root opt-in
+#: 会自动纳入索引的盘类型。可移动盘（U 盘、移动硬盘）也算——Everything 同样索引
+#: 它们，而「插上 U 盘却搜不到里面的东西」正是用户会当成 bug 的行为。
+#: 拔掉之后那些条目会在结果显示前的存在性检查里自然消失，不会留下幽灵。
+#: 网络盘（DRIVE_REMOTE=4）仍然不自动扫：一次全盘遍历可能要走很久的网络，
+#: 需要用户在设置里显式把 UNC 路径加成索引根。
+_INDEXED_DRIVE_TYPES = (DRIVE_FIXED, DRIVE_REMOVABLE)
+SCAN_POLICY_VERSION = "6"  # v6: 可移动盘纳入自动索引
 
 
 def _norm_path(path: str | os.PathLike[str]) -> str:
@@ -48,7 +55,7 @@ def _is_system_temp_subtree(
 
 
 def fixed_drives() -> list[str]:
-    """返回所有本地固定磁盘根（如 ['C:\\\\', 'D:\\\\']）。"""
+    """返回所有会自动索引的本地磁盘根（固定盘 + 可移动盘）。"""
     drives: list[str] = []
     try:
         bitmask = ctypes.windll.kernel32.GetLogicalDrives()
@@ -56,8 +63,11 @@ def fixed_drives() -> list[str]:
             if not (bitmask & (1 << i)):
                 continue
             root = f"{letter}:\\"
-            if ctypes.windll.kernel32.GetDriveTypeW(root) == DRIVE_FIXED:
-                drives.append(root)
+            if ctypes.windll.kernel32.GetDriveTypeW(root) not in _INDEXED_DRIVE_TYPES:
+                continue
+            if not os.path.isdir(root):
+                continue    # 读卡器插着但没插卡：盘符在，根目录打不开
+            drives.append(root)
     except Exception:  # noqa: BLE001 非 Windows 或调用失败时回退
         pass
     return drives or [str(Path.home())]

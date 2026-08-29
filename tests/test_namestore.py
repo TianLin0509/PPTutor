@@ -12,7 +12,7 @@ import struct
 
 import pytest
 
-from pptx_finder import namestore
+from pptx_finder import namequery, namestore
 from pptx_finder.text_tokenize import normalize
 
 
@@ -273,12 +273,18 @@ def test_pointer_pointing_outside_the_data_dir_is_refused(tmp_path):
 
 
 def test_normalization_matches_the_sqlite_path(tmp_path):
-    """归一化必须与 search.py 用的是同一个函数——两套口径就等于搜不到。"""
+    """索引与查询必须调同一个归一化函数——两套口径就等于搜不到。
+
+    这里用的是 namequery.fold（normalize + 去变音符号），不是通用的 normalize：
+    按名字找文件要忽略变音符号（打 resume 找 résumé），而 PPT 内容搜索不折。
+    """
     names = ["Ünïcödé.txt", "全形ＡＢＣ.txt", "繁體中文.txt", "MiXeD.TXT"]
+    assert namequery.fold("Ünïcödé.txt") == "unicode.txt"       # 变音符号被折掉
+    assert namequery.fold("繁體中文.txt") == "繁体中文.txt"        # 繁简仍照旧
     path = _build([(rf"C:\x\{n}", 1, 1_700_000_000) for n in names])
     with namestore.NameStore(path) as store:
         for n in names:
-            assert store.norm_name(names.index(n)) == normalize(n)
+            assert store.norm_name(names.index(n)) == namequery.fold(n)
             assert len(store.search([n])) == 1
 
 

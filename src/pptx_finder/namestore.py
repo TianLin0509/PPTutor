@@ -64,7 +64,7 @@ from .text_tokenize import normalize
 log = logging.getLogger(__name__)
 
 MAGIC = b"PPTDNAM\x01"
-FORMAT_VERSION = 2
+FORMAT_VERSION = 3
 #: 头部预留大小。留足余量：每加一个段就多 16 字节，装不下的话
 #: `header[:len(packed)] = packed` 会把 bytearray 撑长，于是头部悄悄盖掉第一个段
 #: 的开头、所有偏移全错——不报错，只是搜出来的东西是乱的。下面有断言兜底。
@@ -210,7 +210,7 @@ class NameStoreBuilder:
             # 每次都要现跑一遍 NFKC + OpenCC——真机实测头一条路径查询要为此多花约
             # 2.7 秒。存进来只多占 13% 体积，而且路径匹配可以直接在这一段上做
             # C 速度的子串扫描，连解码都省了。
-            self._dirnorm += normalize(sqlite_safe_text(clean)).replace(
+            self._dirnorm += namequery.fold(clean).replace(
                 "\\", "/").encode("utf-8", "surrogatepass") + b"\n"
         return dir_id
 
@@ -242,8 +242,9 @@ class NameStoreBuilder:
         # 归一化副本必须与 SQLite 那条路逐字节同口径（db.py 也是先 sqlite_safe_text
         # 再 normalize），否则两边搜同一个词会得出不同结果。顺带挡住 OpenCC——
         # 它拿到孤立代理项会直接抛 UnicodeEncodeError，真机上足以让整轮扫盘半途炸掉。
-        self._norm += normalize(
-            sqlite_safe_text(base)).encode("utf-8", "surrogatepass") + b"\n"
+        # fold = normalize + 去掉变音符号。索引与查询必须调同一个函数，否则
+        # 打 resume 找不到 résumé——两边口径不一致就等于搜不到。
+        self._norm += namequery.fold(base).encode("utf-8", "surrogatepass") + b"\n"
         self._recs += struct.pack(
             "<IIIII", dir_id, name_off, int(size),
             max(0, min(int(mtime), 0xFFFFFFFF)), int(flags),
@@ -351,6 +352,7 @@ class NameStore:
         self._norm_offsets = array("I")
         self._dir_offsets = array("I")
         self._dirnorm_offsets = array("I")
+        self._name_offs: array | None = None
         self.count = 0
         self.built_at = 0
         self._open()
@@ -556,6 +558,8 @@ class NameStore:
         if not scope_norm and query.needs() <= namequery.Query.METADATA_ONLY:
             return self._scan_metadata_only(query, limit)
         candidates = self._path_candidates(query)
+        if candidates is None:
+            candidates = self._regex_candidates(query)
         source = range(self.count) if candidates is None else candidates
         out: list[int] = []
         for i in source:
@@ -609,6 +613,37 @@ class NameStore:
                     out.append(i)
             out.sort()
         return out
+
+    def _name_offsets(self) -> array:
+        """每条记录在 NAME 段里的起始偏移。按录入顺序单调递增，可直接二分。
+
+        只在正则查询时才建（200 万条约 0.3 秒），建好挂在 store 上复用。
+        """
+        if self._name_offs is None:
+            off, length = self._span["recs"]
+            assert self._mm is not None
+            raw = self._mm[off: off + length]
+            self._name_offs = array(
+                "I", (r[1] for r in struct.iter_unpack("<IIIII", raw)))
+        return self._name_offs
+
+    def _regex_candidates(self, query) -> list[int] | None:
+        """正则查询：在 NAME 段上整块跑一遍，把命中位置回查成记录序号。"""
+        pattern = query.regex_candidates()
+        if pattern is None:
+            return None
+        off, length = self._span["name"]
+        assert self._mm is not None
+        blob = self._mm[off: off + length]
+        offsets = self._name_offsets()
+        out: list[int] = []
+        seen_last = -1
+        for m in pattern.finditer(blob):
+            i = bisect.bisect_right(offsets, m.start()) - 1
+            if i >= 0 and i != seen_last:
+                seen_last = i
+                out.append(i)
+        return sorted(set(out))
 
     def _name_hits(self, needle: str) -> list[int]:
         encoded = needle.encode("utf-8", "surrogatepass")

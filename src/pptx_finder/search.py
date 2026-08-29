@@ -719,7 +719,10 @@ def search_names(store, query: str, *, limit: int = 200,
     # 那个只认 .pptx/.ppt 的 _stem_name——否则搜 report 时 report.txt 永远评不到
     # 「完全匹配」档，会被一个更新的 report-2026.txt 压在下面。而按名字找文件的
     # 场景里，「名字就是它」本来就该排第一。
-    q_norm = normalize(query, case_sensitive=case_sensitive).strip()
+    # 排序口径要跟匹配口径一致：匹配时 résumé 折成 resume，评「完全匹配」时
+    # 也得折，否则搜 resume 命中了 résumé.pdf 却评不到最高档。
+    q_norm = (query.strip() if case_sensitive
+              else namequery.fold(query).strip())
     q_stem = os.path.splitext(q_norm)[0] or q_norm
     full_phrase = _full_query_phrase(terms, phrases, case_sensitive=case_sensitive)
     query_exact = _compact_normalized(query, case_sensitive=case_sensitive)
@@ -749,9 +752,11 @@ def search_names(store, query: str, *, limit: int = 200,
 
     results: list[FileResult] = []
     for path, name, ext, size, mtime, is_dir in rows:
-        normalized_name = normalize(name, case_sensitive=case_sensitive)
+        normalized_name = (name if case_sensitive else namequery.fold(name))
         stem = os.path.splitext(normalized_name)[0] or normalized_name
-        case_preserved_name = unicodedata.normalize("NFKC", name)
+        # 折过变音符号但保留大小写：不折的话 résumé.pdf 会被判成「与 resume
+        # 大小写不符」，明明是完全匹配却被降档压到后面。
+        case_preserved_name = namequery.fold(name, case_sensitive=True)
         # 连名带扩展名打全（report.txt）和只打名字（report）都算「就是它」
         if q_norm and (normalized_name == q_norm or stem == q_stem):
             bonus = 2.0
