@@ -10,6 +10,7 @@ dev 下 pytest 全绿但 frozen 漏了词典，会在这里暴露。
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import ssl
 import tempfile
@@ -32,6 +33,78 @@ CASES = [
     ("docx内容(文档专属词)", "文档专属词", "11_docx.docx", True),
     ("pdf内容ASCII(pypdf抽取)", "PdfSampleKeyword", "14_pdf.pdf", True),
 ]
+
+
+#: 「全部文件」范围的自检用例：(用例名, 查询, 期望命中的文件名集合)。
+#: 这些名字由 _run_names 现造，不依赖自检集的内容，只考「打包后这条路还通不通」。
+NAME_CASES = [
+    ("通配符(*.pdf)", "*.pdf", {"budget.pdf"}),
+    ("扩展名(ext:md)", "ext:md", {"readme.md", "NOTES.md"}),
+    ("多扩展名(ext:md;pdf)", "ext:md;pdf", {"readme.md", "NOTES.md", "budget.pdf"}),
+    ("大小(size:>2kb)", "size:>2kb ext:md", {"NOTES.md"}),
+    ("或(a|b)", "budget|notes", {"budget.pdf", "NOTES.md"}),
+    ("非(!)", "ext:md !notes", {"readme.md"}),
+    # path: 匹配的是完整路径，所以根目录本身和子目录里的文件也都算命中
+    ("路径(path:)", "path:名字自检", {"名字自检", "readme.md", "NOTES.md",
+                                     "budget.pdf", "résumé.txt",
+                                     "子目录", "自检文件.txt"}),
+    ("正则(regex:)", r"regex:^budget\.", {"budget.pdf"}),
+    ("区分大小写(case:)", "case:NOTES", {"NOTES.md"}),
+    ("变音符号折叠(resume→résumé)", "resume", {"résumé.txt"}),
+    ("文件夹(folder:)", "folder: 子目录", {"子目录"}),
+    ("中文名", "自检文件", {"自检文件.txt"}),
+]
+
+
+def _run_names(workdir: Path) -> dict:
+    """「全部文件」范围（平铺索引 + Everything 语法）在 frozen 下的自检。
+
+    v1.5.0 的主功能整条走的是 namestore/namequery/search_names，而原来的自检
+    一条都没覆盖到——打包漏了什么只会表现为「搜不到」，没有任何报错。这里现造
+    几个带中文名、带变音符号、大小写不同的文件，把已实现的语法逐条过一遍。
+    """
+    from . import namestore, search
+
+    root = workdir / "名字自检"
+    (root / "子目录").mkdir(parents=True, exist_ok=True)
+    (root / "readme.md").write_text("x", encoding="utf-8")
+    (root / "NOTES.md").write_text("y" * 4096, encoding="utf-8")
+    (root / "budget.pdf").write_bytes(b"%PDF-1.4\n")
+    (root / "résumé.txt").write_text("z", encoding="utf-8")
+    (root / "子目录" / "自检文件.txt").write_text("w", encoding="utf-8")
+
+    builder = namestore.NameStoreBuilder()
+    for dirpath, _dirs, files in os.walk(root):
+        st = os.stat(dirpath)
+        builder.add_dir(dirpath, st.st_mtime)
+        for name in files:
+            p = os.path.join(dirpath, name)
+            fs = os.stat(p)
+            builder.add(p, fs.st_size, fs.st_mtime)
+    # 显式指定落盘位置，绝不走 data_dir()：那是用户真实的索引目录，自检往里写
+    # 会顶掉他正在用的那份全盘索引（write() 不带 dest 时还会改写指针）。
+    index_path = Path(builder.write(workdir / "selftest-names.idx"))
+    store = namestore.NameStore(index_path)
+    cases = []
+    try:
+        for label, query, expect in NAME_CASES:
+            got = {r.name for r in search.search_names(store, query, limit=50)}
+            cases.append({
+                "label": label, "query": query,
+                "expect": sorted(expect), "got": sorted(got),
+                "pass": got == expect,
+            })
+    finally:
+        store.close()
+    passed = sum(1 for c in cases if c["pass"])
+    return {
+        "entries": len(builder),
+        "index_bytes": index_path.stat().st_size if index_path.exists() else 0,
+        "passed": passed,
+        "total": len(cases),
+        "all_pass": passed == len(cases),
+        "cases": cases,
+    }
 
 
 def _run(pptx_dir: str) -> dict:
@@ -80,6 +153,8 @@ def _run(pptx_dir: str) -> dict:
             }
         finally:
             conn.close()  # WAL 模式必须先关连接，否则 Windows 下 db 文件被锁、临时目录删不掉
+        # 「全部文件」范围：v1.5.0 的主功能，走的是完全另一条代码路径
+        names = _run_names(Path(td))
     finally:
         shutil.rmtree(td, ignore_errors=True)
 
@@ -95,7 +170,9 @@ def _run(pptx_dir: str) -> dict:
         "executor": idx_summary.get("executor"),  # process=ProcessPool 真生效 / thread=回退
         "passed": passed,
         "total": len(cases),
-        "all_pass": passed == len(cases) and opencc_ok and jieba_ok and ssl_ok,
+        "names": names,
+        "all_pass": (passed == len(cases) and opencc_ok and jieba_ok and ssl_ok
+                     and bool(names.get("all_pass"))),
         "cases": cases,
     }
 

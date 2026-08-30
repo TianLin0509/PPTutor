@@ -87,3 +87,42 @@ def test_frozen_verifier_checks_tls_manifest_and_second_instance_ipc():
         assert required in script
     assert "subprocess.run([str(EXE)], env=ENV, timeout=5" in script
     assert "proc.poll() is None" in script
+
+
+def test_frozen_selftest_covers_the_all_files_engine():
+    """打包自检必须考到「全部文件」那条路——v1.5.0 的主功能走的是它。
+
+    自检的唯一价值是「打包有没有把东西带齐」。原来它只考内容搜索，
+    namestore/namequery/search_names 一条都没考到；那条路真要漏了什么，
+    表现是「搜不到」，不报错，装机的人也发现不了。
+    """
+    from pptx_finder import selftest
+
+    labels = " ".join(label for label, _q, _e in selftest.NAME_CASES)
+    for must in ("通配符", "扩展名", "大小", "或", "非", "路径", "正则",
+                 "区分大小写", "变音符号", "文件夹", "中文名"):
+        assert must in labels, f"打包自检没覆盖 {must}"
+
+
+def test_frozen_selftest_never_writes_into_the_real_data_dir(tmp_path, monkeypatch):
+    """自检绝不能往用户真实数据目录里落索引。
+
+    namestore 的 write() 不给 dest 时写的就是 data_dir()，还会改写指针——
+    自检那样跑一次，等于把用户正在用的那份全盘索引顶掉。
+    """
+    import inspect
+
+    from pptx_finder import selftest
+
+    src = inspect.getsource(selftest._run_names)
+    assert "builder.write(workdir" in src, "自检必须显式指定落盘位置"
+
+    data_dir = tmp_path / "appdata"
+    monkeypatch.setenv("PPTX_FINDER_DATA_DIR", str(data_dir))
+    work = tmp_path / "work"
+    work.mkdir()
+    result = selftest._run_names(work)
+    assert result["all_pass"] is True, result["cases"]
+    # 数据目录要么根本没被创建，要么里面绝不能出现索引文件
+    if data_dir.exists():
+        assert not list(data_dir.glob("names*.idx"))
