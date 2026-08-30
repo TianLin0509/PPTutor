@@ -311,21 +311,66 @@ class NameStoreBuilder:
         return dest
 
 
+#: 替换指针文件的重试次数与间隔。指针从不被 mmap，但读它的那一瞬间
+#: （current_data_path 的 read_text）Windows 照样不让替换：Python 的 open()
+#: 不带 FILE_SHARE_DELETE，于是 os.replace 会撞 WinError 5。
+#: 真机压测：3 个搜索线程 + 换库 8 次，失败 1 次；6 个线程死循环搜 + 换库 40 次，
+#: **失败 39 次**。失败的后果是整轮全盘扫描白干、索引停在上一份，而且不报错。
+_POINTER_RETRIES = 8
+_POINTER_RETRY_SLEEP = 0.01
+
+
 def _write_pointer(data_name: str, kind: str = MAIN) -> None:
+    """把「当前数据文件叫什么」写进指针文件。
+
+    正常路径是「写临时文件 + os.replace」——原子、读者要么看到旧的要么看到新的。
+    但 Windows 上只要有读者正开着指针，replace 就失败；读者一多，重试也未必等得到
+    空档（实测 6 线程死循环下 40 次能失败 6 次）。所以退让几次之后**改为就地重写**：
+
+      · 就地写会被并发读者看到半截内容，但 current_data_path 对读到的东西是校验过的
+        （必须以 `<kind>-` 打头、且那个文件真的存在），半截名字一律当「没有索引」。
+        代价是那一次查询降级成空结果，下一次就好了。
+      · 相比之下，装不上新索引是**永久**的：用户此后搜到的一直是旧快照。
+        一次性的瞬时降级换掉一个永久性的错误，这笔账是划算的。
+    """
     fd, tmp = tempfile.mkstemp(prefix=".ptr-", dir=str(data_dir()))
+    payload = data_name.encode("utf-8")
     try:
         with os.fdopen(fd, "wb") as out:
-            out.write(data_name.encode("utf-8"))
+            out.write(payload)
             out.flush()
             os.fsync(out.fileno())
-        os.replace(tmp, pointer_path(kind))
-        tmp = ""
+        target = pointer_path(kind)
+        for attempt in range(_POINTER_RETRIES):
+            try:
+                os.replace(tmp, target)
+                tmp = ""
+                return
+            except PermissionError:
+                if attempt < _POINTER_RETRIES - 1:
+                    time.sleep(_POINTER_RETRY_SLEEP)
     finally:
         if tmp:
             try:
                 os.unlink(tmp)
             except OSError:
                 pass
+    # 兜底：就地重写。读者拿的是共享读句柄，不挡写。
+    # 用 r+b 而不是 wb：wb 会先把文件截成 0，读者正好撞上就读到空。r+b 不截断，
+    # 而两代文件名长度恒等（都是 `<kind>-` + 13 位毫秒时间戳 + `.idx`），所以
+    # 半截读到的要么是旧名、要么是新名、要么是个数字混合的不存在的名字——
+    # 三种都被 current_data_path 的校验兜住，不会指向别的东西。
+    log.info("name index pointer (%s) busy, rewriting in place", kind)
+    target = pointer_path(kind)
+    try:
+        handle = open(target, "r+b")
+    except FileNotFoundError:
+        handle = open(target, "wb")
+    with handle as out:
+        out.write(payload)
+        out.truncate(len(payload))
+        out.flush()
+        os.fsync(out.fileno())
 
 
 class NameStoreError(RuntimeError):

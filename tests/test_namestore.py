@@ -616,3 +616,128 @@ def test_directory_norms_are_precomputed_at_build_time(tmp_path):
         assert store.dir_norm(0) == "c:/work/软体开发"
         assert store._dirs_matching("软体开发") == {0}
         assert store._dirs_matching("nope") == set()
+
+
+# ---- 预筛必须是「必要条件」：比真正的判定更严就会静默漏结果 ----
+
+PREFILTER_TRAP = [
+    (r"D:\p\README.md", 1, 1_700_000_000),
+    (r"D:\p\readme.txt", 2, 1_700_000_001),
+    (r"D:\p\Readme.rst", 3, 1_700_000_002),
+    (r"D:\p\café-menu.pdf", 4, 1_700_000_003),
+    (r"D:\p\CAFÉ-BILL.pdf", 5, 1_700_000_004),
+    (r"D:\p\cafe-plain.pdf", 6, 1_700_000_005),
+    (r"D:\p\résumé.pdf", 7, 1_700_000_006),
+    (r"D:\p\resume.docx", 8, 1_700_000_007),
+    (r"D:\p\naïve-approach.md", 9, 1_700_000_008),
+    (r"D:\p\MyReportX.txt", 10, 1_700_000_009),
+    (r"D:\p\Report-Final.pptx", 11, 1_700_000_010),
+]
+
+
+@pytest.mark.parametrize("query", [
+    "case:README", "case:Readme", "case:Report", "case:MyReport",
+    "case:readme", "nocase:readme", "case:RESUME*", "case:Report-*",
+    "*café*", "*CAFÉ*", "*cafe*", "café", "cafe",
+    "*résumé*", "résumé", "resume", "*naïve*", "naive",
+    "ww:readme", "ww:café",
+])
+def test_index_scan_agrees_with_per_record_match(query):
+    """索引扫描的结果必须与逐条判定完全一致。
+
+    两处真实的漏结果就是这样被抓出来的，都是「预筛比判定更严」：
+      · `case:README` 拿保留大小写的针去扫**归一化过**的名字块 → 恒 0 条；
+      · `*café*` 的通配符片段用 normalize()（不折变音符号）去筛，而名字块用
+        fold()（折了）→ 同样恒 0 条。
+    两者都不报错，只是搜不到——所以这条对账必须留着。
+    """
+    path = _build(PREFILTER_TRAP)
+    with namestore.NameStore(path) as store:
+        parsed = namequery.parse(query)
+        scanned = set(store.search(parsed, limit=1000))
+        expected = {i for i in range(store.count)
+                    if parsed.match(store.record_for(i))}
+        assert scanned == expected, (
+            f"{query!r} 漏 {sorted(store.entry(i)[1] for i in expected - scanned)}"
+            f" 多 {sorted(store.entry(i)[1] for i in scanned - expected)}")
+
+
+def test_case_sensitive_term_actually_finds_something():
+    """光对账还不够：如果两边一起错成空集也算「一致」。这条钉住真实答案。"""
+    path = _build(PREFILTER_TRAP)
+    with namestore.NameStore(path) as store:
+        names = {store.entry(i)[1]
+                 for i in store.search(namequery.parse("case:README"), limit=10)}
+        assert names == {"README.md"}
+        names = {store.entry(i)[1]
+                 for i in store.search(namequery.parse("*café*"), limit=10)}
+        assert names == {"café-menu.pdf", "CAFÉ-BILL.pdf", "cafe-plain.pdf"}
+
+
+def test_pointer_replace_retries_when_a_reader_holds_it(monkeypatch, tmp_path):
+    """指针文件被读的那一瞬间 Windows 不让替换，必须退让重试而不是放弃整轮建库。
+
+    Python 的 open() 不带 FILE_SHARE_DELETE，所以 current_data_path 读指针的几十
+    微秒里 os.replace 会撞 WinError 5（PermissionError）。真机压测「3 个搜索线程 +
+    连续换库 8 次」实测 8 次里失败 1 次；失败的后果是整轮全盘扫描白干、索引停在
+    上一份，而且用户完全看不出来。
+    """
+    real_replace = os.replace
+    calls = {"n": 0}
+
+    def flaky(src, dst):
+        # 只拦指针那一次；数据文件每轮都是新名字，压根不会被占住
+        if str(dst) == str(namestore.pointer_path()) and calls["n"] < 3:
+            calls["n"] += 1
+            raise PermissionError(5, "拒绝访问。")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(namestore.os, "replace", flaky)
+    monkeypatch.setattr(namestore, "_POINTER_RETRY_SLEEP", 0)
+    path = _build(SAMPLE)
+    assert calls["n"] == 3                       # 确实撞上了，不是没触发
+    assert namestore.current_data_path() == path
+    with namestore.NameStore(path) as store:
+        assert store.count == len(SAMPLE)
+
+
+def test_pointer_falls_back_to_in_place_write_when_replace_never_wins():
+    """一直抢不到 replace 就就地重写，绝不能让这一轮建库白干。
+
+    os.replace 需要对目标拿 DELETE 权限，而 Python 的 open() 不带
+    FILE_SHARE_DELETE——读者一多就永远抢不到空档。真机压测：6 个线程死循环搜 +
+    连续换库 40 次，纯重试仍失败 6 次。装不上是**永久性**的错（此后一直搜旧快照），
+    而就地写最坏只是某一次查询读到半截名字、当次降级成空结果。
+    """
+    real_replace = os.replace
+
+    def always_locked(src, dst):
+        if str(dst) == str(namestore.pointer_path()):
+            raise PermissionError(5, "拒绝访问。")
+        return real_replace(src, dst)
+
+    monkeypatch_sleep = 0
+    b = namestore.NameStoreBuilder()
+    for path, size, mtime in SAMPLE:
+        b.add(path, size, mtime)
+    import unittest.mock as _mock
+    with _mock.patch.object(namestore.os, "replace", always_locked),          _mock.patch.object(namestore, "_POINTER_RETRY_SLEEP", monkeypatch_sleep):
+        dest = b.write()
+    assert namestore.current_data_path() == dest
+    with namestore.NameStore(dest) as store:
+        assert store.count == len(SAMPLE)
+
+
+def test_pointer_file_names_are_fixed_width_so_a_torn_read_cannot_alias():
+    """就地重写的安全前提：两代文件名长度恒等，半截读到的只能是旧名/新名/不存在的名。
+
+    长度一旦不等，半截读就可能拼出一个**存在但不该指向**的文件名。
+    """
+    a = namestore.NameStoreBuilder()
+    a.add(r"D:\p.txt", 1, 1_700_000_000)
+    first = a.write()
+    b = namestore.NameStoreBuilder()
+    b.add(r"D:\p.txt", 1, 1_700_000_001)
+    second = b.write()
+    assert len(first.name) == len(second.name)
+    assert first.name != second.name

@@ -764,9 +764,16 @@ def search_names(store, query: str, *, limit: int = 200,
             bonus = 1.0
         else:
             bonus = NAME_BONUS
-        if query_exact and _COMPACT_RE.sub("", stem) == query_exact:
+        # 「完全匹配」这一档必须**连全名一起判**，不能只判去掉扩展名的 stem。
+        # 只判 stem 时，搜 `parse.cjs` 会是这样：`parse.cjs.map` 的 stem 正好是
+        # `parse.cjs`，评到最高档；而真正叫 `parse.cjs` 的那个文件 stem 是 `parse`，
+        # 评不上、掉到 partial 档——硬分层压过分数，于是「打全名字反而找不到它」。
+        # 真机抽样就是这么被抓到的（parse.cjs / index.js / report.txt 都中招）。
+        if query_exact and query_exact in (
+                _COMPACT_RE.sub("", stem), _COMPACT_RE.sub("", normalized_name)):
             match_kind = "filename_exact"
-        elif _contains_full_phrase(stem, full_phrase):
+        elif (_contains_full_phrase(stem, full_phrase)
+              or _contains_full_phrase(normalized_name, full_phrase)):
             match_kind = "filename_phrase"
         else:
             match_kind = "partial"

@@ -297,12 +297,24 @@ class _Term(_Node):
     def literals(self):
         if self._needle:
             # 路径匹配的字面串同样出现在名字块之外，不能拿来预筛名字段
-            return None if self.on_path else [[self._needle]]
-        if self._rx is not None and not self.on_path and not self.case_sensitive:
+            if self.on_path:
+                return None
+            # 预筛扫的是**归一化后**的名字块（小写、折过变音符号）。区分大小写的
+            # 词若拿原样大小写去那里找，必然一条都找不到——`case:README` 因此
+            # 恒返回 0 条，而且不报错。预筛只需要是**必要条件**，而
+            # 「原样命中」蕴含「折过之后也命中」，所以这里改用折过的针；
+            # 真正的大小写判定仍由下面的 match() 逐条做。
+            needle = self._needle if not self.case_sensitive else fold(self._needle)
+            return [[needle]] if needle else None
+        if self._rx is not None and not self.on_path:
             # 通配符里夹着的固定片段仍然是必要条件：`*report*.pdf` 必含 report 和 .pdf
-            chunks = [c for c in re.split(r"[*?]+", self.raw) if len(c) >= 2]
+            # 同上，片段也必须按 fold 折过再拿去预筛。原来这里用的是 normalize()，
+            # 它不折变音符号，而名字块折了——于是 `*café*` 拿 café 去一堆 cafe 里找，
+            # 恒 0 条且不报错。区分大小写的通配符同理可以预筛，折过就行。
+            chunks = [fold(c) for c in re.split(r"[*?]+", self.raw) if len(c) >= 2]
+            chunks = [c for c in chunks if c]
             if chunks:
-                return [[normalize(c) for c in chunks]]
+                return [chunks]
         return None
 
     def needs(self):

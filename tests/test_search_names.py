@@ -371,3 +371,50 @@ def test_overlay_alone_works_when_there_is_no_full_index(tmp_path):
     finally:
         for s in stores:
             s.close()
+
+
+# ---- 打全名（含扩展名）时，叫这个名字的文件必须排第一 ----
+
+SIDECAR = [
+    (r"D:\proj\parse.cjs", 100, BASE_T),
+    (r"D:\proj\parse.cjs.map", 100, BASE_T + 500),      # 更新，让「最近」站在错误答案那边
+    (r"D:\proj\index.js", 100, BASE_T),
+    (r"D:\proj\index.js.map", 100, BASE_T + 500),
+    (r"D:\proj\report.txt", 100, BASE_T),
+    (r"D:\proj\report.txt.bak", 100, BASE_T + 500),
+    (r"D:\proj\report-2026.txt", 100, BASE_T + 600),
+]
+
+
+@pytest.mark.parametrize("query,first", [
+    ("parse.cjs", "parse.cjs"),
+    ("index.js", "index.js"),
+    ("report.txt", "report.txt"),
+    ("report", "report.txt"),          # 只打名字：仍是它
+])
+def test_full_name_query_ranks_that_exact_file_first(query, first):
+    """「完全匹配」这一档要连全名一起判，只判 stem 会把 sidecar 文件顶到第一。
+
+    只判去掉扩展名的 stem 时：`parse.cjs.map` 的 stem 恰好是 `parse.cjs`，评到
+    最高档；真正叫 `parse.cjs` 的那个 stem 是 `parse`，评不上、掉到 partial。
+    硬分层压过分数，于是「打全名字反而排不到第一」。真机抽样抓到的就是这个。
+    """
+    store = _store(SIDECAR)
+    try:
+        res = search.search_names(store, query, limit=10)
+        assert res, f"{query!r} 一条都没召回"
+        assert res[0].name == first, [r.name for r in res[:4]]
+    finally:
+        store.close()
+
+
+def test_sidecar_file_is_still_reachable_not_suppressed():
+    """修的是排序，不是召回：sidecar 文件本身照样搜得到。"""
+    store = _store(SIDECAR)
+    try:
+        names = [r.name for r in search.search_names(store, "parse.cjs", limit=10)]
+        assert "parse.cjs.map" in names
+        names = [r.name for r in search.search_names(store, "parse.cjs.map", limit=10)]
+        assert names[0] == "parse.cjs.map"
+    finally:
+        store.close()
