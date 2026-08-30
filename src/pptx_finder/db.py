@@ -355,6 +355,10 @@ def upsert_file(
     name = sqlite_safe_text(name)
     error = sqlite_safe_text(error)
     name_norm = normalize(name)
+    # 这一行之前有没有？files.path 是唯一索引，这次查询是 O(log n)。
+    # 只为了决定下面那句 FTS DELETE 要不要发——见 _update_filename_index 的注释。
+    had_row = conn.execute(
+        "SELECT 1 FROM files WHERE path=?", (path,)).fetchone() is not None
     cur = conn.execute(
         """
         INSERT INTO files(
@@ -383,14 +387,25 @@ def upsert_file(
              created_at=max(0.0, float(created_at or 0.0))),
     )
     file_id = cur.fetchone()[0]
-    _update_filename_index(conn, file_id, name)
+    _update_filename_index(conn, file_id, name, had_row=had_row)
     return file_id
 
 
-def _update_filename_index(conn: sqlite3.Connection, file_id: int, name: str) -> None:
+def _update_filename_index(
+    conn: sqlite3.Connection, file_id: int, name: str, *, had_row: bool = True
+) -> None:
+    """重写这个文件的文件名 FTS 行。
+
+    had_row=False 表示本次是**新插入**，此前不可能有对应的 FTS 行，那句 DELETE
+    必须跳过。原因和 indexer._write_filename_only_batch 注释里写的是同一件事：
+    file_id 是 FTS5 的 UNINDEXED 列，`DELETE ... WHERE file_id=?` 每次都是全表扫，
+    逐行删让首次建库塌成 O(n²)。盘点那条路当年修了，内容类文件走的这条没修——
+    2026-08-29 实测：连写 24,000 行，吞吐从 4,805 行/秒掉到 392 行/秒（末/首 0.08）。
+    id 来自 AUTOINCREMENT、不会被回收，所以「新 id 必无残留 FTS 行」是成立的。
+    """
     name = sqlite_safe_text(name)
-    conn.execute("UPDATE files SET name_norm=? WHERE id=?", (normalize(name), file_id))
-    conn.execute("DELETE FROM file_names_fts WHERE file_id=?", (file_id,))
+    if had_row:
+        conn.execute("DELETE FROM file_names_fts WHERE file_id=?", (file_id,))
     conn.execute(
         "INSERT INTO file_names_fts(content,file_id) VALUES(?,?)",
         (tokenize(name), file_id),
@@ -398,9 +413,18 @@ def _update_filename_index(conn: sqlite3.Connection, file_id: int, name: str) ->
 
 
 def replace_pages(conn: sqlite3.Connection, file_id: int, pages: list[tuple[int, str, str]]) -> None:
-    """pages: [(page_no, raw_text, tokenized_content)]。先清旧页再写。"""
-    conn.execute("DELETE FROM pages_fts WHERE file_id=?", (file_id,))
-    conn.execute("DELETE FROM pages_raw WHERE file_id=?", (file_id,))
+    """pages: [(page_no, raw_text, tokenized_content)]。先清旧页再写。
+
+    同 _update_filename_index：`DELETE FROM pages_fts WHERE file_id=?` 是全表扫，
+    而首次建库时绝大多数文件根本没有旧页。先用 pages_raw 探一下——它有
+    PRIMARY KEY(file_id, page_no)，这次探测是索引查找；有旧页才发那两句 DELETE。
+    实测 6,000 份 ×10 页：吞吐从 406 份/秒掉到 29 份/秒，修掉这一处才是大头。
+    """
+    had_pages = conn.execute(
+        "SELECT 1 FROM pages_raw WHERE file_id=? LIMIT 1", (file_id,)).fetchone() is not None
+    if had_pages:
+        conn.execute("DELETE FROM pages_fts WHERE file_id=?", (file_id,))
+        conn.execute("DELETE FROM pages_raw WHERE file_id=?", (file_id,))
     for page_no, raw, tok in pages:
         raw = sqlite_safe_text(raw)
         tok = sqlite_safe_text(tok)
