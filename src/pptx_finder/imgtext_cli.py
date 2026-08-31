@@ -1,6 +1,6 @@
 """图片转可编辑文字的无界面入口。
 
-    PPT Doctor.exe --imgtext <图片> [输出.pptx] [--install-component]
+    PPT-Doctor.exe --imgtext <图片> [输出.pptx] [--install-component]
 
 两个用途：
   · 批量转换（写个 for 循环就能一次跑一叠图，不用一张张拖进窗口）

@@ -68,6 +68,17 @@ _DROP = (
     'qt6texttospeech', 'qt6remoteobjects', 'qt6scxml', 'qt6statemachine', 'qt6labs',
     'pyside6/plugins/platforms/qdirect2d', 'pyside6/plugins/platforms/qoffscreen',
     'pyside6/plugins/platforms/qminimal',
+    # —— MAX_PATH 减负（v1.5.2）。用户反馈解压失败：包内最深条目原本 112 字符，
+    # 加上「解压目录 + 压缩包同名文件夹 + PPT-Doctor/」的层层嵌套，很容易越过
+    # Windows 的 260 字符上限，而且失败往往只发生在最深的那几个文件上。下面两项
+    # 恰好是最长的 6 条 + 第 7 条，删掉后最深条目 112 → 79。
+    # isoschematron：lxml 的 Schematron 校验资源（9 个文件 176 KB）。本项目只经
+    # python-pptx 用 lxml.etree 读写 OOXML，全库 grep 无任何引用。
+    'lxml/isoschematron/',
+    # qtvirtualkeyboardplugin：它 import 的 Qt6VirtualKeyboard.dll 早就在上面被
+    # 剔除了（'qt6virtualkeyboard'），插件在任何已发布的包里都从未加载成功过——
+    # 读 PE 导入表确认过。Windows 中文输入法走 qwindows 平台插件，与它无关。
+    'plugins/platforminputcontexts/',
     'pyside6/plugins/imageformats/qwebp', 'pyside6/plugins/imageformats/qtiff',
     'pyside6/plugins/imageformats/qicns', 'pyside6/plugins/imageformats/qpdf',
     'pyside6/plugins/imageformats/qtga', 'pyside6/plugins/imageformats/qwbmp',
@@ -91,12 +102,17 @@ def _keep(entry):
 a.binaries = [b for b in a.binaries if _keep(b)]
 a.datas = [d for d in a.datas if _keep(d)]
 
+# 产物名不带空格（v1.5.2）。用户反馈解压后跑不起来，根因是带空格的路径在所有
+# "自己拼命令行"的地方都会裂：批处理、快捷方式目标、解压/安装工具的调用串，以及
+# 同一批修掉的 `explorer /select,` 定位。展示名仍是「PPT Doctor」——那个写在
+# assets/windows_version_info.txt 的 FileDescription 里，任务管理器和属性页照常显示。
+# 与 src/pptx_finder/config.py 的 DIST_DIR_NAME / EXE_NAME 保持一致（tests/test_package_spec.py 锁死）。
 exe = EXE(
     pyz,
     a.scripts,
     [],
     exclude_binaries=True,
-    name='PPT Doctor',
+    name='PPT-Doctor',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -117,5 +133,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='PPT Doctor',
+    name='PPT-Doctor',
 )

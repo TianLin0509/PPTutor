@@ -49,7 +49,7 @@ def _target() -> str:
     if getattr(sys, "frozen", False):
         return exe
     # 源码态：尽量指向已打包的 exe（开发期自启意义不大，仅兜底）
-    guess = Path.cwd() / "dist" / "PPT Doctor" / "PPT Doctor.exe"
+    guess = Path.cwd() / "dist" / "PPT-Doctor" / "PPT-Doctor.exe"
     return str(guess) if guess.exists() else exe
 
 

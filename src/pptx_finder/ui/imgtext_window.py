@@ -7,9 +7,11 @@
 from __future__ import annotations
 
 import os
+import time
+from pathlib import Path
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QPixmap
+from PySide6.QtCore import QStandardPaths, Qt
+from PySide6.QtGui import QGuiApplication, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QFileDialog,
     QFrame,
@@ -21,11 +23,38 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import actions, imgtext, imgtext_ocr
+from .. import actions, config, imgtext, imgtext_ocr
 from .bg_task import BackgroundTask
 
 ACCEPTED = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
 COMPONENT_HINT_MB = 65
+# 粘贴进来的图先落盘（识别管线吃的是路径，不是内存里的 QImage）。放缓存目录下，
+# 那里本来就被索引扫描排除，不会把临时图混进搜索结果。
+PASTE_SUBDIR = "imgtext-paste"
+PASTE_KEEP = 8          # 只留最近这么多张，别让截图在缓存里无限堆积
+
+
+def paste_dir() -> Path:
+    p = config.cache_dir() / PASTE_SUBDIR
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def prune_paste_dir(keep: int = PASTE_KEEP) -> int:
+    """保留最近 keep 张，其余删掉。返回删除数量。"""
+    try:
+        shots = sorted(paste_dir().glob("*.png"), key=lambda p: p.stat().st_mtime,
+                       reverse=True)
+    except OSError:
+        return 0
+    removed = 0
+    for old in shots[keep:]:
+        try:
+            old.unlink()
+            removed += 1
+        except OSError:
+            pass
+    return removed
 
 
 class ImgTextWindow(QWidget):
@@ -36,6 +65,7 @@ class ImgTextWindow(QWidget):
         super().__init__(qt_parent)
         self._tok = tok or {}
         self._source = ""
+        self._source_is_pasted = False
         self._result_path = ""
         self._closing = False
         self._busy = False
@@ -48,6 +78,9 @@ class ImgTextWindow(QWidget):
         self.setAcceptDrops(True)
         self.resize(720, 640)
         self._build()
+        # 截图工具出来的图只在剪贴板里，逼用户先存一次盘再拖进来是多余的一步。
+        self._paste_sc = QShortcut(QKeySequence.StandardKey.Paste, self)
+        self._paste_sc.activated.connect(self.paste_from_clipboard)
         self._refresh_component_state()
         if source:
             self.set_source(source)
@@ -85,7 +118,7 @@ class ImgTextWindow(QWidget):
         self._progress.hide()
         root.addWidget(self._progress)
 
-        self._drop = QLabel("把图片拖到这里，或点「选择图片」")
+        self._drop = QLabel("把图片拖到这里，或按 Ctrl+V 粘贴截图，或点「选择图片」")
         self._drop.setObjectName("previewImage")
         self._drop.setAlignment(Qt.AlignCenter)
         self._drop.setMinimumHeight(280)
@@ -100,6 +133,11 @@ class ImgTextWindow(QWidget):
         self._pick_btn = QPushButton("选择图片…")
         self._pick_btn.clicked.connect(self._pick)
         row.addWidget(self._pick_btn)
+        # 快捷键再方便也得看得见，否则和「找不到入口」是同一个问题。
+        self._paste_btn = QPushButton("粘贴剪贴板")
+        self._paste_btn.setToolTip("Ctrl+V：直接粘贴剪贴板里的截图")
+        self._paste_btn.clicked.connect(self.paste_from_clipboard)
+        row.addWidget(self._paste_btn)
         self._convert_btn = QPushButton("转换为可编辑 PPTX")
         self._convert_btn.setObjectName("primary")
         self._convert_btn.setEnabled(False)
@@ -129,6 +167,7 @@ class ImgTextWindow(QWidget):
         ready = imgtext_ocr.is_installed()
         self._convert_btn.setEnabled(bool(self._source) and ready and not self._busy)
         self._pick_btn.setEnabled(not self._busy)
+        self._paste_btn.setEnabled(not self._busy)
 
     def _install_component(self) -> None:
         if self._busy:
@@ -161,12 +200,13 @@ class ImgTextWindow(QWidget):
         self._refresh_component_state()
 
     # ---------- 选图 ----------
-    def set_source(self, path: str) -> None:
+    def set_source(self, path: str, *, pasted: bool = False) -> None:
         path = os.path.abspath(path)
         if os.path.splitext(path)[1].lower() not in ACCEPTED:
             self._status.setText("只支持 PNG / JPG / BMP / WEBP 图片。")
             return
         self._source = path
+        self._source_is_pasted = pasted
         self._result_path = ""
         self._open_btn.setEnabled(False)
         self._folder_btn.setEnabled(False)
@@ -175,7 +215,8 @@ class ImgTextWindow(QWidget):
             self._drop.setPixmap(pixmap.scaled(
                 self._drop.width() or 640, self._drop.height() or 280,
                 Qt.KeepAspectRatio, Qt.SmoothTransformation))
-        self._status.setText(f"{os.path.basename(path)} · {pixmap.width()}×{pixmap.height()}")
+        label = "剪贴板图片" if pasted else os.path.basename(path)
+        self._status.setText(f"{label} · {pixmap.width()}×{pixmap.height()}")
         self._sync_buttons()
 
     def _pick(self) -> None:
@@ -183,6 +224,69 @@ class ImgTextWindow(QWidget):
             self, "选择图片", "", "图片 (*.png *.jpg *.jpeg *.bmp *.webp)")
         if path:
             self.set_source(path)
+
+    # ---------- 剪贴板 ----------
+    def paste_from_clipboard(self) -> bool:
+        """Ctrl+V：截图工具/浏览器复制的图直接进来，不用先存成文件。
+
+        剪贴板里可能是三种东西，按「最像用户意图」的顺序取：先看有没有复制的
+        图片文件（Explorer 里 Ctrl+C 一张 png），再看有没有位图数据（截图工具、
+        网页里「复制图片」）。两者都没有就明说，别静默无反应。
+        """
+        if self._busy:
+            self._status.setText("正在忙，稍后再粘贴。")
+            return False
+        clipboard = QGuiApplication.clipboard()
+        if clipboard is None:
+            self._status.setText("读不到剪贴板。")
+            return False
+        mime = clipboard.mimeData()
+
+        if mime is not None and mime.hasUrls():
+            for url in mime.urls():
+                local = url.toLocalFile()
+                if local and local.lower().endswith(ACCEPTED) and os.path.exists(local):
+                    self.set_source(local)
+                    return True
+
+        image = clipboard.image()
+        if image is None or image.isNull():
+            self._status.setText(
+                "剪贴板里没有图片。先用截图工具截一张（Win+Shift+S），或复制一个图片文件。")
+            return False
+
+        saved = self._save_pasted_image(image)
+        if not saved:
+            self._status.setText("剪贴板图片存盘失败，换「选择图片」试试。")
+            return False
+        self.set_source(saved, pasted=True)
+        return True
+
+    def _save_pasted_image(self, image) -> str:
+        """存成 PNG（无损）。OCR 吃的是路径，且再压一次 JPEG 只会伤识别率。"""
+        try:
+            root = paste_dir()
+            stem = time.strftime("粘贴-%Y%m%d-%H%M%S")
+            target = root / f"{stem}.png"
+            n = 1
+            while target.exists():          # 同一秒内连粘两次
+                target = root / f"{stem}-{n}.png"
+                n += 1
+            if not image.save(str(target), "PNG"):
+                return ""
+            prune_paste_dir()
+            return str(target)
+        except (OSError, ValueError):
+            return ""
+
+    def _default_save_target(self) -> str:
+        """粘贴来的图没有「原图所在目录」可用，别把结果丢进缓存目录。"""
+        if not self._source_is_pasted:
+            return os.path.splitext(self._source)[0] + "_可编辑.pptx"
+        desktop = QStandardPaths.writableLocation(
+            QStandardPaths.StandardLocation.DesktopLocation) or str(Path.home())
+        stem = os.path.splitext(os.path.basename(self._source))[0]
+        return os.path.normpath(os.path.join(desktop, f"{stem}_可编辑.pptx"))
 
     def dragEnterEvent(self, event):  # noqa: N802
         urls = event.mimeData().urls() if event.mimeData().hasUrls() else []
@@ -201,7 +305,7 @@ class ImgTextWindow(QWidget):
     def _convert(self) -> None:
         if self._busy or not self._source:
             return
-        default = os.path.splitext(self._source)[0] + "_可编辑.pptx"
+        default = self._default_save_target()
         dest, _ = QFileDialog.getSaveFileName(
             self, "另存为", default, "PowerPoint (*.pptx)")
         if not dest:

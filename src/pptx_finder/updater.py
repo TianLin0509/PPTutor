@@ -54,6 +54,12 @@ def _sha256_file(p: Path) -> str:
     return h.hexdigest()
 
 
+def _detect_entry(files: dict) -> str:
+    """安装目录根下唯一的 .exe 就是入口。"""
+    tops = [rel for rel in files if "/" not in rel and rel.lower().endswith(".exe")]
+    return tops[0] if len(tops) == 1 else ""
+
+
 def build_manifest(
     dist_dir: Path,
     version: str,
@@ -61,8 +67,13 @@ def build_manifest(
     *,
     commit: str = "",
     built_at: str = "",
+    entry: str = "",
 ) -> dict:
-    """遍历 dist_dir 生成清单。relpath 用正斜杠；排除 manifest.json 自身。"""
+    """遍历 dist_dir 生成清单。relpath 用正斜杠；排除 manifest.json 自身。
+
+    额外记 `entry`（入口 exe 文件名）：入口改名的那一版，helper 必须启动**新**名
+    字，否则它会去启动一个刚被自己删掉的文件——用户看到的是「更新完程序没了」。
+    """
     dist_dir = Path(dist_dir)
     files: dict[str, dict] = {}
     for p in sorted(dist_dir.rglob("*")):
@@ -73,6 +84,9 @@ def build_manifest(
             continue
         files[rel] = {"hash": _sha256_file(p), "size": p.stat().st_size}
     manifest = {"version": str(version), "notes": notes, "files": files}
+    entry = str(entry or "").strip() or _detect_entry(files)
+    if entry:
+        manifest["entry"] = entry
     if commit or built_at:
         manifest["build"] = {
             "commit": str(commit or ""),
@@ -138,6 +152,26 @@ def sanitize_entries(info: UpdateInfo) -> UpdateInfo:
     for rel in info.deleted:
         safe_relpath(rel)
     return info
+
+
+def relaunch_name(info: UpdateInfo, fallback: str = "") -> str:
+    """更新装完之后该启动哪个 exe——以**新版清单**为准，不是当前进程的名字。
+
+    v1.5.2 把入口从 `PPT Doctor.exe` 改成 `PPT-Doctor.exe`（去掉空格）。这一版的
+    更新里，旧名字会出现在 deletes 里；如果还按 `Path(sys.executable).name` 去
+    relaunch，helper 就会在删完之后启动一个不存在的文件，用户看到的是「更新完就
+    再也打不开了」。所以入口名必须跟着清单走。
+
+    清单来自网络，所以只认「纯文件名 + 确实在本次要落地的文件集合里」；不符合就
+    退回 fallback（当前 exe 名），最坏情况等于旧行为，不会更糟。
+    """
+    raw = info.raw or {}
+    entry = str(raw.get("entry") or "").strip()
+    files = raw.get("files") or {}
+    if entry and entry == os.path.basename(entry) and entry not in ("", ".", "..") \
+            and entry in files:
+        return entry
+    return fallback
 
 
 def compare(local: dict, remote: dict) -> UpdateInfo | None:
@@ -410,7 +444,7 @@ def check_for_update(
 
 
 def run_update_check(argv: list[str]) -> int:
-    """`PPT Doctor.exe --update-check <base_url> <report.json>`：headless 检查 + 下载到 staging，
+    """`PPT-Doctor.exe --update-check <base_url> <report.json>`：headless 检查 + 下载到 staging，
     写报告。用于打包态 E2E 验证 frozen 的 urllib/清单/增量下载/sha256 链路（不弹 GUI、不应用）。
     """
     i = argv.index("--update-check")

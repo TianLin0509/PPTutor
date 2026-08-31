@@ -6,8 +6,8 @@ from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-DIST = Path(r"C:\Users\lintian\pptx-finder\dist\PPT Doctor")
-EXE = DIST / "PPT Doctor.exe"
+DIST = Path(r"C:\Users\lintian\pptx-finder\dist\PPT-Doctor")
+EXE = DIST / "PPT-Doctor.exe"
 
 
 def make_shortcut() -> Path:

@@ -1,6 +1,116 @@
 # 更新日志
 
-## v1.5.1 — 开发中
+## v1.5.2 — 三个用户反馈
+
+### 「打开文件夹」经常打开成别的文件夹
+
+用户反馈定位文件时经常跳到不相干的目录。真机复现（Windows 11，用 `Shell.Application`
+读回资源管理器实际停在哪）：
+
+| 文件路径 | v1.5.1 打开了 | 应该打开 |
+| --- | --- | --- |
+| `…\PPT Doctor\demo.pptx` | **`C:\Users\<me>\Documents`** | `…\PPT Doctor` |
+| `…\comma,dir\demo.pptx` | **`C:\Users\<me>\Desktop`** | `…\comma,dir` |
+| `…\a & b\demo.pptx` | **`C:\Users\<me>\Documents`** | `…\a & b` |
+| `…\plaindir\demo.pptx` | `…\plaindir` ✓ | `…\plaindir` |
+
+根因是两条引号规则打架。`subprocess.Popen(["explorer", f"/select,{path}"])` 交给
+`list2cmdline` 拼命令行，它见参数含空格就把**整个** `/select,路径` 包进引号：
+
+```
+explorer "/select,C:\Users\me\My Docs\PPT Doctor\a.pptx"
+```
+
+而 explorer 的解析器是非标准的，要求引号只包路径（`explorer /select,"…"`）。整体
+加引号它认不出来，于是**默默回落到默认文件夹**——「文档」「桌面」这类位置看起来
+就像"打开了个别的文件夹"。不加引号时，路径里的逗号又会被当成分隔符截断。
+
+**只要路径含空格就必错**。开发机上随手一试往往是好的（`plaindir` 那一行），所以
+这个 bug 能一直活到用户手里。
+
+修法是把引号放对位置：`explorer.exe /select,"路径"`，且传字符串而不是列表
+（列表就会重新落进 `list2cmdline` 的加引号规则），并走 `%SystemRoot%` 绝对路径
+而不是 PATH。实测四种路径全部正确定位。
+
+顺带量了一次**不该**怎么修：`SHOpenFolderAndSelectItems`（shell API）看着更
+「正确」——完全不经过命令行解析——但它是同步的，需要新开资源管理器窗口时实测
+阻塞 **1,465～1,742 ms**（复用已有窗口 42 ms）；而 explorer 在自己进程里干活，
+`Popen` **30～55 ms** 就返回。health / report 那几个调用点是直接在 UI 线程上调
+`open_folder` 的，换成同步版本等于把一个错误 bug 换成一次可见卡顿。所以命令行
+在前，shell API 只在 explorer 起不来时兜底。新增
+`tests/test_open_folder_quoting.py`（15 条），把这个顺序也钉住。
+
+### 图片转可编辑文字：支持 Ctrl+V 直接粘贴
+
+截图工具（Win+Shift+S）产出的图只在剪贴板里，此前必须先存一次盘再拖进窗口。现在
+在窗口里按 **Ctrl+V** 即可，旁边也加了「粘贴剪贴板」按钮（快捷键再方便，看不见就
+等于没有）。剪贴板里如果是复制的图片**文件**，直接用原文件；如果是位图数据，落成
+无损 PNG 再走原有流程（识别管线吃的是路径，且再压一次 JPEG 只会伤识别率）。
+
+两个容易忽略的细节：临时图存进缓存目录（那里本就被索引扫描排除，否则截图会混进
+搜索结果），且只保留最近 8 张；粘贴图没有"原图所在目录"可用，另存默认位置改成
+桌面，不会把成果藏进缓存目录。新增 `tests/test_imgtext_paste.py`（10 条）。
+
+### 解压失败：真因是 MAX_PATH，顺带把产物名的空格也去掉
+
+先说结论：**空格不是主因，路径长度才是。** 一开始按用户描述以为是空格，实测才
+定位到真因——把 v1.5.2 的包解到一个 149 字符的目录，解压在最深的那个文件上炸了：
+
+```
+FileNotFoundError: [Errno 2] No such file or directory:
+  '...\PPT-Doctor\_internal\lxml\isoschematron\resources\xsl\
+   iso-schematron-xslt1\iso_schematron_skeleton_for_xslt1.xsl'
+```
+
+失败**只发生在最深的几个文件上**，前面两百多个都解得出来。所以用户看到的是「解压
+到一半报错」或者「解出来跑不起来」，很难联想到路径长度——也就容易归咎于那个显眼的
+空格。
+
+算一下就知道有多紧：Windows 的 MAX_PATH 是 260，包内最深条目 112 字符，留给用户
+解压目录的只剩 **147**。而「下载目录 + 压缩包同名文件夹 + 包内 `PPT-Doctor/`」本身
+就要吃掉几十个字符，中文用户名再占几个。
+
+最长的 6 条全部来自 `lxml/isoschematron/`——lxml 的 Schematron 校验资源（9 个文件
+176 KB）。本项目只经 python-pptx 用 `lxml.etree` 读写 OOXML，全库 grep 无任何引用。
+第 7 条是 `qtvirtualkeyboardplugin.dll`：它 import 的 `Qt6VirtualKeyboard.dll` 早就
+在 spec 里被剔除了，读 PE 导入表确认过——**这个插件在任何已发布的包里都从未加载
+成功过**，纯属占位。两棵树一起删：
+
+| | v1.5.1 | v1.5.2 |
+| --- | ---: | ---: |
+| 包内最深条目 | 112 字符 | **79 字符** |
+| 解压目录可用长度 | 147 字符 | **180 字符** |
+| 文件数 | 261 | 252 |
+
+同一个 149 字符的目录，改前解压报错，改后 0.6 秒解完、解压副本的冻结自检 26/26 全过。
+
+**顺带把空格也去掉**：程序目录与可执行文件改成 `PPT-Doctor` / `PPT-Doctor.exe`。
+这个不为解压，是为后面每个「自己拼命令行」的环节——批处理、快捷方式目标、安装
+工具的调用串，以及上面那个 `explorer /select,`：**根因是同一条引号规则**。
+
+所以程序目录与可执行文件统一改成 `PPT-Doctor` / `PPT-Doctor.exe`。**展示名仍然是
+「PPT Doctor」**（写在 FileDescription 里，任务管理器、属性页、界面标题照常）。
+
+改名的代价集中在增量更新：旧名字会进 deletes，helper 如果还按当前进程名重启，就
+会去启动一个刚被自己删掉的文件，用户看到的是「更新完程序就打不开了」。所以清单
+新增 `entry` 字段记录入口 exe，重启目标以**新版清单**为准。`entry` 来自网络且会被
+`Start-Process` 直接执行，因此只认「纯文件名 + 确实在本次落地的文件集合里」，
+不符合就退回当前 exe 名（最坏等于旧行为）。老清单没有 `entry` 字段时行为不变。
+
+开机自启不受影响：启动快捷方式本来就在每次启动时按 `sys.executable` 无条件重写，
+更新后 helper 拉起新 exe 即自愈。**桌面上手动建的快捷方式需要重建一次**——这是
+改名无法避免的一次性代价。
+
+新增 `tests/test_dist_name_has_no_space.py`（17 条），把「常量 / spec / 版本资源 /
+打包脚本 / installer」五处对齐，并覆盖改名当天的更新路径与恶意 `entry`；
+`tests/test_dist_path_budget.py`（4 条）把最深条目的预算钉在 85 字符。
+
+还修好了官方打包脚本：`tools/package_dist.py` 的防泄漏闸不认识 spec 里有意打进去的
+`blank_16x9.pptx`（图片转文字的空白母版），一律拒绝打包，于是这条路一直跑不通、
+只能手工压 zip——**v1.5.1 的分发包因此漏掉了 `manifest.json`**（首次启动得自己重算
+一遍全量哈希）。现在按精确相对路径放行这一个文件，新混进来的 pptx 照样拦。
+
+## v1.5.1
 
 ### 联想加硬预算：最慢查询 51 秒 → 0.29 秒
 

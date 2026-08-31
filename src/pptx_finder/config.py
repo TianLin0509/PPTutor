@@ -13,6 +13,14 @@ from pathlib import Path
 _log = logging.getLogger(__name__)
 
 APP_NAME = "pptx-finder"
+# 界面上叫什么（标题栏、托盘、关于）——这个可以有空格。
+APP_DISPLAY_NAME = "PPT Doctor"
+# 落到磁盘上叫什么——**绝不能有空格**。用户反馈解压后跑不起来，而带空格的路径在
+# 没加引号的地方到处裂：批处理、快捷方式目标、`explorer /select,`（同一批修的
+# open_folder 就是这个坑）、各种解压/安装工具自己拼的命令行。展示名和文件名分开，
+# 空格只留在前者。改这两个常量时，pptx-finder.spec 必须同步（test_package_spec 锁死）。
+DIST_DIR_NAME = "PPT-Doctor"
+EXE_NAME = "PPT-Doctor.exe"
 DEFAULT_THEME = "atelier"
 DEFAULT_AUTOSTART = True
 DEFAULT_VERSION_KEEP_PER_DOC = 100

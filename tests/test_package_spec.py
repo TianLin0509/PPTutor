@@ -136,5 +136,14 @@ def test_package_has_regex_and_windows_version_metadata():
         encoding="utf-8")
     assert "collect_all('regex')" in spec
     assert "version='assets\\\\windows_version_info.txt'" in spec
-    assert "filevers=(1, 5, 1, 0)" in version_info
-    assert "ProductVersion', '1.5.1'" in version_info
+
+    # 原来这里写死 "1.5.1"，于是每次升版都会红一次——测的是字面量，不是不变量。
+    # 真正要守的是「exe 属性页里的版本必须等于包版本」，所以对着 __version__ 比。
+    from pptx_finder import __version__
+
+    parts = tuple(int(x) for x in __version__.split("."))
+    assert len(parts) == 3, f"版本号形如 x.y.z：{__version__}"
+    assert f"filevers=({parts[0]}, {parts[1]}, {parts[2]}, 0)" in version_info
+    assert f"prodvers=({parts[0]}, {parts[1]}, {parts[2]}, 0)" in version_info
+    assert f"'FileVersion', '{__version__}'" in version_info
+    assert f"'ProductVersion', '{__version__}'" in version_info

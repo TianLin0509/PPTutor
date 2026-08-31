@@ -351,7 +351,8 @@ class UpdateController(QObject):
         try:
             updater.apply_update(
                 self._staging, updater.install_dir(), self._info,
-                relaunch=Path(sys.executable).name)
+                relaunch=updater.relaunch_name(
+                    self._info, Path(sys.executable).name))
         except Exception as e:  # noqa: BLE001
             self._on_failed(str(e))
             return

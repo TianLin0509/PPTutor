@@ -17,7 +17,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 _EXE_ENV = os.environ.get("PPT_DOCTOR_EXE") or os.environ.get("PPTUTOR_EXE")
-EXE = Path(_EXE_ENV) if _EXE_ENV else ROOT / "dist" / "PPT Doctor" / "PPT Doctor.exe"
+EXE = Path(_EXE_ENV) if _EXE_ENV else ROOT / "dist" / "PPT-Doctor" / "PPT-Doctor.exe"
 sys.path.insert(0, str(ROOT / "tests"))
 sys.path.insert(0, str(ROOT / "src"))
 

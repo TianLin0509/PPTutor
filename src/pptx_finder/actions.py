@@ -24,14 +24,112 @@ def open_file(path: str) -> bool:
         return False
 
 
+def _explorer_exe() -> str:
+    """走绝对路径，别让 PATH 上的同名程序有机会顶上来。"""
+    root = os.environ.get("SystemRoot") or os.environ.get("WINDIR") or r"C:\Windows"
+    return os.path.join(root, "explorer.exe")
+
+
+def _select_via_shell_api(target: str) -> bool:
+    r"""SHOpenFolderAndSelectItems 定位并选中，完全不经过命令行。
+
+    explorer 的命令行解析器是非标准的：`/select,` 后面的路径必须**自己**带引号，
+    整体加引号（`"/select,C:\a b\c.pptx"`）它认不出来，会默默打开「文档」——
+    这正是「打开成错误的文件夹」的来源。而 subprocess 传列表时，Windows 的
+    list2cmdline 见参数里有空格就会整体加引号，于是**每个带空格的路径都中招**。
+    路径里有逗号则相反：不加引号时 explorer 会在逗号处截断。
+
+    所以首选根本不拼命令行的 shell API：空格、逗号、`&`、中文一律无所谓。
+    """
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except ImportError:
+        return False
+    try:
+        ole32 = ctypes.windll.ole32
+        shell32 = ctypes.windll.shell32
+    except (AttributeError, OSError):
+        return False
+
+    # 这个函数跑在后台线程（UI 走 _run_bg），COM 必须在本线程初始化。
+    COINIT_APARTMENTTHREADED = 0x2
+    RPC_E_CHANGED_MODE = -2147417850  # 0x80010106：本线程已按别的模型初始化过
+    hr_init = ole32.CoInitializeEx(None, COINIT_APARTMENTTHREADED)
+    need_uninit = hr_init in (0, 1)  # S_OK / S_FALSE 都要配对 CoUninitialize
+    if hr_init < 0 and hr_init != RPC_E_CHANGED_MODE:
+        return False
+
+    def _parse(name: str):
+        pidl = ctypes.c_void_p()
+        hr = shell32.SHParseDisplayName(
+            wintypes.LPCWSTR(name), None, ctypes.byref(pidl), 0, None)
+        return pidl if hr >= 0 and pidl else None
+
+    folder_pidl = item_pidl = None
+    try:
+        parent = os.path.dirname(target) or target
+        folder_pidl = _parse(parent)
+        item_pidl = _parse(target)
+        if folder_pidl is None:
+            return False
+        if item_pidl is None:
+            # 目录本身可定位不到子项时，退而打开该目录
+            hr = shell32.SHOpenFolderAndSelectItems(folder_pidl, 0, None, 0)
+            return hr >= 0
+        arr = (ctypes.c_void_p * 1)(item_pidl)
+        hr = shell32.SHOpenFolderAndSelectItems(folder_pidl, 1, arr, 0)
+        return hr >= 0
+    except (OSError, ValueError, AttributeError):
+        return False
+    finally:
+        for pidl in (item_pidl, folder_pidl):
+            if pidl:
+                try:
+                    ole32.CoTaskMemFree(pidl)
+                except OSError:
+                    pass
+        if need_uninit:
+            try:
+                ole32.CoUninitialize()
+            except OSError:
+                pass
+
+
+def explorer_select_command(target: str) -> str:
+    r"""`explorer.exe /select,"路径"`：引号只包路径，绝不包住 `/select,`。
+
+    这一条就是修复本身。原来传的是列表，`list2cmdline` 见参数含空格便整体加引号，
+    explorer 的非标准解析器认不出来 → 默默打开默认文件夹（实测是「文档」/「桌面」）。
+    """
+    return f'"{_explorer_exe()}" /select,"{target}"'
+
+
 def open_folder(path: str) -> bool:
-    """在资源管理器中定位文件；文件已不在则退而打开其父目录。"""
+    """在资源管理器中定位文件；文件已不在则退而打开其父目录。
+
+    先起 explorer 而不是先调 shell API，是量出来的：`SHOpenFolderAndSelectItems`
+    是同步的，需要新开窗口时实测阻塞 **1,465～1,742 ms**（复用已有窗口 42 ms）；
+    而 explorer 在自己进程里干活，`Popen` **30～55 ms** 就返回。health / report
+    那几个调用点是直接在 UI 线程上调的，同步版本会变成一次可见卡顿——旧实现用
+    Popen，天然异步，所以从没暴露过这个问题，修 bug 不该顺手把它引进来。
+
+    两条路都实测过带空格 / 逗号 / `&` / 中文的路径，结果一致；shell API 留作
+    explorer 起不来时的兜底（它不经过任何命令行解析，最不挑路径）。
+    """
     if os.path.exists(path):
+        target = os.path.normpath(os.path.abspath(path))
         try:
-            subprocess.Popen(["explorer", f"/select,{os.path.normpath(path)}"])
+            # 传字符串而不是列表：list2cmdline 的加引号规则正是 bug 本身。
+            subprocess.Popen(explorer_select_command(target),
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             return True
         except OSError:
-            return False
+            log.warning("explorer /select failed, falling back to shell API",
+                        exc_info=True)
+        return _select_via_shell_api(target)
     parent = os.path.dirname(path)
     if os.path.isdir(parent):
         try:

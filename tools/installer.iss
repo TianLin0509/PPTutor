@@ -24,20 +24,25 @@ WizardStyle=modern
 PrivilegesRequired=lowest
 ArchitecturesAllowed=x64
 ArchitecturesInstallIn64BitMode=x64
-UninstallDisplayIcon={app}\PPT Doctor.exe
+UninstallDisplayIcon={app}\PPT-Doctor.exe
 CloseApplications=yes
 VersionInfoVersion={#AppVersion}.0
 
 [Tasks]
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加任务："
 
+[InstallDelete]
+; v1.5.2 入口改名（去掉空格）。Inno 不会动它不认识的旧文件，不清掉的话 {app} 里
+; 会留一个 1.5.1 的 PPT Doctor.exe —— 用户桌面上若有旧快捷方式，点开的就是那个旧壳。
+Type: files; Name: "{app}\PPT Doctor.exe"
+
 [Files]
-Source: "..\dist\PPT Doctor\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
+Source: "..\dist\PPT-Doctor\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
 
 [Icons]
-Name: "{group}\PPT Doctor"; Filename: "{app}\PPT Doctor.exe"
+Name: "{group}\PPT Doctor"; Filename: "{app}\PPT-Doctor.exe"
 Name: "{group}\卸载 PPT Doctor"; Filename: "{uninstallexe}"
-Name: "{userdesktop}\PPT Doctor"; Filename: "{app}\PPT Doctor.exe"; Tasks: desktopicon
+Name: "{userdesktop}\PPT Doctor"; Filename: "{app}\PPT-Doctor.exe"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\PPT Doctor.exe"; Description: "启动 PPT Doctor（托盘常驻）"; Flags: postinstall nowait skipifsilent unchecked
+Filename: "{app}\PPT-Doctor.exe"; Description: "启动 PPT Doctor（托盘常驻）"; Flags: postinstall nowait skipifsilent unchecked

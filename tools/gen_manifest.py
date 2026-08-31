@@ -4,7 +4,7 @@
     python tools/gen_manifest.py <dist_dir> [version] [notes]
 
 默认 version 取 pptx_finder.__version__，写入 <dist_dir>/manifest.json。
-打包流程：pyinstaller 出 dist/PPTutor/ 后跑本脚本，把清单塞进 dist（随包发布 +
+打包流程：pyinstaller 出 dist/PPT-Doctor/ 后跑本脚本，把清单塞进 dist（随包发布 +
 供运行时与远端比对）。manifest.json 自身不计入清单。
 """
 from __future__ import annotations
