@@ -123,3 +123,110 @@ def test_open_folder_falls_back_to_the_parent_when_the_file_is_gone(monkeypatch,
 
 def test_open_folder_reports_failure_when_nothing_exists(monkeypatch):
     assert actions.open_folder(r"C:\no\such\dir\gone.pptx") is False
+
+
+# ============ 根路径：压测（62,177 条命令行 + 35 条真机）挖出来的 ============
+#
+# A 层用 Windows 自己的 CommandLineToArgvW 当裁判，62,177 条对抗性路径里只有 5 条
+# 往返失败，全是尾部反斜杠——也就是盘符根 `C:\` 和 UNC 共享根。`"C:\"` 里的 `\"`
+# 会被当成转义引号，参数变成 `/select,C:"` 且引号不闭合。
+#
+# 顺着这条线真机实测，得到几个反直觉的事实（B 层）：
+#
+#     os.startfile('C:\')                窗口集合完全没变化——什么都没发生
+#     ShellExecuteW(open/explore/None)   同上，三种动词都没反应
+#     explorer.exe "C:\\"                落到「文档」（explorer 不做反转义！）
+#     explorer.exe /select,C:\           落到「此电脑」
+#     explorer.exe C:\                   ✅ 正确
+#     os.startfile('C:\Windows')         ✅ 正确（普通目录是好使的）
+#     os.startfile('\\localhost\C$\')    ✅ 正确（UNC 共享根也是好使的）
+#
+# 结论：盘符根必须用**不加引号**的 `explorer.exe C:\`，其余用 os.startfile。
+
+
+@pytest.mark.parametrize("path,is_root", [
+    ("C:\\", True),
+    ("D:\\", True),
+    (r"\\server\share", True),
+    (r"C:\Users", False),
+    (r"C:\Users\me\deck.pptx", False),
+    (r"\\server\share\dir", False),
+])
+def test_is_path_root_recognises_what_has_no_parent(path, is_root):
+    assert actions.is_path_root(path) is is_root
+
+
+def test_a_drive_root_never_reaches_the_select_command(monkeypatch):
+    r"""根路径若流到 explorer_select_command，就会拼出 `/select,"C:\"` 那个坏形状。"""
+    monkeypatch.setattr(
+        actions, "explorer_select_command",
+        lambda t: pytest.fail(f"根路径不该走 /select：{t!r}"))
+    seen: list[str] = []
+    monkeypatch.setattr(actions, "open_drive_root", lambda t: seen.append(t) or True)
+    monkeypatch.setattr(os.path, "exists", lambda _p: True)
+    assert actions.open_folder("C:\\") is True
+    assert seen == ["C:\\"]
+
+
+def test_drive_root_uses_an_unquoted_explorer_argument(monkeypatch):
+    """explorer 不做反转义：加了引号的 `"C:\\\\"` 实测会落到「文档」。"""
+    seen: list[str] = []
+    monkeypatch.setattr(subprocess, "Popen",
+                        lambda cmd, **kw: seen.append(cmd) or object())
+    monkeypatch.setattr(
+        os, "startfile",
+        lambda *a, **k: pytest.fail("盘符根用 os.startfile 实测毫无反应"),
+        raising=False)
+    assert actions.open_drive_root("C:\\") is True
+    assert len(seen) == 1
+    assert seen[0].endswith(" C:\\"), seen[0]
+    assert '"C:' not in seen[0].split("explorer.exe", 1)[1], f"路径不该加引号：{seen[0]}"
+
+
+def test_unc_share_root_uses_startfile(monkeypatch):
+    """UNC 共享根名字可能带空格，而 os.startfile 对它实测是好使的。"""
+    opened: list[str] = []
+    monkeypatch.setattr(os, "startfile", lambda p: opened.append(p), raising=False)
+    monkeypatch.setattr(
+        subprocess, "Popen",
+        lambda *a, **k: pytest.fail("UNC 共享根不该走不加引号的 explorer"))
+    assert actions.open_drive_root(r"\\server\my share") is True
+    assert opened == [r"\\server\my share"]
+
+
+def test_double_clicking_a_drive_root_result_also_works(monkeypatch, tmp_path):
+    """open_file 也踩同一个坑：os.startfile('D:\') 是完全没反应的。"""
+    seen: list[str] = []
+    monkeypatch.setattr(actions, "open_drive_root", lambda t: seen.append(t) or True)
+    monkeypatch.setattr(os.path, "exists", lambda _p: True)
+    monkeypatch.setattr(
+        os, "startfile",
+        lambda *a, **k: pytest.fail("盘符根不该走 os.startfile"), raising=False)
+    assert actions.open_file("C:\\") is True
+    assert seen == ["C:\\"]
+
+
+def test_open_file_still_uses_startfile_for_everything_else(monkeypatch, tmp_path):
+    deck = tmp_path / "a b.pptx"
+    deck.write_bytes(b"x")
+    opened: list[str] = []
+    monkeypatch.setattr(os, "startfile", lambda p: opened.append(p), raising=False)
+    assert actions.open_file(str(deck)) is True
+    assert opened == [str(deck)]
+
+
+@pytest.mark.parametrize("raw", [
+    r"C:\dir\\", r"C:\dir\\\\", r"C:\a\.\b\..\c", r"C:\a\b\\",
+])
+def test_normalising_leaves_no_trailing_slash_on_non_roots(raw):
+    """`explorer_select_command` 的前置条件：归一化后非根路径不带尾部反斜杠。"""
+    target = os.path.normpath(os.path.abspath(raw))
+    assert not target.endswith("\\") or actions.is_path_root(target)
+
+
+def test_select_command_is_verbatim_between_the_quotes():
+    """explorer 拿到的就是两个引号之间的原文——不能有任何转义加工。"""
+    for p in [r"C:\a b\c.pptx", r"C:\a,b\c.pptx", r"C:\a&b\c.pptx",
+              r"C:\中文 目录\报告.pptx", r"C:\a^b\c.pptx"]:
+        cmd = actions.explorer_select_command(p)
+        assert cmd.split("/select,", 1)[1] == f'"{p}"'

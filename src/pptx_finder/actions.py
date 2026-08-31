@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
 import time
 
@@ -13,10 +14,18 @@ log = logging.getLogger(__name__)
 _OPEN_ATTACH_TIMEOUT_SEC = 4.0
 _OPEN_ATTACH_POLL_SEC = 0.08
 
+# 盘符根：`C:\`。形状固定为三个字符，永远不含空格——下面正是靠这一点才敢不加引号。
+_DRIVE_ROOT_RE = re.compile(r"^[A-Za-z]:\\$")
+
 
 def open_file(path: str) -> bool:
     if not os.path.exists(path):
         return False
+    target = os.path.normpath(os.path.abspath(path))
+    if _DRIVE_ROOT_RE.match(target):
+        # 双击一个「D:\」这样的文件夹结果时也得真能打开——os.startfile 对盘符根
+        # 是彻底没反应的（实测），详见 open_drive_root。
+        return open_drive_root(target)
     try:
         os.startfile(path)  # type: ignore[attr-defined]  # Windows only
         return True
@@ -98,11 +107,55 @@ def _select_via_shell_api(target: str) -> bool:
                 pass
 
 
+def is_path_root(target: str) -> bool:
+    r"""盘符根 `C:\` 或 UNC 共享根 `\\server\share`：没有可供「在其中选中」的父目录。"""
+    return os.path.dirname(target) == target
+
+
+def open_drive_root(target: str) -> bool:
+    r"""打开一个盘符根（`C:\`）。这条路径上每一步都是量出来的，别照直觉改。
+
+    实测（Windows 11，用 Shell.Application 读回资源管理器实际停留位置）：
+
+        os.startfile('C:\')                窗口集合完全没变化——什么都没发生
+        ShellExecuteW(open/explore/None)   同上，三种动词都没反应
+        explorer.exe "C:\\"                落到「文档」
+        explorer.exe /select,C:\           落到「此电脑」
+        explorer.exe C:\                   ✅ 正确停在 C:\
+
+    两个反直觉点：
+    1. `os.startfile` 对**普通目录**是好使的（对照组 `C:\Windows` 命中），偏偏对
+       盘符根毫无反应。所以不能想当然地用它兜底。
+    2. explorer **不按 `CommandLineToArgvW` 那套反转义**——`"C:\\"` 里的 `\\` 不会
+       被还原成一个反斜杠，而是原样当成路径的一部分，于是路径非法、回落到默认
+       文件夹。所以这里**绝不能加引号**；盘符根固定是 `X:\` 三个字符、不含空格，
+       不加引号是安全的（`_DRIVE_ROOT_RE` 保证了这个形状）。
+    """
+    if not _DRIVE_ROOT_RE.match(target):
+        # 不是盘符根就别走这条特例（UNC 共享根用 os.startfile 实测是好的）
+        try:
+            os.startfile(target)  # type: ignore[attr-defined]
+            return True
+        except OSError:
+            return False
+    try:
+        subprocess.Popen(f'"{_explorer_exe()}" {target}',
+                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return True
+    except OSError:
+        return False
+
+
 def explorer_select_command(target: str) -> str:
     r"""`explorer.exe /select,"路径"`：引号只包路径，绝不包住 `/select,`。
 
     这一条就是修复本身。原来传的是列表，`list2cmdline` 见参数含空格便整体加引号，
     explorer 的非标准解析器认不出来 → 默默打开默认文件夹（实测是「文档」/「桌面」）。
+
+    **前置条件：target 不能以反斜杠结尾**，也就是不能是根路径。explorer 拿到的就是
+    两个引号之间的原文（它不做任何反转义），而 `"C:\"` 这种形状在别的解析器眼里
+    是「转义引号 + 引号不闭合」。`open_folder` 已经在调用之前把根路径分流走了；
+    Windows 路径不可能含 `"`，所以除此之外没有别的转义问题。
     """
     return f'"{_explorer_exe()}" /select,"{target}"'
 
@@ -121,6 +174,10 @@ def open_folder(path: str) -> bool:
     """
     if os.path.exists(path):
         target = os.path.normpath(os.path.abspath(path))
+        if is_path_root(target):
+            # 盘符根 / 共享根没有父目录，`/select` 无从谈起——直接打开它自己。
+            # 也顺带保证了传给 explorer_select_command 的路径永不以反斜杠结尾。
+            return open_drive_root(target)
         try:
             # 传字符串而不是列表：list2cmdline 的加引号规则正是 bug 本身。
             subprocess.Popen(explorer_select_command(target),
