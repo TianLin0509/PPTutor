@@ -12,6 +12,16 @@
 
 ---
 
+## 📦 v1.5.4：改发 .exe 安装程序
+
+- **下载 `PPT-Doctor-Setup-v1.5.4.exe`，双击就装完**，不用再解压、不用自己找 exe、
+  快捷方式自动建好，可从「应用和功能」卸载。想要绿色免安装的仍可下 zip。
+- 装到 `%LOCALAPPDATA%\Programs\PPT-Doctor`，**全程不弹 UAC**。这是必需的：增量
+  自动更新要就地替换 exe 和 dll，装进 Program Files 会让自动更新永久失效。
+- 卸载不碰索引库和版本库（它们在 `%LOCALAPPDATA%\pptx-finder`，不在安装目录）。
+- 顺手修掉一个静默 bug：`installer.iss` 的版本号写死成 1.3.2 漂了很久——因为这个
+  安装器从没被真正构建过。现在版本号只能从 `__version__` 传入，漏传直接编译失败。
+
 ## 🧪 v1.5.3：「打开所在文件夹」专项压测
 
 - 新增 `scripts/stress_open_folder.py`：**A 层 61,545 条**命令行往返（拿 Windows 自己的
