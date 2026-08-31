@@ -178,11 +178,12 @@ def test_non_utf8_names_survive(tmp_path):
         assert _paths(store, store.search(["name.txt"])) == [weird]
 
 
-def test_huge_file_size_is_capped_not_overflowed(tmp_path):
-    """大小是 u32 存的；超 4 GiB 钉在上限，不许回绕成一个小数字。"""
-    path = _build([(r"C:\x\huge.iso", 8 * 1024 ** 3, 1_700_000_000)])
+def test_huge_file_size_is_stored_as_u64(tmp_path):
+    """size: 查询依赖该字段，大于 4 GiB 不能再被钉成 u32 上限。"""
+    size = 8 * 1024 ** 3
+    path = _build([(r"C:\x\huge.iso", size, 1_700_000_000)])
     with namestore.NameStore(path) as store:
-        assert store.entry(0)[2] == namestore.SIZE_CAP
+        assert store.entry(0)[2] == size
 
 
 def test_missing_file_raises_namestore_error(tmp_path):

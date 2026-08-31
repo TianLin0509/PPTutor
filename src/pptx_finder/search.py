@@ -6,14 +6,18 @@ import os
 import re
 import sqlite3
 import unicodedata
+import heapq
 from collections import defaultdict
 from collections.abc import Callable
 from difflib import SequenceMatcher
 from functools import lru_cache
 
-from . import cluster, namequery
+from . import cluster, namequery, search_relax
 from .models import FileResult, SearchHit
-from .ranking import relevance_components
+from .ranking import (
+    result_sort_key,
+    sort_results as _core_sort_results,
+)
 from .text_tokenize import SEPARATOR_CLASS, char_match, normalize, parse_query
 
 log = logging.getLogger(__name__)
@@ -67,6 +71,10 @@ def _candidate_parts(text: str) -> list[str]:
     return parts
 
 
+#: _suggest_score 里「包含关系」最多能加的分。上界剪枝要扣掉它才仍是必要条件。
+_SUGGEST_MAX_BONUS = 0.18
+
+
 def _suggest_threshold(target_norm: str) -> float:
     if target_norm.isascii():
         return 0.72 if len(target_norm) <= 6 else 0.66
@@ -91,6 +99,7 @@ def suggest_queries(
     limit: int = 3,
     max_files: int = 1200,
     max_pages: int = 1200,
+    budget: search_relax.RelaxBudget | None = None,
 ) -> list[str]:
     """Return lightweight zero-result query suggestions.
 
@@ -108,23 +117,37 @@ def suggest_queries(
         return []
 
     best: dict[str, tuple[float, str]] = {}
+    threshold = _suggest_threshold(target_norm)
 
     def add_candidate(value: str, *, weight: float) -> None:
         value = value.strip()
         cand_norm = normalize(value).strip()
         if len(cand_norm) < 2 or cand_norm == target_norm:
             return
+        # 先用便宜的上界挡一道。real_quick_ratio()/quick_ratio() 都是 ratio() 的
+        # 严格上界（只看长度、只看字符多重集），够不到门槛的候选压根不必跑
+        # O(n·m) 的 ratio()。加分项只会让分数变高，所以扣掉最大加分再比就仍是
+        # 必要条件，召回一条不少。
+        # 真机 profile：这一层把 SequenceMatcher 从 67,263 次降到几百次。
+        need = threshold - _SUGGEST_MAX_BONUS - weight
+        if need > 0:
+            matcher = SequenceMatcher(None, target_norm, cand_norm)
+            if matcher.real_quick_ratio() < need or matcher.quick_ratio() < need:
+                return
         score = _suggest_score(target_norm, cand_norm, weight)
-        if score < _suggest_threshold(target_norm):
+        if score < threshold:
             return
         prev = best.get(cand_norm)
         if prev is None or score > prev[0]:
             best[cand_norm] = (score, value)
 
+    budget = budget if budget is not None else search_relax.RelaxBudget()
     for row in conn.execute(
         "SELECT name FROM files ORDER BY mtime DESC LIMIT ?",
         (int(max_files),),
     ):
+        if not budget.spend():
+            break
         stem = _stem_name(row["name"])
         add_candidate(stem, weight=0.12)
         for part in _candidate_parts(stem):
@@ -137,6 +160,8 @@ def suggest_queries(
         "ORDER BY file_id DESC, page_no LIMIT ?",
         (int(max_pages),),
     ):
+        if not budget.spend():
+            break
         raw = row["raw_text"] or ""
         for m in _TEXT_CAND_RE.finditer(raw):
             add_candidate(m.group(0), weight=0.0)
@@ -374,12 +399,14 @@ def _recall(
     return content
 
 
-def search(conn: sqlite3.Connection, query: str, scope: str | None = None,
-           limit: int = 200, exts: tuple[str, ...] | None = None,
-           case_sensitive: bool = False,
-           group_similar: bool = True,
-           name_limit: int = 3000,
-           name_only: bool = False) -> list[FileResult]:
+def _search_strict(conn: sqlite3.Connection, query: str, scope: str | None = None,
+                   limit: int = 200, exts: tuple[str, ...] | None = None,
+                   case_sensitive: bool = False,
+                   group_similar: bool = True,
+                   name_limit: int = 3000,
+                   name_only: bool = False,
+                   sort_keys=None,
+                   descending: bool = False) -> list[FileResult]:
     ext_filter = {e.lower() for e in exts} if exts else None  # 文件类型过滤；None=全部类型
     terms, phrases = parse_query(query)
     if not terms and not phrases:
@@ -597,12 +624,6 @@ def search(conn: sqlite3.Connection, query: str, scope: str | None = None,
     # 相关度硬分层：文件名来源 > 内容来源；同来源内大小写一致 > 折叠命中，
     # 然后比较连续全字/分隔符压缩/部分命中的质量。
     # 修改时间仍进入 score，并作为最终 tie-breaker。这里与 UI 二次排序共用同一组件。
-    results.sort(key=lambda r: (
-        *relevance_components(r),
-        -r.mtime,
-        r.name.casefold(),
-    ))
-
     # 版本组内标记“最新版”：文件名含 终稿/定稿/final/最终 优先，否则修改时间最新
     members: dict[int, list[FileResult]] = defaultdict(list)
     for r in results:
@@ -615,18 +636,12 @@ def search(conn: sqlite3.Connection, query: str, scope: str | None = None,
             return (kw, r.mtime)
         max(ms, key=_latest_key).is_latest = True
 
-    # 同组聚集：组按其最高分成员首次出现的位置排列，组内按分降序
-    grouped: dict[str, list[FileResult]] = defaultdict(list)
-    order: list[str] = []
-    for r in results:
-        key = f"g{r.group_id}" if r.group_id is not None else f"s{r.file_id}"
-        if key not in grouped:
-            order.append(key)
-        grouped[key].append(r)
-    final: list[FileResult] = []
-    for key in order:
-        final.extend(grouped[key])
-    return _collapse_exact_duplicates(final)[:limit]
+    ordered = _core_sort_results(
+        results,
+        sort_keys or ("relevance",),
+        descending=bool(descending),
+    )
+    return _collapse_exact_duplicates(ordered)[:limit]
 
 
 def _is_exact_hash(value: str) -> bool:
@@ -668,6 +683,199 @@ def _collapse_exact_duplicates(results: list[FileResult]) -> list[FileResult]:
     return collapsed
 
 
+_RELAX_TRIGGER_MAX_STRICT = 40
+#: 模糊（编辑距离）比别名贵好几个量级，只在严格几乎没结果时才兜底。
+_FUZZY_TRIGGER_MAX_STRICT = 3
+_RELAX_VARIANT_LIMIT = 4
+
+
+def _mark_relaxed(result: FileResult, relaxation: search_relax.Relaxation) -> FileResult:
+    result.relaxed = True
+    result.relaxed_kind = relaxation.kind
+    result.relaxed_query = relaxation.value
+    result.match_kind = (
+        f"filename_{relaxation.kind}" if result.name_hit
+        else f"content_{relaxation.kind}"
+    )
+    return result
+
+
+def _fuzzy_ppt_results(
+    conn: sqlite3.Connection,
+    query: str,
+    *,
+    scope: str | None,
+    exts: tuple[str, ...] | None,
+    group_similar: bool,
+    name_only: bool,
+    candidate_limit: int = 300,
+    budget: search_relax.RelaxBudget | None = None,
+) -> list[FileResult]:
+    """Use strict n-gram anchors to find, then Unicode similarity to verify."""
+    anchors = search_relax.fuzzy_anchors(query)
+    if not anchors:
+        return []
+    budget = budget if budget is not None else search_relax.RelaxBudget()
+    best: dict[int, tuple[float, FileResult]] = {}
+    normalized_anchors = [normalize(anchor) for anchor in anchors]
+    for anchor in anchors:
+        if budget.exhausted:
+            break
+        for row in _search_strict(
+            conn,
+            anchor,
+            scope=scope,
+            limit=candidate_limit,
+            exts=exts,
+            case_sensitive=False,
+            group_similar=group_similar,
+            name_limit=candidate_limit,
+            name_only=name_only,
+        ):
+            if budget.exhausted:
+                break
+            name_score = search_relax.fuzzy_name_score(
+                query, row.name, budget=budget, anchors=anchors)
+            content_score = 0.0
+            fuzzy_hits: list[SearchHit] = []
+            if not name_only:
+                for hit in row.hits:
+                    if budget.exhausted:
+                        break
+                    raw_row = conn.execute(
+                        "SELECT raw_text FROM pages_raw WHERE file_id=? AND page_no=?",
+                        (row.file_id, hit.page_no),
+                    ).fetchone()
+                    raw = str(raw_row["raw_text"] or "") if raw_row else ""
+                    score = search_relax.fuzzy_text_score(
+                        query, raw, budget=budget, anchors=anchors)
+                    if score:
+                        content_score = max(content_score, score)
+                        fuzzy_hits.append(SearchHit(
+                            hit.page_no,
+                            _snippet_from_raw(raw, normalized_anchors),
+                        ))
+            score = max(name_score, content_score)
+            if not score:
+                continue
+            row.name_hit = bool(name_score)
+            row.hits = fuzzy_hits[:MAX_HITS_PER_FILE]
+            if not row.name_hit and not row.hits:
+                continue
+            row.score += score
+            row.case_exact = True
+            _mark_relaxed(row, search_relax.Relaxation(query, "fuzzy"))
+            previous = best.get(row.file_id)
+            if previous is None or score > previous[0]:
+                best[row.file_id] = (score, row)
+    return [item[1] for item in best.values()]
+
+
+def search(conn: sqlite3.Connection, query: str, scope: str | None = None,
+           limit: int = 200, exts: tuple[str, ...] | None = None,
+           case_sensitive: bool = False,
+           group_similar: bool = True,
+           name_limit: int = 3000,
+           name_only: bool = False,
+           sort_keys=None,
+           descending: bool = False,
+           enable_relaxed: bool = True,
+           cancel=None) -> list[FileResult]:
+    """Strict results plus bounded automatic aliases/typo correction.
+
+    Relaxed results are concatenated after the complete strict tier even when
+    the user selects another secondary sort.  This is the hard product promise:
+    fuzzy recall can fill an empty/short result set, never steal the first row.
+    """
+    strict = _search_strict(
+        conn, query, scope=scope, limit=limit, exts=exts,
+        case_sensitive=case_sensitive, group_similar=group_similar,
+        name_limit=name_limit, name_only=name_only,
+        sort_keys=sort_keys, descending=descending,
+    )
+    if (
+        not enable_relaxed
+        or len(strict) >= max(1, int(limit))
+        or len(strict) > _RELAX_TRIGGER_MAX_STRICT
+        or not search_relax.is_relaxable_query(query)
+    ):
+        return strict
+
+    # 三条打分路径（建议库 / PPT 名字 / PPT 正文）共用一份预算，
+    # 免得各自限一次、合起来还是超。
+    budget = search_relax.RelaxBudget(cancel=cancel)
+    if (search_relax.alias_expansions(query)
+            or len(strict) > _FUZZY_TRIGGER_MAX_STRICT):
+        # 建议库要扫 1200 个文件名 + 1200 页正文，只在「严格几乎没结果」时才值得。
+        suggestions = []
+    else:
+        try:
+            suggestions = suggest_queries(conn, query, limit=3, budget=budget)
+        except Exception:  # noqa: BLE001 relaxation must never break strict search
+            log.debug("query suggestion fallback failed", exc_info=True)
+            suggestions = []
+    relaxations = search_relax.automatic_relaxations(query, suggestions)
+    seen = {row.file_id for row in strict}
+    # ``name_limit`` is a public candidate cap used by the legacy SQLite
+    # filename path.  Automatic relaxation must not silently bypass it by
+    # issuing several independent strict searches (or by using fuzzy anchors).
+    # Content-only matches do not consume this budget, preserving the original
+    # meaning of the parameter.
+    remaining_name_slots = max(
+        0,
+        max(1, int(name_limit)) - sum(1 for row in strict if row.name_hit),
+    )
+    relaxed: list[FileResult] = []
+    for relaxation in relaxations[:_RELAX_VARIANT_LIMIT]:
+        rows = _search_strict(
+            conn, relaxation.value, scope=scope, limit=limit, exts=exts,
+            case_sensitive=False, group_similar=group_similar,
+            name_limit=name_limit, name_only=name_only,
+            sort_keys=sort_keys, descending=descending,
+        )
+        for row in rows:
+            if row.file_id in seen:
+                continue
+            if row.name_hit and remaining_name_slots <= 0:
+                continue
+            seen.add(row.file_id)
+            relaxed.append(_mark_relaxed(row, relaxation))
+            if row.name_hit:
+                remaining_name_slots -= 1
+
+    # Alias/suggester expansion handles known terms.  N-gram anchors extend the
+    # same automatic behavior to old filenames/slide bodies outside the bounded
+    # suggestion sample, while final similarity prevents anchor-only false hits.
+    #
+    # 别名很便宜（几次普通检索），模糊匹配很贵（逐条编辑距离），所以两者的触发
+    # 门槛不同：别名沿用 _RELAX_TRIGGER_MAX_STRICT，模糊只在「严格几乎没结果」
+    # 时才兜底。原来两者共用 40 这个门槛，等于用户边打字边搜的每一个中间态都要
+    # 付一次最贵的路径——真机实测 0.1 毫秒的查询被拖到 51 秒。
+    for row in ([] if len(strict) > _FUZZY_TRIGGER_MAX_STRICT else _fuzzy_ppt_results(
+        conn,
+        query,
+        scope=scope,
+        exts=exts,
+        group_similar=group_similar,
+        name_only=name_only,
+        budget=budget,
+    )):
+        if row.file_id in seen:
+            continue
+        if row.name_hit and remaining_name_slots <= 0:
+            continue
+        seen.add(row.file_id)
+        relaxed.append(row)
+        if row.name_hit:
+            remaining_name_slots -= 1
+
+    if not relaxed:
+        return strict
+    relaxed = _collapse_exact_duplicates(_core_sort_results(
+        relaxed, sort_keys or ("relevance",), descending=bool(descending)))
+    return (strict + relaxed)[:max(1, int(limit))]
+
+
 # ---------------------------------------------------------------- 全盘文件名（namestore）
 
 def search_names(store, query: str, *, limit: int = 200,
@@ -675,7 +883,11 @@ def search_names(store, query: str, *, limit: int = 200,
                  scope: str | None = None,
                  exts: tuple[str, ...] | None = None,
                  case_sensitive: bool = False,
-                 exists: Callable[[str], bool] = os.path.exists) -> list[FileResult]:
+                 exists: Callable[[str], bool] = os.path.exists,
+                 sort_keys=None,
+                 descending: bool = False,
+                 cancel=None,
+                 enable_relaxed: bool = True) -> list[FileResult]:
     """「全部文件」范围的搜索：只认文件名，数据来自平铺索引而不是 SQLite。
 
     刻意长在 search.py 里而不是单开一个模块：打分要素（name_bonus、match_kind、
@@ -693,118 +905,241 @@ def search_names(store, query: str, *, limit: int = 200,
     # 这个范围用 Everything 那套语法（通配符 / ext: / size: / dm: / | / !），
     # 而不是 PPT 内容搜索的 parse_query——两者的用户习惯完全不同。
     # 语法写错时当零结果处理，不能让搜索线程抛异常。
-    try:
-        parsed = namequery.parse(query)
-    except namequery.QueryError as exc:
-        log.info("bad all-files query %r: %s", query, exc)
-        return []
-    if not parsed:
-        return []
-    terms, phrases = parse_query(query)
-
-    # 可以传一个 store，也可以传一串。传一串时后面的覆盖前面的同名路径——
-    # 增量层放在后面，这样刚改过的文件用的是新的大小/时间，而不是全量里的旧值。
     stores = [store] if not isinstance(store, (list, tuple)) else list(store)
-    hits: list[tuple[object, int]] = []
-    for st in stores:
-        if st is None:
-            continue
-        for i in st.search(parsed, limit=max(1, int(recall_limit)), scope=scope or ""):
-            hits.append((st, i))
-    if not hits:
+    stores = [st for st in stores if st is not None]
+    if not stores:
         return []
-
+    keep = max(1, int(limit))
     ext_filter = {e.lower() for e in exts} if exts else None
-    # 这个范围里什么扩展名都有，所以去扩展名要按「最后一个点」来，不能用内容搜索
-    # 那个只认 .pptx/.ppt 的 _stem_name——否则搜 report 时 report.txt 永远评不到
-    # 「完全匹配」档，会被一个更新的 report-2026.txt 压在下面。而按名字找文件的
-    # 场景里，「名字就是它」本来就该排第一。
-    # 排序口径要跟匹配口径一致：匹配时 résumé 折成 resume，评「完全匹配」时
-    # 也得折，否则搜 resume 命中了 résumé.pdf 却评不到最高档。
-    q_norm = (query.strip() if case_sensitive
-              else namequery.fold(query).strip())
-    q_stem = os.path.splitext(q_norm)[0] or q_norm
-    full_phrase = _full_query_phrase(terms, phrases, case_sensitive=case_sensitive)
-    query_exact = _compact_normalized(query, case_sensitive=case_sensitive)
-    case_needles = _case_rank_needles(query)
-    has_case_signal = bool(case_needles)
+    keys = (sort_keys,) if isinstance(sort_keys, str) else tuple(sort_keys or ("relevance",))
+    explicit_sort = bool(keys and keys[0] != "relevance")
 
-    by_path: dict[str, tuple] = {}
-    for st, i in hits:
+    # Later stores (the live overlay) replace older metadata/name state even if
+    # the new name no longer matches the query.  Build only the small suffix
+    # override sets; never materialize the 2M-entry main index.
+    suffix_overrides: list[set[str]] = [set() for _ in stores]
+    running: set[str] = set()
+    for pos in range(len(stores) - 1, -1, -1):
+        suffix_overrides[pos] = set(running)
+        if pos > 0:
+            st = stores[pos]
+            running.update(st.path_keys())
+
+    def row_from(st, i):
         path, name, size, mtime, is_dir = st.entry(i)
-        # 文件夹没有扩展名概念，按扩展名过滤时（选了 Word/PDF 之类）要整体排除，
-        # 否则「只看 PDF」会莫名其妙冒出一堆目录
+        if scope:
+            try:
+                if os.path.commonpath([
+                    os.path.normcase(os.path.abspath(path)),
+                    os.path.normcase(os.path.abspath(scope)),
+                ]) != os.path.normcase(os.path.abspath(scope)):
+                    return None
+            except ValueError:
+                return None
         ext = "" if is_dir else os.path.splitext(name)[1].lower()
         if ext_filter is not None and (is_dir or ext not in ext_filter):
-            continue
-        # 同一个文件可能同时出现在全量和增量层里；按大小写无关的路径去重，
-        # 否则用户会看到两条一模一样的结果
-        by_path[os.path.normcase(path)] = (path, name, ext, size, float(mtime), is_dir)
-    rows = list(by_path.values())
-    if not rows:
-        return []
+            return None
+        return (path, name, ext, int(size), float(mtime), bool(is_dir))
 
-    mtimes = [r[4] for r in rows]
-    mmin, mmax = min(mtimes), max(mtimes)
+    def iter_rows(parsed, *, unlimited: bool):
+        for pos, st in enumerate(stores):
+            ordinals = (
+                st.iter_search(parsed, scope=scope or "", cancel=cancel)
+                if unlimited else
+                st.search(parsed, limit=max(1, int(recall_limit)),
+                          scope=scope or "", cancel=cancel)
+            )
+            for i in ordinals:
+                row = row_from(st, i)
+                if row is None:
+                    continue
+                path_key = os.path.normcase(row[0])
+                if path_key in suffix_overrides[pos]:
+                    continue
+                yield row
 
-    def rec_norm(m: float) -> float:
-        return 1.0 if mmax == mmin else (m - mmin) / (mmax - mmin)
+    def build_results(rows, effective_query: str, *, relaxation=None,
+                      fuzzy_scores: dict[str, float] | None = None):
+        rows = list(rows)
+        if not rows:
+            return []
+        terms, phrases = parse_query(effective_query)
+        q_norm = (effective_query.strip() if case_sensitive and relaxation is None
+                  else namequery.fold(effective_query).strip())
+        q_stem = os.path.splitext(q_norm)[0] or q_norm
+        full_phrase = _full_query_phrase(
+            terms, phrases, case_sensitive=case_sensitive and relaxation is None)
+        query_exact = _compact_normalized(
+            effective_query, case_sensitive=case_sensitive and relaxation is None)
+        case_needles = _case_rank_needles(effective_query)
+        has_case_signal = bool(case_needles)
+        mtimes = [row[4] for row in rows]
+        mmin, mmax = min(mtimes), max(mtimes)
 
-    results: list[FileResult] = []
-    for path, name, ext, size, mtime, is_dir in rows:
-        normalized_name = (name if case_sensitive else namequery.fold(name))
-        stem = os.path.splitext(normalized_name)[0] or normalized_name
-        # 折过变音符号但保留大小写：不折的话 résumé.pdf 会被判成「与 resume
-        # 大小写不符」，明明是完全匹配却被降档压到后面。
-        case_preserved_name = namequery.fold(name, case_sensitive=True)
-        # 连名带扩展名打全（report.txt）和只打名字（report）都算「就是它」
-        if q_norm and (normalized_name == q_norm or stem == q_stem):
-            bonus = 2.0
-        elif q_norm and (normalized_name.startswith(q_norm) or stem.startswith(q_stem)):
-            bonus = 1.0
-        else:
-            bonus = NAME_BONUS
-        # 「完全匹配」这一档必须**连全名一起判**，不能只判去掉扩展名的 stem。
-        # 只判 stem 时，搜 `parse.cjs` 会是这样：`parse.cjs.map` 的 stem 正好是
-        # `parse.cjs`，评到最高档；而真正叫 `parse.cjs` 的那个文件 stem 是 `parse`，
-        # 评不上、掉到 partial 档——硬分层压过分数，于是「打全名字反而找不到它」。
-        # 真机抽样就是这么被抓到的（parse.cjs / index.js / report.txt 都中招）。
-        if query_exact and query_exact in (
-                _COMPACT_RE.sub("", stem), _COMPACT_RE.sub("", normalized_name)):
-            match_kind = "filename_exact"
-        elif (_contains_full_phrase(stem, full_phrase)
-              or _contains_full_phrase(normalized_name, full_phrase)):
-            match_kind = "filename_phrase"
-        else:
-            match_kind = "partial"
-        case_exact = True if not has_case_signal else bool(
-            case_needles and all(n in case_preserved_name for n in case_needles))
-        results.append(FileResult(
-            file_id=0, path=path, name=name, ext=ext, mtime=mtime, size=size,
-            page_count=0, status="filename_only",
-            score=W_RECENCY * rec_norm(mtime) + bonus,
-            name_hit=True, hits=[], match_kind=match_kind, case_exact=case_exact,
-            is_dir=is_dir,
-        ))
+        def rec_norm(value: float) -> float:
+            return 1.0 if mmax == mmin else (value - mmin) / (mmax - mmin)
 
-    results.sort(key=lambda r: (
-        *relevance_components(r),
-        -r.mtime,
-        r.name.casefold(),
-    ))
+        built: list[FileResult] = []
+        for ordinal, (path, name, ext, size, mtime, is_dir) in enumerate(rows, start=1):
+            normalized_name = namequery.fold(name)
+            stem = os.path.splitext(normalized_name)[0] or normalized_name
+            case_preserved_name = namequery.fold(name, case_sensitive=True)
+            if q_norm and (normalized_name == q_norm or stem == q_stem):
+                bonus = 2.0
+            elif q_norm and (normalized_name.startswith(q_norm) or stem.startswith(q_stem)):
+                bonus = 1.0
+            else:
+                bonus = NAME_BONUS
+            if relaxation is not None:
+                match_kind = f"filename_{relaxation.kind}"
+            elif query_exact and query_exact in (
+                    _COMPACT_RE.sub("", stem), _COMPACT_RE.sub("", normalized_name)):
+                match_kind = "filename_exact"
+            elif (_contains_full_phrase(stem, full_phrase)
+                  or _contains_full_phrase(normalized_name, full_phrase)):
+                match_kind = "filename_phrase"
+            else:
+                match_kind = "partial"
+            case_exact = True if relaxation is not None or not has_case_signal else bool(
+                case_needles and all(n in case_preserved_name for n in case_needles))
+            extra = (fuzzy_scores or {}).get(os.path.normcase(path), 0.0)
+            built.append(FileResult(
+                file_id=-ordinal, path=path, name=name, ext=ext, mtime=mtime, size=size,
+                page_count=0, status="filename_only",
+                score=W_RECENCY * rec_norm(mtime) + bonus + extra,
+                name_hit=True, hits=[], match_kind=match_kind, case_exact=case_exact,
+                is_dir=is_dir,
+                relaxed=relaxation is not None,
+                relaxed_kind=relaxation.kind if relaxation is not None else "",
+                relaxed_query=relaxation.value if relaxation is not None else "",
+            ))
+        return built
 
-    # 平铺索引是整份重建的，两次重建之间删掉的文件仍留在里面。与其为删除单独维护
-    # 一套增量账本，不如在**要显示的那几条**上顺手 stat 一下：只对排序后的前 N 条
-    # 生效（通常正好 200 次 stat，几毫秒），却能保证结果里不会出现已经不存在的文件。
-    # 边过滤边取够 limit，而不是先截断再过滤——后者会平白少给用户几条。
-    keep = max(1, int(limit))
-    alive: list[FileResult] = []
-    for r in results:
-        if exists(r.path):
-            alive.append(r)
-            if len(alive) >= keep:
-                break
-    # 排完序再发 id：名次即身份，既保证互不相同，也让它稳定可复现
-    for rank, r in enumerate(alive, start=1):
-        r.file_id = -rank
-    return alive
+    def raw_sort_key(row, q_norm: str, q_stem: str):
+        path, name, _ext, size, mtime, _is_dir = row
+        out: list = []
+        for key in keys:
+            if key == "recent":
+                out.append(-mtime)
+            elif key == "name":
+                out.append(name.casefold())
+            elif key == "size":
+                out.append(-size)
+            elif key == "path":
+                out.append(path.casefold())
+            else:
+                normalized = namequery.fold(name)
+                stem = os.path.splitext(normalized)[0] or normalized
+                quality = 0 if q_norm and (normalized == q_norm or stem == q_stem) else (
+                    1 if q_norm and (normalized.startswith(q_norm) or stem.startswith(q_stem))
+                    else 2
+                )
+                out.extend((0, 0, quality, -float(2 - quality)))
+        out.extend((-mtime, name.casefold()))
+        return tuple(out)
+
+    def strict_for(effective_query: str, *, relaxation=None):
+        try:
+            parsed = namequery.parse(effective_query)
+            if not parsed:
+                return []
+            if explicit_sort:
+                pool = max(keep * 5, 1000)
+                rows_iter = iter_rows(parsed, unlimited=True)
+                chooser = heapq.nlargest if descending else heapq.nsmallest
+                q_norm = namequery.fold(effective_query).strip()
+                q_stem = os.path.splitext(q_norm)[0] or q_norm
+                rows = chooser(pool, rows_iter,
+                               key=lambda row: raw_sort_key(row, q_norm, q_stem))
+            else:
+                by_path = {
+                    os.path.normcase(row[0]): row
+                    for row in iter_rows(parsed, unlimited=False)
+                }
+                rows = list(by_path.values())
+        except namequery.QueryError as exc:
+            # Syntax mistakes remain a friendly zero-result query, but a
+            # runtime timeout is operational failure and must reach the worker
+            # so the UI can say so instead of lying that nothing matched.
+            if "超时" in str(exc):
+                raise
+            log.info("bad all-files query %r: %s", effective_query, exc)
+            return []
+        except RuntimeError as exc:
+            if "interrupted" in str(exc).casefold():
+                raise
+            log.info("bad all-files query %r: %s", effective_query, exc)
+            return []
+        results = build_results(rows, effective_query, relaxation=relaxation)
+        results.sort(key=lambda result: result_sort_key(result, keys),
+                     reverse=bool(descending))
+        alive: list[FileResult] = []
+        for result in results:
+            if exists(result.path):
+                alive.append(result)
+                if len(alive) >= keep:
+                    break
+        return alive
+
+    strict = strict_for(query)
+    if (
+        not enable_relaxed
+        or len(strict) >= keep
+        or len(strict) > _RELAX_TRIGGER_MAX_STRICT
+        or not search_relax.is_relaxable_query(query, all_files=True)
+    ):
+        final = strict
+    else:
+        relaxed: list[FileResult] = []
+        for relaxation in search_relax.automatic_relaxations(query)[:_RELAX_VARIANT_LIMIT]:
+            relaxed.extend(strict_for(relaxation.value, relaxation=relaxation))
+
+        # Corpus-independent typo/fuzzy fallback: n-grams only generate a small
+        # candidate set; Unicode similarity is the final gate.
+        anchors = search_relax.fuzzy_anchors(query)
+        fuzzy_rows: dict[str, tuple] = {}
+        fuzzy_scores: dict[str, float] = {}
+        # 候选生成会查 cancel，但打分循环原来一次都不查——实测「1 秒时置取消」
+        # 仍要跑满 7.3 秒。预算对象把墙钟、工作量、取消三件事一起管住。
+        budget = search_relax.RelaxBudget(cancel=cancel)
+        if anchors and len(strict) <= _FUZZY_TRIGGER_MAX_STRICT:
+            for pos, st in enumerate(stores):
+                if budget.exhausted:
+                    break
+                for i in st.fuzzy_candidates(anchors, cancel=cancel):
+                    if budget.exhausted:
+                        break
+                    row = row_from(st, i)
+                    if row is None:
+                        continue
+                    key = os.path.normcase(row[0])
+                    if key in suffix_overrides[pos]:
+                        continue
+                    score = search_relax.fuzzy_name_score(
+                        query, row[1], budget=budget, anchors=anchors)
+                    if score and score > fuzzy_scores.get(key, 0.0):
+                        fuzzy_rows[key] = row
+                        fuzzy_scores[key] = score
+            fuzzy_relaxation = search_relax.Relaxation(query, "fuzzy")
+            fuzzy = build_results(
+                fuzzy_rows.values(), query, relaxation=fuzzy_relaxation,
+                fuzzy_scores=fuzzy_scores,
+            )
+            fuzzy.sort(key=lambda result: result_sort_key(result, keys),
+                       reverse=bool(descending))
+            relaxed.extend(fuzzy)
+
+        seen = {os.path.normcase(result.path) for result in strict}
+        deduped: list[FileResult] = []
+        for result in relaxed:
+            key = os.path.normcase(result.path)
+            if key in seen or not exists(result.path):
+                continue
+            seen.add(key)
+            deduped.append(result)
+        # Strict tier is never mixed with relaxed sorting.
+        final = (strict + deduped)[:keep]
+
+    for rank, result in enumerate(final, start=1):
+        result.file_id = -rank
+    return final

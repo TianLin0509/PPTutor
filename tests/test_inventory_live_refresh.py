@@ -388,3 +388,66 @@ def test_main_window_dirty_dir_queue_is_bounded(qtbot, tmp_path, monkeypatch):
     assert len(win._dirty_inventory_dirs) == MainWindow._INVENTORY_DIRS_MAX
     assert win._inventory_dirs_overflowed is True
     conn.close()
+
+
+def test_overlay_is_a_true_delta_and_refreshes_repeated_metadata(tmp_path, monkeypatch):
+    from pptx_finder.ui.main_window import MainWindow
+
+    monkeypatch.setenv("PPTX_FINDER_DATA_DIR", str(tmp_path / "appdata"))
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    target = docs / "changing.bin"
+    target.write_bytes(b"x")
+    os.utime(target, (BASE := 1_700_000_000, BASE))
+
+    # Full snapshot already contains this exact file: a directory event must not
+    # copy every unchanged child into the overlay.
+    main = namestore.NameStoreBuilder()
+    stat = target.stat()
+    main.add(str(target), stat.st_size, stat.st_mtime)
+    main.write(kind=namestore.MAIN)
+    first = MainWindow._reconcile_inventory_dirs_sync((str(docs),))
+    assert first["added"] == 0
+    overlay = namestore.open_store(namestore.OVERLAY)
+    try:
+        assert overlay is not None and overlay.count == 0
+    finally:
+        if overlay is not None:
+            overlay.close()
+
+    target.write_bytes(b"y" * 999)
+    os.utime(target, (BASE + 100, BASE + 100))
+    second = MainWindow._reconcile_inventory_dirs_sync((str(docs),))
+    assert second["added"] == 1
+    overlay = namestore.open_store(namestore.OVERLAY)
+    try:
+        assert overlay.entry(0)[2:4] == (999, BASE + 100)
+    finally:
+        overlay.close()
+
+    # A second change in the same dirty directory replaces, rather than copies,
+    # the old overlay record.
+    target.write_bytes(b"z" * 1234)
+    os.utime(target, (BASE + 200, BASE + 200))
+    third = MainWindow._reconcile_inventory_dirs_sync((str(docs),))
+    assert third["added"] == 1
+    overlay = namestore.open_store(namestore.OVERLAY)
+    try:
+        assert overlay.count == 1
+        assert overlay.entry(0)[2:4] == (1234, BASE + 200)
+    finally:
+        overlay.close()
+
+
+def test_overlay_reports_capacity_overflow_instead_of_silently_stopping(tmp_path, monkeypatch):
+    from pptx_finder.ui.main_window import MainWindow
+
+    monkeypatch.setenv("PPTX_FINDER_DATA_DIR", str(tmp_path / "appdata"))
+    monkeypatch.setattr(MainWindow, "_OVERLAY_MAX_ENTRIES", 1)
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "a.bin").write_bytes(b"a")
+    (docs / "b.bin").write_bytes(b"b")
+
+    result = MainWindow._reconcile_inventory_dirs_sync((str(docs),))
+    assert result["overflowed"] is True

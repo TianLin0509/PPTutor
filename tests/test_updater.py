@@ -57,6 +57,20 @@ def test_build_manifest_excludes_self_and_uses_posix(tmp_path):
     assert set(m["files"]) == {"a.txt", "sub/b.txt"}  # 正斜杠 + 不含 manifest.json 自身
 
 
+def test_build_manifest_can_carry_immutable_build_provenance(tmp_path):
+    (tmp_path / "app.exe").write_bytes(b"x")
+    manifest = updater.build_manifest(
+        tmp_path,
+        "1.5.1",
+        commit="abc123",
+        built_at="2026-08-30T00:00:00Z",
+    )
+    assert manifest["build"] == {
+        "commit": "abc123",
+        "built_at": "2026-08-30T00:00:00Z",
+    }
+
+
 def test_local_manifest_self_heals_when_missing(tmp_path, monkeypatch):
     """已发出的绿色包若漏带 manifest，应能按当前安装目录补生成。"""
     (tmp_path / "PPT Doctor.exe").write_bytes(b"exe")

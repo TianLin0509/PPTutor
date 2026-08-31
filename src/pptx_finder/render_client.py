@@ -422,6 +422,10 @@ class RendererProcessClient:
         except Exception:
             return None
         png = str(resp.get("path") or "")
+        if not png:
+            self._last_error = str(resp.get("reason") or self._last_error or "render returned no image")
+        else:
+            self._last_error = ""
         return Path(png) if png else None
 
     def close_current_presentation(self) -> None:

@@ -769,6 +769,7 @@ def test_active_powerpoint_fails_closed_without_getting_user_app(
     monkeypatch.setattr(renderer, "cache_dir", lambda: tmp_path)
     monkeypatch.setattr(renderer, "_ipc_enabled", lambda: False)
     monkeypatch.setattr(renderer, "_powerpoint_active", lambda **_kwargs: True)
+    monkeypatch.setattr(renderer, "_powerpoint_process_ids", lambda: {4242})
     src = tmp_path / "user-session-active.pptx"
     src.write_bytes(b"dummy")
     get_app_calls = []
@@ -800,6 +801,7 @@ def test_explicit_preview_borrows_active_powerpoint_but_opens_only_hidden_readon
     monkeypatch.setattr(renderer, "cache_dir", lambda: tmp_path)
     monkeypatch.setattr(renderer, "_ipc_enabled", lambda: False)
     monkeypatch.setattr(renderer, "_powerpoint_active", lambda **_kwargs: True)
+    monkeypatch.setattr(renderer, "_powerpoint_process_ids", lambda: {4242})
     src = tmp_path / "user-session-active.pptx"
     src.write_bytes(b"dummy")
     opened = []

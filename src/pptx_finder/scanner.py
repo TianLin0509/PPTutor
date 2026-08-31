@@ -19,7 +19,7 @@ DRIVE_FIXED = 3
 #: 网络盘（DRIVE_REMOTE=4）仍然不自动扫：一次全盘遍历可能要走很久的网络，
 #: 需要用户在设置里显式把 UNC 路径加成索引根。
 _INDEXED_DRIVE_TYPES = (DRIVE_FIXED, DRIVE_REMOVABLE)
-SCAN_POLICY_VERSION = "6"  # v6: 可移动盘纳入自动索引
+SCAN_POLICY_VERSION = "7"  # v7: NameStore size u32→u64，必须重建平铺索引
 
 
 def _norm_path(path: str | os.PathLike[str]) -> str:

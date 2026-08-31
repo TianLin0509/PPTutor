@@ -49,7 +49,7 @@ def test_render_service_render_request_returns_path(monkeypatch, tmp_path):
         "allow_borrowed_session": True,
     })
 
-    assert resp == {"id": 7, "ok": True, "path": str(out)}
+    assert resp == {"id": 7, "ok": True, "path": str(out), "reason": ""}
 
 
 def test_render_service_does_not_enable_borrowed_session_implicitly(monkeypatch, tmp_path):
@@ -69,7 +69,7 @@ def test_render_service_does_not_enable_borrowed_session_implicitly(monkeypatch,
         "page_no": 1,
     })
 
-    assert resp == {"id": 71, "ok": True, "path": str(out)}
+    assert resp == {"id": 71, "ok": True, "path": str(out), "reason": ""}
     assert seen == [False]
 
 
@@ -105,7 +105,7 @@ def test_render_service_propagates_existing_session_only(monkeypatch, tmp_path):
         "existing_session_only": True,
     })
 
-    assert resp == {"id": 8, "ok": True, "path": str(out)}
+    assert resp == {"id": 8, "ok": True, "path": str(out), "reason": ""}
     assert seen == [True]
 
 
@@ -277,7 +277,7 @@ def test_render_service_render_once_closes_the_historical_presentation(monkeypat
         "long_edge": 360,
     })
 
-    assert resp == {"id": 19, "ok": True, "path": str(out)}
+    assert resp == {"id": 19, "ok": True, "path": str(out), "reason": ""}
     assert events == ["render", "close"]
 
 

@@ -90,7 +90,12 @@ def _env_bool(name: str) -> bool | None:
 
 
 def _powerpoint_active(*, force: bool = False) -> bool:
-    """Best-effort check for an already running user PowerPoint session."""
+    """Check for an actual Microsoft POWERPNT process, not a compatible ROT entry.
+
+    WPS registers itself as ``PowerPoint.Application`` and even reports
+    ``Name=Microsoft PowerPoint``.  Treating any ROT object as Microsoft Office
+    made previews permanently unavailable whenever WPS had a presentation open.
+    """
     global _powerpoint_active_cache_at, _powerpoint_active_cache
     if os.name != "nt":
         return False
@@ -98,6 +103,15 @@ def _powerpoint_active(*, force: bool = False) -> bool:
     if not force and now - _powerpoint_active_cache_at < _POWERPOINT_ACTIVE_TTL_SEC:
         return _powerpoint_active_cache
 
+    pids = _powerpoint_process_ids()
+    if pids is not None:
+        active = bool(pids)
+        _powerpoint_active_cache_at = now
+        _powerpoint_active_cache = active
+        return active
+
+    # PID auditing itself failed.  Fail closed using the old ROT probe rather
+    # than assuming it is safe to start/borrow an automation server.
     active = False
     pythoncom = None
     initialized = False
@@ -560,7 +574,7 @@ def _app_for_render(*, allow_borrowed_session: bool):
         raise PowerPointSessionBusy(
             "cannot audit PowerPoint process ownership; preview renderer disabled"
         )
-    if existing_pids or _powerpoint_active(force=True):
+    if existing_pids:
         if allow_borrowed_session:
             return _attach_borrowed_powerpoint()
         raise PowerPointSessionBusy(
@@ -572,7 +586,8 @@ def _app_for_render(*, allow_borrowed_session: bool):
         # Close the race where the user starts PowerPoint between the process
         # audit above and DispatchEx.  Only the explicit clicked-preview path may
         # recover by borrowing the now-active server.
-        if allow_borrowed_session and _powerpoint_active(force=True):
+        now_running = _powerpoint_process_ids()
+        if allow_borrowed_session and now_running:
             return _attach_borrowed_powerpoint()
         raise
 
@@ -586,7 +601,7 @@ def _get_app():
         raise PowerPointSessionBusy(
             "cannot audit PowerPoint process ownership; preview renderer disabled"
         )
-    if existing_pids or _powerpoint_active(force=True):
+    if existing_pids:
         raise PowerPointSessionBusy(
             "PowerPoint is already running; refusing to attach the preview renderer"
         )
@@ -1229,6 +1244,7 @@ def _render_page_direct(
     缓存文件名含 long_edge，提分辨率后旧低清缓存自动失效。
     hi_priority=True（预览）抢占共享 COM 锁，缩略图等低优先渲染让路（见 _priority）。
     """
+    _state.last_error = ""
     path = os.path.abspath(path)
     if cache_key is None:
         cache_key = default_cache_key(path)
@@ -1241,10 +1257,12 @@ def _render_page_direct(
     if cached is not None:
         return cached
     if not os.path.exists(path):
+        _state.last_error = "source file does not exist"
         return None
 
     fail_key = (path, int(page_no), cache_key, int(long_edge))
     if time.monotonic() < _failed_until.get(fail_key, 0.0):
+        _state.last_error = "preview is temporarily throttled after a recent failure"
         return None
     _sweep_failed_until()
 
@@ -1258,6 +1276,7 @@ def _render_page_direct(
             # Background work must never attach to the user's PowerPoint.  An
             # explicit clicked preview may use the audited borrowed path below.
             log.info("PowerPoint is active; background COM render declined safely")
+            _state.last_error = "PowerPoint is active; background preview declined safely"
             return None
         try:
             if existing_session_only:
@@ -1276,6 +1295,7 @@ def _render_page_direct(
                     and getattr(_state, "pres_path", None) == open_path
                     and getattr(_state, "pres_key", None) == cache_key
                 ):
+                    _state.last_error = "no reusable preview session"
                     return None
             else:
                 app = _app_for_render(
@@ -1285,9 +1305,11 @@ def _render_page_direct(
                 if use_snapshot:
                     open_path = _snapshot_for_render(path, cache_key)
                     if open_path is None:
+                        _state.last_error = "snapshot copy failed"
                         return None
                 pres = _open_pres(app, open_path, cache_key)  # 复用已打开的同文件，免重复 Open
             if page_no < 1 or page_no > int(pres.Slides.Count):
+                _state.last_error = "page number is out of range"
                 return None
             # 按 slide 实际宽高比算输出像素（宽高比随 pres 缓存，避免每页重取）
             width = long_edge
@@ -1295,15 +1317,19 @@ def _render_page_direct(
             pres.Slides(page_no).Export(str(out), "PNG", width, height)
             if out.exists() and out.stat().st_size > 0:
                 _failed_until.pop(fail_key, None)
+                _state.last_error = ""
                 return out
+            _state.last_error = "PowerPoint exported an empty preview"
             return None
         except PowerPointSessionBusy as e:
             # This is an expected safety decision, not a broken-file failure;
             # do not poison the page's 90-second retry cache.
             log.info("COM-only preview skipped: %s", e)
+            _state.last_error = str(e)
             return None
         except Exception as e:  # noqa: BLE001
             log.warning("render_page failed path=%s page=%s: %s", path, page_no, e)
+            _state.last_error = f"{type(e).__name__}: {e}"
             _failed_until[fail_key] = time.monotonic() + _FAILED_TTL_SEC
             _close_pres()       # 关掉可能损坏的 pres
             _release_local_app_reference()  # 丢弃损坏的 COM apartment，下次重建
@@ -1448,3 +1474,7 @@ def diagnostic_lines() -> list[str]:
         return [*render_client.diagnostic_lines(), "renderer_mode: com-only"]
     except Exception as e:  # noqa: BLE001
         return [f"renderer_ipc: enabled=True unavailable ({type(e).__name__}: {e})"]
+
+
+def last_error() -> str:
+    return str(getattr(_state, "last_error", "") or "")

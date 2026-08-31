@@ -37,7 +37,7 @@ def test_query_suggestions_find_close_filename(tmp_path):
     assert "算力方案" in suggestions[0]
 
 
-def test_zero_result_query_suggestion_can_be_applied(qtbot, tmp_path):
+def test_typo_query_is_automatically_relaxed_without_an_empty_state(qtbot, tmp_path):
     conn = _index(tmp_path)
     win = MainWindow(conn=conn, render_worker=StubRender(), do_index=False)
     qtbot.addWidget(win)
@@ -45,13 +45,12 @@ def test_zero_result_query_suggestion_can_be_applied(qtbot, tmp_path):
     win.search_box.setText("算力方按")
     win._do_search()
 
-    qtbot.waitUntil(lambda: not win._sugg_btns["query"].isHidden(), timeout=2000)
-    assert "算力方案" in win._empty_query_suggestion
-
-    qtbot.mouseClick(win._sugg_btns["query"], Qt.LeftButton)
-
     assert win.result_list.count() == 1
     assert win.empty_hint.isHidden()
+    assert win._results[0].name == "算力方案v2.pptx"
+    assert win._results[0].relaxed is True
+    assert win._results[0].relaxed_kind == "fuzzy"
+    assert win._empty_query_suggestion == ""
 
 
 def test_zero_result_shows_hint(qtbot, tmp_path):

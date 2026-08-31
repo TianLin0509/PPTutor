@@ -632,6 +632,18 @@ class ResultItem(QWidget):
                 f"font-size:10.5px;font-weight:600;color:{tok['ink3']};"
                 f"background:{tok['field']};border:none;border-radius:5px;padding:2px 7px;")
             row.addWidget(nh, 0)
+        if r.relaxed:
+            relaxed = QLabel("联想")
+            relaxed.setToolTip(
+                f"原词未直接命中；按“{r.relaxed_query}”补充召回"
+                if r.relaxed_query else "原词未直接命中；这是近似联想结果"
+            )
+            relaxed.setStyleSheet(
+                "font-size:10px;font-weight:700;color:#6D4AFF;"
+                f"background:{tok['field']};border:1px solid {tok['bd2']};"
+                "border-radius:5px;padding:1px 6px;"
+            )
+            row.addWidget(relaxed, 0)
         if r.status == "filename_only":
             # 按真实扩展名显示：.ppt 旧格式 / 任意文件盘点都走这个 badge
             ext = QLabel("文件夹" if r.is_dir else ((r.ext or "").lower() or "?"))
@@ -679,6 +691,9 @@ class ResultItem(QWidget):
                 sub = QLabel("\u6587\u4ef6\u5939 \u00b7 \u53cc\u51fb\u5728\u8d44\u6e90\u7ba1\u7406\u5668\u4e2d\u6253\u5f00")
             elif (r.ext or "").lower() == ".ppt":
                 sub = QLabel("\u8001\u683c\u5f0f \u00b7 \u4ec5\u6587\u4ef6\u540d\u641c\u7d22\u4e0e\u9884\u89c8")
+            elif r.relaxed:
+                shown = _elide_middle(r.relaxed_query or r.name, 24)
+                sub = QLabel(f"联想命中 · 按“{shown}”找到")
             else:
                 sub = QLabel("仅文件名收录 · 未解析内容")
             sub.setStyleSheet(f"font-size:11.5px;color:{tok['ink4']};background:transparent;")
@@ -900,6 +915,7 @@ class MainWindow(QMainWindow):
         self._search_pending_req: int | None = None
         self._last_query_text = ""            # 上次 _do_search 入口的查询文本（识别后台重搜）
         self._search_keep_selection = False   # 本次搜索是否「文本未变的后台重搜」（保留选中用）
+        self._sort_refresh_pending = False
         self._search_worker: SearchWorker | None = None
         self._async_search = conn is None and do_index
         self._live_refresh_after_search = False
@@ -1537,6 +1553,12 @@ class MainWindow(QMainWindow):
             lay.addWidget(btn, 0, Qt.AlignHCenter)
             self._rail_page_btns[key] = btn
         lay.addStretch(1)
+        # 「图片转可编辑文字」原来只在托盘右键菜单里，主窗口一个入口都没有——
+        # 连做这个功能的人自己都找不到。放进导航轨底部的动作区，与报告/设置同组。
+        self.rail_imgtext_btn = self._mk_rail_btn("转字", "图片转可编辑文字")
+        self.rail_imgtext_btn.setAccessibleName("图片转可编辑文字")
+        self.rail_imgtext_btn.clicked.connect(self._open_imgtext_from_rail)
+        lay.addWidget(self.rail_imgtext_btn, 0, Qt.AlignHCenter)
         self.rail_report_btn = self._mk_rail_btn("报告", "我的胶片报告")
         self.rail_report_btn.setAccessibleName("打开胶片报告")
         self.rail_report_btn.clicked.connect(self._open_report_from_rail)
@@ -1576,6 +1598,10 @@ class MainWindow(QMainWindow):
             if btn is not None:
                 btn.setIcon(factory(acc if btn.isChecked() else ink, 16))
                 btn.setIconSize(QSize(16, 16))
+        imgtext = getattr(self, "rail_imgtext_btn", None)
+        if imgtext is not None:
+            imgtext.setIcon(_icon_folder(ink, 16))
+            imgtext.setIconSize(QSize(16, 16))
         report = getattr(self, "rail_report_btn", None)
         if report is not None:
             report.setIcon(_icon_film(ink, 16))
@@ -1584,6 +1610,11 @@ class MainWindow(QMainWindow):
         if settings is not None:
             settings.setIcon(_icon_settings(ink, 16))
             settings.setIconSize(QSize(16, 16))
+
+    def _open_imgtext_from_rail(self) -> None:
+        """rail「转字」：与托盘菜单同一条路径，保证「重复点击只把已开的窗带到前台」。"""
+        from ..app import _open_imgtext_window
+        _open_imgtext_window(self)
 
     def _open_report_from_rail(self) -> None:
         """rail「报告」：打开胶片报告浮层（逻辑全在 stats_entry，盖主窗语义不变）。"""
@@ -2076,7 +2107,7 @@ class MainWindow(QMainWindow):
         self.goto_btn.setEnabled(can_goto)
         self.goto_btn.setToolTip(
             "用 PowerPoint 打开并跳到当前页"
-            if can_goto else "Word/PDF 暂不支持自动跳转；可使用“打开文件”"
+            if can_goto else "此文件类型不支持自动跳页；可使用“打开文件”"
         )
         for b in getattr(self, "_thumb_btns", []):
             b.setEnabled(on)
@@ -2483,6 +2514,17 @@ class MainWindow(QMainWindow):
     def _run_inventory_reconcile(self) -> None:
         """定时把一批脏目录交给后台线程对账（新增登记 + 消失删除）。"""
         if (
+            self._inventory_dirs_overflowed
+            and self._index_all_files_enabled
+            and not self._inventory_reconcile_inflight
+            and not (self._indexer is not None and self._indexer.isRunning())
+        ):
+            self._inventory_dirs_overflowed = False
+            self._schedule_full_coverage_scan(
+                self._index_roots, "inventory_live_overflow")
+            self._toast("文件变化较多，已安排后台全量校准")
+            return
+        if (
             not self._index_all_files_enabled
             or self._inventory_reconcile_inflight
             or not self._dirty_inventory_dirs
@@ -2523,10 +2565,20 @@ class MainWindow(QMainWindow):
         同格式的小索引，搜索时两份一起扫、按路径去重。删除不用管：结果在显示前会
         逐条 stat，已经不存在的自然消失。
         """
-        totals = {"added": 0, "dirs": 0}
+        totals = {"added": 0, "dirs": 0, "overflowed": False}
         try:
             builder = namestore.NameStoreBuilder()
             seen: set[str] = set()
+            dirty_keys = {
+                os.path.normcase(os.path.abspath(str(directory))) for directory in dirs
+            }
+            baseline: dict[str, tuple] = {}
+            main_store = namestore.open_store(namestore.MAIN)
+            if main_store is not None:
+                try:
+                    baseline = main_store.entries_for_directories(dirs)
+                finally:
+                    main_store.close()
             # 先把上一版增量层原样搬过来，否则这一轮只保留本批目录的内容，
             # 上一批刚发现的新文件会当场消失
             previous = namestore.open_store(namestore.OVERLAY)
@@ -2535,6 +2587,10 @@ class MainWindow(QMainWindow):
                     for i in range(previous.count):
                         path, _name, size, mtime, is_dir = previous.entry(i)
                         key = os.path.normcase(path)
+                        # 当前批目录必须整目录替换，不能先复制旧 metadata 再因 seen
+                        # 跳过新值；那会让第二次修改永远保留第一次的大小/时间。
+                        if os.path.normcase(os.path.dirname(path)) in dirty_keys:
+                            continue
                         if key in seen or not os.path.exists(path):
                             continue      # 顺手把已经删掉的条目扔掉，别让增量层只涨不消
                         seen.add(key)
@@ -2550,14 +2606,27 @@ class MainWindow(QMainWindow):
                 totals["dirs"] += 1
                 for entry in entries:
                     if len(seen) >= MainWindow._OVERLAY_MAX_ENTRIES:
+                        totals["overflowed"] = True
                         break
                     try:
                         key = os.path.normcase(entry.path)
                         if key in seen or entry.name.startswith("~$"):
                             continue
-                        seen.add(key)
                         st = entry.stat()
-                        if entry.is_dir(follow_symlinks=False):
+                        is_dir = entry.is_dir(follow_symlinks=False)
+                        base = baseline.get(key)
+                        current = (
+                            entry.path, entry.name, 0 if is_dir else int(st.st_size),
+                            int(st.st_mtime), is_dir,
+                        )
+                        # Main snapshot already has the same direct child: it is
+                        # not a delta and must not consume overlay capacity.
+                        if base is not None and (
+                            int(base[2]), int(base[3]), bool(base[4])
+                        ) == (current[2], current[3], current[4]):
+                            continue
+                        seen.add(key)
+                        if is_dir:
                             builder.add_dir(entry.path, st.st_mtime)
                         else:
                             builder.add(entry.path, st.st_size, st.st_mtime)
@@ -2575,6 +2644,8 @@ class MainWindow(QMainWindow):
     def _on_inventory_reconciled(self, payload: object) -> None:
         if not isinstance(payload, dict):
             return
+        if bool(payload.get("overflowed")):
+            self._inventory_dirs_overflowed = True
         if int(payload.get("added", 0)) or int(payload.get("dirs", 0)):
             self._index_status_cache = None
             self._refresh_status()
@@ -2643,6 +2714,7 @@ class MainWindow(QMainWindow):
     def _note_user_query_input(self) -> None:
         """查询词变化打点（F1）：后台重搜据此避开用户正在输入的窗口。"""
         self._last_user_input_ts = time.monotonic()
+        self._sort_refresh_pending = False
 
     def _do_search(self) -> None:
         if self._closing:
@@ -2688,8 +2760,11 @@ class MainWindow(QMainWindow):
             request_kwargs = {}
             if self.case_sensitive_btn.isChecked():
                 request_kwargs["case_sensitive"] = True
-            if isinstance(self._search_worker, SearchWorker) and not self._smart_grouping_enabled:
-                request_kwargs["group_similar"] = False
+            if isinstance(self._search_worker, SearchWorker):
+                if not self._smart_grouping_enabled:
+                    request_kwargs["group_similar"] = False
+                request_kwargs["sort_keys"] = self._sort_keys()
+                request_kwargs["descending"] = self.sort_desc_btn.isChecked()
             self._search_worker.request(*request_args, **request_kwargs)
             return
         started = time.perf_counter()
@@ -2700,6 +2775,8 @@ class MainWindow(QMainWindow):
                 exts=self._search_exts(),
                 case_sensitive=self.case_sensitive_btn.isChecked(),
                 group_similar=self._smart_grouping_enabled,
+                sort_keys=self._sort_keys(),
+                descending=self.sort_desc_btn.isChecked(),
             ),
             self._mode_key(),
         )
@@ -2805,6 +2882,9 @@ class MainWindow(QMainWindow):
             self._maybe_run_deferred_live_refresh(query)
             return
         self._finish_search(query, list(results or []), elapsed_ms)
+        if self._sort_refresh_pending and self.search_box.text().strip():
+            self._sort_refresh_pending = False
+            QTimer.singleShot(0, self._do_search)
         # 索引统计不是搜索收口的一部分；缓存缺失时才补一次后台读取。
         if self._index_status_cache is None:
             self._refresh_status()
@@ -2818,8 +2898,12 @@ class MainWindow(QMainWindow):
         keep_path = self._cur.path if (self._search_keep_selection and self._cur is not None) else None
         suffix = f" \u00b7 {elapsed_ms:.0f} ms" if elapsed_ms is not None else ""
         if results:
-            self.result_count.setText(f"\u547d\u4e2d {len(results)} \u4e2a\u6587\u4ef6{suffix}")
-            self.status_label.setText(f"搜索完成：命中 {len(results)} 个文件{suffix}")
+            relaxed_count = sum(1 for result in results if result.relaxed)
+            relaxed_suffix = f" · 联想 {relaxed_count}" if relaxed_count else ""
+            self.result_count.setText(
+                f"\u547d\u4e2d {len(results)} \u4e2a\u6587\u4ef6{relaxed_suffix}{suffix}")
+            self.status_label.setText(
+                f"搜索完成：命中 {len(results)} 个文件{relaxed_suffix}{suffix}")
         else:
             self.status_label.setText(f"搜索完成：没有命中{suffix}")
         self._apply_sort_render()
@@ -3639,6 +3723,13 @@ class MainWindow(QMainWindow):
 
     def _on_sort_changed(self) -> None:
         if self._search_pending_req is not None:
+            self._sort_refresh_pending = True
+            return
+        # Backend must see the requested order before truncating to 200.  The
+        # old UI-only re-sort could never surface a globally largest/earliest
+        # match that relevance had already cut off at row 201.
+        if self.search_box.text().strip() and self._search_worker is not None:
+            self._do_search()
             return
         if self._results_raw:
             self._cancel_auto_preview()
@@ -4675,14 +4766,22 @@ class MainWindow(QMainWindow):
     def _show_non_powerpoint_preview(self, ext: str) -> None:
         self._last_preview_key = None  # F2：非 PPT 文本占位替换画面，去重 key 失效
         self._inflight_preview_key = None
-        kind = "Word" if ext == DOCX_EXT else "PDF"
-        unit = "段落" if ext == DOCX_EXT else "页面"
         self.image_label.setPixmap(QPixmap())
-        self.image_label.setText(
-            f'<div style="font-size:15px;font-weight:600">{kind} 内容已全文索引</div>'
-            f'<div style="color:#888;font-size:12px;margin-top:8px">可定位命中{unit}<br>'
-            f'暂不支持页图预览；点“打开文件”查看原文</div>'
-        )
+        if ext in (DOCX_EXT, PDF_EXT):
+            kind = "Word" if ext == DOCX_EXT else "PDF"
+            unit = "段落" if ext == DOCX_EXT else "页面"
+            self.image_label.setText(
+                f'<div style="font-size:15px;font-weight:600">{kind} 内容已全文索引</div>'
+                f'<div style="color:#888;font-size:12px;margin-top:8px">可定位命中{unit}<br>'
+                f'暂不支持页图预览；点“打开文件”查看原文</div>'
+            )
+        else:
+            label = ext.lstrip(".").upper() or "普通文件"
+            self.image_label.setText(
+                f'<div style="font-size:15px;font-weight:600">{label} · 仅文件名索引</div>'
+                '<div style="color:#888;font-size:12px;margin-top:8px">'
+                '没有解析正文，也没有页码；点“打开文件”交给系统默认程序</div>'
+            )
         self._cur_pixmap = None
 
     def _show_cached_com_preview(self, path: str, page: int, required_edge: int) -> bool:
@@ -4738,6 +4837,14 @@ class MainWindow(QMainWindow):
         ext = (self._cur.ext or os.path.splitext(self._cur.path)[1]).lower()
         if ext not in PPT_EXTS:
             self._invalidate_preview_request(clear_deferred=False)
+            if ext not in (DOCX_EXT, PDF_EXT):
+                self.page_label.setText("仅文件名")
+                self.prev_btn.setEnabled(False)
+                self.next_btn.setEnabled(False)
+                self.goto_btn.setEnabled(False)
+                self.goto_btn.setToolTip("普通文件没有可跳转页码；可使用“打开文件”")
+                self._show_non_powerpoint_preview(ext)
+                return
             ordn = next((i for i, h in enumerate(hits) if h.page_no == page), None)
             hit_tag = f" · 命中 {ordn + 1}/{n}" if ordn is not None else ""
             unit = "段" if ext == DOCX_EXT else "页"
@@ -5333,9 +5440,10 @@ class MainWindow(QMainWindow):
             self._open_file_path(self._cur.path)
             return
         if (self._cur.ext or os.path.splitext(self._cur.path)[1]).lower() not in PPT_EXTS:
-            kind = "Word" if (self._cur.ext or "").lower() == DOCX_EXT else "PDF"
+            ext = (self._cur.ext or os.path.splitext(self._cur.path)[1]).lower()
+            kind = "Word" if ext == DOCX_EXT else "PDF" if ext == PDF_EXT else "普通文件"
             self._open_file_path(self._cur.path)
-            self._toast(f"{kind} 暂不支持自动跳转，已按普通方式打开")
+            self._toast(f"{kind} 不支持自动跳页，已按普通方式打开")
             return
         self._open_at_page_bg(self._cur.path, self._view_page)
 

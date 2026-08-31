@@ -9,7 +9,7 @@ from .config import data_dir
 _configured = False
 
 
-def configure_logging(level: int = logging.INFO) -> None:
+def configure_logging(level: int = logging.INFO, *, filename: str = "app.log") -> None:
     global _configured
     if _configured:
         return
@@ -18,7 +18,7 @@ def configure_logging(level: int = logging.INFO) -> None:
     root.setLevel(level)
     try:
         fh = RotatingFileHandler(
-            data_dir() / "app.log", maxBytes=1_000_000, backupCount=3, encoding="utf-8"
+            data_dir() / filename, maxBytes=1_000_000, backupCount=3, encoding="utf-8"
         )
         fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
         root.addHandler(fh)

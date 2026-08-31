@@ -52,6 +52,28 @@ def _powerpoint_pids() -> set[int]:
     return pids
 
 
+def _wps_presentation_pids() -> set[int]:
+    """WPS registers PowerPoint.Application too; never let E2E borrow/close it."""
+    completed = subprocess.run(
+        ["tasklist", "/FI", "IMAGENAME eq wpp.exe", "/FO", "CSV", "/NH"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(f"tasklist failed: {completed.stderr.strip()}")
+    pids: set[int] = set()
+    for row in csv.reader(io.StringIO(completed.stdout)):
+        if len(row) >= 2 and row[0].upper() == "WPP.EXE":
+            try:
+                pids.add(int(row[1]))
+            except ValueError:
+                continue
+    return pids
+
+
 def _norm(path: object) -> str:
     return os.path.normcase(os.path.abspath(str(path or "")))
 
@@ -210,12 +232,14 @@ def main() -> int:
     artifact = ROOT / "artifacts" / "e2e_powerpoint_coexistence.json"
     artifact.parent.mkdir(parents=True, exist_ok=True)
     before_pids = _powerpoint_pids()
-    if before_pids:
+    before_wps_pids = _wps_presentation_pids()
+    if before_pids or before_wps_pids:
         result = {
             "passed": False,
             "blocked": True,
-            "reason": "A user PowerPoint process already exists; safety refusal",
+            "reason": "A user PowerPoint/WPS presentation process already exists; safety refusal",
             "preexisting_pids": sorted(before_pids),
+            "preexisting_wps_pids": sorted(before_wps_pids),
         }
         artifact.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
         print(json.dumps(result, ensure_ascii=False, indent=2))

@@ -35,10 +35,11 @@ Everything 还有第三招我们学不了：直接读 NTFS 的 MFT。那要管�
     [DIROFF]       u32 × dir_count      DIRS 段内每个目录的起始偏移
     [DIRNORMOFF]   u32 × dir_count      DIRNORM 段内每个目录的起始偏移
     [NORMOFF]      u32 × count          NORM 段内每条记录的起始偏移（供二分反查）
-    [RECS]         每条 20 字节：dir_id u32 / name_off u32 / size u32 / mtime u32 / flags u32
+    [RECS]         每条 24 字节：dir_id u32 / name_off u32 / size u64 / mtime u32 / flags u32
 
-size 用 u32 存（上限 4 GiB-1），超过就钉在 0xFFFFFFFF——这个字段只用来在结果里
-显示大小，不参与任何判断，为几个超大文件把每条记录撑到 24 字节不划算。
+size 用 u64 存。v3 曾用 u32 并声称“只显示不判断”，但 `size:` 查询实际直接读取
+这个字段，导致所有大于 4 GiB 的文件被截断并被 `size:>4gb` 静默漏掉。每条多 4 B，
+200 万条约 8 MB，换来正确的大小过滤与全局大小排序。
 
 **文件夹和文件在同一个记录表里**，靠 flags 的 FLAG_DIR 位区分。Everything 能按
 名字搜到文件夹，我们也要能——分成两张表会让搜索得扫两遍、排序还得再合并一次，
@@ -64,13 +65,14 @@ from .text_tokenize import normalize
 log = logging.getLogger(__name__)
 
 MAGIC = b"PPTDNAM\x01"
-FORMAT_VERSION = 3
+FORMAT_VERSION = 4
 #: 头部预留大小。留足余量：每加一个段就多 16 字节，装不下的话
 #: `header[:len(packed)] = packed` 会把 bytearray 撑长，于是头部悄悄盖掉第一个段
 #: 的开头、所有偏移全错——不报错，只是搜出来的东西是乱的。下面有断言兜底。
 HEADER_SIZE = 256
-RECORD_SIZE = 20
-SIZE_CAP = 0xFFFFFFFF
+_RECORD_STRUCT = struct.Struct("<IIQII")
+RECORD_SIZE = _RECORD_STRUCT.size
+SIZE_CAP = 0xFFFFFFFFFFFFFFFF
 FLAG_DIR = 1 << 0
 
 # 段顺序固定，Header 里逐段记 (offset, length)
@@ -245,8 +247,8 @@ class NameStoreBuilder:
         # fold = normalize + 去掉变音符号。索引与查询必须调同一个函数，否则
         # 打 resume 找不到 résumé——两边口径不一致就等于搜不到。
         self._norm += namequery.fold(base).encode("utf-8", "surrogatepass") + b"\n"
-        self._recs += struct.pack(
-            "<IIIII", dir_id, name_off, int(size),
+        self._recs += _RECORD_STRUCT.pack(
+            dir_id, name_off, int(size),
             max(0, min(int(mtime), 0xFFFFFFFF)), int(flags),
         )
         self._count += 1
@@ -398,6 +400,7 @@ class NameStore:
         self._dir_offsets = array("I")
         self._dirnorm_offsets = array("I")
         self._name_offs: array | None = None
+        self._path_keys_cache: set[str] | None = None
         self.count = 0
         self.built_at = 0
         self._open()
@@ -450,6 +453,7 @@ class NameStore:
         self._dirnorm_offsets.frombytes(mm[off: off + length])
 
     def close(self) -> None:
+        self._path_keys_cache = None
         if self._mm is not None:
             try:
                 self._mm.close()
@@ -474,7 +478,7 @@ class NameStore:
     def _record(self, i: int) -> tuple[int, int, int, int, int]:
         off = self._span["recs"][0] + i * RECORD_SIZE
         assert self._mm is not None
-        return struct.unpack_from("<IIIII", self._mm, off)
+        return _RECORD_STRUCT.unpack_from(self._mm, off)
 
     def _slice_until_newline(self, key: str, start: int) -> bytes:
         off, length = self._span[key]
@@ -503,6 +507,14 @@ class NameStore:
         directory = self.directory(dir_id)
         return (os.path.join(directory, name) if directory else name,
                 name, int(size), int(mtime), bool(flags & FLAG_DIR))
+
+    def path_keys(self) -> set[str]:
+        """Cached case-insensitive paths, intended for the small overlay store."""
+        if self._path_keys_cache is None:
+            self._path_keys_cache = {
+                os.path.normcase(self.entry(i)[0]) for i in range(self.count)
+            }
+        return self._path_keys_cache
 
     # ---------------------------------------------------------------- 搜索
 
@@ -543,7 +555,14 @@ class NameStore:
         """第 i 条 → 判定用的记录。字段全部惰性求值：查询用不到的字段不解码。"""
         return _LazyRecord(self, i)
 
-    def search(self, query, *, limit: int = 100_000, scope: str = "") -> list[int]:
+    @staticmethod
+    def _check_cancel(cancel, counter: int = 0) -> None:
+        if cancel is not None and (counter & 0x3FF) == 0 and bool(cancel()):
+            raise RuntimeError("interrupted")
+
+    def search(
+        self, query, *, limit: int = 100_000, scope: str = "", cancel=None,
+    ) -> list[int]:
         """返回命中记录的序号。
 
         两段式，与 Everything 一样：
@@ -557,15 +576,25 @@ class NameStore:
         limit 是**召回上限**，不是最终条数：排序和截断交给调用方，否则截出来的
         就是磁盘遍历顺序里靠前的那些，跟相关度毫无关系。
         """
+        out: list[int] = []
+        for i in self.iter_search(query, scope=scope, cancel=cancel):
+            out.append(i)
+            if len(out) >= max(1, int(limit)):
+                break
+        return sorted(out)
+
+    def iter_search(self, query, *, scope: str = "", cancel=None):
+        """Yield every matching ordinal, allowing global top-K sorting upstream."""
         if isinstance(query, (list, tuple)):
             query = namequery.from_terms(query)
         if not query or self.count == 0:
-            return []
+            return
         scope_norm = os.path.normcase(scope) if scope else ""
         branches = query.prefilter()
         if branches is None:
-            return self._scan_all(query, limit, scope_norm)
-        return self._scan_prefiltered(query, branches, limit, scope_norm)
+            yield from self._iter_scan_all(query, scope_norm, cancel)
+        else:
+            yield from self._iter_scan_prefiltered(query, branches, scope_norm, cancel)
 
     def _accept(self, i: int, query, scope_norm: str) -> bool:
         if scope_norm:
@@ -574,14 +603,15 @@ class NameStore:
                 return False
         return query.match(self.record_for(i))
 
-    def _scan_prefiltered(self, query, branches, limit, scope_norm) -> list[int]:
+    def _iter_scan_prefiltered(self, query, branches, scope_norm, cancel):
         offsets = self._norm_offsets
         found: set[int] = set()
-        out: list[int] = []
+        checked = 0
         for needles in branches:
             encoded = [n.encode("utf-8", "surrogatepass") for n in needles if n]
             if not encoded:
-                return self._scan_all(query, limit, scope_norm)
+                yield from self._iter_scan_all(query, scope_norm, cancel)
+                return
             # 用最长的那个起手：它命中最少，候选集越小后面复核越省
             primary = max(encoded, key=len)
             seen_last = -1
@@ -591,30 +621,27 @@ class NameStore:
                 i = bisect.bisect_right(offsets, pos) - 1
                 if i >= 0 and i != seen_last:
                     seen_last = i
+                    checked += 1
+                    self._check_cancel(cancel, checked)
                     if i not in found and self._accept(i, query, scope_norm):
                         found.add(i)
-                        out.append(i)
-                        if len(out) >= limit:
-                            return sorted(out)
+                        yield i
                 pos = self._find_in_norm(primary, pos + 1)
-        return sorted(out)
 
-    def _scan_all(self, query, limit, scope_norm) -> list[int]:
+    def _iter_scan_all(self, query, scope_norm, cancel):
         if not scope_norm and query.needs() <= namequery.Query.METADATA_ONLY:
-            return self._scan_metadata_only(query, limit)
-        candidates = self._path_candidates(query)
+            yield from self._iter_scan_metadata_only(query, cancel)
+            return
+        candidates = self._path_candidates(query, cancel=cancel)
         if candidates is None:
-            candidates = self._regex_candidates(query)
+            candidates = self._regex_candidates(query, cancel=cancel)
         source = range(self.count) if candidates is None else candidates
-        out: list[int] = []
         for i in source:
+            self._check_cancel(cancel, i)
             if self._accept(i, query, scope_norm):
-                out.append(i)
-                if len(out) >= limit:
-                    break
-        return out
+                yield i
 
-    def _path_candidates(self, query) -> list[int] | None:
+    def _path_candidates(self, query, *, cancel=None) -> list[int] | None:
         """靠目录表把路径查询的候选先压小；压不动就返回 None（老老实实全扫）。
 
         路径 = 目录 + '/' + 名字，而目录只有 25 万个、被 200 万个文件共享。
@@ -643,12 +670,17 @@ class NameStore:
         out: list[int] = []
         off, length = self._span["recs"]
         assert self._mm is not None
-        raw = self._mm[off: off + length]
-        for i, (dir_id, _n, _s, _m, _f) in enumerate(struct.iter_unpack("<IIIII", raw)):
-            if dir_id in hit_dirs:
-                out.append(i)
-            elif dir_id in boundary and self.norm_name(i).startswith(boundary[dir_id]):
-                out.append(i)
+        raw = memoryview(self._mm)[off: off + length]
+        try:
+            for i, (dir_id, _n, _s, _m, _f) in enumerate(
+                    _RECORD_STRUCT.iter_unpack(raw)):
+                self._check_cancel(cancel, i)
+                if dir_id in hit_dirs:
+                    out.append(i)
+                elif dir_id in boundary and self.norm_name(i).startswith(boundary[dir_id]):
+                    out.append(i)
+        finally:
+            raw.release()
         if not sep:
             # 串整个落在文件名里的情形，用名字块快扫补齐（'/' 不可能出现在文件名里，
             # 所以带分隔符时这一步没有意义）
@@ -667,12 +699,15 @@ class NameStore:
         if self._name_offs is None:
             off, length = self._span["recs"]
             assert self._mm is not None
-            raw = self._mm[off: off + length]
-            self._name_offs = array(
-                "I", (r[1] for r in struct.iter_unpack("<IIIII", raw)))
+            raw = memoryview(self._mm)[off: off + length]
+            try:
+                self._name_offs = array(
+                    "I", (r[1] for r in _RECORD_STRUCT.iter_unpack(raw)))
+            finally:
+                raw.release()
         return self._name_offs
 
-    def _regex_candidates(self, query) -> list[int] | None:
+    def _regex_candidates(self, query, *, cancel=None) -> list[int] | None:
         """正则查询：在 NAME 段上整块跑一遍，把命中位置回查成记录序号。"""
         pattern = query.regex_candidates()
         if pattern is None:
@@ -683,11 +718,16 @@ class NameStore:
         offsets = self._name_offsets()
         out: list[int] = []
         seen_last = -1
-        for m in pattern.finditer(blob):
-            i = bisect.bisect_right(offsets, m.start()) - 1
-            if i >= 0 and i != seen_last:
-                seen_last = i
-                out.append(i)
+        try:
+            for n, m in enumerate(pattern.finditer(
+                    blob, timeout=namequery.REGEX_BLOCK_TIMEOUT_SEC)):
+                self._check_cancel(cancel, n)
+                i = bisect.bisect_right(offsets, m.start()) - 1
+                if i >= 0 and i != seen_last:
+                    seen_last = i
+                    out.append(i)
+        except TimeoutError as exc:
+            raise namequery.QueryError("正则扫描超时，请简化表达式") from exc
         return sorted(set(out))
 
     def _name_hits(self, needle: str) -> list[int]:
@@ -704,24 +744,69 @@ class NameStore:
             pos = self._find_in_norm(encoded, pos + 1)
         return out
 
-    def _scan_metadata_only(self, query, limit) -> list[int]:
-        """只看大小/时间/是否目录的查询：直接遍历 20 字节定长记录，一个字符串都不解码。
+    def fuzzy_candidates(
+        self, anchors, *, limit: int = 20_000, cancel=None,
+    ) -> list[int]:
+        """Union name n-gram hits; full fuzzy verification happens upstream."""
+        found: set[int] = set()
+        for anchor in anchors or ():
+            for i in self._name_hits(str(anchor)):
+                self._check_cancel(cancel, len(found))
+                found.add(i)
+                if len(found) >= max(1, int(limit)):
+                    return sorted(found)
+        return sorted(found)
+
+    def entries_for_directories(self, directories, *, cancel=None) -> dict[str, tuple]:
+        """Return direct-child metadata for exact directories in one record pass.
+
+        The live overlay uses this to store only entries that differ from the
+        last full snapshot.  Without a baseline, one noisy 34k-entry cache
+        directory is copied wholesale and permanently consumes the 50k overlay.
+        """
+        wanted_ids: set[int] = set()
+        for directory in directories or ():
+            clean = os.path.abspath(str(directory))
+            needle = namequery.fold(clean).replace("\\", "/")
+            for dir_id in self._dirs_matching(needle):
+                if self.dir_norm(dir_id) == needle:
+                    wanted_ids.add(dir_id)
+        if not wanted_ids:
+            return {}
+        out: dict[str, tuple] = {}
+        off, length = self._span["recs"]
+        assert self._mm is not None
+        raw = memoryview(self._mm)[off: off + length]
+        try:
+            for i, (dir_id, _name, _size, _mtime, _flags) in enumerate(
+                    _RECORD_STRUCT.iter_unpack(raw)):
+                self._check_cancel(cancel, i)
+                if dir_id not in wanted_ids:
+                    continue
+                path, name, size, mtime, is_dir = self.entry(i)
+                out[os.path.normcase(path)] = (path, name, size, mtime, is_dir)
+        finally:
+            raw.release()
+        return out
+
+    def _iter_scan_metadata_only(self, query, cancel):
+        """只看大小/时间/是否目录的查询：直接遍历定长记录，一个字符串都不解码。
 
         `size:` `dm:` `folder:` 这类查询抠不出任何名字片段，只能全扫；但它们
         根本不需要名字。真机 200 万条实测 6.4 秒 → 0.3 秒。
         """
         off, length = self._span["recs"]
         assert self._mm is not None
-        raw = self._mm[off: off + length]
+        raw = memoryview(self._mm)[off: off + length]
         root = query.root
-        out: list[int] = []
-        for i, (_dir_id, _name_off, size, mtime, flags) in enumerate(
-                struct.iter_unpack("<IIIII", raw)):
-            if root.match(_MetaRecord(size, mtime, bool(flags & FLAG_DIR))):
-                out.append(i)
-                if len(out) >= limit:
-                    break
-        return out
+        try:
+            for i, (_dir_id, _name_off, size, mtime, flags) in enumerate(
+                    _RECORD_STRUCT.iter_unpack(raw)):
+                self._check_cancel(cancel, i)
+                if root.match(_MetaRecord(size, mtime, bool(flags & FLAG_DIR))):
+                    yield i
+        finally:
+            raw.release()
 
 
 class _MetaRecord:

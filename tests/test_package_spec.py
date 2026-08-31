@@ -100,7 +100,8 @@ def test_frozen_selftest_covers_the_all_files_engine():
 
     labels = " ".join(label for label, _q, _e in selftest.NAME_CASES)
     for must in ("通配符", "扩展名", "大小", "或", "非", "路径", "正则",
-                 "区分大小写", "变音符号", "文件夹", "中文名"):
+                 "区分大小写", "变音符号", "自动联想", "拼写近似",
+                 "文件夹", "中文名"):
         assert must in labels, f"打包自检没覆盖 {must}"
 
 
@@ -126,3 +127,14 @@ def test_frozen_selftest_never_writes_into_the_real_data_dir(tmp_path, monkeypat
     # 数据目录要么根本没被创建，要么里面绝不能出现索引文件
     if data_dir.exists():
         assert not list(data_dir.glob("names*.idx"))
+
+
+def test_package_has_regex_and_windows_version_metadata():
+    root = Path(__file__).resolve().parents[1]
+    spec = (root / "pptx-finder.spec").read_text(encoding="utf-8")
+    version_info = (root / "assets" / "windows_version_info.txt").read_text(
+        encoding="utf-8")
+    assert "collect_all('regex')" in spec
+    assert "version='assets\\\\windows_version_info.txt'" in spec
+    assert "filevers=(1, 5, 1, 0)" in version_info
+    assert "ProductVersion', '1.5.1'" in version_info

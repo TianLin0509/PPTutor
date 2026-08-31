@@ -20,6 +20,10 @@ datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 # 读自身版本——必须带上 dist-info 元数据 + 全子模块，否则 frozen 下搜 PDF 静默失效/报错。
 tmp_ret = collect_all('pypdf')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+# regex 为用户正则提供 Unicode 语义与超时；显式收集其 C 扩展，避免 frozen
+# 环境退回成“源码测试能用、打包后 regex 模块缺失”。
+tmp_ret = collect_all('regex')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 a = Analysis(
     ['src\\pptx_finder\\__main__.py'],
     pathex=[],
@@ -104,6 +108,7 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=['assets\\app.ico'],
+    version='assets\\windows_version_info.txt',
 )
 coll = COLLECT(
     exe,

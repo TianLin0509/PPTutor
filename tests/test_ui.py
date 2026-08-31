@@ -478,6 +478,34 @@ def test_non_powerpoint_result_never_enters_com_preview_or_goto(qtbot, monkeypat
     assert opened == [result.path]
 
 
+def test_arbitrary_filename_only_result_is_not_mislabeled_as_pdf(qtbot, monkeypatch, tmp_path):
+    conn = _index(tmp_path)
+    render = StubRender()
+    win = MainWindow(conn=conn, render_worker=render, do_index=False)
+    qtbot.addWidget(win)
+    result = _fake_results(1)[0]
+    result.ext = ".html"
+    result.path = "C:/page.html"
+    result.name = "page.html"
+    result.status = "filename_only"
+    result.page_count = 0
+    result.hits = []
+    win._cur = result
+    win._view_page = 1
+    win._set_ops_enabled(True)
+    opened = []
+    monkeypatch.setattr(win, "_open_file_path", opened.append)
+
+    win._request_preview()
+    win._act_goto()
+
+    assert render.calls == []
+    assert "HTML · 仅文件名索引" in win.image_label.text()
+    assert "PDF" not in win.image_label.text()
+    assert win.page_label.text() == "仅文件名"
+    assert opened == [result.path]
+
+
 def test_actions_open_at_page_defensively_bypasses_powerpoint_for_docx(monkeypatch, tmp_path):
     path = tmp_path / "report.docx"
     path.write_bytes(b"doc")

@@ -89,3 +89,8 @@ class FileResult:
     # 双击应该是打开这个目录而不是拿它当文档打开——UI 据此分流。
     # 内容搜索永远不会置位，所以 PPT 那条路的行为一个字节都不变。
     is_dir: bool = False
+    # 查询放宽只负责补充召回。ranking.relevance_components 把所有 relaxed 结果
+    # 硬压在任意严格结果之后，不能靠分数或文件名来源反超。
+    relaxed: bool = False
+    relaxed_kind: str = ""       # alias | fuzzy
+    relaxed_query: str = ""      # 实际命中的扩展词，供 UI 解释“为什么会出现”

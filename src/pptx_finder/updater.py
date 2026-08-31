@@ -54,7 +54,14 @@ def _sha256_file(p: Path) -> str:
     return h.hexdigest()
 
 
-def build_manifest(dist_dir: Path, version: str, notes: str = "") -> dict:
+def build_manifest(
+    dist_dir: Path,
+    version: str,
+    notes: str = "",
+    *,
+    commit: str = "",
+    built_at: str = "",
+) -> dict:
     """遍历 dist_dir 生成清单。relpath 用正斜杠；排除 manifest.json 自身。"""
     dist_dir = Path(dist_dir)
     files: dict[str, dict] = {}
@@ -65,7 +72,13 @@ def build_manifest(dist_dir: Path, version: str, notes: str = "") -> dict:
         if rel == MANIFEST_NAME:
             continue
         files[rel] = {"hash": _sha256_file(p), "size": p.stat().st_size}
-    return {"version": str(version), "notes": notes, "files": files}
+    manifest = {"version": str(version), "notes": notes, "files": files}
+    if commit or built_at:
+        manifest["build"] = {
+            "commit": str(commit or ""),
+            "built_at": str(built_at or ""),
+        }
+    return manifest
 
 
 def _ver_tuple(v: str) -> tuple:

@@ -41,6 +41,8 @@ import re
 import unicodedata
 from dataclasses import dataclass, field
 
+import regex as _regex
+
 from .db import sqlite_safe_text
 from .text_tokenize import normalize
 
@@ -51,6 +53,9 @@ KNOWN_GAPS = (
 )
 
 _MAX_REGEX_LEN = 500
+REGEX_ITEM_TIMEOUT_SEC = 0.02
+REGEX_BLOCK_TIMEOUT_SEC = 3.0
+_UNICODE_REGEX_ESCAPE_RE = re.compile(r"\\[wWdDsSbB]")
 
 #: 变音符号（Unicode 的 Mn 类：组合用重音、变音点等）
 _COMBINING = "Mn"
@@ -324,18 +329,21 @@ class _Term(_Node):
 @dataclass
 class _Regex(_Node):
     pattern: str
-    _rx: re.Pattern | None = field(default=None, repr=False)
+    _rx: object | None = field(default=None, repr=False)
 
     def __post_init__(self):
         if len(self.pattern) > _MAX_REGEX_LEN:
             raise QueryError("正则太长")
         try:
-            self._rx = re.compile(self.pattern, re.IGNORECASE)
-        except re.error as exc:
+            self._rx = _regex.compile(self.pattern, _regex.IGNORECASE)
+        except _regex.error as exc:
             raise QueryError(f"正则写错了：{exc}") from exc
 
     def match(self, rec):
-        return self._rx.search(rec.name) is not None
+        try:
+            return self._rx.search(rec.name, timeout=REGEX_ITEM_TIMEOUT_SEC) is not None
+        except TimeoutError as exc:
+            raise QueryError("正则执行超时，请简化表达式") from exc
 
     def literals(self):
         return None
@@ -385,6 +393,8 @@ class _Range(_Node):
     field_name: str
 
     def match(self, rec):
+        if self.field_name == "size" and rec.is_dir:
+            return False
         value = rec.size if self.field_name == "size" else rec.mtime
         return self.lo <= value <= self.hi
 
@@ -392,7 +402,10 @@ class _Range(_Node):
         return None
 
     def needs(self):
-        return frozenset({self.field_name})
+        return frozenset(
+            {self.field_name, "is_dir"}
+            if self.field_name == "size" else {self.field_name}
+        )
 
 
 @dataclass
@@ -424,10 +437,17 @@ class Query:
             node = next((p for p in node.parts if isinstance(p, _Regex)), None)
         if not isinstance(node, _Regex):
             return None
+        # bytes regex has ASCII-only case/character-class semantics.  Using it
+        # for Unicode-sensitive expressions silently loses candidates before
+        # the correct string matcher can verify them.
+        if not node.pattern.isascii() or _UNICODE_REGEX_ESCAPE_RE.search(node.pattern):
+            return None
         try:
-            return re.compile(node.pattern.encode("utf-8", "surrogatepass"),
-                              re.IGNORECASE | re.MULTILINE)
-        except (re.error, UnicodeEncodeError):
+            return _regex.compile(
+                node.pattern.encode("utf-8", "surrogatepass"),
+                _regex.IGNORECASE | _regex.MULTILINE,
+            )
+        except (_regex.error, UnicodeEncodeError):
             return None
 
     def path_literals(self) -> list[str]:
@@ -487,7 +507,7 @@ def _numeric_filter(v: str, field_name: str, to_value) -> _Node:
             if op == "<=":
                 return _Range(0, value, field_name)
             if op == "<":
-                return _Range(0, max(0, value - 1), field_name)
+                return _Range(0, value - 1, field_name)
             return _Range(value, value, field_name)
     value = to_value(v)
     return _Range(value, value, field_name)
@@ -495,7 +515,8 @@ def _numeric_filter(v: str, field_name: str, to_value) -> _Node:
 
 def _day_bounds(day: _dt.date) -> tuple[int, int]:
     start = _dt.datetime(day.year, day.month, day.day)
-    return int(start.timestamp()), int(start.timestamp()) + 86399
+    next_day = start + _dt.timedelta(days=1)
+    return int(start.timestamp()), int(next_day.timestamp()) - 1
 
 
 def _parse_date(value: str, *, now: _dt.datetime | None = None) -> _Node:

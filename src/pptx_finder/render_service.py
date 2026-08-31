@@ -47,7 +47,12 @@ def handle_request(req: dict[str, Any]) -> dict[str, Any]:
             finally:
                 if op == "render_once":
                     renderer.close_current_presentation()
-            return {"id": req_id, "ok": True, "path": str(png) if png else ""}
+            return {
+                "id": req_id,
+                "ok": True,
+                "path": str(png) if png else "",
+                "reason": "" if png else renderer.last_error(),
+            }
         if op == "close_current":
             renderer.close_current_presentation()
             return {"id": req_id, "ok": True}
@@ -107,6 +112,11 @@ def serve(sock: socket.socket, token: str) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from .logging_setup import configure_logging
+
+    # The windowed renderer has no usable stderr.  Without its own file every
+    # COM refusal/crash becomes a silent empty path in the GUI.
+    configure_logging(filename="renderer.log")
     argv = list(sys.argv if argv is None else argv)
     try:
         idx = argv.index("--renderer-worker")

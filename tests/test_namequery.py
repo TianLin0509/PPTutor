@@ -188,6 +188,14 @@ def test_dm_today():
     assert not hit("dm:today", rec("x", mtime=_epoch(2026, 8, 27) + 3600))
 
 
+def test_day_bounds_use_next_local_midnight_not_a_fixed_86400_seconds():
+    import datetime as dt
+
+    lo, hi = namequery._day_bounds(dt.date(2026, 3, 8))
+    assert lo == int(dt.datetime(2026, 3, 8).timestamp())
+    assert hi == int(dt.datetime(2026, 3, 9).timestamp()) - 1
+
+
 def test_dm_yesterday():
     assert hit("dm:yesterday", rec("x", mtime=_epoch(2026, 8, 27) + 60))
 

@@ -136,3 +136,23 @@ def test_locate_health_item_switches_to_search_filename_mode(qtbot, tmp_path):
     assert win._rail_page_btns["search"].isChecked()
     assert win.mode.currentIndex() == 1
     assert win.search_box.text() == "昇腾 汇报"
+
+
+def test_nav_rail_has_an_imgtext_entry(qtbot, tmp_path, monkeypatch):
+    """「图片转可编辑文字」必须在主窗口有入口。
+
+    它原来只在托盘右键菜单里，主窗口和设置页各一个都没有——做这个功能的人
+    自己都没找到它。
+    """
+    win = _win(qtbot, tmp_path)
+    btn = getattr(win, "rail_imgtext_btn", None)
+    assert btn is not None, "导航轨缺少「图片转可编辑文字」按钮"
+    assert btn.toolTip() == "图片转可编辑文字"
+    assert btn.isVisible() or btn.parent() is not None
+
+    opened = {"n": 0}
+    import pptx_finder.app as app_mod
+    monkeypatch.setattr(app_mod, "_open_imgtext_window",
+                        lambda owner, **kw: opened.__setitem__("n", opened["n"] + 1))
+    btn.click()
+    assert opened["n"] == 1, "点了没反应"

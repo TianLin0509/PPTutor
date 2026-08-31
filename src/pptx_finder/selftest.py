@@ -47,10 +47,13 @@ NAME_CASES = [
     # path: 匹配的是完整路径，所以根目录本身和子目录里的文件也都算命中
     ("路径(path:)", "path:名字自检", {"名字自检", "readme.md", "NOTES.md",
                                      "budget.pdf", "résumé.txt",
+                                     "百度网盘.lnk",
                                      "子目录", "自检文件.txt"}),
     ("正则(regex:)", r"regex:^budget\.", {"budget.pdf"}),
     ("区分大小写(case:)", "case:NOTES", {"NOTES.md"}),
     ("变音符号折叠(resume→résumé)", "resume", {"résumé.txt"}),
+    ("自动联想(百度云→百度网盘)", "百度云", {"百度网盘.lnk"}),
+    ("拼写近似(resmue→résumé)", "resmue", {"résumé.txt"}),
     ("文件夹(folder:)", "folder: 子目录", {"子目录"}),
     ("中文名", "自检文件", {"自检文件.txt"}),
 ]
@@ -71,6 +74,7 @@ def _run_names(workdir: Path) -> dict:
     (root / "NOTES.md").write_text("y" * 4096, encoding="utf-8")
     (root / "budget.pdf").write_bytes(b"%PDF-1.4\n")
     (root / "résumé.txt").write_text("z", encoding="utf-8")
+    (root / "百度网盘.lnk").write_text("shortcut", encoding="utf-8")
     (root / "子目录" / "自检文件.txt").write_text("w", encoding="utf-8")
 
     builder = namestore.NameStoreBuilder()
