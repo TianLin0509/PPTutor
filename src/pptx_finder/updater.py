@@ -22,7 +22,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.error
 import urllib.request
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -30,6 +32,56 @@ MANIFEST_NAME = "manifest.json"
 _CHECK_TIMEOUT = 8       # 拉清单超时（秒）
 _DL_TIMEOUT = 30         # 单文件下载超时（秒）
 _BUF = 1 << 16
+
+# GitHub Release 作为第二个更新源。`releases/latest/download/<资产名>` 是稳定入口，
+# 永远指向最新一版，不用查 API、也不用把 tag 写死（实测可用）。
+#
+# 为什么要有第二个源：自建源 me.lt-stockpartner.tech 上的清单长期停在 v1.2.7，而
+# `compare()` 只在远端版本更高时才返回更新——于是 >=1.2.7 的用户**永远收不到更新**，
+# <1.2.7 的用户被更新到 1.2.7 就卡住。单源一旦不更新，整个自动更新链路是静默死的。
+# 而「图片转文字」的识别组件早就是双源（主源 404，实际一直靠 GitHub 回落在服务
+# 用户），这条通道已经被真实用户验证过可达。
+GITHUB_RELEASE_LATEST = "https://github.com/TianLin0509/PPTutor/releases/latest/download"
+
+
+@dataclass(frozen=True)
+class UpdateSource:
+    """一个更新源：从哪拿清单、从哪拿变化块、块缺失时从哪拿整包。"""
+
+    label: str
+    manifest_url: str
+    block_url: str                # 含 "{hash}"
+    package_url: str = ""         # 含 "{version}"；空 = 该源没有整包兜底
+
+    def block(self, sha256: str) -> str:
+        return self.block_url.format(hash=sha256)
+
+    def package(self, version: str) -> str:
+        return self.package_url.format(version=version) if self.package_url else ""
+
+
+def update_sources(base_url: str) -> list[UpdateSource]:
+    base = (base_url or "").rstrip("/")
+    out = []
+    if base:
+        out.append(UpdateSource(
+            label="self-hosted",
+            manifest_url=f"{base}/{MANIFEST_NAME}",
+            block_url=base + "/files/{hash}",
+        ))
+    out.append(UpdateSource(
+        label="github-release",
+        manifest_url=f"{GITHUB_RELEASE_LATEST}/{MANIFEST_NAME}",
+        block_url=GITHUB_RELEASE_LATEST + "/{hash}",
+        # GitHub 的资产是平铺的，没有 files/ 子目录；块就以 sha256 为资产名上传。
+        # 落后好几版的用户需要的块可能没随最新一版发布，那时回落到整包。
+        package_url=GITHUB_RELEASE_LATEST + "/PPT-Doctor-v{version}.zip",
+    ))
+    return out
+
+
+class BlockUnavailableError(RuntimeError):
+    """某个变化块在该源上取不到（多半是落后太多版），应回落到整包。"""
 
 
 @dataclass
@@ -39,6 +91,7 @@ class UpdateInfo:
     changed: list          # [(relpath, sha256, size)] 需下载的文件
     deleted: list           # [relpath] 远端已移除、本地应删
     raw: dict = field(default_factory=dict)  # 远端完整清单（落地为新本地 manifest）
+    source: UpdateSource | None = None       # 这份更新是从哪个源比出来的
 
     @property
     def total_bytes(self) -> int:
@@ -198,12 +251,28 @@ def compare(local: dict, remote: dict) -> UpdateInfo | None:
 
 
 # ---------- 网络 ----------
+def fetch_manifest_from(
+    source: UpdateSource,
+    timeout: float = _CHECK_TIMEOUT,
+    response_callback=None,
+) -> dict:
+    return _fetch_manifest_url(source.manifest_url, timeout, response_callback)
+
+
 def fetch_remote_manifest(
     base_url: str,
     timeout: float = _CHECK_TIMEOUT,
     response_callback=None,
 ) -> dict:
-    url = base_url.rstrip("/") + "/" + MANIFEST_NAME
+    return _fetch_manifest_url(
+        base_url.rstrip("/") + "/" + MANIFEST_NAME, timeout, response_callback)
+
+
+def _fetch_manifest_url(
+    url: str,
+    timeout: float = _CHECK_TIMEOUT,
+    response_callback=None,
+) -> dict:
     req = urllib.request.Request(url, headers={"Cache-Control": "no-cache"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         if response_callback is not None:
@@ -226,6 +295,7 @@ def download_delta(base_url: str, info: UpdateInfo, staging: Path,
     避免下载线程「运行中被析构」崩溃。
     """
     sanitize_entries(info)  # 越界条目在落盘之前就整批拦下
+    source = info.source or update_sources(base_url)[0]
     staging = Path(staging)
     staging.mkdir(parents=True, exist_ok=True)
     total = info.total_bytes
@@ -234,11 +304,18 @@ def download_delta(base_url: str, info: UpdateInfo, staging: Path,
         if cancel is not None and cancel():
             raise InterruptedError("下载已取消")
         h = _safe_hash(h, rel)  # 块名直接拼进 URL，落到这一刻才校验
-        url = base_url.rstrip("/") + "/files/" + h
+        url = source.block(h)
         dest = staging / safe_relpath(rel)
         dest.parent.mkdir(parents=True, exist_ok=True)
         hasher = hashlib.sha256()
-        with urllib.request.urlopen(url, timeout=timeout) as r, open(dest, "wb") as f:
+        try:
+            opened = urllib.request.urlopen(url, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            if e.code in (403, 404):
+                # 该块没随最新一版发布（用户落后好几版）。不是错误，换整包。
+                raise BlockUnavailableError(f"{rel} 的块在 {source.label} 上取不到") from e
+            raise
+        with opened as r, open(dest, "wb") as f:
             if response_callback is not None:
                 response_callback(r)
             while True:
@@ -261,6 +338,85 @@ def download_delta(base_url: str, info: UpdateInfo, staging: Path,
         (staging / MANIFEST_NAME).write_text(
             json.dumps(info.raw, ensure_ascii=False), encoding="utf-8")
     return staging
+
+
+def download_package(info: UpdateInfo, staging: Path,
+                     progress=None, timeout: float = _DL_TIMEOUT, cancel=None) -> Path:
+    """整包兜底：下发布 zip，只把**本次要换的那些文件**解出来。
+
+    用在「用户落后好几版、需要的块没随最新一版发布」的情况。只解 info.changed 里
+    的条目，helper 的 updates 列表才和 staging 里的内容对得上（多解无用文件不会
+    出错，但会白占磁盘和时间）。
+    """
+    source = info.source
+    if source is None or not source.package_url:
+        raise BlockUnavailableError("该源没有整包可回落")
+    sanitize_entries(info)
+    staging = Path(staging)
+    staging.mkdir(parents=True, exist_ok=True)
+    wanted = {safe_relpath(rel): _safe_hash(h, rel) for rel, h, _ in info.changed}
+
+    url = source.package(info.version)
+    tmp = staging / "_package.zip"
+    done = 0
+    with urllib.request.urlopen(url, timeout=timeout) as r, open(tmp, "wb") as f:
+        total = int(r.headers.get("Content-Length") or 0)
+        while True:
+            if cancel is not None and cancel():
+                raise InterruptedError("下载已取消")
+            chunk = r.read(_BUF)
+            if not chunk:
+                break
+            f.write(chunk)
+            done += len(chunk)
+            if progress:
+                progress(done, total or done)
+    try:
+        with zipfile.ZipFile(tmp) as z:
+            names = {n.replace("\\", "/"): n for n in z.namelist()}
+            # 包内是 PPT-Doctor/<relpath>；剥掉这一层顶层目录
+            roots = {n.split("/", 1)[0] for n in names if "/" in n}
+            prefix = (roots.pop() + "/") if len(roots) == 1 else ""
+            for rel, want_hash in wanted.items():
+                member = names.get(prefix + rel)
+                if member is None:
+                    raise ValueError(f"整包里缺少 {rel}")
+                dest = staging / rel          # rel 已过 safe_relpath，无法越界
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                data = z.read(member)
+                got = hashlib.sha256(data).hexdigest()
+                if got != want_hash:
+                    raise ValueError(
+                        f"哈希校验失败 {rel}：期望 {want_hash[:12]}… 实得 {got[:12]}…")
+                dest.write_bytes(data)
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+    if info.raw:
+        (staging / MANIFEST_NAME).write_text(
+            json.dumps(info.raw, ensure_ascii=False), encoding="utf-8")
+    return staging
+
+
+def download_update(base_url: str, info: UpdateInfo, staging: Path,
+                    progress=None, timeout: float = _DL_TIMEOUT, cancel=None,
+                    response_callback=None) -> Path:
+    """先试增量，块取不到就整包。UI 只需要调这一个。
+
+    实测相邻两版之间只有 2 个文件真的变（exe 5.8 MB + base_library.zip 1.3 MB），
+    增量 7.0 MB / 全量 91.3 MB = 7.6%——所以增量这条路值得留，整包只是兜底。
+    """
+    try:
+        return download_delta(base_url, info, staging, progress=progress,
+                              timeout=timeout, cancel=cancel,
+                              response_callback=response_callback)
+    except BlockUnavailableError:
+        # 半截的 staging 会让 helper 的 preflight 直接放弃本次更新，先清干净
+        shutil.rmtree(staging, ignore_errors=True)
+        return download_package(info, staging, progress=progress,
+                                timeout=timeout, cancel=cancel)
 
 
 # ---------- 应用（Windows 原地替换） ----------
@@ -429,18 +585,31 @@ def check_for_update(
     timeout: float = _CHECK_TIMEOUT,
     response_callback=None,
 ) -> UpdateInfo | None:
-    """供 UI 后台线程调用：非 frozen / 无本地清单 / 拉取失败 → None（不打扰）。"""
+    """供 UI 后台线程调用：非 frozen / 无本地清单 / 全部源都拿不到 → None（不打扰）。
+
+    **挑版本最高的源，而不是第一个能连上的源。** 自建源的清单长期停在 v1.2.7；
+    如果按「第一个连得上就用」，那台服务器一天不更新，所有用户就一天收不到更新，
+    而且完全没有报错——正是此前的实际状况。现在只要任一源有更新的版本就能拿到。
+    """
     if not is_frozen():
         return None
     local = local_manifest()
     if not local:
         return None
-    remote = fetch_remote_manifest(
-        base_url,
-        timeout=timeout,
-        response_callback=response_callback,
-    )
-    return compare(local, remote)
+    best: UpdateInfo | None = None
+    for source in update_sources(base_url):
+        try:
+            remote = fetch_manifest_from(
+                source, timeout=timeout, response_callback=response_callback)
+            info = compare(local, remote)
+        except Exception:  # noqa: BLE001 单个源不可达不该拖垮整次检查
+            continue
+        if info is None:
+            continue
+        info.source = source
+        if best is None or _ver_tuple(info.version) > _ver_tuple(best.version):
+            best = info
+    return best
 
 
 def run_update_check(argv: list[str]) -> int:

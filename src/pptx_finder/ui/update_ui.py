@@ -104,7 +104,8 @@ class _DownloadThread(QThread, _CancelableNetworkThread):
     def run(self) -> None:
         try:
             shutil.rmtree(self._staging, ignore_errors=True)
-            updater.download_delta(
+            # download_update：先增量，块取不到（用户落后好几版）就整包兜底
+            updater.download_update(
                 self._url, self._info, self._staging,
                 progress=lambda d, t: self.progress.emit(int(d * 100 / t) if t else 100),
                 timeout=5.0,
