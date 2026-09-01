@@ -52,6 +52,10 @@ def test_version_info_original_filename_matches_the_exe():
 ])
 def test_packaging_scripts_no_longer_point_at_the_spaced_path(rel):
     text = (ROOT / rel).read_text(encoding="utf-8")
+    # installer.iss 的 [Code] 段整段豁免：v1.5.5 的「清理旧版本」功能**必须**认得
+    # 历来的每个 exe 名（含带空格的旧名），那正是它的职责。这里要守的是「安装/图标
+    # 等指令不再指向旧路径」。
+    text = text.split("[Code]", 1)[0]
     for i, line in enumerate(text.splitlines(), 1):
         if line.lstrip().startswith((";", "#")):
             continue

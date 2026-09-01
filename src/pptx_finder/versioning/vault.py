@@ -1133,8 +1133,9 @@ def _verify(doc_id: str, names: list[str], parts: dict[str, str]) -> bool:
 def _change_summary(conn, latest_vid: str, new_pages: list, new_pc: int, old_pc: int) -> str:
     """对比上一版逐页文本，给一句大致改动简述（改了几页 + 页数增减）。"""
     try:
-        old = {r["page_no"]: r["content"] for r in conn.execute(
-            "SELECT page_no, content FROM version_pages_fts WHERE version_id=?", (latest_vid,))}
+        # 走 store.version_pages：它用 rowid 侧表，不像原来那样按 UNINDEXED 列扫全表。
+        # 这个函数**每次保存都会跑**，360k 行的库上原来单这一下就要 109 ms。
+        old = {r["page_no"]: r["content"] for r in store.version_pages(conn, latest_vid)}
     except Exception:  # noqa: BLE001
         old = {}
     new = {pno: txt for pno, txt in new_pages}

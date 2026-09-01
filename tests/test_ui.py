@@ -3397,7 +3397,7 @@ def test_show_dashboard_schedules_refresh_after_switch(qtbot, monkeypatch, tmp_p
     monkeypatch.setattr(
         win.dashboard,
         "schedule_refresh",
-        lambda *, force=False: calls.append((force, win._page_stack.currentWidget() is win.dashboard)),
+        lambda *, force=False: calls.append((force, win._page_stack.currentWidget() is win._pages['dashboard'])),
     )
 
     win._show_list()

@@ -25,6 +25,24 @@ CREATE INDEX IF NOT EXISTS idx_versions_hash ON versions(content_hash, ts);
 CREATE VIRTUAL TABLE IF NOT EXISTS version_pages_fts USING fts5(
   content, doc_id UNINDEXED, version_id UNINDEXED, page_no UNINDEXED
 );
+-- FTS5 的 UNINDEXED 列**没有索引**，按 version_id / doc_id 过滤就是全表扫。这张
+-- 侧表把「哪些 FTS rowid 属于哪一版」记下来，让删除和取页都走 rowid（FTS5 的
+-- content 表以 rowid 为主键，是直查）。
+-- 实测（每操作耗时，随 FTS 总行数线性增长）：
+--     行数        delete_version   version_pages   delete_doc(40版)
+--     4,000            1.1 ms          0.8 ms          8.5 ms
+--     75,000          24.1 ms         19.1 ms          612 ms
+--     360,000        106.4 ms        108.7 ms        4,022 ms
+-- 而 version_pages 在**每次保存**都会被 _change_summary 调用（算「改了几页」），
+-- 差异视图更是一次调两遍——是热路径，不是只有清理时才付。
+CREATE TABLE IF NOT EXISTS version_page_rows(
+  fts_rowid INTEGER PRIMARY KEY,
+  version_id TEXT NOT NULL,
+  doc_id TEXT NOT NULL,
+  page_no INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_vpr_version ON version_page_rows(version_id, page_no);
+CREATE INDEX IF NOT EXISTS idx_vpr_doc ON version_page_rows(doc_id);
 CREATE TABLE IF NOT EXISTS doc_paths(
   doc_id TEXT NOT NULL, path TEXT NOT NULL, path_key TEXT NOT NULL,
   status TEXT DEFAULT 'current', first_seen REAL DEFAULT 0, last_seen REAL DEFAULT 0,
@@ -80,7 +98,32 @@ def init_db(conn: sqlite3.Connection) -> None:
             continue
         ts = row["updated_at"] or row["created_at"] or 0
         record_path(conn, row["doc_id"], row["path"], ts, "current")
+    _backfill_version_page_rows(conn)
     conn.commit()
+
+
+_PAGE_ROWS_BACKFILL_KEY = "version_page_rows_backfilled"
+
+
+def _backfill_version_page_rows(conn: sqlite3.Connection) -> int:
+    """给 v1.5.5 之前建的版本库补上 FTS rowid 侧表。
+
+    只跑一次，用 vault_meta 打标记而不是「侧表空不空」——后者在「新版本写了侧表、
+    老版本还没补」的半迁移状态下会误判成已完成，那些老版本的页就永远删不掉也查不到。
+    整批在一个事务里做，中途崩溃就整体回滚，不会留下半套。
+    """
+    if get_meta(conn, _PAGE_ROWS_BACKFILL_KEY, "") == "1":
+        return 0
+    rows = conn.execute(
+        "SELECT rowid, version_id, doc_id, page_no FROM version_pages_fts").fetchall()
+    if rows:
+        conn.executemany(
+            "INSERT OR REPLACE INTO version_page_rows(fts_rowid, version_id, doc_id, page_no)"
+            " VALUES(?,?,?,?)",
+            [(r["rowid"], str(r["version_id"] or ""), str(r["doc_id"] or ""),
+              int(r["page_no"] or 0)) for r in rows])
+    set_meta(conn, _PAGE_ROWS_BACKFILL_KEY, "1")
+    return len(rows)
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, decl: str) -> None:
@@ -365,8 +408,13 @@ def previous_version(conn, doc_id: str, ts: float, version_id: str):
 
 
 def version_pages(conn, version_id: str):
+    """取某一版的全部页文本。走侧表 -> rowid，不扫全表（见 version_page_rows 的注释）。"""
     return conn.execute(
-        "SELECT page_no, content FROM version_pages_fts WHERE version_id=? ORDER BY page_no",
+        """SELECT r.page_no AS page_no, f.content AS content
+             FROM version_page_rows AS r
+             JOIN version_pages_fts AS f ON f.rowid = r.fts_rowid
+            WHERE r.version_id=?
+            ORDER BY r.page_no""",
         (version_id,),
     ).fetchall()
 
@@ -382,15 +430,34 @@ def find_versions_by_content_hash(conn, content_hash: str):
     ).fetchall()
 
 
+def _drop_fts_rows(conn, rowids) -> None:
+    """按 rowid 删 FTS 行。FTS5 的 content 表以 rowid 为主键，是直查不是扫表。"""
+    rowids = [(int(r),) for r in rowids]
+    if rowids:
+        conn.executemany("DELETE FROM version_pages_fts WHERE rowid=?", rowids)
+
+
 def delete_version(conn, version_id: str) -> None:
     conn.execute("DELETE FROM versions WHERE version_id=?", (version_id,))
-    conn.execute("DELETE FROM version_pages_fts WHERE version_id=?", (version_id,))
+    _drop_fts_rows(conn, [
+        r[0] for r in conn.execute(
+            "SELECT fts_rowid FROM version_page_rows WHERE version_id=?", (version_id,))
+    ])
+    conn.execute("DELETE FROM version_page_rows WHERE version_id=?", (version_id,))
 
 
 def delete_doc(conn, doc_id: str) -> None:
-    """删除文档及其全部版本/路径/分支记录（磁盘目录与对象回收由调用方处理）。"""
-    for row in conn.execute("SELECT version_id FROM versions WHERE doc_id=?", (doc_id,)).fetchall():
-        delete_version(conn, str(row["version_id"] if isinstance(row, sqlite3.Row) else row[0]))
+    """删除文档及其全部版本/路径/分支记录（磁盘目录与对象回收由调用方处理）。
+
+    整份文档的 FTS 行一次取完再删，而不是每个版本各查一遍——原来是循环调
+    delete_version，40 个版本就是 40 次全表扫（实测 4 秒）。
+    """
+    _drop_fts_rows(conn, [
+        r[0] for r in conn.execute(
+            "SELECT fts_rowid FROM version_page_rows WHERE doc_id=?", (doc_id,))
+    ])
+    conn.execute("DELETE FROM version_page_rows WHERE doc_id=?", (doc_id,))
+    conn.execute("DELETE FROM versions WHERE doc_id=?", (doc_id,))
     conn.execute("DELETE FROM doc_paths WHERE doc_id=?", (doc_id,))
     conn.execute("DELETE FROM doc_branches WHERE doc_id=? OR parent_doc_id=?", (doc_id, doc_id))
     conn.execute("DELETE FROM managed_docs WHERE doc_id=?", (doc_id,))
@@ -425,9 +492,15 @@ def get_branch(conn, doc_id: str):
 def index_pages(conn, doc_id: str, version_id: str, pages: list[tuple[int, str]]) -> None:
     for pno, toks in pages:
         if toks:
-            conn.execute(
+            cur = conn.execute(
                 "INSERT INTO version_pages_fts(content, doc_id, version_id, page_no) VALUES(?,?,?,?)",
                 (toks, doc_id, version_id, pno),
+            )
+            # 记下 rowid，删除和取页才能不扫全表（见 version_page_rows 的注释）
+            conn.execute(
+                "INSERT OR REPLACE INTO version_page_rows(fts_rowid, version_id, doc_id, page_no)"
+                " VALUES(?,?,?,?)",
+                (cur.lastrowid, version_id, doc_id, pno),
             )
 
 

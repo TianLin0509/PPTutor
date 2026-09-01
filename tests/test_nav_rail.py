@@ -52,7 +52,10 @@ def test_nav_rail_exists_and_default_page_is_dashboard(qtbot, tmp_path):
 
     # 启动默认页 = 概览，rail checked 态跟随
     assert win._current_page_key() == "dashboard"
-    assert win._page_stack.currentWidget() is win.dashboard
+    # 概览页套了一层 QScrollArea（否则它的内容高度会变成整窗的最小高度），
+    # 所以栈里放的是滚动区而不是 DashboardView 本身
+    assert win._page_stack.currentWidget() is win._pages['dashboard']
+    assert win._pages['dashboard'].widget() is win.dashboard
     assert win._rail_page_btns["dashboard"].isChecked()
     assert not win._rail_page_btns["search"].isChecked()
 

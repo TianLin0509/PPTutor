@@ -218,6 +218,32 @@ def update_ui_settings(**changes) -> None:
             _log.debug("ui.json.bak 备份写入失败", exc_info=True)
 
 
+def get_window_geometry() -> dict | None:
+    """上次关窗时的窗口几何。读不出合法值就返回 None（交给调用方用默认尺寸）。
+
+    只做类型与正负校验，**不**在这里判断「屏幕上放不放得下」——那要看当下接了哪些
+    显示器，属于 UI 层的事（见 main_window._fit_rect_to_screen）。
+    """
+    v = load_ui_settings().get("window_geometry")
+    if not isinstance(v, dict):
+        return None
+    try:
+        w, h = int(v["w"]), int(v["h"])
+        x, y = int(v["x"]), int(v["y"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if w <= 0 or h <= 0:
+        return None
+    return {"x": x, "y": y, "w": w, "h": h, "maximized": bool(v.get("maximized"))}
+
+
+def set_window_geometry(x: int, y: int, w: int, h: int, maximized: bool = False) -> None:
+    update_ui_settings(window_geometry={
+        "x": int(x), "y": int(y), "w": int(w), "h": int(h),
+        "maximized": bool(maximized),
+    })
+
+
 def get_theme(default: str = DEFAULT_THEME) -> str:
     v = load_ui_settings().get("theme")
     return v if isinstance(v, str) and v else default

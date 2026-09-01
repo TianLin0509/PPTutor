@@ -15,8 +15,8 @@ from collections import deque
 import sys
 import time
 
-from PySide6.QtCore import QEvent, QMimeData, QObject, QPoint, QPropertyAnimation, QSize, Qt, QStringListModel, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QCursor, QDrag, QFontMetrics, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap, QShortcut
+from PySide6.QtCore import QEvent, QMimeData, QObject, QPoint, QPropertyAnimation, QRect, QSize, Qt, QStringListModel, QTimer, QUrl, Signal
+from PySide6.QtGui import QColor, QCursor, QDrag, QFontMetrics, QGuiApplication, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QCompleter, QDialog, QFrame, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMainWindow, QMenu, QProgressBar, QPushButton, QScrollArea,
@@ -40,6 +40,7 @@ from ..config import (
     get_document_search_enabled, get_font_family, get_font_scale, get_hotkey,
     get_index_all_files,
     get_smart_grouping_enabled, get_theme,
+    get_window_geometry, set_window_geometry,
     index_feature_signature,
     is_first_run, mark_welcomed,
     set_completed_index_feature_signature,
@@ -869,7 +870,7 @@ class MainWindow(QMainWindow):
         if app_icon.isNull():
             app_icon = QIcon(_asset_path("app.ico"))
         self.setWindowIcon(app_icon)
-        self.resize(1180, 760)
+        self._restore_window_geometry()
         self._title_h = 52  # 自绘玻璃标题栏高度（nativeEvent 拖动区 / 缩放边判定用）
         self.setWindowFlag(Qt.FramelessWindowHint, True)  # 无边框 → 自绘玻璃标题栏
 
@@ -1431,11 +1432,22 @@ class MainWindow(QMainWindow):
         # 主区四页一个栈：搜索（splitter 原样）/ 概览（DashboardView 全宽）/
         # 版本 + 健康（懒加载容器，首次切入才构造嵌入窗口）
         self.dashboard = DashboardView(self)
+        # 概览页套一层滚动区，否则它 652px 的内容高度会变成**整个窗口的最小高度**。
+        # 实测：不套时窗口缩不到 1280x747 以下，而 1920x1080@150% 的可用高度只有
+        # 约 672 —— 窗口比工作区还高 75px，下边缘压在任务栏下面抓不到，这正是
+        # 用户说的「尺寸不可控」里比写死 resize 更深的那一层。
+        dash_scroll = QScrollArea()
+        dash_scroll.setObjectName("dashScroll")
+        dash_scroll.setWidgetResizable(True)
+        dash_scroll.setFrameShape(QFrame.NoFrame)
+        dash_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        dash_scroll.setWidget(self.dashboard)
+        self._dash_scroll = dash_scroll
         self._version_page_win = None
         self._health_page_win = None
         self._page_stack = QStackedWidget()
         self._page_stack.setObjectName("pageStack")
-        self._pages: dict[str, QWidget] = {"search": split, "dashboard": self.dashboard}
+        self._pages: dict[str, QWidget] = {"search": split, "dashboard": dash_scroll}
         for key in ("version", "health"):
             container = QWidget()
             container.setObjectName(f"page_{key}")
@@ -1447,7 +1459,7 @@ class MainWindow(QMainWindow):
         self._health_page_lay = self._pages["health"].layout()
         for key in ("search", "dashboard", "version", "health"):
             self._page_stack.addWidget(self._pages[key])
-        self._page_stack.setCurrentWidget(self.dashboard)  # 启动默认页 = 概览
+        self._page_stack.setCurrentWidget(dash_scroll)  # 启动默认页 = 概览
 
         wrap = QWidget()
         wrap.setObjectName("contentWrap")
@@ -2179,6 +2191,10 @@ class MainWindow(QMainWindow):
     # ---------- 主题 ----------
     def showEvent(self, e):  # noqa: N802
         super().showEvent(e)
+        if getattr(self, "_restore_maximized_on_show", False):
+            # 只补一次，且推到事件循环里做：showEvent 里直接改窗口状态容易递归。
+            self._restore_maximized_on_show = False
+            QTimer.singleShot(0, self.showMaximized)
         self._start_ui_loop_monitor()
         self._apply_titlebar_theme()  # 窗口显示后系统标题栏才接受深色属性
         if not getattr(self, "_did_fade", False):
@@ -5132,11 +5148,97 @@ class MainWindow(QMainWindow):
             self._welcome.resize(self.size())
         if getattr(self, "_stats_overlay", None) is not None:
             self._stats_overlay.resize(self.size())
+        self._schedule_geometry_save()
+
+    def moveEvent(self, e):  # noqa: N802
+        super().moveEvent(e)
+        self._schedule_geometry_save()
 
     def changeEvent(self, e):  # noqa: N802
         if e.type() == QEvent.ActivationChange and self._cur_item_widget is not None:
             self._cur_item_widget.set_selected(True, self.isActiveWindow())
         super().changeEvent(e)
+
+    # ---------- 窗口几何记忆 ----------
+    DEFAULT_WIN_W = 1180
+    DEFAULT_WIN_H = 760
+    _GEOM_SAVE_DELAY_MS = 800
+
+    @staticmethod
+    def _fit_rect_to_screen(rect: QRect, avail: QRect) -> QRect:
+        """把窗口收进目标屏幕的**可用区域**（已扣掉任务栏）。
+
+        这是「窗口尺寸不可控」的正解。原来写死 `resize(1180, 760)`，而 760 是逻辑
+        像素——在 1920x1080 @150% 上可用高度只有约 672，在 1366x768 上约 728，两种
+        都放不下。本窗口又是无边框的（自绘标题栏），超出的部分压在任务栏下面，
+        用户连下边缘都抓不到，没法缩回来。所以尺寸和位置都要按当下这块屏夹一遍。
+        """
+        w = max(1, min(rect.width(), avail.width()))
+        h = max(1, min(rect.height(), avail.height()))
+        x = min(max(rect.x(), avail.left()), avail.left() + avail.width() - w)
+        y = min(max(rect.y(), avail.top()), avail.top() + avail.height() - h)
+        return QRect(x, y, w, h)
+
+    def _target_screen(self, pos: QPoint | None):
+        """按保存的位置挑屏幕；显示器拔掉/改了分辨率就回主屏。"""
+        screen = QGuiApplication.screenAt(pos) if pos is not None else None
+        return screen or QGuiApplication.primaryScreen()
+
+    def _restore_window_geometry(self) -> None:
+        saved = get_window_geometry()
+        if saved is None:
+            screen = self._target_screen(None)
+            if screen is None:                      # 无头环境
+                self.resize(self.DEFAULT_WIN_W, self.DEFAULT_WIN_H)
+                return
+            avail = screen.availableGeometry()
+            want = QRect(0, 0,
+                         min(self.DEFAULT_WIN_W, avail.width()),
+                         min(self.DEFAULT_WIN_H, avail.height()))
+            want.moveCenter(avail.center())
+            self.setGeometry(self._fit_rect_to_screen(want, avail))
+            return
+
+        pos = QPoint(saved["x"], saved["y"])
+        screen = self._target_screen(pos)
+        if screen is None:
+            self.resize(saved["w"], saved["h"])
+            return
+        self.setGeometry(self._fit_rect_to_screen(
+            QRect(pos.x(), pos.y(), saved["w"], saved["h"]),
+            screen.availableGeometry()))
+        if saved.get("maximized"):
+            self._restore_maximized_on_show = True
+
+    def _schedule_geometry_save(self) -> None:
+        """拖动/缩放停下来 800ms 再写盘。
+
+        不能只在关窗时写：关窗有两条路（关到托盘、真退出），而增量更新的 helper
+        还会直接强杀本进程——那种情况下只写在关窗路径上的尺寸就丢了。
+        """
+        timer = getattr(self, "_geom_save_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.setInterval(self._GEOM_SAVE_DELAY_MS)
+            timer.timeout.connect(self._save_window_geometry)
+            self._geom_save_timer = timer
+        timer.start()
+
+    def _save_window_geometry(self) -> None:
+        if getattr(self, "_closing", False) and getattr(self, "_geom_saved", False):
+            return
+        try:
+            maximized = self.isMaximized()
+            # 最大化时 geometry() 是全屏尺寸，存它等于把「还原后的大小」弄丢了。
+            rect = self.normalGeometry() if maximized else self.geometry()
+            if rect.width() <= 0 or rect.height() <= 0:
+                return
+            set_window_geometry(rect.x(), rect.y(), rect.width(), rect.height(),
+                                maximized)
+            self._geom_saved = True
+        except Exception:  # noqa: BLE001 记不住尺寸不该拖垮关窗
+            _log.debug("窗口几何保存失败", exc_info=True)
 
     # ---------- 閿洏 ----------
     def eventFilter(self, obj, ev):  # noqa: N802
@@ -6511,6 +6613,8 @@ class MainWindow(QMainWindow):
         QApplication.quit()
 
     def closeEvent(self, e):  # noqa: N802
+        # 关到托盘也要存：那是最常见的「关窗」动作，不存的话下次从托盘唤起又变回默认尺寸。
+        self._save_window_geometry()
         if self._to_tray_on_close:
             e.ignore()
             self.hide()
