@@ -31,7 +31,11 @@ DefaultDirName={localappdata}\Programs\PPT-Doctor
 DefaultGroupName=PPT Doctor
 DisableProgramGroupPage=yes
 OutputDir=..\artifacts
+#ifdef FullOcr
+OutputBaseFilename=PPT-Doctor-Setup-v{#AppVersion}-Full
+#else
 OutputBaseFilename=PPT-Doctor-Setup-v{#AppVersion}
+#endif
 SetupIconFile=..\assets\app.ico
 Compression=lzma2/max
 SolidCompression=yes

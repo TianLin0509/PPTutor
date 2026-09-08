@@ -3,7 +3,7 @@
 为什么做成独立进程而不是直接 import：
   识别模型那套依赖（onnxruntime + numpy + opencv）打包后约 65 MB，塞进主程序
   等于让所有人——包括从不用这个功能的人——的绿色包翻三倍。做成按需下载的
-  独立 exe 之后，主程序的依赖清单一个字都不用改，基础包仍是约 37 MB。
+  独立 exe 之后，基础包可以按需下载；完整包则把同一套侧车放在安装目录内。
   副作用还挺好：识别崩了也只崩侧车，主程序照常。
 
 一次调用可以处理多张图（模型加载只付一次）。侧车不常驻，用完即退，不占内存。
@@ -38,6 +38,22 @@ def component_dir() -> Path:
     return data_dir() / SIDE_CAR_DIRNAME
 
 
+def active_component_dir() -> Path:
+    """内置包使用独立本地缓存，保留用户原来下载的组件。"""
+    if bundled_component_dir() is not None:
+        return data_dir() / "ocr-bundled"
+    return component_dir()
+
+
+def bundled_component_dir() -> Path | None:
+    runtime = getattr(sys, "_MEIPASS", None)
+    if runtime:
+        bundled = Path(runtime) / SIDE_CAR_DIRNAME
+        if (bundled / VERSION_FILE).is_file() and (bundled / "component.zip").is_file():
+            return bundled
+    return None
+
+
 def _dev_command() -> list[str] | None:
     """开发期用环境变量直接指到源码侧车，免得每改一行都要重新打包。"""
     raw = os.environ.get("PPTUTOR_OCR_CMD", "").strip()
@@ -55,26 +71,42 @@ def command() -> list[str] | None:
     dev = _dev_command()
     if dev:
         return dev
-    exe = component_dir() / SIDE_CAR_EXE
+    exe = active_component_dir() / SIDE_CAR_EXE
+    bundled = bundled_component_dir()
+    if bundled is not None:
+        try:
+            manifest = json.loads((bundled / VERSION_FILE).read_text("utf-8"))
+            marker = active_component_dir() / VERSION_FILE
+            cached = json.loads(marker.read_text("utf-8")) if marker.is_file() else {}
+            if not exe.is_file() or cached.get("archive_hash") != manifest["archive"]["hash"]:
+                install(manifest, archive_path=bundled / "component.zip",
+                        target_dir=active_component_dir())
+        except (OSError, ValueError, KeyError) as exc:
+            raise OcrUnavailable(f"内置识别组件准备失败：{exc}") from exc
     return [str(exe)] if exe.is_file() else None
 
 
 def is_installed() -> bool:
-    return command() is not None
+    # UI 刷新只探测；190 MB 解包留到转换 worker 内第一次真正识别时进行。
+    return (bool(_dev_command()) or bundled_component_dir() is not None
+            or (component_dir() / SIDE_CAR_EXE).is_file())
 
 
 def installed_version() -> str:
     try:
-        data = json.loads((component_dir() / VERSION_FILE).read_text("utf-8"))
+        root = bundled_component_dir() or active_component_dir()
+        data = json.loads((root / VERSION_FILE).read_text("utf-8"))
         return str(data.get("version") or "")
     except (OSError, ValueError):
         return ""
 
 
 def component_size_bytes() -> int:
-    root = component_dir()
+    root = active_component_dir()
     if not root.is_dir():
-        return 0
+        root = bundled_component_dir()
+        if root is None:
+            return 0
     total = 0
     for path in root.rglob("*"):
         try:
@@ -183,7 +215,8 @@ def fetch_component_manifest(timeout: float = 8.0) -> dict:
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
 
-def install(manifest: dict | None = None, *, progress=None, cancel=None) -> str:
+def install(manifest: dict | None = None, *, progress=None, cancel=None,
+            archive_path: Path | None = None, target_dir: Path | None = None) -> str:
     """下载识别组件并原子安装，返回安装好的版本号。
 
     两层校验：先验整包 sha256，解开后再逐文件对清单里的 sha256。全部就绪之后才
@@ -222,7 +255,9 @@ def install(manifest: dict | None = None, *, progress=None, cancel=None) -> str:
         done = 0
         base = str(manifest.get("_base") or component_base_url())
         url = base + "/" + archive_name
-        with urllib.request.urlopen(url, timeout=60) as src, open(bundle, "wb") as out:
+        source = (archive_path.open("rb") if archive_path is not None
+                  else urllib.request.urlopen(url, timeout=60))
+        with source as src, open(bundle, "wb") as out:
             while True:
                 chunk = src.read(1 << 18)
                 if not chunk:
@@ -260,12 +295,13 @@ def install(manifest: dict | None = None, *, progress=None, cancel=None) -> str:
             if check.hexdigest() != digest:
                 raise OcrUnavailable(f"组件文件校验失败：{rel}")
         (unpacked / VERSION_FILE).write_text(
-            json.dumps({"version": str(manifest.get("version") or "")},
+            json.dumps({"version": str(manifest.get("version") or ""),
+                        "archive_hash": archive_hash},
                        ensure_ascii=False), encoding="utf-8")
         bundle.unlink(missing_ok=True)
         staging_payload = unpacked
 
-        target = component_dir()
+        target = target_dir if target_dir is not None else component_dir()
         target.parent.mkdir(parents=True, exist_ok=True)
         retired = target.with_name(target.name + ".old")
         shutil.rmtree(retired, ignore_errors=True)
@@ -282,7 +318,7 @@ def install(manifest: dict | None = None, *, progress=None, cancel=None) -> str:
                     os.replace(retired, target)
                 raise
         shutil.rmtree(retired, ignore_errors=True)
-        return installed_version()
+        return str(manifest.get("version") or "")
     finally:
         if staging is not None:
             shutil.rmtree(staging, ignore_errors=True)
@@ -304,7 +340,7 @@ def self_test() -> str:
         return "imgtext_ocr: 未安装"
     size_mb = component_size_bytes() / (1024 * 1024)
     return (f"imgtext_ocr: 已安装 version={installed_version() or '?'} "
-            f"size={size_mb:.0f}MB path={component_dir()}")
+            f"size={size_mb:.0f}MB path={active_component_dir()}")
 
 
 if __name__ == "__main__":  # 手动排查：python -m pptx_finder.imgtext_ocr 图片

@@ -271,6 +271,31 @@ uv run python -m pptx_finder
 uv run pyinstaller pptx-finder.spec --noconfirm    # → dist/PPT-Doctor/PPT-Doctor.exe
 ```
 
+完整安装包（首次转字不再下载组件）：
+
+```powershell
+uv run python tools/build_installer.py --full-ocr --ocr-component C:\path\to\ocr
+```
+
+`--ocr-component` 指向含 `component.json` 和 `component.zip` 的识别组件发布目录；
+默认是 `dist/ocr`，可用 `tools/ocr_sidecar/build.py` 生成。构建工具离线校验压缩包和
+每个文件，把组件压缩包放在 `dist/PPT-Doctor/_internal/ocr`，输出
+`artifacts/PPT-Doctor-Setup-v<版本>-Full.exe`。首次转换时本地展开到用户数据目录的
+`ocr-bundled`（约 190 MB），无需联网；后续复用。保留压缩包是为了遵守分发包的短路径
+限制，模型和许可证一个不删。侧车与主程序各自保留运行库，不合并 DLL。
+完整包优先用内置组件；普通包仍可按需下载。重新执行 PyInstaller 后再打不带
+`--full-ocr` 的安装包，可回到普通包；已有内置组件时产物始终标为 Full。
+
+打包前会拒绝缺少或损坏 `base_library.zip` / `encodings` 的载荷。这类缺失可触发
+“Failed to start embedded python interpreter!”；用户若遇到此提示，应安装完整安装包
+恢复运行库，不要只替换主程序 EXE。相同提示也可能有其他原因，仍需结合现场文件与日志排查。
+
+完整包的实际 EXE 验证（不启动 PowerPoint；用隔离数据目录）：
+
+```powershell
+uv run python scripts/verify_full_package.py --dist dist/PPT-Doctor --fixtures .selftest/set
+```
+
 ## 🧱 技术栈
 
 Python 3.12 · PySide6 · SQLite FTS5（每页一行存页码定位）· OpenCC 繁简归一化 · MinHash-LSH 版本归组 · PowerPoint COM 预览 · PyInstaller 绿色打包。
@@ -305,7 +330,7 @@ Python 3.12 · PySide6 · SQLite FTS5（每页一行存页码定位）· OpenCC 
 | 全文件名字索引 `names.idx` | **177.8 MB** | 207 万条目 ≈ **90 字节/条**；1.2 万条目只要 0.8 MB |
 | 预览缓存 `cache/` | ≤ 512 MB | 上限，可随时删 |
 | 版本库 `vault/` | 默认上限 **5 GB** | 首版约为源文件的 116%（OpenXML 零件解压后寻址），**之后每改一版只多约 5 KB**；连改 50 版实测共增 268 KB，比不去重省 97.9% |
-| 识别组件 `ocr/` | 190 MB | **可选**，只有用「图片转可编辑文字」才下载 |
+| 识别组件 `ocr/` | 190 MB | 完整包已内置；普通包首次转字时下载 |
 
 > 版本管理默认**关闭**。开了之后版本库会随你改稿增长，超过上限按从老到新驱逐；设置页有一键清理已删除文档的入口。
 
