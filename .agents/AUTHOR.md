@@ -20,8 +20,10 @@ uv sync                     # 在 worktree 里建它自己的 .venv
 ```
 
 - 分支名用 `feat/` `fix/` `chore/` 开头 + 一句能看懂在干嘛的短语
-- `uv sync` 只是从 uv 全局缓存（`C:\Users\lintian\AppData\Local\uv\cache`）**硬链接**，
-  同一个盘符，几乎不占额外磁盘，也碰不到主目录
+- `uv sync` 大约 **2 分钟**（2026-09-08 实测 1 分 57 秒），别以为它卡住了。
+  它是从 uv 全局缓存（`C:/Users/lintian/AppData/Local/uv/cache`）**硬链接**过来的
+  （实测 .venv 里的 DLL 硬链接数=2），同一个盘符，几乎不占额外磁盘，也碰不到主目录。
+  装完先跑一个快文件确认能自测：`uv run pytest -q tests/test_parser.py`（约 2 秒）
 - 别去动主目录里别人的未提交改动
 
 ### ⚠ 绝对不要把主目录的 `.venv` 借给 worktree
