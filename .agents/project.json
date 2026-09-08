@@ -1,0 +1,48 @@
+{
+  "$comment": "项目专属配置。AI HUB 的群聊底座是通用的，对项目一无所知——所有项目差异都读这个文件。",
+
+  "name": "PPT Doctor",
+  "trunk": "master",
+
+  "$comment_test": "合并脚本亲自跑这些，不采信 Agent 的说法。退出码非 0 就不合。耗时见 timingNote——这个项目的闸门要一刻钟，所以 MERGER.md 明确要求直接跑真合、不要先 dry-run（两遍就是 29 分钟，必然超步骤预算）。",
+  "test": [
+    "uv run pytest -q"
+  ],
+
+  "$comment_version": "版本号由合并脚本在合并那一刻抬，分支不要碰。这个项目版本号在四个文件里：pyproject.toml / src/pptx_finder/__init__.py / assets/windows_version_info.txt（tests/test_package_spec.py 守一致性，不同步会在抬完之后立刻变红）/ uv.lock（记着本项目自己的版本，不同步的话 uv run 会顺手改写它，让工作区永远脏一块）。",
+  "versionFiles": [
+    "pyproject.toml",
+    "src/pptx_finder/__init__.py",
+    "assets/windows_version_info.txt",
+    "uv.lock"
+  ],
+  "versionBump": [
+    "python scripts/bump_version.py"
+  ],
+
+  "$comment_afterMerge": "合并成功后跑。这个项目的打包发布（pyinstaller + gh release）和 ECS 增量更新（要 ECS_PWD）必须用户点头才跑，所以不放在这里自动化。占位符：{branch} {sha}",
+  "afterMerge": [],
+
+  "contracts": {
+    "author": ".agents/AUTHOR.md",
+    "merger": ".agents/MERGER.md"
+  },
+
+  "worktreeRoot": "C:/AIWork",
+  "worktreeHint": "开完 worktree 先 cd 进去跑 uv sync（从 uv 全局缓存硬链接，不碰主目录）；绝不要把主目录的 .venv 借过去——pptx_finder.pth 写死指向主目录 src，测的就不是你的代码了",
+
+  "$comment_notes": "这个项目不知道就会踩的几条；详细版在 .agents/PITFALLS.md",
+  "notes": [
+    "每个 worktree 必须有自己的 .venv：.venv/Lib/site-packages/pptx_finder.pth 写死 C:/Users/lintian/pptx-finder/src，借用主目录 venv 等于在测主目录的代码",
+    "合并脚本必须在主工作目录跑，同上原因",
+    "带 slow 标记的 14 条会真起 PowerPoint COM，跑之前确认没有开着的 PPT 窗口，只关脚本自己开的对象",
+    "不要用 QT_QPA_PLATFORM=offscreen 量字号/行距常量：离屏不加载系统字体，8.5~9.7pt vs 真实 11.6pt",
+    "版本库对象名永远是未压缩内容的 xxh64，.z 只是存放形态；存量零件不动；压完必须逐字节比对",
+    "整库建索引慢是设计如此（低优先级、最多 2 worker、用户一交互就暂停），不要去优化",
+    "Everything 全文件索引 +1.19 GB 是用户拍板要的，不许以省磁盘为由改回去",
+    "打包发布和 ECS 上传一律等用户点头，agent 不碰",
+    "core.autocrlf=true，所以 .gitattributes 里 .githooks/* eol=lf 那行是钩子能活着的前提，别删"
+  ],
+
+  "timingNote": "2026-09-08 本机实测：全量 uv run pytest -q = 1718 条 / 14 分 36 秒（全绿）。分档参考：-m slow 那 14 条 = 3 分 50 秒（主要是 100 万文件清点、10 万目录树这类压力测试，真正的 PowerPoint COM 只有 test_render_real_page 一条）；-m 'not slow' 的 1704 条 ≈ 10 分 45 秒。没有便宜的子集可砍——耗时是 1700 多条 Qt 窗口测试均摊的（每条约 2 秒），砍掉全部 test_stress_*.py 只省 2.7 分钟，却要丢掉版本库/字体缩放的压力覆盖，不划算。"
+}

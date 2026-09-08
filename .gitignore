@@ -16,6 +16,9 @@ wheels/
 # 版本化命名的构建/分发产物（build/ dist/ 规则盖不住带后缀名）
 build-*/
 dist-*/
+# 不带连字符的那种（build151/ dist151/ 实测漏网，111 MB 一直裸躺在工作区）
+build[0-9]*/
+dist[0-9]*/
 
 # 打包自检临时产物（测试集 PPTX + 报告 + 构建日志）
 .selftest/

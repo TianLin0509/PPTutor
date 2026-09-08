@@ -1,0 +1,65 @@
+#!/bin/sh
+# ─────────────────────────────────────────────────────────────────────────────
+# 拒绝在「主工作目录」提交。
+#
+# 为什么：主工作目录是这个项目的「最终版本」，不是干活的地方。
+#         多个 agent 同时在同一个目录动手 = 互相覆盖，而且谁都不知道被覆盖了。
+#         各干各的（每人一个 worktree）是防覆盖的第一半，pre-push 管另一半。
+#
+# 怎么办：去开自己的 worktree，一个任务一个。具体命令见下面的报错提示，
+#         它会读 .agents/project.json，把这个项目真实的路径和主干名印出来。
+#
+# 放行：HUB_ALLOW_MAIN_COMMIT=1 —— 只给合并脚本和紧急修复用。
+#
+# 本文件是通用的，正常情况下不需要按项目修改：项目差异全部读 .agents/project.json
+#   trunk         主干分支名
+#   worktreeRoot  worktree 放哪
+#   worktreeHint  开完 worktree 还要做什么（可选，例如「先设 PYTHONPATH」）
+# ─────────────────────────────────────────────────────────────────────────────
+
+[ "$HUB_ALLOW_MAIN_COMMIT" = "1" ] && exit 0
+
+main_wt=$(git worktree list --porcelain 2>/dev/null | sed -n '1s/^worktree //p')
+this_wt=$(git rev-parse --show-toplevel 2>/dev/null)
+
+[ -z "$main_wt" ] || [ -z "$this_wt" ] && exit 0
+
+norm() { printf '%s' "$1" | tr 'A-Z' 'a-z' | tr '\134' '/'; }
+
+[ "$(norm "$main_wt")" = "$(norm "$this_wt")" ] || exit 0
+
+# 到这里说明确实在主工作目录。读项目配置，把提示写具体。
+cfg=$(python -c "
+import json, sys
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')   # 不加这句，配置里的中文会让本段崩掉、钩子静默走兜底
+try:
+    c = json.load(open('.agents/project.json', encoding='utf-8'))
+except Exception:
+    sys.exit(0)
+print(c.get('trunk') or 'master')
+print(c.get('worktreeRoot') or 'C:/Worktrees')
+print(c.get('worktreeHint') or '')
+" 2>/dev/null)
+
+trunk=$(printf '%s\n' "$cfg" | sed -n '1p')
+wtroot=$(printf '%s\n' "$cfg" | sed -n '2p')
+hint=$(printf '%s\n' "$cfg" | sed -n '3p')
+[ -n "$trunk" ]  || trunk="master"
+[ -n "$wtroot" ] || wtroot="C:/Worktrees"
+
+echo "" >&2
+echo "  ✗ 这里是主工作目录，不能直接提交。" >&2
+echo "" >&2
+echo "    $this_wt 是这个项目的最终版本。" >&2
+echo "    在这里提交，等于绕过验证直接改成品，也是多 agent 互相覆盖的主要来源。" >&2
+echo "" >&2
+echo "  请开一个属于本任务的 worktree：" >&2
+echo "" >&2
+echo "    git worktree add $wtroot/<日期>-<任务>-<席位> -b <分支名> $trunk" >&2
+[ -n "$hint" ] && { echo "" >&2; echo "    $hint" >&2; }
+echo "" >&2
+echo "  然后把改动挪过去再提交。" >&2
+echo "  （合并脚本走 HUB_ALLOW_MAIN_COMMIT=1 放行，不受此限制。）" >&2
+echo "" >&2
+exit 1
