@@ -77,6 +77,24 @@ class PowerPointHandoffBusy(RuntimeError):
     """A hidden preview PowerPoint process has not finished exiting yet."""
 
 
+def _is_powerpoint_busy_error(error: Exception) -> bool:
+    """Recognize COM call refusals, including IDispatch-wrapped HRESULTs."""
+    import pywintypes
+
+    if not isinstance(error, pywintypes.com_error):
+        return False
+    code = error.hresult & 0xFFFFFFFF
+    if code == 0x80020009:  # DISP_E_EXCEPTION: Office puts its code in EXCEPINFO.
+        info = error.excepinfo
+        if not info or len(info) < 6 or not isinstance(info[5], int):
+            return False
+        code = info[5] & 0xFFFFFFFF
+    return code in {
+        0x80010001,  # RPC_E_CALL_REJECTED
+        0x8001010A,  # RPC_E_SERVERCALL_RETRYLATER
+    }
+
+
 def _env_bool(name: str) -> bool | None:
     raw = os.environ.get(name)
     if raw is None:
@@ -1328,8 +1346,15 @@ def _render_page_direct(
             _state.last_error = str(e)
             return None
         except Exception as e:  # noqa: BLE001
-            log.warning("render_page failed path=%s page=%s: %s", path, page_no, e)
             _state.last_error = f"{type(e).__name__}: {e}"
+            if _is_powerpoint_busy_error(e):
+                # A rejected call says nothing about the document's health.
+                # Keep our exact snapshot for a later request/idle cleanup and
+                # let the user retry as soon as PowerPoint is available again.
+                # Do not loop while the user is editing or handling a dialog.
+                log.info("PowerPoint busy; preview can be retried path=%s page=%s: %s", path, page_no, e)
+                return None
+            log.warning("render_page failed path=%s page=%s: %s", path, page_no, e)
             _failed_until[fail_key] = time.monotonic() + _FAILED_TTL_SEC
             _close_pres()       # 关掉可能损坏的 pres
             _release_local_app_reference()  # 丢弃损坏的 COM apartment，下次重建
