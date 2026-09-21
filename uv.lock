@@ -248,7 +248,7 @@ wheels = [
 
 [[package]]
 name = "pptx-finder"
-version = "1.5.8"
+version = "1.6.1"
 source = { editable = "." }
 dependencies = [
     { name = "jieba" },

@@ -32,6 +32,17 @@ def test_builder_rejects_missing_python_standard_library(builder, tmp_path, monk
     assert builder.check_dist() != 0
 
 
+def test_default_installer_cannot_skip_offline_ocr(builder, monkeypatch):
+    monkeypatch.setattr(builder, "check_dist", lambda: 0)
+    calls = []
+    def missing(component, dist):
+        calls.append((component, dist))
+        raise FileNotFoundError("offline OCR is required")
+    monkeypatch.setattr(builder, "bundle_ocr", missing)
+    assert builder.main([]) == 1
+    assert len(calls) == 1
+
+
 @pytest.mark.parametrize("broken", [True, False])
 def test_builder_rejects_broken_or_incomplete_standard_library(builder, tmp_path, monkeypatch, broken):
     monkeypatch.setattr(builder, "DIST", tmp_path)

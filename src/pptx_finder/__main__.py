@@ -37,6 +37,22 @@ if __name__ == "__main__":
     # 图片转可编辑文字的无界面入口：
     #   `PPT-Doctor.exe --imgtext <图片> <输出.pptx>`
     # 既方便批量转换，也是打包后验证这条链路的唯一手段——GUI 里点不出退出码。
+    if "--material-selftest" in sys.argv:
+        from pptx_finder.material_selftest import main as material_selftest
+        index = sys.argv.index("--material-selftest")
+        if len(sys.argv) <= index + 1:
+            raise SystemExit("--material-selftest requires an isolated output directory")
+        try:
+            material_selftest(sys.argv[index + 1])
+        except Exception:
+            import traceback
+            from pathlib import Path
+            output = Path(sys.argv[index + 1])
+            output.mkdir(parents=True, exist_ok=True)
+            (output / "failure.txt").write_text(traceback.format_exc(), encoding="utf-8")
+            raise SystemExit(1)
+        raise SystemExit(0)
+
     if "--imgtext" in sys.argv:
         from pptx_finder.imgtext_cli import run_imgtext
         raise SystemExit(run_imgtext(sys.argv))
