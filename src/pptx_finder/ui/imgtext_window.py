@@ -77,6 +77,7 @@ class ImgTextWindow(QWidget):
 
         self.setObjectName("imgTextWin")
         self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setStyleSheet("QWidget#imgTextWin { background: palette(window); }")
         self.setWindowFlag(Qt.Window, True)
         self.setWindowTitle("图片转可编辑文字 · PPT Doctor")
         self.setAcceptDrops(True)

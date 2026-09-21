@@ -21,6 +21,7 @@ class MaterialWindow(QWidget):
         super().__init__(parent)
         self.setObjectName("materialWin")
         self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setStyleSheet("QWidget#materialWin { background: palette(window); }")
         self.setWindowFlag(Qt.Window, True)
         self.setWindowTitle("素材库 · PPT Doctor")
         self.resize(880, 640)
