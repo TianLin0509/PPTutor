@@ -1571,6 +1571,10 @@ class MainWindow(QMainWindow):
         self.rail_imgtext_btn.setAccessibleName("图片转可编辑文字")
         self.rail_imgtext_btn.clicked.connect(self._open_imgtext_from_rail)
         lay.addWidget(self.rail_imgtext_btn, 0, Qt.AlignHCenter)
+        self.rail_material_btn = self._mk_rail_btn("素材", "收藏形状、图标与图片，分享 PPTX 素材包")
+        self.rail_material_btn.setAccessibleName("素材库")
+        self.rail_material_btn.clicked.connect(self._open_materials_from_rail)
+        lay.addWidget(self.rail_material_btn, 0, Qt.AlignHCenter)
         self.rail_report_btn = self._mk_rail_btn("报告", "我的胶片报告")
         self.rail_report_btn.setAccessibleName("打开胶片报告")
         self.rail_report_btn.clicked.connect(self._open_report_from_rail)
@@ -1614,6 +1618,10 @@ class MainWindow(QMainWindow):
         if imgtext is not None:
             imgtext.setIcon(_icon_folder(ink, 16))
             imgtext.setIconSize(QSize(16, 16))
+        materials = getattr(self, "rail_material_btn", None)
+        if materials is not None:
+            materials.setIcon(_icon_folder(ink, 16))
+            materials.setIconSize(QSize(16, 16))
         report = getattr(self, "rail_report_btn", None)
         if report is not None:
             report.setIcon(_icon_film(ink, 16))
@@ -1622,6 +1630,10 @@ class MainWindow(QMainWindow):
         if settings is not None:
             settings.setIcon(_icon_settings(ink, 16))
             settings.setIconSize(QSize(16, 16))
+
+    def _open_materials_from_rail(self) -> None:
+        from ..app import _open_material_window
+        _open_material_window(self)
 
     def _open_imgtext_from_rail(self) -> None:
         """rail「转字」：与托盘菜单同一条路径，保证「重复点击只把已开的窗带到前台」。"""

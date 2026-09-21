@@ -203,6 +203,22 @@ def _open_imgtext_window(owner, *, window_cls=None):
     return window
 
 
+def _open_material_window(owner):
+    existing = getattr(owner, "_material_window", None)
+    if existing is not None and _qt_is_valid(existing):
+        existing.show()
+        existing.raise_()
+        existing.activateWindow()
+        return existing
+    from .ui.material_window import MaterialWindow
+    window = MaterialWindow(getattr(owner, "_tok", {}), owner)
+    owner._material_window = window
+    window.show()
+    window.raise_()
+    window.activateWindow()
+    return window
+
+
 def _open_settings_dialog(owner, version_mgr, *, dialog_cls=None):
     if dialog_cls is None:
         from .ui.settings_dialog import SettingsDialog
@@ -735,6 +751,8 @@ def main() -> int:
     act_versions.setEnabled(feature_runtime.version_enabled)
     act_imgtext = QAction("图片转可编辑文字…", app)
     act_imgtext.triggered.connect(_open_imgtext)
+    act_materials = QAction("素材库…", app)
+    act_materials.triggered.connect(lambda: _open_material_window(win))
     act_settings = QAction("设置…", app)
     act_settings.triggered.connect(_open_settings)
     act_rescan = QAction("重新扫描全盘", app)
@@ -799,6 +817,7 @@ def main() -> int:
     menu.addAction(act_rescan)
     menu.addAction(act_versions)
     menu.addAction(act_imgtext)
+    menu.addAction(act_materials)
     menu.addAction(act_settings)
     menu.addSeparator()
     menu.addAction(act_quit)

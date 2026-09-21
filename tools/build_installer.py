@@ -186,11 +186,16 @@ def check_dist() -> int:
 
 
 def main(argv=None) -> int:
+    global DIST
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--full-ocr", action="store_true", help="内置 OCR，首次转字无需下载")
+    parser.add_argument("--full-ocr", action="store_true", default=True,
+                        help="兼容旧命令；安装包始终内置 OCR，首次转字无需下载")
     parser.add_argument("--ocr-component", type=Path, default=ROOT / "dist" / "ocr",
                         help="含 component.json/component.zip 的离线组件目录")
+    parser.add_argument("--dist", type=Path, default=DIST,
+                        help="隔离构建目录，避免覆盖正在运行的生产程序")
     args = parser.parse_args(argv)
+    DIST = args.dist.resolve()
     rc = check_dist()
     if rc:
         return rc
@@ -217,7 +222,7 @@ def main(argv=None) -> int:
     if out.exists():
         out.unlink()
 
-    cmd = [str(iscc), f"/DAppVersion={__version__}", str(ISS)]
+    cmd = [str(iscc), f"/DAppVersion={__version__}", f"/DAppSourceDir={DIST}", str(ISS)]
     if full:
         cmd.insert(2, "/DFullOcr=1")
     print(f"[*] {iscc}")

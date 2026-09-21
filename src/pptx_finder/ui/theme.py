@@ -133,6 +133,7 @@ THEMES: list[tuple[str, str]] = [
 _QSS = Template("""
 * { font-family: $font_family; }
 QWidget { background: $base; color: $ink1; font-size: 13px; }
+QWidget#materialWin, QWidget#imgTextWin { background: $win; }
 QMainWindow { background: $win; }
 QWidget#central { background: transparent; }
 QToolTip { background: $win; color: $ink1; border: 1px solid $bd; border-radius: 7px; padding: 6px 9px; }

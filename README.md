@@ -271,10 +271,23 @@ uv run python -m pptx_finder
 uv run pyinstaller pptx-finder.spec --noconfirm    # → dist/PPT-Doctor/PPT-Doctor.exe
 ```
 
-完整安装包（首次转字不再下载组件）：
+v1.6.0 的转字结果提供「复制整页到剪贴板」和「新增一页到 PPT」两个交付按钮。
+整页复制前请先打开目标 PowerPoint 文稿，复制后在左侧幻灯片缩略图区粘贴。
+PowerPoint 完全退出后原生整页剪贴板可能失效，因此程序会先检查已有文稿打开。
+新增页只选择已打开的 PPT，追加到末尾，不自动保存。结果缓存保留最近七天。
+
+主窗口「素材」或托盘「素材库」打开收藏库。在 PPT 中选中对象并 Ctrl+C，点击
+「从剪贴板收藏」，名称、分类可选填。复制素材后，在 PPT 页面编辑区 Ctrl+V。
+多选素材可导出一页一份素材的普通 PPTX，名称分类在备注中；接收方可直接用 PPT
+打开或导入素材库。只导入 PPT Doctor 格式的素材包，不自动拆解普通汇报文件。
+素材库和转字传输目前针对 Microsoft PowerPoint 验证；需要安装该程序。
+为避免素材粘到另一份 PPT 后变色，主题色按收藏时的外观固定为可编辑的 RGB 色，
+透明度、渐变等颜色变换保留；不会把原生形状改成截图。
+
+完整安装包（默认且唯一的安装包模式，首次转字不再下载组件）：
 
 ```powershell
-uv run python tools/build_installer.py --full-ocr --ocr-component C:\path\to\ocr
+uv run python tools/build_installer.py --ocr-component C:\path\to\ocr
 ```
 
 `--ocr-component` 指向含 `component.json` 和 `component.zip` 的识别组件发布目录；
@@ -283,8 +296,9 @@ uv run python tools/build_installer.py --full-ocr --ocr-component C:\path\to\ocr
 `artifacts/PPT-Doctor-Setup-v<版本>-Full.exe`。首次转换时本地展开到用户数据目录的
 `ocr-bundled`（约 190 MB），无需联网；后续复用。保留压缩包是为了遵守分发包的短路径
 限制，模型和许可证一个不删。侧车与主程序各自保留运行库，不合并 DLL。
-完整包优先用内置组件；普通包仍可按需下载。重新执行 PyInstaller 后再打不带
-`--full-ocr` 的安装包，可回到普通包；已有内置组件时产物始终标为 Full。
+安装包始终内置完整组件，缺少组件时构建失败，不会静默发布普通包。
+`--full-ocr` 保留为旧命令兼容参数。历史普通包仍可按需下载；新发布的 ZIP 和增量
+更新清单也必须从完成 OCR 内置后的 `dist/PPT-Doctor` 生成。
 
 打包前会拒绝缺少或损坏 `base_library.zip` / `encodings` 的载荷。这类缺失可触发
 “Failed to start embedded python interpreter!”；用户若遇到此提示，应安装完整安装包

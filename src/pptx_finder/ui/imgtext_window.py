@@ -8,12 +8,15 @@ from __future__ import annotations
 
 import os
 import time
+import uuid
+import logging
 from pathlib import Path
 
 from PySide6.QtCore import QStandardPaths, Qt
 from PySide6.QtGui import QGuiApplication, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QFileDialog,
+    QInputDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -23,7 +26,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import actions, config, imgtext, imgtext_ocr
+from .. import actions, config, imgtext, imgtext_ocr, ppt_transfer
 from .bg_task import BackgroundTask
 
 ACCEPTED = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
@@ -73,6 +76,7 @@ class ImgTextWindow(QWidget):
         self._tasks: list[BackgroundTask] = []
 
         self.setObjectName("imgTextWin")
+        self.setAttribute(Qt.WA_StyledBackground, True)
         self.setWindowFlag(Qt.Window, True)
         self.setWindowTitle("图片转可编辑文字 · PPT Doctor")
         self.setAcceptDrops(True)
@@ -144,15 +148,19 @@ class ImgTextWindow(QWidget):
         self._convert_btn.clicked.connect(self._convert)
         row.addWidget(self._convert_btn)
         row.addStretch(1)
-        self._open_btn = QPushButton("打开结果")
-        self._open_btn.setEnabled(False)
-        self._open_btn.clicked.connect(self._open_result)
-        row.addWidget(self._open_btn)
-        self._folder_btn = QPushButton("打开所在文件夹")
-        self._folder_btn.setEnabled(False)
-        self._folder_btn.clicked.connect(self._open_folder)
-        row.addWidget(self._folder_btn)
         root.addLayout(row)
+        outputs = QHBoxLayout()
+        self._copy_btn = QPushButton("复制整页到剪贴板")
+        self._copy_btn.setToolTip("请先打开目标 Microsoft PowerPoint 文稿；复制后在左侧幻灯片缩略图区粘贴。")
+        self._copy_btn.setEnabled(False)
+        self._copy_btn.clicked.connect(self._copy_result)
+        self._insert_btn = QPushButton("新增一页到 PPT…")
+        self._insert_btn.setEnabled(False)
+        self._insert_btn.clicked.connect(self._choose_target)
+        outputs.addWidget(self._copy_btn)
+        outputs.addWidget(self._insert_btn)
+        outputs.addStretch()
+        root.addLayout(outputs)
 
     # ---------- 组件状态 ----------
     def _refresh_component_state(self) -> None:
@@ -168,6 +176,8 @@ class ImgTextWindow(QWidget):
         self._convert_btn.setEnabled(bool(self._source) and ready and not self._busy)
         self._pick_btn.setEnabled(not self._busy)
         self._paste_btn.setEnabled(not self._busy)
+        self._copy_btn.setEnabled(bool(self._result_path) and not self._busy)
+        self._insert_btn.setEnabled(bool(self._result_path) and not self._busy)
 
     def _install_component(self) -> None:
         if self._busy:
@@ -208,8 +218,8 @@ class ImgTextWindow(QWidget):
         self._source = path
         self._source_is_pasted = pasted
         self._result_path = ""
-        self._open_btn.setEnabled(False)
-        self._folder_btn.setEnabled(False)
+        self._copy_btn.setEnabled(False)
+        self._insert_btn.setEnabled(False)
         pixmap = QPixmap(path)
         if not pixmap.isNull():
             self._drop.setPixmap(pixmap.scaled(
@@ -294,6 +304,9 @@ class ImgTextWindow(QWidget):
             event.acceptProposedAction()
 
     def dropEvent(self, event):  # noqa: N802
+        if self._busy:
+            event.ignore()
+            return
         for url in event.mimeData().urls():
             local = url.toLocalFile()
             if local.lower().endswith(ACCEPTED):
@@ -305,13 +318,17 @@ class ImgTextWindow(QWidget):
     def _convert(self) -> None:
         if self._busy or not self._source:
             return
-        default = self._default_save_target()
-        dest, _ = QFileDialog.getSaveFileName(
-            self, "另存为", default, "PowerPoint (*.pptx)")
-        if not dest:
-            return
-        if not dest.lower().endswith(".pptx"):
-            dest += ".pptx"
+        results = config.cache_dir() / "imgtext-results"
+        results.mkdir(parents=True, exist_ok=True)
+        # Avoid desktop clutter. Clean only old, app-owned conversion results.
+        for old in results.glob("*.pptx"):
+            if old.stat().st_mtime < time.time() - 7 * 86400:
+                try:
+                    old.unlink()
+                except OSError:
+                    logging.getLogger(__name__).warning("cannot remove old conversion: %s", old)
+        dest = str(results / f"{uuid.uuid4().hex}.pptx")
+        self._result_path = ""
         self._busy = True
         self._sync_buttons()
         self._convert_btn.setEnabled(False)
@@ -322,9 +339,13 @@ class ImgTextWindow(QWidget):
         source, target = self._source, dest
 
         def work():
-            rows = imgtext_ocr.recognize_one(source)
-            result = imgtext.convert(source, target, rows)
-            return {"dest": target, "result": result}
+            try:
+                rows = imgtext_ocr.recognize_one(source)
+                result = imgtext.convert(source, target, rows)
+                return {"dest": target, "result": result}
+            except Exception as exc:
+                logging.getLogger(__name__).exception("image conversion failed")
+                return {"error": str(exc)}
 
         self._start(work, self._on_converted, "imgtext-convert")
 
@@ -332,15 +353,13 @@ class ImgTextWindow(QWidget):
         self._busy = False
         self._progress.hide()
         self._sync_buttons()
-        if not isinstance(payload, dict):
+        if not isinstance(payload, dict) or "error" in payload:
             self._status.setText(
-                "转换失败。若提示识别组件不可用，请先下载组件；"
-                "其余原因可在设置的健康诊断里查看日志。")
+                "转换失败：" + (payload["error"] if isinstance(payload, dict) else "请查看健康诊断日志。"))
             return
         result = payload["result"]
         self._result_path = payload["dest"]
-        self._open_btn.setEnabled(True)
-        self._folder_btn.setEnabled(True)
+        self._sync_buttons()
         # 跳过的都原样留在背景图里。如实说清去向，别让人以为内容丢了。
         extra = ""
         if result.skipped_small:
@@ -356,7 +375,61 @@ class ImgTextWindow(QWidget):
         lines = "" if len(result.runs) == len(result.blocks) else f"（共 {len(result.runs)} 行）"
         self._status.setText(
             f"已生成 {len(result.blocks)} 个可编辑文本框{lines}{extra}。"
-            f"\n{self._result_path}")
+            "\n可复制整页，或选择已打开的 PPT，在末尾新增一页。")
+
+    def _transfer(self, fn, done, label):
+        if self._busy:
+            return
+        self._busy = True
+        self._sync_buttons()
+        self._status.setText(f"正在{label}…")
+
+        def work():
+            try:
+                return {"value": fn()}
+            except Exception as exc:
+                logging.getLogger(__name__).exception("PowerPoint transfer failed")
+                return {"error": str(exc)}
+
+        def finish(payload):
+            self._busy = False
+            self._sync_buttons()
+            if not isinstance(payload, dict) or "error" in payload:
+                detail = payload.get("error", "任务未完成") if isinstance(payload, dict) else "任务未完成"
+                self._status.setText(f"{label}失败：{detail}")
+                return
+            done(payload["value"])
+
+        self._start(work, finish, "ppt-transfer")
+
+    def _copy_result(self):
+        source = self._result_path
+        if source:
+            self._transfer(lambda: ppt_transfer.copy_slide(source),
+                           lambda _: self._status.setText(
+                               "整页已复制。请在目标 PPT 左侧的幻灯片缩略图区按 Ctrl+V，粘贴为新的一页。"),
+                           "复制整页")
+
+    def _choose_target(self):
+        if not self._result_path:
+            return
+
+        def choose(targets):
+            if not targets:
+                self._status.setText("没有可编辑的已打开 PPT。请先在 Microsoft PowerPoint 中打开文件。")
+                return
+            labels = [f"{i + 1}. {t.name} · {t.slides} 页 · {t.full_name}" for i, t in enumerate(targets)]
+            label, ok = QInputDialog.getItem(self, "选择已打开的 PPT", "在所选 PPT 末尾新增一页（不自动保存）：",
+                                           labels, 0, False)
+            if ok:
+                target = targets[labels.index(label)]
+                source = self._result_path
+                self._transfer(lambda: ppt_transfer.append_slide(source, target),
+                               lambda page: self._status.setText(
+                                   f"已在 {target.name} 末尾新增第 {page} 页。请在 PowerPoint 中检查并保存。"),
+                               "新增一页")
+
+        self._transfer(ppt_transfer.list_presentations, choose, "读取已打开的 PPT")
 
     def _open_result(self) -> None:
         if self._result_path:
@@ -375,6 +448,10 @@ class ImgTextWindow(QWidget):
         task.start()
 
     def closeEvent(self, event):  # noqa: N802
+        if self._tasks:
+            self._status.setText("操作仍在进行，完成后即可关闭窗口。")
+            event.ignore()
+            return
         self._closing = True
         self._cancel_download = True
         super().closeEvent(event)

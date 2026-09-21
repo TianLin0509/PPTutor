@@ -18,6 +18,10 @@
   #error 必须用 /DAppVersion=x.y.z 传版本号；请走 tools/build_installer.py
 #endif
 
+#ifndef AppSourceDir
+  #define AppSourceDir "..\dist\PPT-Doctor"
+#endif
+
 [Setup]
 AppId={{B7E2A8F3-5C4D-4E1F-9A2B-3D4C5E6F7A08}
 AppName=PPT Doctor
@@ -65,7 +69,7 @@ Name: "cleanlegacy"; Description: "清理电脑上的旧版本（只删程序文
 Type: files; Name: "{app}\PPT Doctor.exe"
 
 [Files]
-Source: "..\dist\PPT-Doctor\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
+Source: "{#AppSourceDir}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
 
 [Icons]
 Name: "{group}\PPT Doctor"; Filename: "{app}\PPT-Doctor.exe"
