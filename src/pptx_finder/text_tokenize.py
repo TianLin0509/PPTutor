@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from functools import lru_cache
 
 try:
     from opencc import OpenCC
@@ -147,3 +148,31 @@ def build_fts_match_exact(query: str) -> str:
         if toks:
             clauses.append('"' + " ".join(toks) + '"')  # 相邻短语=子串（精确，无 trigram）
     return " AND ".join(clauses)
+
+
+_ASCII_ALNUM = frozenset("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+
+@lru_cache(maxsize=256)
+def exact_word_pattern(needle: str) -> re.Pattern[str]:
+    """「精确匹配」的整词规则：只在针的边缘是英文字母/数字的那一侧要求边界。
+
+    搜 RAN 不命中 brand、搜 5G 不命中 15G；但中文没有天然词边界，「RAN架构」里的
+    RAN 算独立词，搜「接入网」照旧命中「无线接入网规划」。
+    """
+    left = r"(?<![0-9A-Za-z])" if needle[:1] in _ASCII_ALNUM else ""
+    right = r"(?![0-9A-Za-z])" if needle[-1:] in _ASCII_ALNUM else ""
+    return re.compile(left + re.escape(needle) + right)
+
+
+def has_word_edge(needle: str) -> bool:
+    """针的首或尾是英文字母/数字 → 整词规则才有约束；否则退化为普通子串。"""
+    return needle[:1] in _ASCII_ALNUM or needle[-1:] in _ASCII_ALNUM
+
+
+def contains_exact_word(haystack: str, needle: str) -> bool:
+    if not needle:
+        return False
+    if not has_word_edge(needle):
+        return needle in haystack  # 省掉正则
+    return exact_word_pattern(needle).search(haystack) is not None

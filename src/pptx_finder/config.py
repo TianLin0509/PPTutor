@@ -409,6 +409,15 @@ def set_smart_grouping_enabled(enabled: bool) -> None:
     update_ui_settings(smart_grouping_enabled=bool(enabled))
 
 
+def get_search_exact_match() -> bool:
+    """结果栏「模糊匹配 / 精确匹配」下拉的上次选择；默认模糊（精确优先 + 自动联想）。"""
+    return _get_bool_setting("search_exact_match", False)
+
+
+def set_search_exact_match(enabled: bool) -> None:
+    update_ui_settings(search_exact_match=bool(enabled))
+
+
 def enabled_index_exts(document_search_enabled: bool | None = None) -> tuple[str, ...]:
     """当前产品层允许进入索引/搜索的扩展名。
 

@@ -302,9 +302,9 @@ QPushButton#verPreviewBtn:hover { background: $hover; color: $ink1; }
 QPushButton#outlineItem { background: transparent; border: none; text-align: left; padding: 4px 6px; color: $ink2; font-size: 11.5px; border-radius: 5px; }
 QPushButton#outlineItem:hover { background: $hover; color: $acc; }
 QLabel#listHead { color: $ink3; font-size: 11.5px; font-weight: 600; background: transparent; }
-QComboBox#sortCombo, QComboBox#sortSecondary { background: transparent; border: 1px solid $bd2; border-radius: 7px; padding: 3px 24px 3px 9px; color: $ink3; font-size: 11.5px; }
-QComboBox#sortCombo:hover, QComboBox#sortSecondary:hover { background: $hover; color: $ink2; }
-QComboBox#sortCombo QAbstractItemView { background: $win; border: 1px solid $bd; border-radius: 8px; selection-background-color: $sel; selection-color: $ink1; }
+QComboBox#sortCombo, QComboBox#sortSecondary, QComboBox#matchModeCombo { background: transparent; border: 1px solid $bd2; border-radius: 7px; padding: 3px 24px 3px 9px; color: $ink3; font-size: 11.5px; }
+QComboBox#sortCombo:hover, QComboBox#sortSecondary:hover, QComboBox#matchModeCombo:hover { background: $hover; color: $ink2; }
+QComboBox#sortCombo QAbstractItemView, QComboBox#matchModeCombo QAbstractItemView { background: $win; border: 1px solid $bd; border-radius: 8px; selection-background-color: $sel; selection-color: $ink1; }
 
 /* 搜索历史下拉 */
 QListView#historyPopup { background: $win; border: 1px solid $bd2; border-radius: 8px; padding: 4px; outline: 0; color: $ink1; }

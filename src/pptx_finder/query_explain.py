@@ -35,7 +35,7 @@ ALL_FILES_HINTS = (
 )
 
 
-def explain_all_files(query: str) -> QueryExplanation:
+def explain_all_files(query: str, *, exact_match: bool = False) -> QueryExplanation:
     """「全部文件」范围的查询说明：这一支走 Everything 语法，不是内容搜索那套。"""
     from . import namequery
 
@@ -48,7 +48,9 @@ def explain_all_files(query: str) -> QueryExplanation:
     # 按查询长度轮换提示，让用户逐渐把语法都见一遍，而不是永远只看到第一条
     hint = ALL_FILES_HINTS[len(query) % len(ALL_FILES_HINTS)]
     return QueryExplanation(
-        summary=f"范围：{mode_label('any_filename')} · 按文件名与文件夹名查找 · 试试 {hint}",
+        summary=(f"范围：{mode_label('any_filename')} · 按文件名与文件夹名查找"
+                 + (" · 精确匹配：英文/数字按完整单词，不联想" if exact_match else "")
+                 + f" · 试试 {hint}"),
         terms=[], phrases=[], short_ascii_terms=[])
 
 
@@ -57,9 +59,10 @@ def explain_query(
     mode_key: str = "all",
     *,
     case_sensitive: bool = False,
+    exact_match: bool = False,
 ) -> QueryExplanation:
     if mode_key == "any_filename":
-        return explain_all_files(query)
+        return explain_all_files(query, exact_match=exact_match)
     terms, phrases = parse_query(query)
     short_ascii = [
         t for t in terms
@@ -73,7 +76,9 @@ def explain_query(
         parts.append("精确短语：" + " / ".join(phrases))
     if not phrases and len(terms) >= 2:
         parts.append("完整短语优先：" + " ".join(terms))
-    if short_ascii:
+    if exact_match:
+        parts.append("精确匹配：英文/数字按完整单词，不联想")
+    elif short_ascii:
         parts.append("短英文/数字按完整词匹配：" + "、".join(short_ascii))
     if len(terms) + len(phrases) > 1:
         parts.append("多条件为 AND，优先命中同一页")
@@ -86,9 +91,12 @@ def explain_query(
     )
 
 
-def suggestion_keys(query: str, mode_key: str = "all") -> list[str]:
+def suggestion_keys(query: str, mode_key: str = "all", *,
+                    exact_match: bool = False) -> list[str]:
     terms, phrases = parse_query(query)
     keys: list[str] = []
+    if exact_match:
+        keys.append("fuzzy")
     if phrases:
         keys.append("unquote")
     if len(terms) + len(phrases) > 1:

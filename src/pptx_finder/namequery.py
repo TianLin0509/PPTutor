@@ -44,7 +44,7 @@ from dataclasses import dataclass, field
 import regex as _regex
 
 from .db import sqlite_safe_text
-from .text_tokenize import normalize
+from .text_tokenize import exact_word_pattern, has_word_edge, normalize
 
 #: 明确没做、也不假装做了的 Everything 功能。写在这里是为了别让人以为漏了。
 KNOWN_GAPS = (
@@ -262,6 +262,7 @@ class _Term(_Node):
     on_path: bool = False
     case_sensitive: bool = False
     whole_word: bool = False
+    exact_word: bool = False             # 界面「精确匹配」：英数边缘要求词边界，中文照旧子串
     literal: bool = False                # 引号里的：* ? 不当通配符
     _rx: re.Pattern | None = field(default=None, repr=False)
     _needle: str = field(default="", repr=False)
@@ -282,6 +283,8 @@ class _Term(_Node):
         elif self.whole_word:
             body = re.escape(text if self.case_sensitive else fold(text))
             self._rx = re.compile(rf"(?<![0-9A-Za-z]){body}(?![0-9A-Za-z])")
+        elif self.exact_word and has_word_edge(text):
+            self._rx = exact_word_pattern(text if self.case_sensitive else fold(text))
         else:
             self._needle = text if self.case_sensitive else fold(text)
 
@@ -591,7 +594,8 @@ def _date_span_end(token: str) -> int:
         raise QueryError(f"看不懂的日期：{token}") from exc
 
 
-def _parse_function(name: str, value: str, *, now=None) -> _Node | None:
+def _parse_function(name: str, value: str, *, now=None,
+                    exact_words: bool = False) -> _Node | None:
     fn = name.casefold()
     if fn == "ext":
         exts = tuple(e.strip().lstrip(".").casefold()
@@ -609,7 +613,7 @@ def _parse_function(name: str, value: str, *, now=None) -> _Node | None:
             return _Range(lo, hi, "mtime")
         return _parse_date(value, now=now)
     if fn == "path":
-        return _Term(value, on_path=True)
+        return _Term(value, on_path=True, exact_word=exact_words)
     if fn == "regex":
         return _Regex(value)
     if fn in ("file", "files"):
@@ -619,9 +623,9 @@ def _parse_function(name: str, value: str, *, now=None) -> _Node | None:
     if fn == "empty":
         return _Range(0, 0, "size")
     if fn == "case":
-        return _Term(value, case_sensitive=True)
+        return _Term(value, case_sensitive=True, exact_word=exact_words)
     if fn == "nocase":
-        return _Term(value)
+        return _Term(value, exact_word=exact_words)
     if fn in ("ww", "wholeword"):
         return _Term(value, whole_word=True)
     return None
@@ -634,15 +638,17 @@ def _unify_seps(text: str) -> str:
     return text.replace("\\", "/")
 
 
-def _make_term(text: str, *, match_path: bool) -> _Node:
+def _make_term(text: str, *, match_path: bool, exact_words: bool = False) -> _Node:
     if text.startswith('"') and text.endswith('"') and len(text) >= 2:
-        return _Term(text[1:-1], literal=True, on_path=match_path)
+        return _Term(text[1:-1], literal=True, on_path=match_path, exact_word=exact_words)
     # 查询里带路径分隔符时，该词自动改成拿完整路径匹配——与 Everything 一致，
     # 因为打 `ui\search` 的人显然是在描述位置而不是文件名
-    return _Term(text, on_path=match_path or bool(_HAS_SEP_RE.search(text)))
+    return _Term(text, on_path=match_path or bool(_HAS_SEP_RE.search(text)),
+                 exact_word=exact_words)
 
 
-def _parse_tokens(tokens: list[str], pos: int, *, now, match_path: bool):
+def _parse_tokens(tokens: list[str], pos: int, *, now, match_path: bool,
+                  exact_words: bool = False):
     """递归下降：or := and ('|' and)* ; and := unary+ ; unary := '!'? primary"""
     branches: list[_Node] = []
     current: list[_Node] = []
@@ -658,7 +664,8 @@ def _parse_tokens(tokens: list[str], pos: int, *, now, match_path: bool):
             pos += 1
             continue
         if tok in ("<", "("):
-            node, pos = _parse_tokens(tokens, pos + 1, now=now, match_path=match_path)
+            node, pos = _parse_tokens(tokens, pos + 1, now=now, match_path=match_path,
+                                      exact_words=exact_words)
             closing = ">" if tok == "<" else ")"
             if pos >= len(tokens) or tokens[pos] != closing:
                 raise QueryError(f"缺少 {closing}")
@@ -671,7 +678,7 @@ def _parse_tokens(tokens: list[str], pos: int, *, now, match_path: bool):
         while body.startswith("!") and len(body) > 1:
             negate = not negate
             body = body[1:]
-        node = _parse_atom(body, now=now, match_path=match_path)
+        node = _parse_atom(body, now=now, match_path=match_path, exact_words=exact_words)
         if node is not None:
             current.append(_Not(node) if negate else node)
         pos += 1
@@ -683,27 +690,29 @@ def _parse_tokens(tokens: list[str], pos: int, *, now, match_path: bool):
     return root, pos
 
 
-def _parse_atom(body: str, *, now, match_path: bool) -> _Node | None:
+def _parse_atom(body: str, *, now, match_path: bool,
+                exact_words: bool = False) -> _Node | None:
     if not body:
         return None
     # 函数名后面跟冒号；冒号在引号里不算
     if not body.startswith('"'):
         head, sep, tail = body.partition(":")
         if sep and head.casefold() in _FUNCTIONS:
-            node = _parse_function(head, tail, now=now)
+            node = _parse_function(head, tail, now=now, exact_words=exact_words)
             if node is not None:
                 return node
-    return _make_term(body, match_path=match_path)
+    return _make_term(body, match_path=match_path, exact_words=exact_words)
 
 
 def parse(text: str, *, now: _dt.datetime | None = None,
-          match_path: bool = False) -> Query:
+          match_path: bool = False, exact_words: bool = False) -> Query:
     """解析一条「全部文件」范围的查询。语法错误抛 QueryError。"""
     raw = (text or "").strip()
     if not raw:
         return Query(None, raw)
     tokens = _split_tokens(raw)
-    root, pos = _parse_tokens(tokens, 0, now=now, match_path=match_path)
+    root, pos = _parse_tokens(tokens, 0, now=now, match_path=match_path,
+                              exact_words=exact_words)
     if pos < len(tokens):
         raise QueryError(f"多余的 {tokens[pos]}")
     return Query(root, raw)
