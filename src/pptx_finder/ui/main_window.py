@@ -477,11 +477,14 @@ def _elide_middle(s: str, maxlen: int = 72) -> str:
 
 
 def _file_mime_for_path(path: str) -> QMimeData:
+    """「复制到剪贴板」和拖拽共用的文件数据包：只带文件（CF_HDROP），两者效果一致。
+
+    不附带纯文本路径：聊天输入框同时拿到文件和文本时，可能插入一串路径而不是附件。
+    """
     mime = QMimeData()
     clean = str(path or "")
     if clean:
         mime.setUrls([QUrl.fromLocalFile(clean)])
-        mime.setText(clean)
     return mime
 
 
@@ -731,6 +734,10 @@ class ResultItem(QWidget):
             self._dup_hint = hint
             lay.addWidget(hint)
         outer.addLayout(lay, 1)
+        # 富文本 QLabel 默认接管鼠标移动（为链接交互），移动事件就到不了卡片，拖拽永远起不来。
+        # 卡片上的字没有链接也不需要选中，统一交还给卡片；悬停提示不受影响。
+        for label in self.findChildren(QLabel):
+            label.setTextInteractionFlags(Qt.NoTextInteraction)
         self._apply("normal", True)
 
     def set_version_expanded(self, expanded: bool, count: int) -> None:
@@ -5492,9 +5499,7 @@ class MainWindow(QMainWindow):
         self._run_bg(lambda: os.path.exists(path), _after, "copy-exists")
 
     def _set_file_clipboard(self, path: str) -> None:
-        mime = QMimeData()
-        mime.setUrls([QUrl.fromLocalFile(path)])
-        QApplication.clipboard().setMimeData(mime)
+        QApplication.clipboard().setMimeData(_file_mime_for_path(path))
 
     def _confirm_file_clipboard(self, path: str, token: int, remaining: int) -> None:
         if self._closing or token != self._clipboard_copy_token:

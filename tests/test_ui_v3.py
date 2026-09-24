@@ -146,7 +146,54 @@ def test_file_drag_mime_uses_local_file_url(tmp_path):
 
     assert md.hasUrls()
     assert md.urls()[0].toLocalFile().replace("/", "\\") == str(p)
-    assert md.text() == str(p)
+    # 拖拽要与「复制到剪贴板」效果一致：只带文件，不带纯文本路径——
+    # 聊天输入框同时拿到两种格式时可能插入一串路径而不是附件
+    # （Qt 的 hasText() 会由 urls 合成，不能拿它判断；看实际导出的格式）
+    assert md.formats() == ["text/uri-list"]
+
+
+def test_copy_and_drag_share_same_file_payload(qtbot, tmp_path, monkeypatch):
+    conn = _mk(tmp_path)
+    win = MainWindow(conn=conn, render_worker=_Stub(), do_index=False)
+    qtbot.addWidget(win)
+    fake = _FakeClipboard()
+    captured = []
+    fake.setMimeData = lambda mime: captured.append(sorted(mime.formats()))
+    monkeypatch.setattr(QApplication, "clipboard", staticmethod(lambda: fake))
+
+    win._set_file_clipboard(str(tmp_path / "x.pptx"))
+
+    assert captured == [sorted(_file_mime_for_path(str(tmp_path / "x.pptx")).formats())]
+
+
+def test_result_card_drag_starts_from_any_text_on_card(qtbot, tmp_path, monkeypatch):
+    """回归：卡片上的富文本标签（文件名 / 高亮片段）默认接管鼠标移动，
+    移动事件到不了卡片，真实鼠标下拖拽永远起不来。要走真实事件链路测，不能直接调 _start_file_drag。"""
+    from PySide6.QtCore import QPoint
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QLabel
+
+    conn = _mk(tmp_path)
+    win = MainWindow(conn=conn, render_worker=_Stub(), do_index=False)
+    qtbot.addWidget(win)
+    win.show()
+    qtbot.waitExposed(win)
+    win.search_box.setText("昇腾")
+    win._do_search()
+    card = win.result_list.itemWidget(win.result_list.item(0))
+    assert isinstance(card, main_window_mod.ResultItem)
+    started = []
+    monkeypatch.setattr(card, "_start_file_drag", lambda: started.append(True))
+    labels = [lb for lb in card.findChildren(QLabel) if lb.isVisible() and lb.width() > 4]
+    assert labels
+
+    for lb in labels:
+        started.clear()
+        start = QPoint(min(3, lb.width() - 1), lb.height() // 2)
+        QTest.mousePress(lb, Qt.LeftButton, Qt.NoModifier, start)
+        QTest.mouseMove(lb, start + QPoint(40, 0))
+        QTest.mouseRelease(lb, Qt.LeftButton, Qt.NoModifier, start + QPoint(40, 0))
+        assert started, f"从标签「{lb.text()[:30]}」上拖不起来"
 
 
 def test_result_card_drag_exports_source_file_url(qtbot, tmp_path, monkeypatch):
