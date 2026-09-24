@@ -18,7 +18,9 @@ from .ranking import (
     result_sort_key,
     sort_results as _core_sort_results,
 )
-from .text_tokenize import SEPARATOR_CLASS, char_match, normalize, parse_query
+from .text_tokenize import (
+    SEPARATOR_CLASS, char_match, contains_exact_word, normalize, parse_query,
+)
 
 log = logging.getLogger(__name__)
 
@@ -338,6 +340,7 @@ def _recall(
     scope: str | None = None,
     exts: tuple[str, ...] | None = None,
     case_sensitive: bool = False,
+    exact_match: bool = False,
 ) -> dict[int, list[tuple[int, float, str, str]]]:
     """字级 FTS5 召回 + 原文验证 → {file_id: [(page, rank)]}。
 
@@ -382,7 +385,10 @@ def _recall(
             fid, pg = r["file_id"], r["page_no"]
             raw = r["raw_text"] or ""
             raw_norm = _normalized_for_verify(raw, case_sensitive=case_sensitive)
-            if all(nw in raw_norm for nw in nws):
+            if all(
+                contains_exact_word(raw_norm, nw) if exact_match else nw in raw_norm
+                for nw in nws
+            ):
                 content.setdefault(fid, []).append((pg, r["rank"], raw, raw_norm))
     except sqlite3.OperationalError as e:
         db_error = str(e).casefold()
@@ -406,7 +412,8 @@ def _search_strict(conn: sqlite3.Connection, query: str, scope: str | None = Non
                    name_limit: int = 3000,
                    name_only: bool = False,
                    sort_keys=None,
-                   descending: bool = False) -> list[FileResult]:
+                   descending: bool = False,
+                   exact_match: bool = False) -> list[FileResult]:
     ext_filter = {e.lower() for e in exts} if exts else None  # 文件类型过滤；None=全部类型
     terms, phrases = parse_query(query)
     if not terms and not phrases:
@@ -438,6 +445,7 @@ def _search_strict(conn: sqlite3.Connection, query: str, scope: str | None = Non
             scope=scope,
             exts=exts,
             case_sensitive=case_sensitive,
+            exact_match=exact_match,
         )
     )
 
@@ -483,7 +491,10 @@ def _search_strict(conn: sqlite3.Connection, query: str, scope: str | None = Non
                     if case_sensitive
                     else (r["name_norm"] or normalize(r["name"]))
                 )
-                if all(t in nm for t in nterms):
+                if all(
+                    contains_exact_word(nm, t) if exact_match else t in nm
+                    for t in nterms
+                ):
                     name_hits.add(r["id"])
 
     file_ids = set(content) | name_hits
@@ -780,8 +791,11 @@ def search(conn: sqlite3.Connection, query: str, scope: str | None = None,
            sort_keys=None,
            descending: bool = False,
            enable_relaxed: bool = True,
+           exact_match: bool = False,
            cancel=None) -> list[FileResult]:
     """Strict results plus bounded automatic aliases/typo correction.
+
+    ``exact_match``（界面上的「精确匹配」）：英文/数字按整词核验，且不做任何联想。
 
     Relaxed results are concatenated after the complete strict tier even when
     the user selects another secondary sort.  This is the hard product promise:
@@ -792,9 +806,11 @@ def search(conn: sqlite3.Connection, query: str, scope: str | None = None,
         case_sensitive=case_sensitive, group_similar=group_similar,
         name_limit=name_limit, name_only=name_only,
         sort_keys=sort_keys, descending=descending,
+        exact_match=exact_match,
     )
     if (
         not enable_relaxed
+        or exact_match
         or len(strict) >= max(1, int(limit))
         or len(strict) > _RELAX_TRIGGER_MAX_STRICT
         or not search_relax.is_relaxable_query(query)
@@ -887,7 +903,8 @@ def search_names(store, query: str, *, limit: int = 200,
                  sort_keys=None,
                  descending: bool = False,
                  cancel=None,
-                 enable_relaxed: bool = True) -> list[FileResult]:
+                 enable_relaxed: bool = True,
+                 exact_match: bool = False) -> list[FileResult]:
     """「全部文件」范围的搜索：只认文件名，数据来自平铺索引而不是 SQLite。
 
     刻意长在 search.py 里而不是单开一个模块：打分要素（name_bonus、match_kind、
@@ -1040,7 +1057,7 @@ def search_names(store, query: str, *, limit: int = 200,
 
     def strict_for(effective_query: str, *, relaxation=None):
         try:
-            parsed = namequery.parse(effective_query)
+            parsed = namequery.parse(effective_query, exact_words=exact_match)
             if not parsed:
                 return []
             if explicit_sort:
@@ -1084,6 +1101,7 @@ def search_names(store, query: str, *, limit: int = 200,
     strict = strict_for(query)
     if (
         not enable_relaxed
+        or exact_match
         or len(strict) >= keep
         or len(strict) > _RELAX_TRIGGER_MAX_STRICT
         or not search_relax.is_relaxable_query(query, all_files=True)

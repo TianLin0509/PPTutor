@@ -48,7 +48,7 @@ class SearchWorker(QThread):
         self._cv = threading.Condition()
         self._pending: tuple[
             int, str, str, tuple[str, ...] | None, bool, bool,
-            tuple[str, ...] | None, bool,
+            tuple[str, ...] | None, bool, bool,
         ] | None = None
         self._stop = False
         self._active_conn = None
@@ -74,7 +74,8 @@ class SearchWorker(QThread):
                 case_sensitive: bool = False,
                 group_similar: bool = True,
                 sort_keys: tuple[str, ...] | None = None,
-                descending: bool = False) -> None:
+                descending: bool = False,
+                exact_match: bool = False) -> None:
         with self._cv:
             self._pending = (
                 req_id,
@@ -85,6 +86,7 @@ class SearchWorker(QThread):
                 bool(group_similar),
                 tuple(sort_keys) if sort_keys else None,
                 bool(descending),
+                bool(exact_match),
             )
             self._cancel_active = False
             with self._diag_lock:
@@ -151,14 +153,16 @@ class SearchWorker(QThread):
             return bool(self._stop or self._cancel_active or self._pending is not None)
 
     def _search_names(self, query: str, exts, case_sensitive: bool,
-                      sort_keys=None, descending: bool = False) -> list:
+                      sort_keys=None, descending: bool = False,
+                      exact_match: bool = False) -> list:
         stores = self._name_store()
         if not stores:
             return []
+        kwargs = {"exact_match": True} if exact_match else {}
         return search_mod.search_names(
             stores, query, exts=exts, case_sensitive=case_sensitive,
             sort_keys=sort_keys, descending=descending,
-            cancel=self._name_cancelled,
+            cancel=self._name_cancelled, **kwargs,
         )
 
     @staticmethod
@@ -236,7 +240,7 @@ class SearchWorker(QThread):
                     if self._stop:
                         return
                     (req_id, query, mode_key, exts, case_sensitive, group_similar,
-                     sort_keys, descending) = self._pending
+                     sort_keys, descending, exact_match) = self._pending
                     self._pending = None
                     self._cancel_active = False
                     self._active_conn = conn  # 在同一把锁内提前置位，消除「取消落在赋值之前」的窗口
@@ -252,7 +256,8 @@ class SearchWorker(QThread):
                         # 「全部文件」范围走平铺文件名索引，整段绕开 SQLite——那 180 万个
                         # 文件的名字根本不在库里了，连读连接都不必开（顺带不与建库抢锁）。
                         results = self._search_names(
-                            query, exts, case_sensitive, sort_keys, descending)
+                            query, exts, case_sensitive, sort_keys, descending,
+                            exact_match)
                     else:
                         if conn is None:
                             if not self._db_path:
@@ -285,6 +290,8 @@ class SearchWorker(QThread):
                             search_kwargs["sort_keys"] = sort_keys
                         if descending:
                             search_kwargs["descending"] = True
+                        if exact_match:
+                            search_kwargs["exact_match"] = True
                         # 联想打分是纯 Python 循环，conn.interrupt() 管不到它。
                         # 不给取消钩子的话，用户连打字时每个中间态都要跑满。
                         if _accepts_kwarg(search_mod.search, "cancel"):

@@ -39,7 +39,8 @@ from ..config import (
     get_completed_index_feature_signature,
     get_document_search_enabled, get_font_family, get_font_scale, get_hotkey,
     get_index_all_files,
-    get_smart_grouping_enabled, get_theme,
+    get_search_exact_match, get_smart_grouping_enabled, get_theme,
+    set_search_exact_match,
     get_window_geometry, set_window_geometry,
     index_feature_signature,
     is_first_run, mark_welcomed,
@@ -1380,6 +1381,20 @@ class MainWindow(QMainWindow):
         self.sort_desc_btn.setFixedWidth(30)
         self.sort_desc_btn.toggled.connect(self._on_sort_direction_changed)
         hr.addWidget(self.sort_desc_btn, 0)
+        self.match_mode_combo = QComboBox()
+        # 复用排序下拉的样式名：外观本就该一致；另起名字就得改 theme.py，而样式表逐字节
+        # 守卫（test_scale_1_byte_safe_vs_git_head）比的是 HEAD，合并闸门里必然失败
+        self.match_mode_combo.setObjectName("sortCombo")
+        self.match_mode_combo.addItems(["模糊匹配", "精确匹配"])
+        self.match_mode_combo.setAccessibleName("匹配方式")
+        self.match_mode_combo.setToolTip(
+            "模糊匹配（默认）：先按原词找；结果很少时自动联想错别字、别名，"
+            "联想结果排在后面并标「联想」\n"
+            "精确匹配：只认原词，英文/数字按完整单词（RAN 不再命中 brand），不联想")
+        if get_search_exact_match():
+            self.match_mode_combo.setCurrentIndex(1)
+        self.match_mode_combo.currentIndexChanged.connect(self._on_match_mode_changed)
+        hr.addWidget(self.match_mode_combo, 0)
         self.case_sensitive_btn = QPushButton("Aa 大小写")
         self.case_sensitive_btn.setObjectName("chip")
         self.case_sensitive_btn.setCheckable(True)
@@ -2151,6 +2166,7 @@ class MainWindow(QMainWindow):
         for w in (
             self.sort_combo,
             self.sort_secondary,
+            self.match_mode_combo,
             self.case_sensitive_btn,
             self.facet_bar,
             self.facet_panel,
@@ -2445,6 +2461,7 @@ class MainWindow(QMainWindow):
             query,
             self._mode_key(),
             case_sensitive=self.case_sensitive_btn.isChecked(),
+            exact_match=self._exact_match(),
         ).summary)
         self.query_hint.show()
 
@@ -2795,6 +2812,8 @@ class MainWindow(QMainWindow):
             request_kwargs = {}
             if self.case_sensitive_btn.isChecked():
                 request_kwargs["case_sensitive"] = True
+            if self._exact_match():
+                request_kwargs["exact_match"] = True
             if isinstance(self._search_worker, SearchWorker):
                 if not self._smart_grouping_enabled:
                     request_kwargs["group_similar"] = False
@@ -2812,10 +2831,23 @@ class MainWindow(QMainWindow):
                 group_similar=self._smart_grouping_enabled,
                 sort_keys=self._sort_keys(),
                 descending=self.sort_desc_btn.isChecked(),
+                # 只在开启时才传：与 worker 一致，兼容签名较窄的旧调用约定
+                **({"exact_match": True} if self._exact_match() else {}),
             ),
             self._mode_key(),
         )
         self._finish_search(query, results, (time.perf_counter() - started) * 1000)
+
+    def _exact_match(self) -> bool:
+        return self.match_mode_combo.currentIndex() == 1
+
+    def _on_match_mode_changed(self, _index: int) -> None:
+        """匹配方式属于检索语义：切换即重搜；记住选择，下拉框常驻显示当前模式，不怕忘了关。"""
+        set_search_exact_match(self._exact_match())
+        query = self.search_box.text().strip()
+        self._update_query_hint(query)
+        if query:
+            self._do_search()
 
     def _on_case_sensitive_changed(self, _checked: bool) -> None:
         """大小写属于检索语义；切换后重跑当前词，而不是只重排旧结果。"""
@@ -3133,6 +3165,7 @@ class MainWindow(QMainWindow):
         self._sugg_btns: dict[str, QPushButton] = {}
         for key, text in (
             ("query", "搜这个试试"),
+            ("fuzzy", "改用模糊匹配（含联想）"),  # 精确模式下零结果时最可能的出路，放最前
             ("unquote", "去掉引号再搜"),
             ("fewer", "只用第一个词"),
             ("allmode", "恢复全部范围"),
@@ -3275,7 +3308,7 @@ class MainWindow(QMainWindow):
         self._empty_tip.setText("换个说法试试")
         self._empty_query_label.setText(f"\u6ca1\u627e\u5230\u300c{query}\u300d")
         self._set_empty_index_status_async()
-        sugg = suggestion_keys(query, self._mode_key())
+        sugg = suggestion_keys(query, self._mode_key(), exact_match=self._exact_match())
         for key, btn in self._sugg_btns.items():
             btn.setVisible(key in sugg)
         self._sugg_btns["query"].hide()
@@ -3332,6 +3365,9 @@ class MainWindow(QMainWindow):
             old_index = self.mode.currentIndex()
             self.mode.setCurrentIndex(0)
             search_started = self.mode.currentIndex() != old_index
+        elif key == "fuzzy":
+            search_started = self._exact_match()
+            self.match_mode_combo.setCurrentIndex(0)  # 切换本身会重搜
         if not search_started:
             self._do_search()
 
@@ -3680,8 +3716,8 @@ class MainWindow(QMainWindow):
         vm = self._version_mgr
         q = (query or "").strip()
         # 历史版本 FTS 只保存归一化 token、没有保留大小写原文，无法可靠二次验证；
-        # 区分大小写时宁可不显示历史提示，也不混入语义不一致的假命中。
-        if self.case_sensitive_btn.isChecked():
+        # 区分大小写 / 精确匹配（整词）时宁可不显示历史提示，也不混入语义不一致的假命中。
+        if self.case_sensitive_btn.isChecked() or self._exact_match():
             self._history_hint_pending_query = ""
             return
         if vm is None or len(q) < 2 or not _backend_supports(vm, "search_history_details"):
@@ -3702,6 +3738,7 @@ class MainWindow(QMainWindow):
             or q != self.search_box.text().strip()
             or self._search_pending_req is not None
             or self.case_sensitive_btn.isChecked()
+            or self._exact_match()
         ):
             return
         seq = self._search_seq
