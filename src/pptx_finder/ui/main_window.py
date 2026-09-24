@@ -5500,7 +5500,11 @@ class MainWindow(QMainWindow):
         if self._closing or token != self._clipboard_copy_token:
             return
         md = QApplication.clipboard().mimeData()
-        ok = md.hasUrls() and any(u.toLocalFile() == path for u in md.urls())
+        # Qt 回读的本地路径一律是正斜杠（C:/a/b.pptx），而 path 是 C:\a\b.pptx，必须归一化再比
+        want = os.path.normcase(os.path.normpath(path))
+        ok = md.hasUrls() and any(
+            os.path.normcase(os.path.normpath(u.toLocalFile())) == want for u in md.urls()
+        )
         if ok:
             self._toast("已复制文件到剪贴板，可粘贴到邮件 / 聊天")
             return
