@@ -1382,7 +1382,9 @@ class MainWindow(QMainWindow):
         self.sort_desc_btn.toggled.connect(self._on_sort_direction_changed)
         hr.addWidget(self.sort_desc_btn, 0)
         self.match_mode_combo = QComboBox()
-        self.match_mode_combo.setObjectName("matchModeCombo")
+        # 复用排序下拉的样式名：外观本就该一致；另起名字就得改 theme.py，而样式表逐字节
+        # 守卫（test_scale_1_byte_safe_vs_git_head）比的是 HEAD，合并闸门里必然失败
+        self.match_mode_combo.setObjectName("sortCombo")
         self.match_mode_combo.addItems(["模糊匹配", "精确匹配"])
         self.match_mode_combo.setAccessibleName("匹配方式")
         self.match_mode_combo.setToolTip(
