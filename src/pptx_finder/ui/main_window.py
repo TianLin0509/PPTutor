@@ -1589,6 +1589,10 @@ class MainWindow(QMainWindow):
         lay.addStretch(1)
         # 「图片转可编辑文字」原来只在托盘右键菜单里，主窗口一个入口都没有——
         # 连做这个功能的人自己都找不到。放进导航轨底部的动作区，与报告/设置同组。
+        self.rail_screenshot_btn = self._mk_rail_btn("截图", "框选任意区域：普通截图、滚动截图、小图模式（每张 ≤50 KB）")
+        self.rail_screenshot_btn.setAccessibleName("截图")
+        self.rail_screenshot_btn.clicked.connect(self._open_screenshot_from_rail)
+        lay.addWidget(self.rail_screenshot_btn, 0, Qt.AlignHCenter)
         self.rail_imgtext_btn = self._mk_rail_btn("转字", "图片转可编辑文字")
         self.rail_imgtext_btn.setAccessibleName("图片转可编辑文字")
         self.rail_imgtext_btn.clicked.connect(self._open_imgtext_from_rail)
@@ -1636,6 +1640,11 @@ class MainWindow(QMainWindow):
             if btn is not None:
                 btn.setIcon(factory(acc if btn.isChecked() else ink, 16))
                 btn.setIconSize(QSize(16, 16))
+        screenshot = getattr(self, "rail_screenshot_btn", None)
+        if screenshot is not None:
+            from .screenshot_icon import screenshot_icon
+            screenshot.setIcon(screenshot_icon(ink, 16))
+            screenshot.setIconSize(QSize(16, 16))
         imgtext = getattr(self, "rail_imgtext_btn", None)
         if imgtext is not None:
             imgtext.setIcon(_icon_folder(ink, 16))
@@ -1652,6 +1661,10 @@ class MainWindow(QMainWindow):
         if settings is not None:
             settings.setIcon(_icon_settings(ink, 16))
             settings.setIconSize(QSize(16, 16))
+
+    def _open_screenshot_from_rail(self) -> None:
+        from .screenshot_window import open_screenshot
+        open_screenshot(self)
 
     def _open_materials_from_rail(self) -> None:
         from ..app import _open_material_window
@@ -6684,6 +6697,9 @@ class MainWindow(QMainWindow):
         if self._closing:
             return
         self._closing = True
+        screenshot = getattr(self, "_screenshot_window", None)
+        if screenshot is not None:
+            screenshot.close()
         # The updater exits through ``force_quit`` instead of the tray action.
         # Keep optional watchers/version reconciliation tied to the window's
         # single shutdown path so an update can never leave background threads
