@@ -7,6 +7,8 @@ datas = [
     ('assets/ui-chevron-dark.svg', 'assets'),
     ('assets/ui-chevron-light.svg', 'assets'),
     ('assets/ui-check.svg', 'assets'),
+    ('assets/formula-katex.html', 'assets'),
+    ('tools/formula_sidecar/licenses/KaTeX-MIT.txt', 'assets'),
     # 图片转可编辑文字的空白母版：注入背景图与文本框的底板（28 KB）
     ('assets/blank_16x9.pptx', 'assets'),
 ]
@@ -23,6 +25,8 @@ datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 # regex 为用户正则提供 Unicode 语义与超时；显式收集其 C 扩展，避免 frozen
 # 环境退回成“源码测试能用、打包后 regex 模块缺失”。
 tmp_ret = collect_all('regex')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('latex2mathml')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 a = Analysis(
     ['src\\pptx_finder\\__main__.py'],
