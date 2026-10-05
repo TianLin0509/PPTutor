@@ -441,24 +441,31 @@ class ScreenshotWindow(QDialog):
             return
         try:
             target = NativeScrollTarget(screen,local,screen.grabWindow(0).size())
-            def capture():
+            def without_notice(action):
                 global_rect = local.translated(geometry.topLeft())
                 visible = self._notice.isVisible()
                 covered = global_rect.intersects(self._notice.geometry())
-                if covered:
-                    self._notice.hide()
-                    QGuiApplication.processEvents()
-                if self._closed:
-                    raise CaptureCancelled()
-                frame = crop_physical(screen.grabWindow(0).toImage(),local,geometry)
-                if covered and visible:
-                    self._notice.show()
-                return frame
-            self._scroll = ScrollCapture(capture,target.wheel,parent=self)
+                try:
+                    if covered and visible:
+                        self._notice.hide()
+                        QGuiApplication.processEvents()
+                    if self._closed:
+                        raise CaptureCancelled()
+                    return action()
+                finally:
+                    if covered and visible and not self._closed:
+                        self._notice.show()
+            def capture():
+                return without_notice(lambda: crop_physical(screen.grabWindow(0).toImage(),local,geometry))
+            def wheel():
+                return without_notice(target.wheel)
+            self._scroll = ScrollCapture(capture,wheel,parent=self)
             self._scroll.progress.connect(lambda text: self._notice.progress(text,screen,stoppable=True))
             self._scroll.finished.connect(self._scroll_finished)
             self._scroll.start()
         except Exception as exc:
+            if self._closed:
+                return
             self._set_busy(False)
             self.status.setText(f'滚动截图无法开始：{exc}')
             self._notice.hide()

@@ -1,4 +1,5 @@
 from PySide6.QtCore import QPoint,QRect,Qt
+import pytest
 from PySide6.QtGui import QColor,QImage
 from PySide6.QtTest import QTest
 from pptx_finder.ui.screenshot_overlay import ScreenshotOverlay
@@ -138,4 +139,43 @@ def test_new_capture_hides_previous_notice_before_freezing(qtbot,tmp_path,monkey
     monkeypatch.setattr(win,'_take_frames',lambda:None)
     win.begin_capture()
     assert not win._notice.isVisible()
+    win.close()
+
+
+@pytest.mark.parametrize('close_on_events',[False,True])
+def test_scroll_notice_cannot_obscure_its_own_native_wheel_target(qtbot,tmp_path,monkeypatch,close_on_events):
+    from PySide6.QtCore import QObject,Signal
+    from PySide6.QtGui import QGuiApplication
+    import pptx_finder.screenshots.scroll_native as native
+    import pptx_finder.ui.scroll_capture as controller
+    win=ScreenshotWindow(output_root=tmp_path)
+    win.setAttribute(Qt.WA_DontShowOnScreen,True)
+    win._notice.setAttribute(Qt.WA_DontShowOnScreen,True)
+    qtbot.addWidget(win)
+    calls=[]
+    class Target:
+        def __init__(self,*a):pass
+        def wheel(self):
+            assert not win._notice.isVisible(),'own feedback obscures target'
+            calls.append('wheel')
+    class Engine(QObject):
+        progress=Signal(str)
+        finished=Signal(object,str,bool)
+        def __init__(self,capture,wheel,parent=None):
+            super().__init__(parent);self.wheel=wheel
+        def start(self):
+            self.progress.emit('滚动中')
+            self.wheel()
+        def stop(self,**kwargs):pass
+    monkeypatch.setattr(native,'NativeScrollTarget',Target)
+    monkeypatch.setattr(controller,'ScrollCapture',Engine)
+    if close_on_events:
+        monkeypatch.setattr(QGuiApplication,'processEvents',lambda *a,**kw:win.close())
+    screen=QGuiApplication.primaryScreen()
+    geometry=screen.geometry()
+    win._start_scroll(QRect(0,0,geometry.width(),geometry.height()),geometry)
+    assert calls==([] if close_on_events else ['wheel'])
+    assert win._notice.isVisible()!=close_on_events
+    if close_on_events:
+        assert not win.isVisible()
     win.close()
