@@ -5,13 +5,16 @@ from dataclasses import dataclass
 from collections.abc import Callable
 from threading import Event
 
-from PySide6.QtCore import QBuffer, QIODevice, QRect, Qt
+from PySide6.QtCore import QBuffer, QIODevice
 from PySide6.QtGui import QColor, QImage, QImageWriter, QPainter
+
+from .fidelity import visually_close
+from .splitting import split_region
 
 MAX_BYTES = 50_000  # Decimal KB: stricter than a 50 KiB upload limit.
 MAX_PIXELS = 24_000_000
 MAX_PARTS = 16
-MIN_JPEG_QUALITY = 75
+MIN_JPEG_QUALITY = 80
 
 
 @dataclass(frozen=True)
@@ -56,37 +59,23 @@ def _opaque(image: QImage) -> QImage:
     return canvas
 
 
-def _split(image: QImage, rect: QRect) -> tuple[QRect, QRect]:
-    # Prefer two horizontal reading bands on a normal PPT. Subsequent cuts
-    # alternate when a band would become excessively wide. No pixels are lost.
-    horizontal = rect.width() <= rect.height() * 2.4
-    length = rect.height() if horizontal else rect.width()
-    if length < 32:
-        horizontal = not horizontal
-        length = rect.height() if horizontal else rect.width()
-    if length < 32:
-        raise ValueError("截图细节太多，无法在保留原始分辨率的同时继续分图；请缩小截图区域")
-    # Find a low-edge cut close to the middle to favour gaps between text rows.
-    sample = image.copy(rect).scaled(96, 96, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
-    scores = []
-    for position in range(40, 57):
-        score = 0
-        for j in range(1, 96):
-            c = sample.pixelColor(j, position) if horizontal else sample.pixelColor(position, j)
-            prev = sample.pixelColor(j - 1, position) if horizontal else sample.pixelColor(position, j - 1)
-            score += abs(c.lightness() - prev.lightness())
-        scores.append((score, abs(position - 48), position))
-    cut = max(16, min(length - 16, round(min(scores)[2] * length / 96)))
-    overlap = min(8, cut // 4, (length - cut) // 4)
-    if horizontal:
-        return (
-            QRect(rect.x(), rect.y(), rect.width(), cut + overlap),
-            QRect(rect.x(), rect.y() + cut - overlap, rect.width(), length - cut + overlap),
-        )
-    return (
-        QRect(rect.x(), rect.y(), cut + overlap, rect.height()),
-        QRect(rect.x() + cut - overlap, rect.y(), length - cut + overlap, rect.height()),
-    )
+def _smallest_safe(tile: QImage, limit: int, cancelled: Event):
+    best = None
+    # Try JPEG first, beginning with stronger compression. Accept a smaller
+    # result only after native-pixel appearance/edge checks; never resize text.
+    for quality in (MIN_JPEG_QUALITY, 85, 90, 95):
+        if cancelled.is_set():
+            raise CaptureCancelled()
+        data = encode(tile, 'JPEG', quality)
+        if len(data) <= limit and (best is None or len(data) < len(best[0])):
+            if visually_close(tile, QImage.fromData(data)):
+                best = data, 'JPEG', quality
+    if cancelled.is_set():
+        raise CaptureCancelled()
+    lossless = encode(tile, 'PNG')
+    if len(lossless) <= limit and (best is None or len(lossless) < len(best[0])):
+        best = lossless, 'PNG', None
+    return best
 
 
 def compress(
@@ -109,17 +98,9 @@ def compress(
         tile = image.copy(rect)
         if progress:
             progress(f"正在压缩 · 已完成 {len(parts)} 张，待处理 {len(pending) + 1} 块")
-        data = encode(tile, 'PNG')
-        fmt, quality = 'PNG', None
-        if len(data) > max_bytes:
-            fmt = 'JPEG'
-            for quality in (95, 90, 85, 80, MIN_JPEG_QUALITY):
-                if cancelled.is_set():
-                    raise CaptureCancelled()
-                data = encode(tile, fmt, quality)
-                if len(data) <= max_bytes:
-                    break
-        if len(data) <= max_bytes:
+        result = _smallest_safe(tile, max_bytes, cancelled)
+        if result is not None:
+            data, fmt, quality = result
             # A decoded, full-resolution image and an actual byte count are
             # required before calling a part upload-ready.
             check = QImage.fromData(data)
@@ -129,7 +110,7 @@ def compress(
         else:
             if len(parts) + len(pending) + 2 > max_parts:
                 raise ValueError(f"需要超过 {max_parts} 张才能保留清晰度，请缩小截图区域后重试")
-            pending[0:0] = list(_split(image, rect))
+            pending[0:0] = list(split_region(image, rect))
     if cancelled.is_set():
         raise CaptureCancelled()
-    return sorted(parts, key=lambda p: (p.region[1], p.region[0]))
+    return parts

@@ -38,7 +38,7 @@ def test_text_stays_lossless_and_full_resolution(qapp):
 
 
 def test_complex_image_splits_into_bounded_full_resolution_parts(qapp):
-    image=detailed_image()
+    image=detailed_image(320,180)
     parts=compress(image)
     assert 1<len(parts)<=16
     coverage=set()
@@ -115,6 +115,8 @@ def test_overlay_drag_emits_crop_and_escape_cancels(qtbot):
     from PySide6.QtCore import QPoint
     QTest.mousePress(overlay,Qt.LeftButton,pos=QPoint(320,240))
     QTest.mouseRelease(overlay,Qt.LeftButton,pos=QPoint(40,30))
+    assert received==[] and overlay.toolbar.isVisible()
+    QTest.mouseClick(overlay.confirm_btn,Qt.LeftButton)
     assert len(received)==1 and received[0].width()>=280
     QTest.keyClick(overlay,Qt.Key_Escape)
     assert cancel==[True]
@@ -125,7 +127,7 @@ def test_result_window_auto_copies_all_and_individual_part(qtbot,tmp_path):
     win=ScreenshotWindow(clipboard_writer=lambda paths:copied.append(paths),output_root=tmp_path)
     win.setAttribute(Qt.WA_DontShowOnScreen,True)
     qtbot.addWidget(win)
-    assert win.process_image(detailed_image(1024,640))
+    assert win.process_image(detailed_image(320,180))
     qtbot.waitUntil(lambda:len(copied)==1 and not win._busy,timeout=15000)
     assert win.grab().toImage().pixelColor(0,0)==QColor('white')
     assert len(copied[0])>1
@@ -151,7 +153,6 @@ def test_closing_pending_capture_preserves_clipboard_and_restores_owner(qtbot,tm
     copied=[]
     win=ScreenshotWindow(owner,clipboard_writer=lambda p:copied.append(p),output_root=tmp_path)
     win.setAttribute(Qt.WA_DontShowOnScreen,True)
-    qtbot.addWidget(win)
     win.begin_capture();assert not owner.isVisible()
     win.close();qtbot.wait(180)
     assert owner.isVisible() and not win._overlays and copied==[]

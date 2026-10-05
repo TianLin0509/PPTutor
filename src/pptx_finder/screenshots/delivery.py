@@ -11,6 +11,26 @@ from pathlib import Path
 from .encoding import ImagePart, MAX_BYTES
 
 
+def copy_image(image, *, hwnd=0) -> None:
+    """Ordinary capture: one original-resolution bitmap, no 50KB conversion."""
+    from .encoding import encode, MAX_PIXELS
+    if image.isNull() or image.width()*image.height() > MAX_PIXELS:
+        raise ValueError('截图为空或过大，请缩小截图区域')
+    if sys.platform == 'win32':
+        import win32clipboard as cb
+        import win32con
+        from ..native_clipboard import opened_clipboard
+        png = encode(image,'PNG')
+        bitmap = encode(image,'BMP')
+        with opened_clipboard(hwnd):
+            cb.EmptyClipboard()
+            cb.SetClipboardData(cb.RegisterClipboardFormat('PNG'),png)
+            cb.SetClipboardData(win32con.CF_DIB,bitmap[14:])
+    else:
+        from PySide6.QtGui import QGuiApplication
+        QGuiApplication.clipboard().setImage(image)
+
+
 def store_parts(parts: list[ImagePart], root: Path) -> list[Path]:
     if not parts or any(p.size > MAX_BYTES or p.size == 0 for p in parts):
         raise ValueError("分图尚未满足每张 50 KB 的限制")
@@ -41,14 +61,14 @@ def hdrop_payload(paths: list[Path]) -> bytes:
     return struct.pack('<IiiII', 20, 0, 0, 0, 1) + ('\0'.join(names) + '\0\0').encode('utf-16-le')
 
 
-def copy_files(paths: list[Path]) -> None:
+def copy_files(paths: list[Path], *, hwnd=0) -> None:
     if not paths or any(not p.is_file() or not 0 < p.stat().st_size <= MAX_BYTES for p in paths):
         raise ValueError("图片文件丢失或超过 50 KB，请重新处理截图")
     if sys.platform == 'win32':
         import win32clipboard as cb
         import win32con
         from ..native_clipboard import opened_clipboard
-        with opened_clipboard():
+        with opened_clipboard(hwnd):
             cb.EmptyClipboard()
             cb.SetClipboardData(win32con.CF_HDROP, hdrop_payload(paths))
             cb.SetClipboardData(cb.RegisterClipboardFormat('Preferred DropEffect'), struct.pack('<I', 1))

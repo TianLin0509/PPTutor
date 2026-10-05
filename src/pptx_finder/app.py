@@ -750,7 +750,7 @@ def main() -> int:
     act_versions.triggered.connect(_open_version_mgr)
     act_versions.setEnabled(feature_runtime.version_enabled)
     act_imgtext = QAction("图片转可编辑文字…", app)
-    act_screenshot = QAction("截图（每张 ≤50 KB）…", app)
+    act_screenshot = QAction("截图（普通 / 滚动 / 小图模式）…", app)
     act_screenshot.triggered.connect(win._open_screenshot_from_rail)
     menu.addAction(act_screenshot)
     act_imgtext.triggered.connect(_open_imgtext)

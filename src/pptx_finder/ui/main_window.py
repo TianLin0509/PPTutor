@@ -1589,7 +1589,7 @@ class MainWindow(QMainWindow):
         lay.addStretch(1)
         # 「图片转可编辑文字」原来只在托盘右键菜单里，主窗口一个入口都没有——
         # 连做这个功能的人自己都找不到。放进导航轨底部的动作区，与报告/设置同组。
-        self.rail_screenshot_btn = self._mk_rail_btn("截图", "框选截图，自动处理到每张不超过 50 KB")
+        self.rail_screenshot_btn = self._mk_rail_btn("截图", "框选任意区域：普通截图、滚动截图、小图模式（每张 ≤50 KB）")
         self.rail_screenshot_btn.setAccessibleName("截图")
         self.rail_screenshot_btn.clicked.connect(self._open_screenshot_from_rail)
         lay.addWidget(self.rail_screenshot_btn, 0, Qt.AlignHCenter)

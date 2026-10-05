@@ -12,10 +12,12 @@ from PySide6.QtWidgets import (
 )
 
 from ..config import cache_dir
+from .. import __version__
 from ..screenshots.encoding import CaptureCancelled, ImagePart, compress
-from ..screenshots.delivery import copy_files, export_files, store_parts
+from ..screenshots.delivery import copy_files, copy_image, export_files, store_parts
 from .bg_task import BackgroundTask
 from .screenshot_overlay import ScreenshotOverlay
+from .screenshot_notice import ScreenshotNotice
 
 _tasks: set[BackgroundTask] = set()
 
@@ -23,14 +25,23 @@ _tasks: set[BackgroundTask] = set()
 class ScreenshotWindow(QDialog):
     progress = Signal(str)
 
-    def __init__(self, parent=None, *, clipboard_writer=copy_files, output_root: Path | None = None):
+    def __init__(self, parent=None, *, clipboard_writer=copy_files, image_writer=copy_image, output_root: Path | None = None):
         super().__init__(parent)
         self.setObjectName('screenshotWindow')
         self.setAttribute(Qt.WA_StyledBackground, True)
         self.setStyleSheet('#screenshotWindow { background: #ffffff; color: #242b35; }')
-        self.setWindowTitle('截图 · PPT Doctor · 候选 v0.1')
+        self.setWindowTitle(f'截图 · PPT Doctor {__version__}')
         self.setModal(False)
-        self._clipboard_writer = clipboard_writer
+        clipboard_owner = int(self.winId())
+        self._clipboard_writer = ((lambda paths:copy_files(paths,hwnd=clipboard_owner))
+                                  if clipboard_writer is copy_files else clipboard_writer)
+        self._image_writer = ((lambda image:copy_image(image,hwnd=clipboard_owner))
+                              if image_writer is copy_image else image_writer)
+        self._notice = ScreenshotNotice()
+        self._notice.stop_requested.connect(self._stop_scroll)
+        self._notice.small_requested.connect(lambda: self.process_image(self._preview_image))
+        self._scroll = None
+        self._silent = False
         self._output_root = output_root or cache_dir() / 'screenshots'
         self._paths: list[Path] = []
         self._parts: list[ImagePart] = []
@@ -46,7 +57,7 @@ class ScreenshotWindow(QDialog):
         root.setContentsMargins(22, 20, 22, 20)
         root.setSpacing(12)
         heading = QHBoxLayout()
-        title = QLabel('截图 · 每张不超过 50 KB')
+        title = QLabel('截图 · 小图模式')
         title.setStyleSheet('font-size: 19px; font-weight: 600;')
         heading.addWidget(title, 1)
         self.capture_btn = QPushButton('框选截图')
@@ -56,7 +67,7 @@ class ScreenshotWindow(QDialog):
         self.paste_btn.clicked.connect(self.paste_image)
         heading.addWidget(self.paste_btn)
         root.addLayout(heading)
-        self.status = QLabel('框选 PPT 区域后自动压缩、必要时分图，并复制图片文件。')
+        self.status = QLabel('框选后选择：✓ 普通截图、滚动截图，或小图模式（每张 ≤50 KB）。')
         self.status.setWordWrap(True)
         root.addWidget(self.status)
         self.preview = QLabel('截图预览')
@@ -83,6 +94,9 @@ class ScreenshotWindow(QDialog):
         self.save_btn.clicked.connect(self.save_result)
         actions.addWidget(self.copy_btn)
         actions.addWidget(self.save_btn)
+        self.small_btn = QPushButton('将原图转为小图')
+        self.small_btn.clicked.connect(lambda: self.process_image(self._preview_image))
+        actions.addWidget(self.small_btn)
         actions.addStretch(1)
         actions.addWidget(QLabel('清晰优先 · 原始分辨率 · 50,000 字节 / 张'))
         root.addLayout(actions)
@@ -90,7 +104,7 @@ class ScreenshotWindow(QDialog):
         hint.setWordWrap(True)
         hint.setStyleSheet('color: #626b78; font-size: 12px;')
         root.addWidget(hint)
-        self.progress.connect(self.status.setText)
+        self.progress.connect(self._progress)
         self.resize(1000, 720)
         screen = self.screen()
         if screen:
@@ -104,6 +118,7 @@ class ScreenshotWindow(QDialog):
         self.paste_btn.setEnabled(not busy)
         self.copy_btn.setEnabled(not busy and bool(self._paths))
         self.save_btn.setEnabled(not busy and bool(self._paths))
+        self.small_btn.setEnabled(not busy and not self._preview_image.isNull())
         for button in self.cards.findChildren(QPushButton):
             button.setEnabled(not busy)
 
@@ -114,10 +129,18 @@ class ScreenshotWindow(QDialog):
         task.finished.connect(lambda: _tasks.discard(task))
         task.start(QThread.LowPriority)
 
-    def process_image(self, image: QImage):
+    def _progress(self,text):
+        if self._closed:
+            return
+        self.status.setText(text)
+        if self._silent:
+            self._notice.label.setText(text)
+
+    def process_image(self, image: QImage, *, show_result=True):
         if image.isNull() or self._busy:
             return False
         self._closed = False
+        self._silent = not show_result
         self._serial += 1
         serial = self._serial
         self._cancel = Event()
@@ -129,7 +152,10 @@ class ScreenshotWindow(QDialog):
         self._update_preview()
         self._set_busy(True)
         self.status.setText('正在压缩截图…')
-        self.show()
+        if show_result:
+            self.show()
+        else:
+            self._notice.progress('小图模式 · 正在压缩截图…')
         progress = self.progress
         root = self._output_root
 
@@ -155,6 +181,8 @@ class ScreenshotWindow(QDialog):
             self._parts, self._paths, error = result
             if error:
                 self.status.setText(error)
+                self._notice.hide()
+                self.show()
                 return
             self._build_cards()
             self._set_busy(False)
@@ -215,9 +243,13 @@ class ScreenshotWindow(QDialog):
             self._set_busy(False)
             if error is None or error:
                 self.status.setText(f'图片已处理，复制未成功：{error or "请重试"}。可点击复制或保存图片。')
+                self._notice.hide()
+                self.show()
             else:
                 sizes = ' / '.join(f'{p.stat().st_size / 1000:.2f}' for p in paths)
                 self.status.setText(f'已复制 {len(paths)} 张图片文件 · {sizes} KB · 可 Ctrl+V 尝试粘贴。')
+                if self._silent:
+                    self._notice.complete(f'已复制 {len(paths)} 张小图 · 每张 ≤50 KB · Ctrl+V 粘贴')
 
         self._run(copy, done, 'screenshot-copy')
 
@@ -280,6 +312,8 @@ class ScreenshotWindow(QDialog):
                 continue
             overlay = ScreenshotOverlay(image, geometry)
             overlay.selected.connect(self._selected)
+            overlay.small_selected.connect(self._small_selected)
+            overlay.scroll_selected.connect(self._scroll_selected)
             overlay.cancelled.connect(self._cancel_capture)
             self._overlays.append(overlay)
             overlay.show()
@@ -302,14 +336,109 @@ class ScreenshotWindow(QDialog):
 
     def _selected(self, image):
         self._close_overlays()
-        self._restore_owner()
-        self.process_image(image)
+        self._owner_was_visible = False
+        self._copy_original(image)
+
+    def _small_selected(self,image):
+        self._close_overlays()
+        self._owner_was_visible = False
+        self.process_image(image,show_result=False)
+
+    def _copy_original(self,image,*,scroll_message='',complete=True):
+        self._closed = False
+        self._serial += 1
+        serial = self._serial
+        self._cancel = Event()
+        cancel = self._cancel
+        self._preview_image = image.copy()
+        self._paths = []
+        self._parts = []
+        self._clear_cards()
+        self._update_preview()
+        self._set_busy(True)
+        self._notice.progress('正在复制原图…')
+        writer = self._image_writer
+        def work():
+            try:
+                if cancel.is_set():
+                    return '已取消'
+                writer(image)
+                return ''
+            except Exception as exc:
+                return str(exc)
+        def done(error):
+            if self._closed or serial != self._serial:
+                return
+            self._set_busy(False)
+            if error is None or error:
+                self.status.setText(f'原图复制失败：{error or "请重试"}')
+                self._notice.hide()
+                self.show()
+            else:
+                message = '原图已复制 · Ctrl+V 粘贴'
+                if scroll_message:
+                    message = ('长图已复制' if complete else '部分长图已复制')+' · '+scroll_message
+                self.status.setText(message)
+                self._notice.complete(message,allow_small=bool(scroll_message))
+        self._run(work,done,'screenshot-original-copy')
+
+    def _scroll_selected(self,local,geometry):
+        self._close_overlays()
+        self._owner_was_visible = False
+        self._set_busy(True)
+        QTimer.singleShot(160,lambda: self._start_scroll(local,geometry))
+
+    def _start_scroll(self,local,geometry):
+        if self._closed:
+            return
+        from .scroll_capture import ScrollCapture
+        from .screenshot_overlay import crop_physical
+        from ..screenshots.scroll_native import NativeScrollTarget
+        screen = next((s for s in QGuiApplication.screens() if s.geometry()==geometry),None)
+        if screen is None:
+            self._set_busy(False)
+            self.status.setText('显示器配置改变，请重新框选')
+            self.show()
+            return
+        try:
+            target = NativeScrollTarget(screen,local,screen.grabWindow(0).size())
+            def capture():
+                global_rect = local.translated(geometry.topLeft())
+                visible = self._notice.isVisible()
+                covered = global_rect.intersects(self._notice.geometry())
+                if covered:
+                    self._notice.hide()
+                    QGuiApplication.processEvents()
+                if self._closed:
+                    raise CaptureCancelled()
+                frame = crop_physical(screen.grabWindow(0).toImage(),local,geometry)
+                if covered and visible:
+                    self._notice.show()
+                return frame
+            self._scroll = ScrollCapture(capture,target.wheel,parent=self)
+            self._scroll.progress.connect(lambda text: self._notice.progress(text,screen,stoppable=True))
+            self._scroll.finished.connect(self._scroll_finished)
+            self._scroll.start()
+        except Exception as exc:
+            self._set_busy(False)
+            self.status.setText(f'滚动截图无法开始：{exc}')
+            self._notice.hide()
+            self.show()
+
+    def _stop_scroll(self):
+        if self._scroll is not None:
+            self._scroll.stop()
+
+    def _scroll_finished(self,image,message,complete):
+        if self._closed:
+            return
+        self._set_busy(False)
+        self._copy_original(image,scroll_message=message,complete=complete)
 
     def _cancel_capture(self):
         self._close_overlays()
         self._restore_owner()
         self.status.setText('已取消截图；剪贴板未修改。')
-        self.show()
 
     def _update_preview(self):
         if not self._preview_image.isNull():
@@ -328,6 +457,9 @@ class ScreenshotWindow(QDialog):
         self._serial += 1
         self._cancel.set()
         self._capture_pending = False
+        if self._scroll is not None:
+            self._scroll.stop(discard=True)
+        self._notice.close()
         self._close_overlays()
         self._restore_owner()
         self._set_busy(False)
@@ -340,9 +472,6 @@ def open_screenshot(parent=None):
         window = ScreenshotWindow(parent)
         if parent is not None:
             parent._screenshot_window = window
-    if window.isVisible():
-        window.raise_()
-        window.activateWindow()
-    else:
+    if not window._busy:
         window.begin_capture()
     return window
