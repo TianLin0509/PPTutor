@@ -148,6 +148,35 @@ def test_stale_install_progress_cannot_override_new_task(qtbot,tmp_path):
     assert win._notice.label.text()=='当前进度'
 
 
+def test_closing_component_install_allows_new_capture_to_install_again(qtbot,tmp_path,monkeypatch):
+    from pptx_finder import imgtext_ocr
+    win=window(qtbot,tmp_path,lambda text:None,None);jobs=[]
+    monkeypatch.setattr(imgtext_ocr,'is_installed',lambda:False)
+    monkeypatch.setattr(win,'_run',lambda fn,cb,label:jobs.append((fn,cb)))
+    monkeypatch.setattr(win,'_take_frames',lambda:None)
+    win._text_selected(image());win._text.install()
+    assert win._busy and not win._text.dialog.install_btn.isEnabled()
+    win.close();assert not win._busy
+    win.begin_capture();win._text_selected(image())
+    assert win._text.dialog.install_btn.isEnabled()
+    # Completion of the cancelled install cannot restart recognition or
+    # disable the fresh install page.
+    jobs[0][1]('')
+    assert len(jobs)==1 and not win._busy and win._text.dialog.install_btn.isEnabled()
+
+
+def test_copying_text_after_owner_reopens_updates_and_unlocks_dialog(qtbot,tmp_path,monkeypatch):
+    written=[];jobs=[]
+    win=window(qtbot,tmp_path,written.append,lambda p:[])
+    monkeypatch.setattr(win,'_run',lambda fn,cb,label:jobs.append((fn,cb)))
+    win.close();win.show();win._text.show()
+    win._text.dialog.editor.setPlainText('恢复复制')
+    QTest.mouseClick(win._text.dialog.copy_btn,Qt.LeftButton)
+    result=jobs[0][0]();jobs[0][1](result)
+    assert written==['恢复复制'] and not win._busy
+    assert win._text.dialog.copy_btn.isEnabled() and '已复制' in win._text.dialog.status.text()
+
+
 def test_text_reading_order_and_temporary_cleanup(qapp):
     paths=[]
     def read(path):

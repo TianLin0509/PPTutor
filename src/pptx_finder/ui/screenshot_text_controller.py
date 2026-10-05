@@ -40,6 +40,7 @@ class ScreenshotTextController(QObject):
     def start(self,image):
         owner=self.owner
         if owner._busy or image.isNull():return
+        owner._closed=False
         self.source=image.copy()
         self.dialog.editor.clear()
         owner._preview_image=image.copy()
@@ -86,6 +87,7 @@ class ScreenshotTextController(QObject):
     def copy(self,text):
         owner=self.owner
         if owner._busy:return
+        owner._closed=False
         owner._serial+=1;serial=owner._serial
         self._active_serial=serial
         owner._cancel=Event()
@@ -107,6 +109,7 @@ class ScreenshotTextController(QObject):
     def install(self):
         owner=self.owner
         if owner._busy:return
+        owner._closed=False
         owner._serial+=1;serial=owner._serial
         self._active_serial=serial
         owner._cancel=Event();cancel=owner._cancel
@@ -140,6 +143,8 @@ class ScreenshotTextController(QObject):
             self.owner._cancel.set()
             self.owner._serial+=1
             self.owner._set_busy(False)
-            self.dialog.set_busy(False)
             self.owner._notice.hide()
+        # Closing this result view always releases its own controls. The
+        # shared image task is cancelled only when it belongs to this view.
+        self.dialog.set_busy(False)
         self._active_serial=None
