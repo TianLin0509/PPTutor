@@ -295,7 +295,8 @@ def test_settings_save_is_async_when_validate_slow(qtbot, mgr, monkeypatch):
     assert call_ms < 500, f"保存调用阻塞 UI 线程 {call_ms:.0f}ms（validate 应放后台）"
     assert not dlg._index_roots_save.isEnabled()  # 校验期间防重入
 
-    qtbot.waitUntil(lambda: "已保存" in dlg._index_roots_result.text(), timeout=5000)
+    qtbot.waitUntil(lambda: "已保存" in dlg._index_roots_result.text()
+                   and not dlg._index_roots_inflight, timeout=5000)
     assert config.get_index_roots() == (r"\\127.0.0.1\pptx_finder_async_share",)
     assert dlg._index_roots_save.isEnabled()
 
@@ -304,6 +305,12 @@ def test_settings_inflight_disables_root_editing(qtbot, mgr, monkeypatch):
     """校验在途期间添加/删除/输入框全部禁用——在途编辑会被校验完成后的
     列表重建静默覆盖，修复后直接从交互上杜绝。"""
     monkeypatch.setattr(settings_dialog_mod, "validate_index_root", _slow_validate_stub)
+    # Force the valid gap between the result signal and finished cleanup so
+    # the test cannot accidentally treat the saved label as an unlocked UI.
+    from PySide6.QtCore import QTimer
+    finish = SettingsDialog._finish_index_roots_validate
+    monkeypatch.setattr(SettingsDialog, "_finish_index_roots_validate",
+                        lambda self, task: QTimer.singleShot(100, lambda: finish(self, task)))
     dlg = SettingsDialog(mgr)
     qtbot.addWidget(dlg)
     dlg.index_root_edit.setText(r"\\127.0.0.1\pptx_finder_async_share")
@@ -316,7 +323,8 @@ def test_settings_inflight_disables_root_editing(qtbot, mgr, monkeypatch):
     assert not dlg._index_root_local_add.isEnabled()
     assert not dlg._index_root_remove.isEnabled()
 
-    qtbot.waitUntil(lambda: "已保存" in dlg._index_roots_result.text(), timeout=5000)
+    qtbot.waitUntil(lambda: "已保存" in dlg._index_roots_result.text()
+                   and not dlg._index_roots_inflight, timeout=5000)
     assert dlg._index_roots_save.isEnabled()
     assert dlg.index_root_edit.isEnabled()
     assert dlg._index_root_net_add.isEnabled()
