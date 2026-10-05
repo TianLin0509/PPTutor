@@ -25,7 +25,7 @@ _tasks: set[BackgroundTask] = set()
 class ScreenshotWindow(QDialog):
     progress = Signal(str)
 
-    def __init__(self, parent=None, *, clipboard_writer=copy_files, image_writer=copy_image, output_root: Path | None = None, preferences=None, text_writer=None, recognizer=None):
+    def __init__(self, parent=None, *, clipboard_writer=copy_files, image_writer=copy_image, output_root: Path | None = None, preferences=None, text_writer=None, recognizer=None, formula_recognizer=None, formula_renderer=None, formula_writer=None):
         super().__init__(parent)
         self.setObjectName('screenshotWindow')
         self.setAttribute(Qt.WA_StyledBackground, True)
@@ -57,6 +57,8 @@ class ScreenshotWindow(QDialog):
         self._preferences = preferences or CapturePreferences((output_root or data_dir()) / 'screenshot-preferences.json')
         self._repeat = False
         self._text = ScreenshotTextController(self,writer=text_writer,recognizer=recognizer)
+        from .screenshot_formula_controller import ScreenshotFormulaController
+        self._formula = ScreenshotFormulaController(self,recognizer=formula_recognizer,renderer=formula_renderer,writer=formula_writer)
         root = QVBoxLayout(self)
         root.setContentsMargins(22, 20, 22, 20)
         root.setSpacing(12)
@@ -78,10 +80,12 @@ class ScreenshotWindow(QDialog):
         self.shortcuts_btn.clicked.connect(self._configure_shortcuts)
         self.text_result_btn = QPushButton('查看文字结果')
         self.text_result_btn.clicked.connect(self._text.show)
-        for button in [self.repeat_btn,self.shortcuts_btn,self.text_result_btn]:tools.addWidget(button)
+        self.formula_result_btn = QPushButton('查看公式结果')
+        self.formula_result_btn.clicked.connect(self._formula.show)
+        for button in [self.repeat_btn,self.shortcuts_btn,self.text_result_btn,self.formula_result_btn]:tools.addWidget(button)
         tools.addStretch(1)
         root.addLayout(tools)
-        self.status = QLabel('框选后选择：✓ 普通截图、滚动截图，或小图模式（每张 ≤50 KB）。')
+        self.status = QLabel('框选后选择：✓ 普通截图、滚动截图、小图模式（每张 ≤50 KB），或识别公式。')
         self.status.setWordWrap(True)
         root.addWidget(self.status)
         self.preview = QLabel('截图预览')
@@ -131,6 +135,7 @@ class ScreenshotWindow(QDialog):
         self.capture_btn.setEnabled(not busy)
         self.repeat_btn.setEnabled(not busy)
         self.text_result_btn.setEnabled(not busy and bool(self._text.dialog.editor.toPlainText()))
+        self.formula_result_btn.setEnabled(not busy and bool(self._formula.dialog.editor.toPlainText()))
         self.paste_btn.setEnabled(not busy)
         has_result = bool(self._paths) or not self._preview_image.isNull()
         self.copy_btn.setText('复制全部图片' if self._paths else '复制原图')
@@ -364,6 +369,7 @@ class ScreenshotWindow(QDialog):
         self._closed = False
         self._repeat = repeat
         self._text.dialog.hide()
+        self._formula.dialog.hide()
         self._capture_pending = True
         self._notice.hide()
         owner = self.parentWidget()
@@ -407,6 +413,7 @@ class ScreenshotWindow(QDialog):
             overlay.small_selected.connect(self._small_selected)
             overlay.scroll_selected.connect(self._scroll_selected)
             overlay.text_selected.connect(self._text_selected)
+            overlay.formula_selected.connect(self._formula_selected)
             overlay.cancelled.connect(self._cancel_capture)
             self._overlays.append(overlay)
             overlay.show()
@@ -443,6 +450,11 @@ class ScreenshotWindow(QDialog):
         self._close_overlays()
         self._owner_was_visible=False
         self._text.start(image)
+
+    def _formula_selected(self,image):
+        self._close_overlays()
+        self._owner_was_visible=False
+        self._formula.start(image)
 
     def _copy_original(self,image,*,scroll_message='',complete=True):
         self._closed = False
@@ -573,6 +585,7 @@ class ScreenshotWindow(QDialog):
             self._scroll.stop(discard=True)
         self._notice.close()
         self._text.close()
+        self._formula.close()
         self._close_overlays()
         self._restore_owner()
         self._set_busy(False)

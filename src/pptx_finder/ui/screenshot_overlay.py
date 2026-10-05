@@ -25,6 +25,7 @@ class ScreenshotOverlay(QWidget):
     small_selected = Signal(QImage)
     scroll_selected = Signal(object, object)
     text_selected = Signal(QImage)
+    formula_selected = Signal(QImage)
     region_selected = Signal(object)
     cancelled = Signal()
 
@@ -55,7 +56,9 @@ class ScreenshotOverlay(QWidget):
         self.small_btn = QPushButton('小图模式')
         self.cancel_btn = QPushButton('× 取消')
         self.text_btn = QPushButton('提取文字')
-        for button in (self.confirm_btn,self.scroll_btn,self.small_btn,self.text_btn,self.cancel_btn):
+        self.formula_btn = QPushButton('识别公式')
+        self.formula_btn.setStyleSheet('color: #2867bd; background: #edf3fc; font-weight: 600;')
+        for button in (self.confirm_btn,self.scroll_btn,self.small_btn,self.text_btn,self.formula_btn,self.cancel_btn):
             bar.addWidget(button)
         self.confirm_btn.setToolTip('普通截图：直接复制原图')
         self.small_btn.setToolTip('AI 上传：压缩并按每张 50 KB 分图')
@@ -64,6 +67,8 @@ class ScreenshotOverlay(QWidget):
         self.small_btn.clicked.connect(lambda: self._confirm('small'))
         self.scroll_btn.clicked.connect(lambda: self._confirm('scroll'))
         self.text_btn.clicked.connect(lambda: self._confirm('text'))
+        self.formula_btn.clicked.connect(lambda: self._confirm('formula'))
+        self.formula_btn.setToolTip('框选单个公式 → 本机识别 → LaTeX / Word 输入格式和预览')
         self.text_btn.setToolTip('本机识别选区文字并复制；点击查看文字可核对修改')
         self.cancel_btn.clicked.connect(self.cancelled)
         drawing = QHBoxLayout()
@@ -202,6 +207,8 @@ class ScreenshotOverlay(QWidget):
             self.small_selected.emit(annotated(result,self.marks,self._selection))
         elif mode == 'text':
             self.text_selected.emit(result)
+        elif mode == 'formula':
+            self.formula_selected.emit(result)
         else:
             self.selected.emit(annotated(result,self.marks,self._selection))
 

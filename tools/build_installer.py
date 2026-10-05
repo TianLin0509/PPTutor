@@ -83,9 +83,9 @@ def _sha256(path: Path) -> str:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def check_ocr_bundle(root: Path, manifest: dict) -> None:
+def check_ocr_bundle(root: Path, manifest: dict, entry='pptdoctor-ocr.exe') -> None:
     files = manifest.get("files") or {}
-    if "pptdoctor-ocr.exe" not in files or not manifest.get("version"):
+    if entry not in files or not manifest.get("version"):
         raise ValueError("OCR 清单缺少入口或版本")
     for rel, meta in files.items():
         path = root / safe_relpath(rel)
@@ -105,13 +105,14 @@ def check_ocr_archive(root: Path, manifest: dict) -> Path:
     return archive
 
 
-def bundle_ocr(component: Path, dist: Path) -> Path:
+def bundle_ocr(component: Path, dist: Path, target_name='ocr', entry='pptdoctor-ocr.exe') -> Path:
     """校验所有文件，分发压缩包以保留短路径预算；首次转字再在本地展开。"""
     manifest = json.loads((component / "component.json").read_text("utf-8"))
     archive = check_ocr_archive(component, manifest)
     runtime = dist / "_internal"
     runtime.mkdir(parents=True, exist_ok=True)
-    target = runtime / "ocr"
+    if target_name not in ('ocr','formula'):raise ValueError('未知组件目录')
+    target = runtime / target_name
     # 要更换已打包组件时重新构建 dist，避免失败后留下混版/额外文件。
     if target.exists():
         check_ocr_archive(target, manifest)
@@ -134,7 +135,7 @@ def bundle_ocr(component: Path, dist: Path) -> Path:
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 with z.open(item) as src, dest.open("wb") as dst:
                     shutil.copyfileobj(src, dst)
-        check_ocr_bundle(unpacked, manifest)
+        check_ocr_bundle(unpacked, manifest, entry)
         packed = Path(tmp) / "packed"
         packed.mkdir()
         shutil.copyfile(archive, packed / "component.zip")
@@ -194,6 +195,7 @@ def main(argv=None) -> int:
                         help="含 component.json/component.zip 的离线组件目录")
     parser.add_argument("--dist", type=Path, default=DIST,
                         help="隔离构建目录，避免覆盖正在运行的生产程序")
+    parser.add_argument('--formula-component',type=Path,help='含 component.json/component.zip 的公式离线组件')
     args = parser.parse_args(argv)
     DIST = args.dist.resolve()
     rc = check_dist()
@@ -202,6 +204,8 @@ def main(argv=None) -> int:
     if args.full_ocr:
         try:
             bundle_ocr(args.ocr_component, DIST)
+            if args.formula_component:
+                bundle_ocr(args.formula_component,DIST,'formula','pptdoctor-formula.exe')
         except (OSError, ValueError, KeyError, zipfile.BadZipFile) as exc:
             print(f"[!] 完整包 OCR 准备失败：{exc}")
             return 1
