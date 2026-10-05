@@ -32,11 +32,8 @@ class ScreenshotWindow(QDialog):
         self.setStyleSheet('#screenshotWindow { background: #ffffff; color: #242b35; }')
         self.setWindowTitle(f'截图 · PPT Doctor {__version__}')
         self.setModal(False)
-        clipboard_owner = int(self.winId())
-        self._clipboard_writer = ((lambda paths:copy_files(paths,hwnd=clipboard_owner))
-                                  if clipboard_writer is copy_files else clipboard_writer)
-        self._image_writer = ((lambda image:copy_image(image,hwnd=clipboard_owner))
-                              if image_writer is copy_image else image_writer)
+        self._clipboard_writer = clipboard_writer
+        self._image_writer = image_writer
         self._notice = ScreenshotNotice()
         self._notice.stop_requested.connect(self._stop_scroll)
         self._notice.small_requested.connect(lambda: self.process_image(self._preview_image))
@@ -250,9 +247,15 @@ class ScreenshotWindow(QDialog):
                                     complete=self._original_complete)
             return
         paths = list(self._paths if index is None else [self._paths[index]])
+        self._closed = False
+        self._serial += 1
+        self._cancel = Event()
         serial = self._serial
-        writer = self._clipboard_writer
         cancel = self._cancel
+        writer = self._clipboard_writer
+        if writer is copy_files:
+            hwnd = int(self.winId())
+            writer = lambda paths: copy_files(paths, hwnd=hwnd, cancelled=cancel)
         self._set_busy(True)
         self.status.setText('正在复制图片文件…')
 
@@ -297,6 +300,9 @@ class ScreenshotWindow(QDialog):
             filename,_ = QFileDialog.getSaveFileName(self,'保存原图','截图.png','PNG 图片 (*.png)')
             if not filename:
                 return
+            self._closed = False
+            self._serial += 1
+            self._cancel = Event()
             image,serial = self._preview_image.copy(),self._serial
             self._set_busy(True)
             self.status.setText('正在保存原图…')
@@ -319,6 +325,9 @@ class ScreenshotWindow(QDialog):
         directory = QFileDialog.getExistingDirectory(self, '选择图片保存目录')
         if not directory:
             return
+        self._closed = False
+        self._serial += 1
+        self._cancel = Event()
         paths, serial = list(self._paths), self._serial
         self._set_busy(True)
         self.status.setText('正在保存图片…')
@@ -451,6 +460,9 @@ class ScreenshotWindow(QDialog):
         self._set_busy(True)
         self._notice.progress('正在复制原图…')
         writer = self._image_writer
+        if writer is copy_image:
+            hwnd = int(self.winId())
+            writer = lambda image: copy_image(image, hwnd=hwnd, cancelled=cancel)
         def work():
             try:
                 if cancel.is_set():
