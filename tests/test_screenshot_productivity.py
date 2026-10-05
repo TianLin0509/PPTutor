@@ -319,5 +319,17 @@ def test_recreated_native_window_uses_current_clipboard_owner(qtbot,tmp_path,mon
     elif mode=='image':win._copy_original(image())
     else:
         part=tmp_path/'part.jpg';part.write_bytes(b'valid size')
-        win._paths=[part];win._closed=False;win._cancel=Event();win.copy_result()
+        win._paths=[part];win.copy_result()
     assert calls==[current] and results==['ownership probe']
+
+
+def test_existing_small_result_can_be_copied_after_close_reopen(qtbot,tmp_path,monkeypatch):
+    written=[];jobs=[]
+    win=hidden(qtbot,ScreenshotWindow(output_root=tmp_path,clipboard_writer=written.append))
+    win._notice.setAttribute(Qt.WA_DontShowOnScreen,True)
+    part=tmp_path/'part.jpg';part.write_bytes(b'valid size');win._paths=[part]
+    monkeypatch.setattr(win,'_run',lambda fn,cb,label:jobs.append((fn,cb)))
+    win.close();win.show();win.copy_result()
+    result=jobs[0][0]();jobs[0][1](result)
+    assert written==[[part]] and not win._closed and not win._busy
+    assert win.copy_btn.isEnabled() and '已复制' in win.status.text()

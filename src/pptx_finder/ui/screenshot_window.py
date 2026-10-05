@@ -247,6 +247,9 @@ class ScreenshotWindow(QDialog):
                                     complete=self._original_complete)
             return
         paths = list(self._paths if index is None else [self._paths[index]])
+        self._closed = False
+        self._serial += 1
+        self._cancel = Event()
         serial = self._serial
         cancel = self._cancel
         writer = self._clipboard_writer
