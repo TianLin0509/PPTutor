@@ -32,11 +32,8 @@ class ScreenshotWindow(QDialog):
         self.setStyleSheet('#screenshotWindow { background: #ffffff; color: #242b35; }')
         self.setWindowTitle(f'截图 · PPT Doctor {__version__}')
         self.setModal(False)
-        clipboard_owner = int(self.winId())
-        self._clipboard_writer = ((lambda paths:copy_files(paths,hwnd=clipboard_owner))
-                                  if clipboard_writer is copy_files else clipboard_writer)
-        self._image_writer = ((lambda image:copy_image(image,hwnd=clipboard_owner))
-                              if image_writer is copy_image else image_writer)
+        self._clipboard_writer = clipboard_writer
+        self._image_writer = image_writer
         self._notice = ScreenshotNotice()
         self._notice.stop_requested.connect(self._stop_scroll)
         self._notice.small_requested.connect(lambda: self.process_image(self._preview_image))
@@ -252,6 +249,9 @@ class ScreenshotWindow(QDialog):
         paths = list(self._paths if index is None else [self._paths[index]])
         serial = self._serial
         writer = self._clipboard_writer
+        if writer is copy_files:
+            hwnd = int(self.winId())
+            writer = lambda paths: copy_files(paths, hwnd=hwnd)
         cancel = self._cancel
         self._set_busy(True)
         self.status.setText('正在复制图片文件…')
@@ -451,6 +451,9 @@ class ScreenshotWindow(QDialog):
         self._set_busy(True)
         self._notice.progress('正在复制原图…')
         writer = self._image_writer
+        if writer is copy_image:
+            hwnd = int(self.winId())
+            writer = lambda image: copy_image(image, hwnd=hwnd)
         def work():
             try:
                 if cancel.is_set():

@@ -289,3 +289,29 @@ def test_native_message_routes_capture_and_repeat(qtbot,qapp,tmp_path,monkeypatc
             qtbot.waitUntil(lambda:len(calls)==(1 if key=='capture' else 2))
         assert calls==['capture','repeat']
     finally:controller.close()
+
+
+@pytest.mark.parametrize('mode',['text','image','files'])
+def test_recreated_native_window_uses_current_clipboard_owner(qtbot,tmp_path,monkeypatch,mode):
+    import sys
+    if sys.platform!='win32':pytest.skip('Windows native window ownership')
+    from contextlib import contextmanager
+    win=hidden(qtbot,ScreenshotWindow(output_root=tmp_path))
+    win._notice.setAttribute(Qt.WA_DontShowOnScreen,True)
+    old=int(win.winId());win.destroy();win.show()
+    current=int(win.winId());assert current!=old
+    calls=[];results=[]
+    @contextmanager
+    def acquired(hwnd):
+        calls.append(hwnd)
+        assert hwnd==current
+        raise RuntimeError('ownership probe')
+        yield
+    monkeypatch.setattr('pptx_finder.native_clipboard.opened_clipboard',acquired)
+    monkeypatch.setattr(win,'_run',lambda fn,cb,label:results.append(fn()))
+    if mode=='text':win._text.copy('probe')
+    elif mode=='image':win._copy_original(image())
+    else:
+        part=tmp_path/'part.jpg';part.write_bytes(b'valid size')
+        win._paths=[part];win._closed=False;win._cancel=Event();win.copy_result()
+    assert calls==[current] and results==['ownership probe']

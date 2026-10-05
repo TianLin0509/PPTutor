@@ -15,7 +15,6 @@ class ScreenshotTextController(QObject):
         super().__init__(owner)
         self.owner=owner
         self.writer=writer
-        self._hwnd=int(owner.winId())
         self.recognizer=recognizer
         self.source=QImage()
         self._active_serial=None
@@ -59,13 +58,14 @@ class ScreenshotTextController(QObject):
         owner._notice.progress('正在本机提取文字…')
         self.dialog.status.setText('正在本机提取文字…')
         recognizer=self.recognizer
+        hwnd=int(owner.winId())
         def work():
             text=''
             try:
                 text=recognize_image(image,cancelled=cancel,recognizer=recognizer)
                 if not text.strip():raise ValueError('未识别到文字，可重新框选更清晰的区域')
                 if cancel.is_set():return text,'已取消'
-                self._write(text,cancel)
+                self._write(text,cancel,hwnd)
                 return text,''
             except Exception as exc:return text,str(exc)
         def done(result):
@@ -93,10 +93,11 @@ class ScreenshotTextController(QObject):
         owner._cancel=Event()
         cancel=owner._cancel
         owner._set_busy(True);self.dialog.set_busy(True)
+        hwnd=int(owner.winId())
         def work():
             try:
                 if cancel.is_set():return '已取消'
-                self._write(text,cancel)
+                self._write(text,cancel,hwnd)
                 return ''
             except Exception as exc:return str(exc)
         def done(error):
@@ -129,9 +130,9 @@ class ScreenshotTextController(QObject):
             else:self.start(self.source)
         owner._run(work,done,'screenshot-ocr-install')
 
-    def _write(self,text,cancel):
+    def _write(self,text,cancel,hwnd):
         if self.writer is None:
-            copy_text(text,hwnd=self._hwnd,cancelled=cancel)
+            copy_text(text,hwnd=hwnd,cancelled=cancel)
         elif not cancel.is_set():
             self.writer(text)
 
