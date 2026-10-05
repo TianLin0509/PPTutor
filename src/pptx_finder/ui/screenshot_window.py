@@ -1,0 +1,348 @@
+"""A nonmodal screenshot utility; encoding and file delivery run off the UI thread."""
+from __future__ import annotations
+
+from pathlib import Path
+from threading import Event
+
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QGuiApplication, QImage, QPixmap
+from PySide6.QtWidgets import (
+    QDialog, QFileDialog, QFrame, QHBoxLayout, QLabel, QPushButton,
+    QScrollArea, QVBoxLayout, QWidget,
+)
+
+from ..config import cache_dir
+from ..screenshots.encoding import CaptureCancelled, ImagePart, compress
+from ..screenshots.delivery import copy_files, export_files, store_parts
+from .bg_task import BackgroundTask
+from .screenshot_overlay import ScreenshotOverlay
+
+_tasks: set[BackgroundTask] = set()
+
+
+class ScreenshotWindow(QDialog):
+    progress = Signal(str)
+
+    def __init__(self, parent=None, *, clipboard_writer=copy_files, output_root: Path | None = None):
+        super().__init__(parent)
+        self.setObjectName('screenshotWindow')
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setStyleSheet('#screenshotWindow { background: #ffffff; color: #242b35; }')
+        self.setWindowTitle('截图 · PPT Doctor · 候选 v0.1')
+        self.setModal(False)
+        self._clipboard_writer = clipboard_writer
+        self._output_root = output_root or cache_dir() / 'screenshots'
+        self._paths: list[Path] = []
+        self._parts: list[ImagePart] = []
+        self._cancel = Event()
+        self._closed = False
+        self._serial = 0
+        self._capture_pending = False
+        self._overlays: list[ScreenshotOverlay] = []
+        self._owner_was_visible = False
+        self._preview_image = QImage()
+        self._busy = False
+        root = QVBoxLayout(self)
+        root.setContentsMargins(22, 20, 22, 20)
+        root.setSpacing(12)
+        heading = QHBoxLayout()
+        title = QLabel('截图 · 每张不超过 50 KB')
+        title.setStyleSheet('font-size: 19px; font-weight: 600;')
+        heading.addWidget(title, 1)
+        self.capture_btn = QPushButton('框选截图')
+        self.capture_btn.clicked.connect(self.begin_capture)
+        heading.addWidget(self.capture_btn)
+        self.paste_btn = QPushButton('处理剪贴板截图')
+        self.paste_btn.clicked.connect(self.paste_image)
+        heading.addWidget(self.paste_btn)
+        root.addLayout(heading)
+        self.status = QLabel('框选 PPT 区域后自动压缩、必要时分图，并复制图片文件。')
+        self.status.setWordWrap(True)
+        root.addWidget(self.status)
+        self.preview = QLabel('截图预览')
+        self.preview.setAlignment(Qt.AlignCenter)
+        self.preview.setMinimumHeight(160)
+        self.preview.setMaximumHeight(330)
+        self.preview.setStyleSheet('background: #f3f5f8; border: 1px solid #dfe3e9; border-radius: 6px;')
+        root.addWidget(self.preview, 1)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setMinimumHeight(170)
+        self.cards = QWidget()
+        self.card_layout = QHBoxLayout(self.cards)
+        self.card_layout.setContentsMargins(0, 0, 0, 0)
+        scroll.setWidget(self.cards)
+        root.addWidget(scroll)
+        actions = QHBoxLayout()
+        self.copy_btn = QPushButton('复制全部图片')
+        self.copy_btn.setObjectName('gotoBtn')
+        self.copy_btn.setStyleSheet('QPushButton { background: #2867bd; color: #ffffff; border: 1px solid #2867bd; } QPushButton:disabled { background: #e7ebf1; color: #87909e; border-color: #e1e5eb; }')
+        self.copy_btn.clicked.connect(lambda: self.copy_result())
+        self.save_btn = QPushButton('保存图片')
+        self.save_btn.clicked.connect(self.save_result)
+        actions.addWidget(self.copy_btn)
+        actions.addWidget(self.save_btn)
+        actions.addStretch(1)
+        actions.addWidget(QLabel('清晰优先 · 原始分辨率 · 50,000 字节 / 张'))
+        root.addLayout(actions)
+        hint = QLabel('复制的是 PNG / JPEG 图片文件；多图粘贴取决于目标网页支持。不支持时可保存后上传。')
+        hint.setWordWrap(True)
+        hint.setStyleSheet('color: #626b78; font-size: 12px;')
+        root.addWidget(hint)
+        self.progress.connect(self.status.setText)
+        self.resize(1000, 720)
+        screen = self.screen()
+        if screen:
+            area = screen.availableGeometry()
+            self.resize(min(1000, area.width() - 30), min(720, area.height() - 30))
+        self._set_busy(False)
+
+    def _set_busy(self, busy: bool):
+        self._busy = busy
+        self.capture_btn.setEnabled(not busy)
+        self.paste_btn.setEnabled(not busy)
+        self.copy_btn.setEnabled(not busy and bool(self._paths))
+        self.save_btn.setEnabled(not busy and bool(self._paths))
+        for button in self.cards.findChildren(QPushButton):
+            button.setEnabled(not busy)
+
+    def _run(self, fn, callback, label):
+        task = BackgroundTask(fn, label=label)
+        _tasks.add(task)
+        task.done.connect(callback)
+        task.finished.connect(lambda: _tasks.discard(task))
+        task.start(QThread.LowPriority)
+
+    def process_image(self, image: QImage):
+        if image.isNull() or self._busy:
+            return False
+        self._closed = False
+        self._serial += 1
+        serial = self._serial
+        self._cancel = Event()
+        cancel = self._cancel
+        self._paths = []
+        self._parts = []
+        self._clear_cards()
+        self._preview_image = image.copy()
+        self._update_preview()
+        self._set_busy(True)
+        self.status.setText('正在压缩截图…')
+        self.show()
+        progress = self.progress
+        root = self._output_root
+
+        def work():
+            try:
+                parts = compress(image, cancelled=cancel, progress=progress.emit)
+                if cancel.is_set():
+                    raise CaptureCancelled()
+                paths = store_parts(parts, root)
+                return parts, paths, ''
+            except CaptureCancelled:
+                return [], [], '已取消'
+            except Exception as exc:
+                return [], [], str(exc)
+
+        def done(result):
+            if serial != self._serial or self._closed:
+                return
+            self._set_busy(False)
+            if result is None:
+                self.status.setText('截图处理失败，请重试')
+                return
+            self._parts, self._paths, error = result
+            if error:
+                self.status.setText(error)
+                return
+            self._build_cards()
+            self._set_busy(False)
+            self.copy_result()
+
+        self._run(work, done, 'screenshot-compress')
+        return True
+
+    def _clear_cards(self):
+        while self.card_layout.count():
+            item = self.card_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+    def _build_cards(self):
+        self._clear_cards()
+        for i, part in enumerate(self._parts):
+            card = QFrame()
+            card.setObjectName('screenshotCard')
+            card.setStyleSheet('#screenshotCard { background: #ffffff; border: 1px solid #e1e5eb; border-radius: 6px; }')
+            card.setMinimumWidth(230)
+            lay = QVBoxLayout(card)
+            label = QLabel(f'第 {i + 1} 张 · {part.size / 1000:.2f} KB · {part.format}')
+            lay.addWidget(label)
+            preview = QLabel()
+            preview.setAlignment(Qt.AlignCenter)
+            pixmap = QPixmap.fromImage(QImage.fromData(part.data))
+            preview.setPixmap(pixmap.scaled(280, 75, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            lay.addWidget(preview)
+            button = QPushButton('单独复制')
+            button.clicked.connect(lambda checked=False, index=i: self.copy_result(index))
+            lay.addWidget(button)
+            self.card_layout.addWidget(card)
+        self.card_layout.addStretch(1)
+
+    def copy_result(self, index: int | None = None):
+        if self._busy or not self._paths:
+            return
+        paths = list(self._paths if index is None else [self._paths[index]])
+        serial = self._serial
+        writer = self._clipboard_writer
+        cancel = self._cancel
+        self._set_busy(True)
+        self.status.setText('正在复制图片文件…')
+
+        def copy():
+            try:
+                if cancel.is_set():
+                    return '已取消'
+                writer(paths)
+                return ''
+            except Exception as exc:
+                return str(exc)
+
+        def done(error):
+            if self._closed or serial != self._serial:
+                return
+            self._set_busy(False)
+            if error is None or error:
+                self.status.setText(f'图片已处理，复制未成功：{error or "请重试"}。可点击复制或保存图片。')
+            else:
+                sizes = ' / '.join(f'{p.stat().st_size / 1000:.2f}' for p in paths)
+                self.status.setText(f'已复制 {len(paths)} 张图片文件 · {sizes} KB · 可 Ctrl+V 尝试粘贴。')
+
+        self._run(copy, done, 'screenshot-copy')
+
+    def paste_image(self):
+        image = QGuiApplication.clipboard().image()
+        if image.isNull():
+            self.status.setText('剪贴板中没有截图。可先用 Win+Shift+S，再点“处理剪贴板截图”。')
+            return
+        self.process_image(image)
+
+    def save_result(self):
+        if self._busy or not self._paths:
+            return
+        directory = QFileDialog.getExistingDirectory(self, '选择图片保存目录')
+        if not directory:
+            return
+        paths, serial = list(self._paths), self._serial
+        self._set_busy(True)
+        self.status.setText('正在保存图片…')
+
+        def work():
+            try:
+                return export_files(paths, Path(directory)), ''
+            except Exception as exc:
+                return [], str(exc)
+
+        def done(result):
+            if self._closed or serial != self._serial:
+                return
+            self._set_busy(False)
+            if result is None or result[1]:
+                self.status.setText(f'保存失败：{result[1] if result else "请重试"}')
+            else:
+                self.status.setText(f'已保存 {len(result[0])} 张图片到 {directory}')
+
+        self._run(work, done, 'screenshot-save')
+
+    def begin_capture(self):
+        if self._busy or self._capture_pending or self._overlays:
+            return
+        self._closed = False
+        self._capture_pending = True
+        owner = self.parentWidget()
+        self._owner_was_visible = bool(owner and owner.isVisible())
+        self.hide()
+        if self._owner_was_visible:
+            owner.hide()
+        QTimer.singleShot(150, self._take_frames)
+
+    def _take_frames(self):
+        if not self._capture_pending or self._closed:
+            self._restore_owner()
+            return
+        self._capture_pending = False
+        # Freeze all displays before opening overlays. Each display keeps its
+        # own geometry and pixel ratio; selections do not cross monitors.
+        frames = [(screen.grabWindow(0).toImage(), screen.geometry()) for screen in QGuiApplication.screens()]
+        for image, geometry in frames:
+            if image.isNull():
+                continue
+            overlay = ScreenshotOverlay(image, geometry)
+            overlay.selected.connect(self._selected)
+            overlay.cancelled.connect(self._cancel_capture)
+            self._overlays.append(overlay)
+            overlay.show()
+        if not self._overlays:
+            self._restore_owner()
+            self.status.setText('无法读取显示器画面，请检查远程桌面或屏幕权限。')
+            self.show()
+
+    def _close_overlays(self):
+        overlays, self._overlays = self._overlays, []
+        for overlay in overlays:
+            overlay.close()
+            overlay.deleteLater()
+
+    def _restore_owner(self):
+        owner = self.parentWidget()
+        if self._owner_was_visible and owner:
+            owner.show()
+        self._owner_was_visible = False
+
+    def _selected(self, image):
+        self._close_overlays()
+        self._restore_owner()
+        self.process_image(image)
+
+    def _cancel_capture(self):
+        self._close_overlays()
+        self._restore_owner()
+        self.status.setText('已取消截图；剪贴板未修改。')
+        self.show()
+
+    def _update_preview(self):
+        if not self._preview_image.isNull():
+            self.preview.setPixmap(QPixmap.fromImage(self._preview_image).scaled(
+                max(1, self.preview.width() - 12), max(1, self.preview.height() - 12),
+                Qt.KeepAspectRatio, Qt.SmoothTransformation,
+            ))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, 'preview'):
+            self._update_preview()
+
+    def closeEvent(self, event):
+        self._closed = True
+        self._serial += 1
+        self._cancel.set()
+        self._capture_pending = False
+        self._close_overlays()
+        self._restore_owner()
+        self._set_busy(False)
+        super().closeEvent(event)
+
+
+def open_screenshot(parent=None):
+    window = getattr(parent, '_screenshot_window', None) if parent else None
+    if window is None:
+        window = ScreenshotWindow(parent)
+        if parent is not None:
+            parent._screenshot_window = window
+    if window.isVisible():
+        window.raise_()
+        window.activateWindow()
+    else:
+        window.begin_capture()
+    return window
