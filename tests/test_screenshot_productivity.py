@@ -333,3 +333,21 @@ def test_existing_small_result_can_be_copied_after_close_reopen(qtbot,tmp_path,m
     result=jobs[0][0]();jobs[0][1](result)
     assert written==[[part]] and not win._closed and not win._busy
     assert win.copy_btn.isEnabled() and '已复制' in win.status.text()
+
+
+@pytest.mark.parametrize('mode',['image','files'])
+def test_retained_result_save_after_close_reopen_unlocks(qtbot,tmp_path,monkeypatch,mode):
+    from PySide6.QtWidgets import QFileDialog
+    win=hidden(qtbot,ScreenshotWindow(output_root=tmp_path))
+    win._notice.setAttribute(Qt.WA_DontShowOnScreen,True)
+    jobs=[];win._preview_image=image()
+    destination=tmp_path/'export';destination.mkdir()
+    monkeypatch.setattr(QFileDialog,'getSaveFileName',lambda *a:(str(destination/'shot.png'),'PNG'))
+    monkeypatch.setattr(QFileDialog,'getExistingDirectory',lambda *a:str(destination))
+    if mode=='files':
+        part=tmp_path/'part.jpg';part.write_bytes(b'valid size');win._paths=[part]
+    monkeypatch.setattr(win,'_run',lambda fn,cb,label:jobs.append((fn,cb)))
+    win.close();win.show();win.save_result()
+    result=jobs[0][0]();jobs[0][1](result)
+    assert not win._closed and not win._busy and win.save_btn.isEnabled()
+    assert '已保存' in win.status.text() and list(destination.iterdir())

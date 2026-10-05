@@ -300,6 +300,9 @@ class ScreenshotWindow(QDialog):
             filename,_ = QFileDialog.getSaveFileName(self,'保存原图','截图.png','PNG 图片 (*.png)')
             if not filename:
                 return
+            self._closed = False
+            self._serial += 1
+            self._cancel = Event()
             image,serial = self._preview_image.copy(),self._serial
             self._set_busy(True)
             self.status.setText('正在保存原图…')
@@ -322,6 +325,9 @@ class ScreenshotWindow(QDialog):
         directory = QFileDialog.getExistingDirectory(self, '选择图片保存目录')
         if not directory:
             return
+        self._closed = False
+        self._serial += 1
+        self._cancel = Event()
         paths, serial = list(self._paths), self._serial
         self._set_busy(True)
         self.status.setText('正在保存图片…')
