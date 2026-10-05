@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (
     QScrollArea, QVBoxLayout, QWidget,
 )
 
-from ..config import cache_dir
+from ..config import cache_dir, data_dir
 from .. import __version__
 from ..screenshots.encoding import CaptureCancelled, ImagePart, compress
 from ..screenshots.delivery import copy_files, copy_image, export_files, store_parts
@@ -25,7 +25,7 @@ _tasks: set[BackgroundTask] = set()
 class ScreenshotWindow(QDialog):
     progress = Signal(str)
 
-    def __init__(self, parent=None, *, clipboard_writer=copy_files, image_writer=copy_image, output_root: Path | None = None):
+    def __init__(self, parent=None, *, clipboard_writer=copy_files, image_writer=copy_image, output_root: Path | None = None, preferences=None, text_writer=None, recognizer=None):
         super().__init__(parent)
         self.setObjectName('screenshotWindow')
         self.setAttribute(Qt.WA_StyledBackground, True)
@@ -55,6 +55,11 @@ class ScreenshotWindow(QDialog):
         self._original_scroll_message = ''
         self._original_complete = True
         self._busy = False
+        from ..screenshots.preferences import CapturePreferences
+        from .screenshot_text_controller import ScreenshotTextController
+        self._preferences = preferences or CapturePreferences((output_root or data_dir()) / 'screenshot-preferences.json')
+        self._repeat = False
+        self._text = ScreenshotTextController(self,writer=text_writer,recognizer=recognizer)
         root = QVBoxLayout(self)
         root.setContentsMargins(22, 20, 22, 20)
         root.setSpacing(12)
@@ -63,12 +68,22 @@ class ScreenshotWindow(QDialog):
         title.setStyleSheet('font-size: 19px; font-weight: 600;')
         heading.addWidget(title, 1)
         self.capture_btn = QPushButton('框选截图')
-        self.capture_btn.clicked.connect(self.begin_capture)
+        self.capture_btn.clicked.connect(lambda:self.begin_capture())
         heading.addWidget(self.capture_btn)
         self.paste_btn = QPushButton('处理剪贴板截图')
         self.paste_btn.clicked.connect(self.paste_image)
         heading.addWidget(self.paste_btn)
         root.addLayout(heading)
+        tools = QHBoxLayout()
+        self.repeat_btn = QPushButton('重复上次区域')
+        self.repeat_btn.clicked.connect(lambda:self.begin_capture(repeat=True))
+        self.shortcuts_btn = QPushButton('截图快捷键…')
+        self.shortcuts_btn.clicked.connect(self._configure_shortcuts)
+        self.text_result_btn = QPushButton('查看文字结果')
+        self.text_result_btn.clicked.connect(self._text.show)
+        for button in [self.repeat_btn,self.shortcuts_btn,self.text_result_btn]:tools.addWidget(button)
+        tools.addStretch(1)
+        root.addLayout(tools)
         self.status = QLabel('框选后选择：✓ 普通截图、滚动截图，或小图模式（每张 ≤50 KB）。')
         self.status.setWordWrap(True)
         root.addWidget(self.status)
@@ -117,6 +132,8 @@ class ScreenshotWindow(QDialog):
     def _set_busy(self, busy: bool):
         self._busy = busy
         self.capture_btn.setEnabled(not busy)
+        self.repeat_btn.setEnabled(not busy)
+        self.text_result_btn.setEnabled(not busy and bool(self._text.dialog.editor.toPlainText()))
         self.paste_btn.setEnabled(not busy)
         has_result = bool(self._paths) or not self._preview_image.isNull()
         self.copy_btn.setText('复制全部图片' if self._paths else '复制原图')
@@ -323,10 +340,21 @@ class ScreenshotWindow(QDialog):
 
         self._run(work, done, 'screenshot-save')
 
-    def begin_capture(self):
+    def _configure_shortcuts(self):
+        from PySide6.QtWidgets import QApplication
+        from .screenshot_shortcuts import install_screenshot_shortcuts
+        app = QApplication.instance()
+        controller = getattr(app,'_screenshot_shortcuts',None)
+        if controller is None:
+            controller=install_screenshot_shortcuts(app,self)
+        controller.show_settings()
+
+    def begin_capture(self, *, repeat=False):
         if self._busy or self._capture_pending or self._overlays:
             return
         self._closed = False
+        self._repeat = repeat
+        self._text.dialog.hide()
         self._capture_pending = True
         self._notice.hide()
         owner = self.parentWidget()
@@ -343,17 +371,38 @@ class ScreenshotWindow(QDialog):
         self._capture_pending = False
         # Freeze all displays before opening overlays. Each display keeps its
         # own geometry and pixel ratio; selections do not cross monitors.
-        frames = [(screen.grabWindow(0).toImage(), screen.geometry()) for screen in QGuiApplication.screens()]
-        for image, geometry in frames:
+        from ..screenshots.regions import binding, matching_region
+        from ..screenshots.preferences import CapturePreferences
+        frames = [(screen.grabWindow(0).toImage(), screen) for screen in QGuiApplication.screens()]
+        saved = CapturePreferences(self._preferences.path).region() if self._repeat else None
+        target = next(((image,screen,matching_region(saved,screen,image)) for image,screen in frames
+                       if saved and matching_region(saved,screen,image) is not None),None)
+        if self._repeat and target is None:
+            self._restore_owner()
+            self.status.setText('上次区域不可用或显示器配置已改变，请重新框选。')
+            self.show()
+            return
+        active = None
+        for image, screen in frames:
+            geometry=screen.geometry()
             if image.isNull():
                 continue
-            overlay = ScreenshotOverlay(image, geometry)
+            initial=matching_region(saved,screen,image) if self._repeat else None
+            overlay = ScreenshotOverlay(image, geometry,initial_selection=initial)
+            if initial is not None:active=overlay
+            def remember(area,s=screen,im=image):
+                try:self._preferences.update(region=binding(s,im,area))
+                except Exception as exc:self.status.setText(f'上次区域保存失败：{exc}')
+            overlay.region_selected.connect(remember)
             overlay.selected.connect(self._selected)
             overlay.small_selected.connect(self._small_selected)
             overlay.scroll_selected.connect(self._scroll_selected)
+            overlay.text_selected.connect(self._text_selected)
             overlay.cancelled.connect(self._cancel_capture)
             self._overlays.append(overlay)
             overlay.show()
+        if active is not None:
+            active.raise_();active.activateWindow();active.setFocus()
         if not self._overlays:
             self._restore_owner()
             self.status.setText('无法读取显示器画面，请检查远程桌面或屏幕权限。')
@@ -380,6 +429,11 @@ class ScreenshotWindow(QDialog):
         self._close_overlays()
         self._owner_was_visible = False
         self.process_image(image,show_result=False)
+
+    def _text_selected(self,image):
+        self._close_overlays()
+        self._owner_was_visible=False
+        self._text.start(image)
 
     def _copy_original(self,image,*,scroll_message='',complete=True):
         self._closed = False
@@ -506,18 +560,19 @@ class ScreenshotWindow(QDialog):
         if self._scroll is not None:
             self._scroll.stop(discard=True)
         self._notice.close()
+        self._text.close()
         self._close_overlays()
         self._restore_owner()
         self._set_busy(False)
         super().closeEvent(event)
 
 
-def open_screenshot(parent=None):
+def open_screenshot(parent=None, *, repeat=False):
     window = getattr(parent, '_screenshot_window', None) if parent else None
     if window is None:
         window = ScreenshotWindow(parent)
         if parent is not None:
             parent._screenshot_window = window
     if not window._busy:
-        window.begin_capture()
+        window.begin_capture(repeat=repeat)
     return window

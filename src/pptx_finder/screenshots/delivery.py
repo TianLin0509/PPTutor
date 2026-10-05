@@ -11,6 +11,29 @@ from pathlib import Path
 from .encoding import ImagePart, MAX_BYTES
 
 
+def copy_text(text: str, *, hwnd=0, cancelled=None) -> None:
+    if not text.strip() or '\0' in text:
+        raise ValueError('没有可复制的文字')
+    if sys.platform == 'win32':
+        import win32clipboard as cb
+        import win32con
+        from ..native_clipboard import opened_clipboard
+        with opened_clipboard(hwnd):
+            # OpenClipboard retries can outlive the UI operation. Check again
+            # after gaining ownership, before modifying any clipboard data.
+            if cancelled is not None and cancelled.is_set():
+                from .encoding import CaptureCancelled
+                raise CaptureCancelled()
+            cb.EmptyClipboard()
+            cb.SetClipboardData(win32con.CF_UNICODETEXT,text)
+    else:
+        from PySide6.QtGui import QGuiApplication
+        if cancelled is not None and cancelled.is_set():
+            from .encoding import CaptureCancelled
+            raise CaptureCancelled()
+        QGuiApplication.clipboard().setText(text)
+
+
 def copy_image(image, *, hwnd=0) -> None:
     """Ordinary capture: one original-resolution bitmap, no 50KB conversion."""
     from .encoding import encode, MAX_PIXELS

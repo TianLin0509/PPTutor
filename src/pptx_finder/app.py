@@ -843,6 +843,15 @@ def main() -> int:
     )  # 搜索结果 → 版本历史（D3/D6）
     win._apply_hotkey = lambda spec: _apply_global_hotkey(app, win, spec)  # 设置页热重绑
     _apply_global_hotkey(app, win, get_hotkey())
+    from .ui.screenshot_shortcuts import install_screenshot_shortcuts
+    screenshot_shortcuts = install_screenshot_shortcuts(app, win)
+    act_repeat = QAction('截图：重复上次区域', app)
+    act_repeat.triggered.connect(lambda: screenshot_shortcuts.activate('repeat'))
+    menu.addAction(act_repeat)
+    act_shortcuts = QAction('截图快捷键…', app)
+    act_shortcuts.triggered.connect(screenshot_shortcuts.show_settings)
+    menu.addAction(act_shortcuts)
+    act_screenshot.setToolTip(screenshot_shortcuts.description())
 
     return app.exec()
 
