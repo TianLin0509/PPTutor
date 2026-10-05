@@ -248,11 +248,11 @@ class ScreenshotWindow(QDialog):
             return
         paths = list(self._paths if index is None else [self._paths[index]])
         serial = self._serial
+        cancel = self._cancel
         writer = self._clipboard_writer
         if writer is copy_files:
             hwnd = int(self.winId())
-            writer = lambda paths: copy_files(paths, hwnd=hwnd)
-        cancel = self._cancel
+            writer = lambda paths: copy_files(paths, hwnd=hwnd, cancelled=cancel)
         self._set_busy(True)
         self.status.setText('正在复制图片文件…')
 
@@ -453,7 +453,7 @@ class ScreenshotWindow(QDialog):
         writer = self._image_writer
         if writer is copy_image:
             hwnd = int(self.winId())
-            writer = lambda image: copy_image(image, hwnd=hwnd)
+            writer = lambda image: copy_image(image, hwnd=hwnd, cancelled=cancel)
         def work():
             try:
                 if cancel.is_set():

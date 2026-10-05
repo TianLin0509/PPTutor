@@ -218,12 +218,13 @@ def test_close_during_ocr_does_not_publish_late_text(qtbot,tmp_path,monkeypatch)
     assert not written and not win._notice.isVisible()
 
 
-def test_cancel_while_waiting_for_clipboard_preserves_existing_data(monkeypatch):
+@pytest.mark.parametrize('mode',['text','image','files'])
+def test_cancel_while_waiting_for_clipboard_preserves_existing_data(monkeypatch,tmp_path,mode):
     import sys
     if sys.platform!='win32':pytest.skip('Windows clipboard context')
     from contextlib import contextmanager
     import win32clipboard as cb
-    from pptx_finder.screenshots.delivery import copy_text
+    from pptx_finder.screenshots.delivery import copy_text,copy_image,copy_files
     cancel=Event();changes=[]
     @contextmanager
     def acquired(hwnd):
@@ -232,7 +233,12 @@ def test_cancel_while_waiting_for_clipboard_preserves_existing_data(monkeypatch)
     monkeypatch.setattr('pptx_finder.native_clipboard.opened_clipboard',acquired)
     monkeypatch.setattr(cb,'EmptyClipboard',lambda:changes.append('empty'))
     monkeypatch.setattr(cb,'SetClipboardData',lambda *args:changes.append('write'))
-    with pytest.raises(CaptureCancelled):copy_text('late',hwnd=1,cancelled=cancel)
+    with pytest.raises(CaptureCancelled):
+        if mode=='text':copy_text('late',hwnd=1,cancelled=cancel)
+        elif mode=='image':copy_image(image(),hwnd=1,cancelled=cancel)
+        else:
+            part=tmp_path/'part.jpg';part.write_bytes(b'valid size')
+            copy_files([part],hwnd=1,cancelled=cancel)
     assert not changes
 
 
