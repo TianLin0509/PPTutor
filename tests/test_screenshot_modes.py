@@ -100,3 +100,42 @@ def test_closing_before_original_copy_runs_does_not_write_clipboard(qtbot,tmp_pa
     win.close()
     jobs[0]()
     assert originals==[]
+
+
+def test_original_copy_failure_allows_retry_and_save_without_small_conversion(qtbot,tmp_path,monkeypatch):
+    attempts=[]
+    def writer(image):
+        attempts.append(image.copy())
+        if len(attempts)==1:raise RuntimeError('clipboard busy')
+    win=ScreenshotWindow(image_writer=writer,output_root=tmp_path)
+    win.setAttribute(Qt.WA_DontShowOnScreen,True)
+    win._notice.setAttribute(Qt.WA_DontShowOnScreen,True)
+    qtbot.addWidget(win)
+    source=text_image()
+    win._copy_original(source,scroll_message='用户停止',complete=False)
+    qtbot.waitUntil(lambda:not win._busy,timeout=5000)
+    assert win.copy_btn.isEnabled() and win.save_btn.isEnabled()
+    assert win.copy_btn.text()=='复制原图'
+    from PySide6.QtWidgets import QFileDialog
+    destination=tmp_path/'original.png'
+    monkeypatch.setattr(QFileDialog,'getSaveFileName',lambda *a,**kw:(str(destination),'PNG'))
+    win.save_result()
+    qtbot.waitUntil(lambda:not win._busy,timeout=5000)
+    assert QImage(str(destination))==source
+    win.copy_result()
+    qtbot.waitUntil(lambda:not win._busy,timeout=5000)
+    assert len(attempts)==2 and attempts[1]==source
+    assert '部分长图' in win.status.text()
+
+
+def test_new_capture_hides_previous_notice_before_freezing(qtbot,tmp_path,monkeypatch):
+    win=ScreenshotWindow(output_root=tmp_path)
+    win.setAttribute(Qt.WA_DontShowOnScreen,True)
+    win._notice.setAttribute(Qt.WA_DontShowOnScreen,True)
+    qtbot.addWidget(win)
+    win._notice.complete('已复制')
+    assert win._notice.isVisible()
+    monkeypatch.setattr(win,'_take_frames',lambda:None)
+    win.begin_capture()
+    assert not win._notice.isVisible()
+    win.close()

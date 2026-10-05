@@ -52,12 +52,14 @@ class ScreenshotWindow(QDialog):
         self._overlays: list[ScreenshotOverlay] = []
         self._owner_was_visible = False
         self._preview_image = QImage()
+        self._original_scroll_message = ''
+        self._original_complete = True
         self._busy = False
         root = QVBoxLayout(self)
         root.setContentsMargins(22, 20, 22, 20)
         root.setSpacing(12)
         heading = QHBoxLayout()
-        title = QLabel('截图 · 小图模式')
+        title = QLabel('截图结果')
         title.setStyleSheet('font-size: 19px; font-weight: 600;')
         heading.addWidget(title, 1)
         self.capture_btn = QPushButton('框选截图')
@@ -116,8 +118,10 @@ class ScreenshotWindow(QDialog):
         self._busy = busy
         self.capture_btn.setEnabled(not busy)
         self.paste_btn.setEnabled(not busy)
-        self.copy_btn.setEnabled(not busy and bool(self._paths))
-        self.save_btn.setEnabled(not busy and bool(self._paths))
+        has_result = bool(self._paths) or not self._preview_image.isNull()
+        self.copy_btn.setText('复制全部图片' if self._paths else '复制原图')
+        self.copy_btn.setEnabled(not busy and has_result)
+        self.save_btn.setEnabled(not busy and has_result)
         self.small_btn.setEnabled(not busy and not self._preview_image.isNull())
         for button in self.cards.findChildren(QPushButton):
             button.setEnabled(not busy)
@@ -141,6 +145,8 @@ class ScreenshotWindow(QDialog):
             return False
         self._closed = False
         self._silent = not show_result
+        self._original_scroll_message = ''
+        self._original_complete = True
         self._serial += 1
         serial = self._serial
         self._cancel = Event()
@@ -219,7 +225,12 @@ class ScreenshotWindow(QDialog):
         self.card_layout.addStretch(1)
 
     def copy_result(self, index: int | None = None):
-        if self._busy or not self._paths:
+        if self._busy:
+            return
+        if not self._paths:
+            if not self._preview_image.isNull():
+                self._copy_original(self._preview_image,scroll_message=self._original_scroll_message,
+                                    complete=self._original_complete)
             return
         paths = list(self._paths if index is None else [self._paths[index]])
         serial = self._serial
@@ -261,7 +272,32 @@ class ScreenshotWindow(QDialog):
         self.process_image(image)
 
     def save_result(self):
-        if self._busy or not self._paths:
+        if self._busy:
+            return
+        if not self._paths:
+            if self._preview_image.isNull():
+                return
+            filename,_ = QFileDialog.getSaveFileName(self,'保存原图','截图.png','PNG 图片 (*.png)')
+            if not filename:
+                return
+            image,serial = self._preview_image.copy(),self._serial
+            self._set_busy(True)
+            self.status.setText('正在保存原图…')
+            def save_original():
+                try:
+                    from ..screenshots.encoding import encode
+                    data = encode(image,'PNG')
+                    with Path(filename).open('xb') as output:
+                        output.write(data)
+                    return ''
+                except Exception as exc:
+                    return str(exc)
+            def saved(error):
+                if self._closed or serial!=self._serial:
+                    return
+                self._set_busy(False)
+                self.status.setText(f'原图保存失败：{error}' if error is None or error else f'原图已保存：{filename}')
+            self._run(save_original,saved,'screenshot-original-save')
             return
         directory = QFileDialog.getExistingDirectory(self, '选择图片保存目录')
         if not directory:
@@ -292,6 +328,7 @@ class ScreenshotWindow(QDialog):
             return
         self._closed = False
         self._capture_pending = True
+        self._notice.hide()
         owner = self.parentWidget()
         self._owner_was_visible = bool(owner and owner.isVisible())
         self.hide()
@@ -351,6 +388,8 @@ class ScreenshotWindow(QDialog):
         self._cancel = Event()
         cancel = self._cancel
         self._preview_image = image.copy()
+        self._original_scroll_message = scroll_message
+        self._original_complete = complete
         self._paths = []
         self._parts = []
         self._clear_cards()
