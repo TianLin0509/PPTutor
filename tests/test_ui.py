@@ -423,7 +423,7 @@ def test_startup_render_prewarm_runs_when_idle(qtbot, tmp_path):
     assert prewarms == ["prewarm"]
 
 
-def test_preview_request_uses_adaptive_first_paint_resolution(qtbot, tmp_path):
+def test_preview_request_uses_adaptive_first_paint_resolution(qtbot, tmp_path, monkeypatch):
     class AdaptiveRender(QObject):
         rendered = Signal(int, str)
 
@@ -439,6 +439,9 @@ def test_preview_request_uses_adaptive_first_paint_resolution(qtbot, tmp_path):
     win = MainWindow(conn=conn, render_worker=render, do_index=False)
     qtbot.addWidget(win)
     win.resize(1180, 760)
+    # This case exercises a 1x display. Native 350% scaling legitimately
+    # reaches the 2560px cap; keep the intended scenario platform-independent.
+    monkeypatch.setattr(win, 'devicePixelRatioF', lambda: 1.0)
     win._cur = _fake_results(1)[0]
     win._view_page = 1
 
@@ -447,6 +450,18 @@ def test_preview_request_uses_adaptive_first_paint_resolution(qtbot, tmp_path):
     assert render.calls
     assert MainWindow._PREVIEW_MIN_EDGE <= render.calls[-1][3] <= MainWindow._PREVIEW_MAX_EDGE
     assert render.calls[-1][3] < 2560
+
+
+def test_preview_native_dpi_increases_resolution_with_a_bounded_cap(qtbot,tmp_path,monkeypatch):
+    win=MainWindow(conn=_index(tmp_path),render_worker=StubRender(),do_index=False)
+    qtbot.addWidget(win)
+    win.resize(1180,760)
+    monkeypatch.setattr(win,'devicePixelRatioF',lambda:1.0)
+    base=win._preview_long_edge()
+    monkeypatch.setattr(win,'devicePixelRatioF',lambda:3.5)
+    high=win._preview_long_edge()
+    assert MainWindow._PREVIEW_MIN_EDGE<=base<=high<=MainWindow._PREVIEW_MAX_EDGE
+    assert high>base
 
 
 @pytest.mark.parametrize(
