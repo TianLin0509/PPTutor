@@ -21,7 +21,7 @@ class ScreenshotFormula(QDialog):
         pictures=QHBoxLayout()
         self.source=QLabel('原图');self.preview=QLabel('识别预览')
         for title,label in [('截图原图',self.source),('公式预览',self.preview)]:
-            column=QVBoxLayout();column.addWidget(QLabel(title))
+            column=QVBoxLayout();caption=QLabel(title);caption.setFixedHeight(24);column.addWidget(caption)
             label.setAlignment(Qt.AlignCenter);label.setMinimumSize(160,130);label.setMaximumHeight(180)
             label.setStyleSheet('background: #f7f9fc; color: #626b78; border: 1px solid #dfe5ed; border-radius: 6px;')
             column.addWidget(label);pictures.addLayout(column,1)

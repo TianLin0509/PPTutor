@@ -7,6 +7,19 @@ from .formula_format import clean_latex
 from .formula_process import run
 
 
+def trim_white(image):
+    from PySide6.QtCore import QRect
+    gray=image.convertToFormat(QImage.Format_Grayscale8);pixels=gray.constBits();stride=gray.bytesPerLine()
+    left=gray.width();right=-1;top=gray.height();bottom=-1
+    for y in range(gray.height()):
+        row=pixels[y*stride:y*stride+gray.width()]
+        ink=[x for x,value in enumerate(row) if value<255]
+        if ink:left=min(left,ink[0]);right=max(right,ink[-1]);top=min(top,y);bottom=y
+    if right<left:raise ValueError('公式预览没有可见内容，请核对 LaTeX')
+    bounds=QRect(left,top,right-left+1,bottom-top+1).adjusted(-16,-16,16,16).intersected(image.rect())
+    return image.copy(bounds)
+
+
 def browser_path():
     roots=[os.environ.get('PROGRAMFILES',''),os.environ.get('PROGRAMFILES(X86)',''),os.environ.get('LOCALAPPDATA','')]
     for root in roots:
@@ -49,4 +62,4 @@ def render(source,*,cancelled=None):
             raise ValueError('公式预览无法完整显示，请核对 LaTeX；仍可复制语法')
         image=QImage(str(png))
         if image.isNull():raise RuntimeError('公式预览未生成，仍可复制公式语法')
-        return image
+        return trim_white(image)

@@ -61,6 +61,10 @@ if __name__ == "__main__":
         from pptx_finder.screenshots.formula_cli import main as formula_main
         raise SystemExit(formula_main(sys.argv))
 
+    if '--formula-ui-selftest' in sys.argv:
+        from pptx_finder.screenshots.formula_ui_selftest import main as formula_ui_main
+        raise SystemExit(formula_ui_main(sys.argv))
+
     from pptx_finder.app import main
 
     raise SystemExit(main())

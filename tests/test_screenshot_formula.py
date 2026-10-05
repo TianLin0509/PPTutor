@@ -216,3 +216,12 @@ def test_formula_source_resets_previous_partial_long_capture(qtbot,tmp_path):
     win=window(qtbot,tmp_path);win._original_scroll_message='旧长图已停止';win._original_complete=False
     win._formula.start(image());qtbot.waitUntil(lambda:not win._busy)
     assert win._original_scroll_message=='' and win._original_complete
+
+
+def test_preview_removes_blank_margins_without_trimming_formula(qapp):
+    from pptx_finder.screenshots.formula_preview import trim_white
+    source=QImage(1400,300,QImage.Format_RGB32);source.fill(QColor('white'))
+    for x,y in [(650,110),(730,160)]:source.setPixelColor(x,y,QColor('black'))
+    result=trim_white(source)
+    assert result.width()<150 and result.height()<100
+    assert result.pixelColor(16,16)==QColor('black')
