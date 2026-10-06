@@ -267,6 +267,43 @@ def test_invalid_hotkeys_rejected(spec):
     with pytest.raises(ValueError):parse_key(spec)
 
 
+def test_default_capture_is_ctrl_alt_a_and_custom_keys_survive(tmp_path):
+    preferences=CapturePreferences(tmp_path/'keys.json')
+    assert preferences.keys()['capture']=='Ctrl+Alt+A'
+    preferences.update(keys={'capture':'Alt+F9','repeat':''})
+    assert CapturePreferences(preferences.path).keys()=={'capture':'Alt+F9','repeat':''}
+
+
+def test_startup_conflict_opens_settings_with_actionable_warning(qtbot,qapp,tmp_path,monkeypatch):
+    from pptx_finder.ui import screenshot_shortcuts
+    original_dialog=screenshot_shortcuts.QDialog
+    def hidden_dialog(*args):
+        dialog=original_dialog(*args);dialog.setAttribute(Qt.WA_DontShowOnScreen,True);return dialog
+    monkeypatch.setattr(screenshot_shortcuts,'QDialog',hidden_dialog)
+    owner=hidden(qtbot,QWidget())
+    controller=ScreenshotShortcuts(qapp,owner,preferences=CapturePreferences(tmp_path/'keys.json'),
+        register=lambda ident,mods,vk:vk!=ord('A'))
+    try:
+        qtbot.waitUntil(lambda:controller.dialog is not None)
+        controller.dialog.setAttribute(Qt.WA_DontShowOnScreen,True)
+        qtbot.addWidget(controller.dialog)
+        assert controller.dialog.isVisible()
+        assert 'Ctrl+Alt+A' in controller.label.text()
+        assert '被占用' in controller.label.text() and '修改' in controller.label.text()
+        assert 'capture' not in controller.registered
+        assert 'repeat' in controller.registered
+    finally:controller.close()
+
+
+def test_startup_without_conflicts_does_not_open_settings(qtbot,qapp,tmp_path):
+    owner=hidden(qtbot,QWidget())
+    controller=ScreenshotShortcuts(qapp,owner,preferences=CapturePreferences(tmp_path/'keys.json'),register=lambda *args:True)
+    try:
+        qapp.processEvents()
+        assert controller.dialog is None
+    finally:controller.close()
+
+
 def test_hotkey_conflict_rollback_and_disabled_setting(qtbot,qapp,tmp_path):
     owner=hidden(qtbot,QWidget());active={}
     def register(ident,mods,vk):
