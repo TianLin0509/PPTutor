@@ -2,7 +2,7 @@
 import json, os, uuid
 from pathlib import Path
 
-DEFAULT_KEYS={'capture':'Ctrl+Alt+S','repeat':'Ctrl+Alt+R'}
+DEFAULT_KEYS={'capture':'Ctrl+Alt+A','repeat':'Ctrl+Alt+R'}
 
 
 class CapturePreferences:

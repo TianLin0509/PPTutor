@@ -71,6 +71,7 @@ class ScreenshotShortcuts(QObject):
         self._bind(self.specs)
         app.aboutToQuit.connect(self.close)
         self.dialog=None
+        if self.errors:QTimer.singleShot(0,self.show_settings)
 
     def _bind(self,specs):
         self.errors={}
@@ -120,6 +121,7 @@ class ScreenshotShortcuts(QObject):
                           +(f'（{self.errors[key]}）' if key in self.errors else '') for key in IDS)
 
     def show_settings(self):
+        if self.closed:return
         if self.dialog is None:
             self.dialog=QDialog(self.owner);self.dialog.setWindowTitle('截图快捷键')
             self.dialog.setStyleSheet('QDialog { background: #fff; } QLabel { color: #243249; } QKeySequenceEdit { background: #f7f9fc; color: #243249; border: 1px solid #dfe5ed; padding: 6px; } QPushButton { background: #edf3fc; color: #2867bd; border: 1px solid #dfe5ed; padding: 8px; }')
@@ -134,7 +136,7 @@ class ScreenshotShortcuts(QObject):
                 ok,message=self.set_bindings(values)
                 self.label.setText(message+'\n'+self.description())
             button.clicked.connect(save)
-        self.label.setText(self.description())
+        self.label.setText(('截图快捷键未能启用，请修改被占用的组合后保存。\n' if self.errors else '')+self.description())
         self.dialog.show();self.dialog.raise_()
 
     def close(self):
