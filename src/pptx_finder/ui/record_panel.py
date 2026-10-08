@@ -1,17 +1,10 @@
 """Small recording controls and an animated, file-backed result preview."""
 from pathlib import Path
 
-from PySide6.QtCore import QSaveFile, QIODevice, Qt, QUrl, Signal
+from PySide6.QtCore import QPoint, QSaveFile, QIODevice, Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QMovie
-from PySide6.QtWidgets import QDialog, QFileDialog, QHBoxLayout, QLabel, QPushButton, QVBoxLayout
-
-
-STYLE = '''QDialog { background: #fff; color: #243249; }
-QLabel { color: #243249; background: transparent; }
-QPushButton { color: #2867bd; background: #edf3fc; border: 1px solid #dfe5ed;
-              border-radius: 5px; padding: 8px 12px; }
-QPushButton:hover { background: #e1ecfb; }
-QPushButton:disabled { color: #8b94a2; background: #f2f4f7; }'''
+from PySide6.QtWidgets import QDialog, QFileDialog, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
+from .capture_style import STYLE, icon, setup_button, shadow
 
 
 class RecordPanel(QDialog):
@@ -20,34 +13,73 @@ class RecordPanel(QDialog):
     discard_requested = Signal()
 
     def __init__(self, owner=None):
-        super().__init__(owner, Qt.Tool | Qt.WindowStaysOnTopHint)
+        super().__init__(owner, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setWindowTitle('录制 GIF · PPT Doctor')
-        self.setStyleSheet(STYLE)
+        self.setObjectName('recordPanel')
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setStyleSheet(STYLE + 'QDialog#recordPanel { background: transparent; }')
         self.setAttribute(Qt.WA_ShowWithoutActivating, True)
-        root = QVBoxLayout(self)
+        outer = QVBoxLayout(self); outer.setContentsMargins(12,12,12,12)
+        surface = QWidget(); surface.setObjectName('captureToolbar')
+        surface.setAttribute(Qt.WA_StyledBackground, True); shadow(surface)
+        outer.addWidget(surface)
+        root = QVBoxLayout(surface); root.setContentsMargins(18,14,18,14); root.setSpacing(10)
+        header = QHBoxLayout(); header.setSpacing(8)
+        emblem = QLabel(); emblem.setPixmap(icon('record', '#e5484d').pixmap(20,20))
+        header.addWidget(emblem)
+        title = QLabel('录制 GIF'); title.setStyleSheet('font-size: 13px; font-weight: 600;')
+        header.addWidget(title)
+        self.state_badge = QLabel('准备中'); self.state_badge.setProperty('role','badge')
+        header.addWidget(self.state_badge); header.addStretch(1)
+        self.clock = QLabel('00:00')
+        self.clock.setStyleSheet('font-family: "Segoe UI"; font-size: 20px; font-weight: 600; color: #1d2939;')
+        header.addWidget(self.clock); root.addLayout(header)
         self.label = QLabel('准备录制')
+        self.label.setWordWrap(True)
         root.addWidget(self.label)
-        self.details = QLabel('10 帧/秒目标 · 最长 2 分钟 · 原始分辨率 · GIF 无声音')
-        self.details.setStyleSheet('color: #68758a; font-size: 12px;')
+        self.details = QLabel('10 帧/秒目标 · 最长 2 分钟 · 原始分辨率 · 无声音')
+        self.details.setWordWrap(True)
+        self.details.setProperty('role', 'muted')
         root.addWidget(self.details)
         row = QHBoxLayout()
-        self.pause_btn = QPushButton('暂停')
-        self.stop_btn = QPushButton('停止并保存')
-        self.discard_btn = QPushButton('放弃录制')
+        row.setSpacing(8)
+        self.pause_btn = setup_button(QPushButton('暂停'), 'pause', role='subtle')
+        self.stop_btn = setup_button(QPushButton('停止并保存'), 'stop', role='primary')
+        self.discard_btn = setup_button(QPushButton('放弃'), 'close', role='danger')
+        self.discard_btn.setToolTip('放弃本次录制，不保存 GIF')
         for button in [self.pause_btn, self.stop_btn, self.discard_btn]:
             row.addWidget(button)
         root.addLayout(row)
         self.pause_btn.clicked.connect(self.pause_requested)
         self.stop_btn.clicked.connect(self.stop_requested)
         self.discard_btn.clicked.connect(self.discard_requested)
-        self.resize(460, 125)
+        self.setFixedWidth(430)
+        self._drag = None
 
-    def update_state(self, state, text):
+    def update_state(self, state, text, elapsed_ms=0):
         self.label.setText(text)
+        seconds = max(0, elapsed_ms//1000)
+        self.clock.setText(f'{seconds//60:02d}:{seconds%60:02d}')
+        self.state_badge.setText({'countdown':'准备中','recording':'录制中','paused':'已暂停','saving':'保存中'}.get(state,'已结束'))
         self.pause_btn.setEnabled(state in ('recording', 'paused'))
         self.pause_btn.setText('继续' if state == 'paused' else '暂停')
+        self.pause_btn.setIcon(icon('play' if state == 'paused' else 'pause'))
         self.stop_btn.setEnabled(state in ('countdown', 'recording', 'paused'))
         self.discard_btn.setEnabled(state in ('countdown', 'recording', 'paused', 'saving'))
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._drag = event.globalPosition().toPoint() - self.pos()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._drag is not None and event.buttons() & Qt.LeftButton:
+            self.move(event.globalPosition().toPoint() - self._drag)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._drag = None
+        super().mouseReleaseEvent(event)
 
     def reject(self):
         # Esc or the native close button stops and saves instead of losing work.
@@ -61,27 +93,32 @@ class RecordPanel(QDialog):
 class RecordResult(QDialog):
     def __init__(self, owner):
         super().__init__(owner)
+        self.setObjectName('recordResult')
         self.setWindowTitle('GIF 录制结果 · PPT Doctor')
         self.setStyleSheet(STYLE)
         self.path = None
         self.movie = None
         root = QVBoxLayout(self)
+        root.setContentsMargins(22,20,22,20); root.setSpacing(14)
+        title = QLabel('录制已完成'); title.setStyleSheet('font-size: 20px; font-weight: 600;')
+        root.addWidget(title)
         self.status = QLabel()
         self.status.setWordWrap(True)
         root.addWidget(self.status)
         self.preview = QLabel()
         self.preview.setAlignment(Qt.AlignCenter)
         self.preview.setMinimumSize(480, 260)
-        self.preview.setStyleSheet('background: #f3f5f8; border: 1px solid #dfe5ed;')
+        self.preview.setStyleSheet('background: #f6f8fb; border: 1px solid #e4e7ec; border-radius: 12px; padding: 8px;')
         root.addWidget(self.preview)
         self.location = QLabel()
         self.location.setWordWrap(True)
         self.location.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.location.setProperty('role', 'muted')
         root.addWidget(self.location)
         row = QHBoxLayout()
-        self.open_btn = QPushButton('打开 GIF')
-        self.folder_btn = QPushButton('打开文件夹')
-        self.save_btn = QPushButton('另存为…')
+        self.open_btn = setup_button(QPushButton('打开 GIF'), 'play', role='primary')
+        self.folder_btn = setup_button(QPushButton('打开文件夹'), 'folder', role='subtle')
+        self.save_btn = setup_button(QPushButton('另存为…'), 'save', role='subtle')
         for button in [self.open_btn, self.folder_btn, self.save_btn]:
             row.addWidget(button)
         root.addLayout(row)

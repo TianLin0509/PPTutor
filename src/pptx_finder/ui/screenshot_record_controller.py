@@ -11,6 +11,7 @@ from PySide6.QtWidgets import QApplication
 
 from .record_capture import RecordCapture, shutdown_writers
 from .record_panel import RecordPanel, RecordResult
+from .record_range import RecordRange
 from .screenshot_overlay import crop_physical
 
 
@@ -36,6 +37,7 @@ class ScreenshotRecordController(QObject):
         self.output_root = Path(output_root) if output_root else recording_directory()
         self.panel = RecordPanel(owner)
         self.result = RecordResult(owner)
+        self.range_frame = RecordRange(owner)
         self.engine = None
         self._closed = False
         self._discarded = False
@@ -55,6 +57,7 @@ class ScreenshotRecordController(QObject):
             if self.engine is not None:
                 self.engine.close()
             self.panel.hide()
+            self.range_frame.hide()
             if not self.owner._closed:
                 self._failed(str(exc))
 
@@ -81,6 +84,18 @@ class ScreenshotRecordController(QObject):
         self.panel.show()
         self.panel.adjustSize()
         target = local.translated(geometry.topLeft())
+        self._place_panel(target, screen.availableGeometry())
+        sx, sy = self._frame_size.width()/geometry.width(), self._frame_size.height()/geometry.height()
+        pixels = (round((local.x()+local.width())*sx)-round(local.x()*sx),
+                  round((local.y()+local.height())*sy)-round(local.y()*sy))
+        self.range_frame.display(target, pixels)
+        # The mask alone keeps all painted pixels outside the capture; affinity
+        # additionally prevents the tool from appearing in other screen grabs.
+        self._range_excluded = exclude_from_capture(self.range_frame)
+        self.range_frame.ensure_on_screen(geometry, capture_excluded=self._range_excluded)
+        self.panel.details.setText('10 帧/秒目标 · 最长 2 分钟 · 原始分辨率 · 无声音'
+                                   + ('\n' + self.range_frame.capture_warning if self.range_frame.capture_warning else ''))
+        self.panel.adjustSize()
         self._place_panel(target, screen.availableGeometry())
         self._excluded = exclude_from_capture(self.panel)
         if self.engine is not None:
@@ -122,7 +137,8 @@ class ScreenshotRecordController(QObject):
 
     def _progress(self, text):
         if not self._closed:
-            self.panel.update_state(self.engine.state, text)
+            self.panel.update_state(self.engine.state, text, self.engine.elapsed() if hasattr(self.engine, 'elapsed') else 0)
+            self.range_frame.update_state(self.engine.state)
 
     def pause(self):
         if self.engine is not None:
@@ -134,12 +150,17 @@ class ScreenshotRecordController(QObject):
             self.engine.stop(discard=discard)
 
     def _failed(self, message):
+        self.range_frame.hide()
+        self.panel.hide()
         self.owner._set_busy(False)
         self.owner.status.setText('录制失败：' + message)
         self.owner.show()
 
     def _finished(self, path, message):
         self.panel.hide()
+        self.range_frame.hide()
+        if path and self.range_frame.capture_warning:
+            message = '；'.join(filter(None, [message, self.range_frame.capture_warning]))
         if path and self._discarded:
             message = message or 'GIF 已保存，未删除；可从结果窗口查看文件'
         if self._closed:
@@ -169,4 +190,5 @@ class ScreenshotRecordController(QObject):
         if self.engine is not None:
             self.engine.close()
         self.panel.hide()
+        self.range_frame.hide()
         self.result.hide()

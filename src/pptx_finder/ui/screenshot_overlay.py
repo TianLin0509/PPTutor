@@ -1,10 +1,12 @@
 """Per-monitor frozen frame selection; capture stays in physical pixels."""
 from __future__ import annotations
 
-from PySide6.QtCore import QPoint, QPointF, QRect, Qt, Signal
-from PySide6.QtGui import QColor, QImage, QPainter, QPen
-from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QButtonGroup, QPushButton, QWidget
+from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, QSize, Qt, Signal
+from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen
+from PySide6.QtWidgets import (QHBoxLayout, QVBoxLayout, QGridLayout, QButtonGroup,
+                              QPushButton, QToolButton, QLabel, QFrame, QWidget)
 from ..screenshots.annotations import Mark, annotated, paint_mark
+from .capture_style import STYLE, BLUE, icon, setup_button, shadow
 
 
 def crop_physical(image: QImage, logical: QRect, bounds: QRect) -> QImage:
@@ -45,23 +47,58 @@ class ScreenshotOverlay(QWidget):
         self.setFocusPolicy(Qt.StrongFocus)
         self.toolbar = QWidget(self)
         self.toolbar.setObjectName('captureToolbar')
-        self.toolbar.setStyleSheet('#captureToolbar { background: white; border: 1px solid #dfe5ed; border-radius: 6px; } QPushButton { background: white; color: #243249; border: 0; padding: 7px 10px; } QPushButton:hover { background: #eaf1fb; }')
+        self.toolbar.setAttribute(Qt.WA_StyledBackground, True)
+        self.toolbar.setStyleSheet(STYLE)
+        shadow(self.toolbar)
         rows = QVBoxLayout(self.toolbar)
-        rows.setContentsMargins(4,4,4,4)
-        rows.setSpacing(0)
-        bar = QHBoxLayout()
-        rows.addLayout(bar)
-        bar.setSpacing(2)
-        self.confirm_btn = QPushButton('✓ 完成')
-        self.scroll_btn = QPushButton('滚动截图')
-        self.record_btn = QPushButton('录制 GIF')
-        self.small_btn = QPushButton('小图模式')
-        self.cancel_btn = QPushButton('× 取消')
-        self.text_btn = QPushButton('提取文字')
-        self.formula_btn = QPushButton('识别公式')
-        self.formula_btn.setStyleSheet('color: #2867bd; background: #edf3fc; font-weight: 600;')
-        for button in (self.confirm_btn,self.scroll_btn,self.record_btn,self.small_btn,self.text_btn,self.formula_btn,self.cancel_btn):
-            bar.addWidget(button)
+        rows.setContentsMargins(12, 10, 12, 12)
+        rows.setSpacing(8)
+        drawing = QHBoxLayout()
+        drawing.setSpacing(4)
+        rows.addLayout(drawing)
+        self.tools = {}
+        self._group = QButtonGroup(self)
+        for mode, name, tip in [('select','capture','重新框选'),('arrow','arrow','箭头标注'),
+                               ('ellipse','ellipse','圈注'),('rect','rect','矩形标注')]:
+            button = setup_button(QPushButton(), name)
+            button.setFixedSize(32, 32)
+            button.setToolTip(tip)
+            button.setAccessibleName(tip)
+            button.setCheckable(True)
+            button.setChecked(mode == 'select')
+            self._group.addButton(button)
+            button.clicked.connect(lambda checked=False, m=mode: self._choose_tool(m))
+            self.tools[mode] = button
+            drawing.addWidget(button)
+        self.undo_btn = setup_button(QPushButton(), 'undo')
+        self.undo_btn.setFixedSize(32, 32)
+        self.undo_btn.setToolTip('撤销标注 · Ctrl + Z')
+        self.undo_btn.setAccessibleName('撤销标注')
+        self.undo_btn.clicked.connect(self.undo)
+        drawing.addWidget(self.undo_btn)
+        drawing.addStretch(1)
+        self.size_label = QLabel()
+        self.size_label.setProperty('role', 'badge')
+        drawing.addWidget(self.size_label)
+        self.cancel_btn = setup_button(QPushButton(), 'close', role='danger')
+        self.cancel_btn.setFixedSize(30, 30)
+        self.cancel_btn.setToolTip('取消 · Esc / 右键')
+        self.cancel_btn.setAccessibleName('取消截图')
+        drawing.addWidget(self.cancel_btn)
+        line = QFrame(); line.setProperty('role', 'divider'); line.setFixedHeight(1)
+        rows.addWidget(line)
+        self.actions = QGridLayout()
+        self.actions.setSpacing(4)
+        rows.addLayout(self.actions)
+        self.confirm_btn = self._action('完成', 'check', primary=True)
+        self.scroll_btn = self._action('滚动截图', 'scroll')
+        self.record_btn = self._action('录制 GIF', 'record')
+        self.small_btn = self._action('小图模式', 'small')
+        self.text_btn = self._action('提取文字', 'text')
+        self.formula_btn = self._action('识别公式', 'formula')
+        self._action_buttons = [self.scroll_btn, self.record_btn, self.small_btn,
+                                self.text_btn, self.formula_btn, self.confirm_btn]
+        self._layout_actions()
         self.confirm_btn.setToolTip('普通截图：直接复制原图')
         self.small_btn.setToolTip('AI 上传：压缩并按每张 50 KB 分图')
         self.scroll_btn.setToolTip('从当前位置向下滚动，拼成长图')
@@ -75,27 +112,46 @@ class ScreenshotOverlay(QWidget):
         self.formula_btn.setToolTip('框选单个公式 → 本机识别 → LaTeX / Word 输入格式和预览')
         self.text_btn.setToolTip('本机识别选区文字并复制；点击查看文字可核对修改')
         self.cancel_btn.clicked.connect(self.cancelled)
-        drawing = QHBoxLayout()
-        rows.addLayout(drawing)
-        self.tools = {}
-        self._group = QButtonGroup(self)
-        for mode, label in [('select','重新框选'),('arrow','箭头'),('ellipse','圈注'),('rect','矩形')]:
-            button = QPushButton(label)
-            button.setCheckable(True)
-            button.setChecked(mode == 'select')
-            self._group.addButton(button)
-            button.clicked.connect(lambda checked=False, m=mode: self._choose_tool(m))
-            self.tools[mode] = button
-            drawing.addWidget(button)
-        self.undo_btn = QPushButton('撤销')
-        self.undo_btn.clicked.connect(self.undo)
-        drawing.addWidget(self.undo_btn)
-        self.toolbar.setStyleSheet(self.toolbar.styleSheet()+' QPushButton:checked { background: #eaf1fb; color: #2867bd; } QPushButton:disabled { color: #87909e; }')
         self.toolbar.hide()
+        self.hint = QWidget(self)
+        self.hint.setObjectName('captureToolbar')
+        self.hint.setAttribute(Qt.WA_StyledBackground, True)
+        self.hint.setStyleSheet(STYLE)
+        hint_row = QHBoxLayout(self.hint)
+        hint_row.setContentsMargins(14, 9, 14, 9); hint_row.setSpacing(12)
+        emblem = QLabel(); emblem.setPixmap(icon('capture', BLUE).pixmap(QSize(20, 20)))
+        hint_row.addWidget(emblem)
+        hint_row.addWidget(QLabel('PPT Doctor'))
+        self.hint_text = QLabel('拖动框选 · Esc 取消')
+        self.hint_text.setProperty('role', 'muted')
+        hint_row.addWidget(self.hint_text)
+        self.hint.adjustSize(); self.hint.move(20, 20)
+        shadow(self.hint)
         self._update_tools()
         if initial_selection is not None:
             self._selection = QRect(initial_selection).intersected(self.rect())
             self._show_toolbar()
+
+    def _action(self, label, name, *, primary=False):
+        button = setup_button(QToolButton(), name, role='primary' if primary else '', size=22)
+        button.setText(label)
+        button.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+        button.setFixedSize(88, 62)
+        return button
+
+    def _layout_actions(self):
+        while self.actions.count():
+            self.actions.takeAt(0)
+        columns = 6 if self.width() >= 584 else 3
+        for i, button in enumerate(self._action_buttons):
+            self.actions.addWidget(button, i // columns, i % columns)
+
+    def _size_text(self):
+        sx, sy = self._image.width()/max(1, self.width()), self._image.height()/max(1, self.height())
+        a = self._selection
+        w = round((a.x()+a.width())*sx) - round(a.x()*sx)
+        h = round((a.y()+a.height())*sy) - round(a.y()*sy)
+        return f'{w} × {h}'
 
     def _choose_tool(self, mode):
         self._mode = mode
@@ -116,6 +172,8 @@ class ScreenshotOverlay(QWidget):
     def _show_toolbar(self):
         if crop_physical(self._image,self._selection,self.rect()).isNull():
             return
+        self.size_label.setText(self._size_text())
+        self._layout_actions()
         self.toolbar.adjustSize()
         width,height = self.toolbar.width(),self.toolbar.height()
         x = max(0,min(self.width()-width,self._selection.right()-width+1))
@@ -124,6 +182,7 @@ class ScreenshotOverlay(QWidget):
             y = max(0,self._selection.bottom()-height-8)
         self.toolbar.move(x,y)
         self.toolbar.show()
+        self.hint.hide()
         self.update()
 
     def _point(self,event):
@@ -133,6 +192,7 @@ class ScreenshotOverlay(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
         painter.drawImage(self.rect(), self._image)
         painter.fillRect(self.rect(), QColor(10, 18, 28, 95))
         if not self._selection.isEmpty():
@@ -144,11 +204,25 @@ class ScreenshotOverlay(QWidget):
             if self._drawing:
                 paint_mark(painter,self._drawing)
             painter.setClipping(False)
-            painter.setPen(QPen(QColor('#4b8bf4'), 2))
-            painter.drawRect(area)
-        painter.fillRect(QRect(20, 20, 470, 42), QColor('#ffffff'))
-        painter.setPen(QColor('#242b35'))
-        painter.drawText(QRect(32, 20, 450, 42), Qt.AlignVCenter, '框选任意区域 · ✓ 普通截图 · Esc / 右键取消')
+            painter.setPen(QPen(QColor(BLUE), 1.5))
+            painter.drawRect(QRectF(area))
+            painter.setPen(QPen(QColor(BLUE), 3, Qt.SolidLine, Qt.RoundCap))
+            length = min(14, area.width()/3, area.height()/3)
+            for x, y, dx, dy in ((area.left(),area.top(),1,1), (area.x()+area.width(),area.top(),-1,1),
+                                 (area.left(),area.y()+area.height(),1,-1),
+                                 (area.x()+area.width(),area.y()+area.height(),-1,-1)):
+                painter.drawLine(QPointF(x,y), QPointF(x+dx*length,y))
+                painter.drawLine(QPointF(x,y), QPointF(x,y+dy*length))
+            if not self.toolbar.isVisible():
+                font = QFont('Microsoft YaHei'); font.setPixelSize(11)
+                painter.setFont(font)
+                text = self._size_text()
+                width = painter.fontMetrics().horizontalAdvance(text)+20
+                badge = QRect(max(4,min(area.left(),self.width()-width-4)),
+                              max(4,area.top()-30),width,24)
+                painter.setPen(Qt.NoPen); painter.setBrush(QColor('#ffffff'))
+                painter.drawRoundedRect(badge,6,6)
+                painter.setPen(QColor('#475467')); painter.drawText(badge,Qt.AlignCenter,text)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.RightButton:
@@ -163,6 +237,7 @@ class ScreenshotOverlay(QWidget):
             self.marks.clear()
             self._update_tools()
             self.toolbar.hide()
+            self.hint.show()
             self._origin = event.position().toPoint()
             self._selection = QRect(self._origin, self._origin)
 
