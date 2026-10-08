@@ -229,10 +229,14 @@ def test_live_manager_switch_keeps_old_vault_but_writes_only_new(tmp_path):
     manager.stop()
 
 
+@pytest.mark.parametrize("transient_winerror", [None, 5, 32, 33])
 def test_live_migration_reconnect_failure_rolls_back_and_manager_stays_usable(
     tmp_path,
     monkeypatch,
+    transient_winerror,
 ):
+    if transient_winerror is not None and os.name != "nt":
+        pytest.skip("Windows directory-lock recovery")
     deck = tmp_path / "deck.pptx"
     fx.make_pptx(deck, [{"body": "safe before failed move"}])
     manager = VersionManager(index_roots=[str(tmp_path)])
@@ -247,10 +251,24 @@ def test_live_migration_reconnect_failure_rolls_back_and_manager_stays_usable(
         return real_open(db_file)
 
     monkeypatch.setattr(manager, "_open_vault_connections", fail_new_vault)
+    real_replace = os.replace
+    restore_attempts = []
+
+    def transient_restore(src, dst):
+        if "migration-backup-" in Path(src).name and Path(dst) == source:
+            restore_attempts.append((src, dst))
+            if transient_winerror is not None and len(restore_attempts) <= 2:
+                error = OSError("injected transient Windows directory lock")
+                error.winerror = transient_winerror
+                raise error
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", transient_restore)
 
     with pytest.raises(RuntimeError, match="已尝试回滚"):
         manager.migrate_vault_dir(destination, config_value=str(destination))
 
+    assert len(restore_attempts) >= (3 if transient_winerror else 1)
     assert source.is_dir()
     assert not destination.exists()
     assert config.get_version_vault_dir() == ""
@@ -258,6 +276,101 @@ def test_live_migration_reconnect_failure_rolls_back_and_manager_stays_usable(
     fx.make_pptx(deck, [{"body": "still usable after rollback"}])
     assert manager.snapshot_now(str(deck), notify=False)
     manager.stop()
+
+
+@pytest.mark.parametrize("winerror, expected_attempts", [(5, 6), (18, 1), ("new-source", 1)])
+def test_live_migration_failed_rollback_preserves_both_verified_copies(
+    tmp_path, monkeypatch, winerror, expected_attempts
+):
+    import hashlib
+    from pptx_finder.versioning import manager as manager_module
+
+    if winerror in (5, "new-source") and os.name != "nt":
+        pytest.skip("Windows directory-lock recovery")
+    deck = tmp_path / "deck.pptx"
+    fx.make_pptx(deck, [{"body": "preserve failed rollback data"}])
+    manager = VersionManager(index_roots=[str(tmp_path)])
+    assert manager.snapshot_now(str(deck), notify=False)
+    source = Path(manager._db_path).parent
+    destination = tmp_path / "failed-destination"
+    real_open, real_replace = manager._open_vault_connections, os.replace
+    attempts = []
+    preserved = {}
+
+    def hashes(folder):
+        return {
+            str(p.relative_to(folder)): hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in folder.rglob("*")
+            if p.is_file() and not p.name.endswith(("-wal", "-shm"))
+        }
+
+    def fail_new(db_file):
+        if Path(db_file).parent == destination:
+            raise sqlite3.DatabaseError("injected reconnect failure")
+        return real_open(db_file)
+
+    def fail_restore(src, dst):
+        if "migration-backup-" in Path(src).name and Path(dst) == source:
+            attempts.append(Path(src))
+            if not preserved:
+                preserved["backup"] = hashes(Path(src))
+                preserved["destination"] = hashes(destination)
+            if winerror == "new-source":
+                source.mkdir()
+                (source / "external.txt").write_text("keep external data")
+            error = OSError("injected persistent restore failure")
+            error.winerror = 32 if winerror == "new-source" else winerror
+            raise error
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(manager, "_open_vault_connections", fail_new)
+    monkeypatch.setattr(os, "replace", fail_restore)
+    monkeypatch.setattr(manager_module.time, "sleep", lambda delay: None)
+    with pytest.raises(RuntimeError) as failure:
+        manager.migrate_vault_dir(destination, config_value=str(destination))
+    assert len(attempts) == expected_attempts
+    backup = attempts[0]
+    if winerror == "new-source":
+        assert (source / "external.txt").read_text() == "keep external data"
+        assert not (source / "versions.db").exists()
+    else:
+        assert not source.exists()
+    assert hashes(backup) == preserved["backup"]
+    assert hashes(destination) == preserved["destination"]
+    assert str(backup) in str(failure.value)
+    assert str(destination) in str(failure.value)
+    assert "旧版本库未恢复" in str(failure.value)
+    for folder in (backup, destination):
+        with sqlite3.connect(folder / "versions.db") as connection:
+            assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    manager.stop()
+
+
+def test_rollback_retry_does_not_replace_a_newly_created_source(tmp_path, monkeypatch):
+    from pptx_finder.versioning import manager as manager_module
+
+    if os.name != "nt":
+        pytest.skip("Windows directory-lock recovery")
+    backup, source = tmp_path / "backup", tmp_path / "source"
+    backup.mkdir()
+    (backup / "original.txt").write_text("original")
+    attempts = []
+
+    def temporary_lock(src, dst):
+        attempts.append(src)
+        source.mkdir()
+        (source / "external.txt").write_text("keep external data")
+        error = OSError("injected sharing violation")
+        error.winerror = 32
+        raise error
+
+    monkeypatch.setattr(os, "replace", temporary_lock)
+    monkeypatch.setattr(manager_module.time, "sleep", lambda delay: None)
+    with pytest.raises(FileExistsError):
+        manager_module._restore_vault_directory(backup, source)
+    assert len(attempts) == 1
+    assert (source / "external.txt").read_text() == "keep external data"
+    assert (backup / "original.txt").read_text() == "original"
 
 
 def test_live_migration_waits_for_inflight_snapshot_and_keeps_that_version(

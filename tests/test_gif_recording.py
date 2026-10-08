@@ -36,7 +36,7 @@ def hidden(widget, qtbot):
 
 def window(qtbot, tmp_path):
     win = hidden(ScreenshotWindow(output_root=tmp_path), qtbot)
-    for item in [win._notice, win._record.panel, win._record.result]:
+    for item in [win._notice, win._record.panel, win._record.result, win._record.range_frame]:
         item.setAttribute(Qt.WA_DontShowOnScreen, True)
     return win
 

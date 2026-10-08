@@ -18,6 +18,7 @@ from ..screenshots.delivery import copy_files, copy_image, export_files, store_p
 from .bg_task import BackgroundTask
 from .screenshot_overlay import ScreenshotOverlay
 from .screenshot_notice import ScreenshotNotice
+from .capture_style import STYLE, setup_button
 
 _tasks: set[BackgroundTask] = set()
 
@@ -29,7 +30,7 @@ class ScreenshotWindow(QDialog):
         super().__init__(parent)
         self.setObjectName('screenshotWindow')
         self.setAttribute(Qt.WA_StyledBackground, True)
-        self.setStyleSheet('#screenshotWindow { background: #ffffff; color: #242b35; }')
+        self.setStyleSheet(STYLE)
         self.setWindowTitle(f'截图 · PPT Doctor {__version__}')
         self.setModal(False)
         self._clipboard_writer = clipboard_writer
@@ -65,13 +66,13 @@ class ScreenshotWindow(QDialog):
         root.setContentsMargins(22, 20, 22, 20)
         root.setSpacing(12)
         heading = QHBoxLayout()
-        title = QLabel('截图结果')
-        title.setStyleSheet('font-size: 19px; font-weight: 600;')
+        title = QLabel('截图工作台')
+        title.setStyleSheet('font-size: 22px; font-weight: 600; color: #1d2939;')
         heading.addWidget(title, 1)
-        self.capture_btn = QPushButton('框选截图')
+        self.capture_btn = setup_button(QPushButton('框选截图'), 'capture', role='primary')
         self.capture_btn.clicked.connect(lambda:self.begin_capture())
         heading.addWidget(self.capture_btn)
-        self.paste_btn = QPushButton('处理剪贴板截图')
+        self.paste_btn = setup_button(QPushButton('处理剪贴板截图'), 'small', role='subtle')
         self.paste_btn.clicked.connect(self.paste_image)
         heading.addWidget(self.paste_btn)
         root.addLayout(heading)
@@ -91,18 +92,24 @@ class ScreenshotWindow(QDialog):
         root.addLayout(tools)
         self.status = QLabel('框选后选择：✓ 普通截图、滚动截图、录制 GIF、小图模式（每张 ≤50 KB），或识别公式。')
         self.status.setWordWrap(True)
+        self.status.setStyleSheet('background: #f6f8fb; color: #475467; border: 1px solid #e9edf3; border-radius: 10px; padding: 12px 14px;')
         root.addWidget(self.status)
         self.preview = QLabel('截图预览')
         self.preview.setAlignment(Qt.AlignCenter)
         self.preview.setMinimumHeight(160)
         self.preview.setMaximumHeight(330)
-        self.preview.setStyleSheet('background: #f3f5f8; border: 1px solid #dfe3e9; border-radius: 6px;')
+        self.preview.setStyleSheet('background: #f6f8fb; color: #667085; border: 1px solid #e4e7ec; border-radius: 12px; padding: 10px;')
         root.addWidget(self.preview, 1)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setMinimumHeight(170)
+        scroll.setStyleSheet('QScrollArea { background: #ffffff; border: none; }')
+        self.parts_scroll = scroll
         self.cards = QWidget()
+        self.cards.setObjectName('screenshotCards')
+        self.cards.setAttribute(Qt.WA_StyledBackground, True)
+        self.cards.setStyleSheet('#screenshotCards { background: #ffffff; }')
         self.card_layout = QHBoxLayout(self.cards)
         self.card_layout.setContentsMargins(0, 0, 0, 0)
         scroll.setWidget(self.cards)
@@ -112,7 +119,7 @@ class ScreenshotWindow(QDialog):
         self.copy_btn.setObjectName('gotoBtn')
         self.copy_btn.setStyleSheet('QPushButton { background: #2867bd; color: #ffffff; border: 1px solid #2867bd; } QPushButton:disabled { background: #e7ebf1; color: #87909e; border-color: #e1e5eb; }')
         self.copy_btn.clicked.connect(lambda: self.copy_result())
-        self.save_btn = QPushButton('保存图片')
+        self.save_btn = setup_button(QPushButton('保存图片'), 'save', role='subtle')
         self.save_btn.clicked.connect(self.save_result)
         actions.addWidget(self.copy_btn)
         actions.addWidget(self.save_btn)
@@ -147,6 +154,7 @@ class ScreenshotWindow(QDialog):
         self.copy_btn.setEnabled(not busy and has_result)
         self.save_btn.setEnabled(not busy and has_result)
         self.small_btn.setEnabled(not busy and not self._preview_image.isNull())
+        self.parts_scroll.setVisible(bool(self._parts))
         for button in self.cards.findChildren(QPushButton):
             button.setEnabled(not busy)
 
