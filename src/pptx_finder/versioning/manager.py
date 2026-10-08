@@ -7,6 +7,7 @@ import os
 import shutil
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 from .. import actions, renderer
@@ -32,6 +33,25 @@ _DEFAULT_VAULT_HEAVY_MAINTENANCE_INTERVAL_SEC = 7 * 24 * 60 * 60
 _DEFAULT_GHOST_GRACE_SEC = 30 * 24 * 60 * 60
 _DEFAULT_QUARANTINE_KEEP_PER_DOC = 10
 _FALSE_ENV = {"0", "false", "no", "off"}
+
+
+def _restore_vault_directory(backup: Path, source: Path) -> None:
+    """Allow brief Windows locks after rename without replacing another vault."""
+    delays = (0.05, 0.1, 0.2, 0.4, 0.8)
+    for attempt in range(len(delays) + 1):
+        if source.exists():
+            raise FileExistsError(f"Rollback destination already exists: {source}")
+        try:
+            os.replace(backup, source)
+            return
+        except OSError as exc:
+            if (
+                os.name != "nt"
+                or getattr(exc, "winerror", None) not in {5, 32, 33}
+                or attempt == len(delays)
+            ):
+                raise
+            time.sleep(delays[attempt])
 
 
 def _now() -> float:
@@ -710,7 +730,7 @@ class VersionManager:
                             rollback_errors.append(f"设置回滚失败：{config_exc}")
                         try:
                             if backup.is_dir() and not source.exists():
-                                os.replace(backup, source)
+                                _restore_vault_directory(backup, source)
                         except OSError as move_exc:
                             rollback_errors.append(f"源目录回滚失败：{move_exc}")
                         if source.is_dir():
@@ -721,6 +741,10 @@ class VersionManager:
                                 shutil.rmtree(destination, ignore_errors=True)
                             except Exception as reopen_exc:  # noqa: BLE001
                                 rollback_errors.append(f"旧版本库重连失败：{reopen_exc}")
+                        else:
+                            rollback_errors.append(
+                                f"旧版本库未恢复；备份保留于 {backup}；已校验副本保留于 {destination}"
+                            )
                         detail = "；".join(rollback_errors)
                         raise RuntimeError(
                             f"新版本库重连失败，已尝试回滚：{exc}"
