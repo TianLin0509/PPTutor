@@ -24,6 +24,7 @@ class ScreenshotOverlay(QWidget):
     selected = Signal(QImage)
     small_selected = Signal(QImage)
     scroll_selected = Signal(object, object)
+    record_selected = Signal(object, object)
     text_selected = Signal(QImage)
     formula_selected = Signal(QImage)
     region_selected = Signal(object)
@@ -53,12 +54,13 @@ class ScreenshotOverlay(QWidget):
         bar.setSpacing(2)
         self.confirm_btn = QPushButton('✓ 完成')
         self.scroll_btn = QPushButton('滚动截图')
+        self.record_btn = QPushButton('录制 GIF')
         self.small_btn = QPushButton('小图模式')
         self.cancel_btn = QPushButton('× 取消')
         self.text_btn = QPushButton('提取文字')
         self.formula_btn = QPushButton('识别公式')
         self.formula_btn.setStyleSheet('color: #2867bd; background: #edf3fc; font-weight: 600;')
-        for button in (self.confirm_btn,self.scroll_btn,self.small_btn,self.text_btn,self.formula_btn,self.cancel_btn):
+        for button in (self.confirm_btn,self.scroll_btn,self.record_btn,self.small_btn,self.text_btn,self.formula_btn,self.cancel_btn):
             bar.addWidget(button)
         self.confirm_btn.setToolTip('普通截图：直接复制原图')
         self.small_btn.setToolTip('AI 上传：压缩并按每张 50 KB 分图')
@@ -66,6 +68,8 @@ class ScreenshotOverlay(QWidget):
         self.confirm_btn.clicked.connect(lambda: self._confirm('normal'))
         self.small_btn.clicked.connect(lambda: self._confirm('small'))
         self.scroll_btn.clicked.connect(lambda: self._confirm('scroll'))
+        self.record_btn.clicked.connect(lambda: self._confirm('record'))
+        self.record_btn.setToolTip('录制选区屏幕变化；停止后自动保存 GIF（无声音）')
         self.text_btn.clicked.connect(lambda: self._confirm('text'))
         self.formula_btn.clicked.connect(lambda: self._confirm('formula'))
         self.formula_btn.setToolTip('框选单个公式 → 本机识别 → LaTeX / Word 输入格式和预览')
@@ -99,6 +103,8 @@ class ScreenshotOverlay(QWidget):
     def _update_tools(self):
         self.undo_btn.setEnabled(bool(self.marks))
         self.scroll_btn.setEnabled(not self.marks)
+        self.record_btn.setEnabled(not self.marks)
+        self.record_btn.setToolTip('请先撤销标注再录制' if self.marks else '录制选区屏幕变化；停止后自动保存 GIF（无声音）')
         self.scroll_btn.setToolTip('请先撤销标注再滚动截图' if self.marks else '从当前位置向下滚动，拼成长图')
 
     def undo(self):
@@ -198,11 +204,13 @@ class ScreenshotOverlay(QWidget):
         result = crop_physical(self._image,self._selection,self.rect())
         if result.isNull():
             return
-        if mode == 'scroll' and self.marks:
+        if mode in ('scroll','record') and self.marks:
             return
         self.region_selected.emit(QRect(self._selection))
         if mode == 'scroll':
             self.scroll_selected.emit(QRect(self._selection),QRect(self._screen_geometry))
+        elif mode == 'record':
+            self.record_selected.emit(QRect(self._selection),QRect(self._screen_geometry))
         elif mode == 'small':
             self.small_selected.emit(annotated(result,self.marks,self._selection))
         elif mode == 'text':

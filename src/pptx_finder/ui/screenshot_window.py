@@ -59,6 +59,8 @@ class ScreenshotWindow(QDialog):
         self._text = ScreenshotTextController(self,writer=text_writer,recognizer=recognizer)
         from .screenshot_formula_controller import ScreenshotFormulaController
         self._formula = ScreenshotFormulaController(self,recognizer=formula_recognizer,renderer=formula_renderer,writer=formula_writer)
+        from .screenshot_record_controller import ScreenshotRecordController
+        self._record = ScreenshotRecordController(self,output_root=output_root)
         root = QVBoxLayout(self)
         root.setContentsMargins(22, 20, 22, 20)
         root.setSpacing(12)
@@ -82,10 +84,12 @@ class ScreenshotWindow(QDialog):
         self.text_result_btn.clicked.connect(self._text.show)
         self.formula_result_btn = QPushButton('查看公式结果')
         self.formula_result_btn.clicked.connect(self._formula.show)
-        for button in [self.repeat_btn,self.shortcuts_btn,self.text_result_btn,self.formula_result_btn]:tools.addWidget(button)
+        self.record_result_btn = QPushButton('查看录制结果')
+        self.record_result_btn.clicked.connect(self._record.show)
+        for button in [self.repeat_btn,self.shortcuts_btn,self.text_result_btn,self.formula_result_btn,self.record_result_btn]:tools.addWidget(button)
         tools.addStretch(1)
         root.addLayout(tools)
-        self.status = QLabel('框选后选择：✓ 普通截图、滚动截图、小图模式（每张 ≤50 KB），或识别公式。')
+        self.status = QLabel('框选后选择：✓ 普通截图、滚动截图、录制 GIF、小图模式（每张 ≤50 KB），或识别公式。')
         self.status.setWordWrap(True)
         root.addWidget(self.status)
         self.preview = QLabel('截图预览')
@@ -136,6 +140,7 @@ class ScreenshotWindow(QDialog):
         self.repeat_btn.setEnabled(not busy)
         self.text_result_btn.setEnabled(not busy and bool(self._text.dialog.editor.toPlainText()))
         self.formula_result_btn.setEnabled(not busy and bool(self._formula.dialog.editor.toPlainText()))
+        self.record_result_btn.setEnabled(not busy and bool(self._record.result.path))
         self.paste_btn.setEnabled(not busy)
         has_result = bool(self._paths) or not self._preview_image.isNull()
         self.copy_btn.setText('复制全部图片' if self._paths else '复制原图')
@@ -370,6 +375,7 @@ class ScreenshotWindow(QDialog):
         self._repeat = repeat
         self._text.dialog.hide()
         self._formula.dialog.hide()
+        self._record.result.hide()
         self._capture_pending = True
         self._notice.hide()
         owner = self.parentWidget()
@@ -412,6 +418,7 @@ class ScreenshotWindow(QDialog):
             overlay.selected.connect(self._selected)
             overlay.small_selected.connect(self._small_selected)
             overlay.scroll_selected.connect(self._scroll_selected)
+            overlay.record_selected.connect(self._record_selected)
             overlay.text_selected.connect(self._text_selected)
             overlay.formula_selected.connect(self._formula_selected)
             overlay.cancelled.connect(self._cancel_capture)
@@ -455,6 +462,17 @@ class ScreenshotWindow(QDialog):
         self._close_overlays()
         self._owner_was_visible=False
         self._formula.start(image)
+
+    def _record_selected(self,local,geometry):
+        self._close_overlays()
+        self._owner_was_visible=False
+        self._set_busy(True)
+        self._serial += 1
+        serial = self._serial
+        def start():
+            if not self._closed and serial == self._serial and self._busy:
+                self._record.start(local,geometry)
+        QTimer.singleShot(160,start)
 
     def _copy_original(self,image,*,scroll_message='',complete=True):
         self._closed = False
@@ -586,6 +604,7 @@ class ScreenshotWindow(QDialog):
         self._notice.close()
         self._text.close()
         self._formula.close()
+        self._record.close()
         self._close_overlays()
         self._restore_owner()
         self._set_busy(False)
