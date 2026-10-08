@@ -37,7 +37,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['PIL', 'Pillow', 'pptx', 'tkinter', 'matplotlib', 'pandas', 'IPython', 'pytest',
+    excludes=['pptx', 'tkinter', 'matplotlib', 'pandas', 'IPython', 'pytest',
               'datasketch', 'numpy', 'scipy',
               'jieba.analyse', 'jieba.posseg', 'jieba.lac_small',
               'PySide6.QtQuick', 'PySide6.QtQml', 'PySide6.QtQuickWidgets', 'PySide6.QtQuick3D',

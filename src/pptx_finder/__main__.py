@@ -65,6 +65,10 @@ if __name__ == "__main__":
         from pptx_finder.screenshots.formula_ui_selftest import main as formula_ui_main
         raise SystemExit(formula_ui_main(sys.argv))
 
+    if '--gif-selftest' in sys.argv:
+        from pptx_finder.screenshots.gif_selftest import main as gif_selftest_main
+        raise SystemExit(gif_selftest_main(sys.argv))
+
     from pptx_finder.app import main
 
     raise SystemExit(main())
