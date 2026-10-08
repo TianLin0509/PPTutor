@@ -94,7 +94,7 @@ class RecordResult(QDialog):
         if path and not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path))):
             self.status.setText('无法打开，请从下方路径找到 GIF 文件。')
 
-    def display(self, path, message=''):
+    def display(self, path, message='', *, show=True):
         self.path = Path(path)
         if self.movie is not None:
             self.movie.stop()
@@ -111,8 +111,11 @@ class RecordResult(QDialog):
         self.status.setText(f'GIF 已保存 · {self.path.stat().st_size / 1024:.1f} KB'
                             + (f' · {message}' if message else ''))
         self.location.setText(str(self.path))
-        self.show()
-        self.raise_()
+        if show:
+            self.show()
+            self.raise_()
+        else:
+            self.movie.setPaused(True)
 
     def _preview_frame(self):
         if self.movie is not None:

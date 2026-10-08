@@ -209,6 +209,55 @@ def test_stop_discards_before_publishing_and_cleans_partial(qtbot, tmp_path):
     assert not list(tmp_path.iterdir())
 
 
+def test_cancel_during_final_flush_never_publishes(qtbot, tmp_path, monkeypatch):
+    import pptx_finder.screenshots.gif_encoding as encoding
+    entered, release = Event(), Event()
+    real_fsync = encoding.os.fsync
+    def slow_fsync(fd):
+        entered.set()
+        assert release.wait(5)
+        real_fsync(fd)
+    monkeypatch.setattr(encoding.os, 'fsync', slow_fsync)
+    writer = GifWriter(tmp_path / 'screen.gif')
+    results = []
+    writer.completed.connect(lambda *a: results.append(a))
+    writer.submit(frame(), 0); writer.end(200); writer.start()
+    try:
+        assert entered.wait(3)
+        writer.end(200, discard=True)
+    finally:
+        release.set()
+        assert writer.wait(5000)
+    qtbot.waitUntil(lambda: bool(results), timeout=1000)
+    assert results == [(None, '')]
+    assert not list(tmp_path.iterdir())
+
+
+def test_cancel_after_publication_reports_saved_file(qtbot, tmp_path):
+    entered, release = Event(), Event()
+    class PublishedStream(GifStream):
+        def finish(self, **kwargs):
+            path = super().finish(**kwargs)
+            entered.set()
+            assert release.wait(5)
+            return path
+    engine = RecordCapture(lambda: frame(), tmp_path / 'screen.gif', countdown=0,
+                           writer_factory=lambda p: GifWriter(p, stream_factory=PublishedStream))
+    results = []
+    engine.finished.connect(lambda *a: results.append(a))
+    engine.start(); engine.timer.stop(); engine.stop()
+    try:
+        assert entered.wait(3)
+        engine.stop(discard=True)
+    finally:
+        release.set()
+        assert engine.writer.wait(5000)
+    qtbot.waitUntil(lambda: bool(results), timeout=1000)
+    assert results[0][0].is_file()
+    assert '已保存' in results[0][1] and '未删除' in results[0][1]
+    assert not engine.writer.discarding.is_set()
+
+
 def test_identical_frames_merge_without_shortening_display_time(qtbot, tmp_path):
     writer = GifWriter(tmp_path / 'screen.gif')
     for ms in [0, 100, 200]: assert writer.submit(frame(), ms)
@@ -258,6 +307,36 @@ def test_close_during_pending_start_never_records(qtbot, tmp_path, monkeypatch):
     win.close()
     qtbot.wait(200)
     assert win._record.engine is None and not list(tmp_path.glob('*.gif'))
+
+
+def test_closed_record_request_cannot_start_after_reopening_capture(qtbot, tmp_path, monkeypatch):
+    win = window(qtbot, tmp_path)
+    calls = []
+    monkeypatch.setattr(win._record, 'start', lambda *a: calls.append(a))
+    monkeypatch.setattr(win, '_take_frames', lambda: None)
+    win._record_selected(QRect(1, 2, 40, 40), QRect(0, 0, 800, 450))
+    win.close()
+    win.begin_capture()
+    qtbot.wait(250)
+    assert not win._closed and calls == []
+    win.close()
+
+
+def test_closed_save_completion_does_not_revive_ui_or_release_a_new_request(qtbot, tmp_path):
+    win = window(qtbot, tmp_path)
+    path = tmp_path / 'saved.gif'
+    stream = GifStream(path)
+    stream.append(Image.new('RGB', (40, 40), 'red'), 100)
+    stream.finish()
+    win.close()
+    win._record._finished(path, '')
+    assert not win.isVisible() and not win._record.result.isVisible()
+    assert win.record_result_btn.isEnabled() and str(path) in win.status.text()
+    win._closed = False
+    win._set_busy(True)
+    win._record._finished(path, '')
+    assert win._busy and not win._record.result.isVisible()
+    win.close()
 
 
 def test_frozen_packaging_includes_gif_encoder_and_declares_runtime_dependency():

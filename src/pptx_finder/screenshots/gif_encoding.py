@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import uuid
+from contextlib import nullcontext
 from pathlib import Path
 
 from PIL import GifImagePlugin, Image
@@ -44,7 +45,7 @@ class GifStream:
         self.frames += 1
         self.duration_ms += duration
 
-    def finish(self) -> Path:
+    def finish(self, *, cancelled=None, commit_lock=None, published=None) -> Path | None:
         if not self.frames or self.output is None:
             raise ValueError('尚未录到画面，GIF 未保存')
         self.output.write(b';')
@@ -54,11 +55,19 @@ class GifStream:
         self.output = None
         # Windows rename is atomic and refuses to replace another file. Use an
         # exclusive hard link elsewhere to provide the same no-overwrite rule.
-        if os.name == 'nt':
-            os.rename(self.temporary, self.path)
-        else:
-            os.link(self.temporary, self.path)
-            self.temporary.unlink()
+        # Flush can take time. Cancellation remains available during that work;
+        # only the short final publication shares a lock with the cancel action.
+        with commit_lock if commit_lock is not None else nullcontext():
+            if cancelled is not None and cancelled.is_set():
+                self.temporary.unlink(missing_ok=True)
+                return None
+            if os.name == 'nt':
+                os.rename(self.temporary, self.path)
+            else:
+                os.link(self.temporary, self.path)
+                self.temporary.unlink()
+            if published is not None:
+                published.set()
         return self.path
 
     def discard(self):

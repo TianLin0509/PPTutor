@@ -4,7 +4,7 @@ from __future__ import annotations
 import time
 from pathlib import Path
 from queue import Empty, Full, Queue
-from threading import Event
+from threading import Event, Lock
 
 from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal
 
@@ -23,6 +23,8 @@ class GifWriter(QThread):
         self.frames = Queue(maxsize=3)
         self.ending = Event()
         self.discarding = Event()
+        self.published = Event()
+        self.commit_lock = Lock()
         self.end_ms = 0
 
     def submit(self, image, timestamp_ms):
@@ -37,8 +39,12 @@ class GifWriter(QThread):
     def end(self, timestamp_ms, *, discard=False):
         self.end_ms = timestamp_ms
         if discard:
-            self.discarding.set()
+            with self.commit_lock:
+                if self.published.is_set():
+                    return False
+                self.discarding.set()
         self.ending.set()
+        return True
 
     def run(self):
         stream = None
@@ -69,7 +75,8 @@ class GifWriter(QThread):
                     stream.discard()
                 self.completed.emit(None, '')
                 return
-            path = stream.finish()
+            path = stream.finish(cancelled=self.discarding, commit_lock=self.commit_lock,
+                                 published=self.published)
             self.completed.emit(path, '')
         except Exception as exc:
             try:
@@ -194,7 +201,8 @@ class RecordCapture(QObject):
         if self.state != 'saving':
             self.elapsed_ms = self.elapsed()
         self.state = 'saving'
-        self.writer.end(self.elapsed_ms, discard=discard)
+        if self.writer.end(self.elapsed_ms, discard=discard) is False:
+            self._capture_error = 'GIF 已保存，未删除；可从结果窗口查看文件'
         if not discard:
             self.progress.emit('正在保存 GIF · 请稍候…')
 

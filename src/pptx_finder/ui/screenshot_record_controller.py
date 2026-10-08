@@ -140,7 +140,14 @@ class ScreenshotRecordController(QObject):
 
     def _finished(self, path, message):
         self.panel.hide()
+        if path and self._discarded:
+            message = message or 'GIF 已保存，未删除；可从结果窗口查看文件'
         if self._closed:
+            if path:
+                self.result.display(path, message, show=False)
+                if self.owner._closed:
+                    self.owner.status.setText(f'GIF 已保存：{path} · {message}')
+                    self.owner._set_busy(False)
             return
         self.owner._set_busy(False)
         if path:

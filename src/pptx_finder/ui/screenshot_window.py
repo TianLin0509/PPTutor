@@ -467,7 +467,12 @@ class ScreenshotWindow(QDialog):
         self._close_overlays()
         self._owner_was_visible=False
         self._set_busy(True)
-        QTimer.singleShot(160,lambda:self._record.start(local,geometry))
+        self._serial += 1
+        serial = self._serial
+        def start():
+            if not self._closed and serial == self._serial and self._busy:
+                self._record.start(local,geometry)
+        QTimer.singleShot(160,start)
 
     def _copy_original(self,image,*,scroll_message='',complete=True):
         self._closed = False
