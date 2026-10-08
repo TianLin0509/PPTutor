@@ -728,12 +728,13 @@ class VersionManager:
                             set_version_vault_dir(old_setting)
                         except Exception as config_exc:  # noqa: BLE001
                             rollback_errors.append(f"设置回滚失败：{config_exc}")
+                        source_restored = False
                         try:
-                            if backup.is_dir() and not source.exists():
-                                _restore_vault_directory(backup, source)
+                            _restore_vault_directory(backup, source)
+                            source_restored = True
                         except OSError as move_exc:
                             rollback_errors.append(f"源目录回滚失败：{move_exc}")
-                        if source.is_dir():
+                        if source_restored:
                             try:
                                 self._conn, self._read_conn = self._open_vault_connections(
                                     source_db

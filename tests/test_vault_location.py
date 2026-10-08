@@ -278,14 +278,14 @@ def test_live_migration_reconnect_failure_rolls_back_and_manager_stays_usable(
     manager.stop()
 
 
-@pytest.mark.parametrize("winerror, expected_attempts", [(5, 6), (18, 1)])
+@pytest.mark.parametrize("winerror, expected_attempts", [(5, 6), (18, 1), ("new-source", 1)])
 def test_live_migration_failed_rollback_preserves_both_verified_copies(
     tmp_path, monkeypatch, winerror, expected_attempts
 ):
     import hashlib
     from pptx_finder.versioning import manager as manager_module
 
-    if winerror == 5 and os.name != "nt":
+    if winerror in (5, "new-source") and os.name != "nt":
         pytest.skip("Windows directory-lock recovery")
     deck = tmp_path / "deck.pptx"
     fx.make_pptx(deck, [{"body": "preserve failed rollback data"}])
@@ -315,8 +315,11 @@ def test_live_migration_failed_rollback_preserves_both_verified_copies(
             if not preserved:
                 preserved["backup"] = hashes(Path(src))
                 preserved["destination"] = hashes(destination)
+            if winerror == "new-source":
+                source.mkdir()
+                (source / "external.txt").write_text("keep external data")
             error = OSError("injected persistent restore failure")
-            error.winerror = winerror
+            error.winerror = 32 if winerror == "new-source" else winerror
             raise error
         return real_replace(src, dst)
 
@@ -327,7 +330,11 @@ def test_live_migration_failed_rollback_preserves_both_verified_copies(
         manager.migrate_vault_dir(destination, config_value=str(destination))
     assert len(attempts) == expected_attempts
     backup = attempts[0]
-    assert not source.exists()
+    if winerror == "new-source":
+        assert (source / "external.txt").read_text() == "keep external data"
+        assert not (source / "versions.db").exists()
+    else:
+        assert not source.exists()
     assert hashes(backup) == preserved["backup"]
     assert hashes(destination) == preserved["destination"]
     assert str(backup) in str(failure.value)
