@@ -15,13 +15,36 @@ import argparse
 import json
 import sys
 import traceback
+import time
+import os
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 
 def build_engine():
     from rapidocr_onnxruntime import RapidOCR
-    return RapidOCR()
+    # Large default thread pools cost more than they save on short screenshots.
+    # These are execution settings; all three original OCR models stay enabled.
+    return RapidOCR(intra_op_num_threads=min(4, os.cpu_count() or 1), inter_op_num_threads=1)
+
+
+def serve():
+    engine = None
+    for line in sys.stdin:
+        request = {}
+        try:
+            request = json.loads(line)
+            start = time.perf_counter()
+            if engine is None:
+                engine = build_engine()
+            images = [str(p) for p in request['images']]
+            payload = {'ok': True, 'results': {p: recognize(engine, p) for p in images},
+                       'seconds': time.perf_counter() - start, 'version': __version__}
+        except Exception as exc:
+            payload = {'ok': False, 'error': f'{type(exc).__name__}: {exc}'}
+        payload['id'] = request.get('id') if isinstance(request, dict) else None
+        print('PPTDOCTOR_OCR:' + json.dumps(payload, ensure_ascii=False), flush=True)
+    return 0
 
 
 def recognize(engine, path: str) -> list[dict]:
@@ -46,14 +69,21 @@ def recognize(engine, path: str) -> list[dict]:
 
 
 def main(argv=None) -> int:
+    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stderr.reconfigure(encoding='utf-8')
     parser = argparse.ArgumentParser(prog="pptdoctor-ocr")
-    parser.add_argument("--request", required=True)
-    parser.add_argument("--response", required=True)
+    parser.add_argument("--request")
+    parser.add_argument("--response")
+    parser.add_argument('--serve', action='store_true')
     parser.add_argument("--version", action="store_true")
     args = parser.parse_args(argv)
     if args.version:
         print(__version__)
         return 0
+    if args.serve:
+        return serve()
+    if not args.request or not args.response:
+        parser.error('--request and --response are required without --serve')
 
     try:
         with open(args.request, encoding="utf-8") as f:

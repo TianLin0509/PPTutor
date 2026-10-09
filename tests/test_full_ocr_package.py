@@ -39,7 +39,7 @@ def test_default_installer_cannot_skip_offline_ocr(builder, monkeypatch):
         calls.append((component, dist))
         raise FileNotFoundError("offline OCR is required")
     monkeypatch.setattr(builder, "bundle_ocr", missing)
-    assert builder.main([]) == 1
+    assert builder.main(['--edition', 'ocr']) == 1
     assert len(calls) == 1
 
 

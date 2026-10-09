@@ -4,7 +4,7 @@ from __future__ import annotations
 from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen
 from PySide6.QtWidgets import (QHBoxLayout, QVBoxLayout, QGridLayout, QButtonGroup,
-                              QPushButton, QToolButton, QLabel, QFrame, QWidget)
+                              QPushButton, QToolButton, QLabel, QFrame, QSpinBox, QWidget)
 from ..screenshots.annotations import Mark, annotated, paint_mark
 from .capture_style import STYLE, BLUE, icon, setup_button, shadow
 
@@ -25,6 +25,7 @@ def crop_physical(image: QImage, logical: QRect, bounds: QRect) -> QImage:
 class ScreenshotOverlay(QWidget):
     selected = Signal(QImage)
     small_selected = Signal(QImage)
+    small_limits_selected = Signal(int, int)
     scroll_selected = Signal(object, object)
     record_selected = Signal(object, object)
     text_selected = Signal(QImage)
@@ -32,7 +33,7 @@ class ScreenshotOverlay(QWidget):
     region_selected = Signal(object)
     cancelled = Signal()
 
-    def __init__(self, image: QImage, geometry: QRect, initial_selection=None):
+    def __init__(self, image: QImage, geometry: QRect, initial_selection=None, *, small_limits=(8, 50)):
         super().__init__(None, Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self._image = image
         self._origin: QPoint | None = None
@@ -100,7 +101,7 @@ class ScreenshotOverlay(QWidget):
                                 self.text_btn, self.formula_btn, self.confirm_btn]
         self._layout_actions()
         self.confirm_btn.setToolTip('普通截图：直接复制原图')
-        self.small_btn.setToolTip('AI 上传：压缩并按每张 50 KB 分图')
+        self.small_btn.setToolTip('先压缩 PNG / JPEG，最多拆到设定张数；超过目标大小也可先尝试上传')
         self.scroll_btn.setToolTip('从当前位置向下滚动，拼成长图')
         self.confirm_btn.clicked.connect(lambda: self._confirm('normal'))
         self.small_btn.clicked.connect(lambda: self._confirm('small'))
@@ -112,6 +113,30 @@ class ScreenshotOverlay(QWidget):
         self.formula_btn.setToolTip('框选单个公式 → 本机识别 → LaTeX / Word 输入格式和预览')
         self.text_btn.setToolTip('本机识别选区文字并复制；点击查看文字可核对修改')
         self.cancel_btn.clicked.connect(self.cancelled)
+        options = QHBoxLayout()
+        self.small_settings_btn = QPushButton('小图设置 ▾')
+        options.addWidget(self.small_settings_btn)
+        options.addStretch(1)
+        rows.addLayout(options)
+        self.small_settings = QWidget()
+        settings = QHBoxLayout(self.small_settings)
+        settings.setContentsMargins(0, 0, 0, 0)
+        settings.addWidget(QLabel('最多'))
+        self.parts_limit = QSpinBox()
+        self.parts_limit.setRange(1, 16)
+        self.parts_limit.setSuffix(' 张')
+        self.parts_limit.setValue(small_limits[0])
+        settings.addWidget(self.parts_limit)
+        settings.addWidget(QLabel('每张目标'))
+        self.size_limit = QSpinBox()
+        self.size_limit.setRange(2, 1000)
+        self.size_limit.setSuffix(' KB')
+        self.size_limit.setValue(small_limits[1])
+        settings.addWidget(self.size_limit)
+        settings.addStretch(1)
+        rows.addWidget(self.small_settings)
+        self.small_settings.hide()
+        self.small_settings_btn.clicked.connect(self._toggle_small_settings)
         self.toolbar.hide()
         self.hint = QWidget(self)
         self.hint.setObjectName('captureToolbar')
@@ -138,6 +163,11 @@ class ScreenshotOverlay(QWidget):
         button.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
         button.setFixedSize(88, 62)
         return button
+
+    def _toggle_small_settings(self):
+        self.small_settings.setVisible(not self.small_settings.isVisible())
+        self.toolbar.adjustSize()
+        self._show_toolbar()
 
     def _layout_actions(self):
         while self.actions.count():
@@ -287,6 +317,7 @@ class ScreenshotOverlay(QWidget):
         elif mode == 'record':
             self.record_selected.emit(QRect(self._selection),QRect(self._screen_geometry))
         elif mode == 'small':
+            self.small_limits_selected.emit(self.parts_limit.value(), self.size_limit.value())
             self.small_selected.emit(annotated(result,self.marks,self._selection))
         elif mode == 'text':
             self.text_selected.emit(result)

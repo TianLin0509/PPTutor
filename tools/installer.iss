@@ -22,11 +22,15 @@
   #define AppSourceDir "..\dist\PPT-Doctor"
 #endif
 
+#ifndef Edition
+  #define Edition "Base"
+#endif
+
 [Setup]
 AppId={{B7E2A8F3-5C4D-4E1F-9A2B-3D4C5E6F7A08}
 AppName=PPT Doctor
 AppVersion={#AppVersion}
-AppVerName=PPT Doctor {#AppVersion}
+AppVerName=PPT Doctor {#AppVersion} ({#Edition})
 AppPublisher=TianLin
 AppPublisherURL=https://github.com/TianLin0509/PPTutor
 AppSupportURL=https://github.com/TianLin0509/PPTutor/issues
@@ -35,11 +39,7 @@ DefaultDirName={localappdata}\Programs\PPT-Doctor
 DefaultGroupName=PPT Doctor
 DisableProgramGroupPage=yes
 OutputDir=..\artifacts
-#ifdef FullOcr
-OutputBaseFilename=PPT-Doctor-Setup-v{#AppVersion}-Full
-#else
-OutputBaseFilename=PPT-Doctor-Setup-v{#AppVersion}
-#endif
+OutputBaseFilename=PPT-Doctor-Setup-v{#AppVersion}-{#Edition}
 SetupIconFile=..\assets\app.ico
 Compression=lzma2/max
 SolidCompression=yes
@@ -67,6 +67,14 @@ Name: "cleanlegacy"; Description: "清理电脑上的旧版本（只删程序文
 ; v1.5.2 入口改名（去掉空格）。Inno 不会动它不认识的旧文件，不清掉的话 {app} 里
 ; 会留一个旧的 PPT Doctor.exe —— 用户桌面上若有旧快捷方式，点开的就是那个旧壳。
 Type: files; Name: "{app}\PPT Doctor.exe"
+#if Edition != "Full"
+Type: files; Name: "{app}\_internal\formula\component.zip"
+Type: files; Name: "{app}\_internal\formula\component.json"
+#endif
+#if Edition == "Base"
+Type: files; Name: "{app}\_internal\ocr\component.zip"
+Type: files; Name: "{app}\_internal\ocr\component.json"
+#endif
 
 [Files]
 Source: "{#AppSourceDir}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion

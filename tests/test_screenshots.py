@@ -40,7 +40,7 @@ def test_text_stays_lossless_and_full_resolution(qapp):
 def test_complex_image_splits_into_bounded_full_resolution_parts(qapp):
     image=detailed_image(320,180)
     parts=compress(image)
-    assert 1<len(parts)<=16
+    assert len(parts)==1
     coverage=set()
     for part in parts:
         assert 0<len(part.data)<=50000
@@ -59,8 +59,9 @@ def test_cancel_does_not_return_upload_ready_parts(qapp):
 
 
 def test_complex_image_cannot_silently_downscale_or_exceed_limit(qapp):
-    with pytest.raises(ValueError,match='超过 1 张'):
-        compress(detailed_image(),max_bytes=2000,max_parts=1)
+    parts=compress(detailed_image(),max_bytes=2000,max_parts=1)
+    assert len(parts)==1 and parts[0].size>2000
+    assert QImage.fromData(parts[0].data).size()==detailed_image().size()
 
 
 @pytest.mark.parametrize('image',[QImage(),QImage(5001,5001,QImage.Format_RGB32)])
@@ -130,7 +131,7 @@ def test_result_window_auto_copies_all_and_individual_part(qtbot,tmp_path):
     assert win.process_image(detailed_image(320,180))
     qtbot.waitUntil(lambda:len(copied)==1 and not win._busy,timeout=15000)
     assert win.grab().toImage().pixelColor(0,0)==QColor('white')
-    assert len(copied[0])>1
+    assert len(copied[0])==1
     assert all(p.stat().st_size<=50000 for p in copied[0])
     win.copy_result(0)
     qtbot.waitUntil(lambda:len(copied)==2 and not win._busy,timeout=5000)

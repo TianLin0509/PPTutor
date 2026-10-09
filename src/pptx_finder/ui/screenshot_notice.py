@@ -8,6 +8,7 @@ class ScreenshotNotice(QWidget):
     stop_requested = Signal()
     small_requested = Signal()
     text_requested = Signal()
+    force_requested = Signal()
 
     def __init__(self):
         super().__init__(None,Qt.Tool|Qt.FramelessWindowHint|Qt.WindowStaysOnTopHint|Qt.WindowDoesNotAcceptFocus)
@@ -31,6 +32,10 @@ class ScreenshotNotice(QWidget):
         self.text_btn.clicked.connect(self.text_requested)
         row.addWidget(self.text_btn)
         self.text_btn.hide()
+        self.force_btn = QPushButton('强制达标')
+        self.force_btn.clicked.connect(self.force_requested)
+        row.addWidget(self.force_btn)
+        self.force_btn.hide()
         self.resize(380,80)
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
@@ -42,16 +47,18 @@ class ScreenshotNotice(QWidget):
         self.stop_btn.setVisible(stoppable)
         self.small_btn.hide()
         self.text_btn.hide()
+        self.force_btn.hide()
         screen = screen or QGuiApplication.primaryScreen()
         if screen:
             area = screen.availableGeometry()
             self.move(area.right()-self.width()-16,area.bottom()-self.height()-16)
         self.show()
 
-    def complete(self,text,*,allow_small=False,allow_text=False):
+    def complete(self,text,*,allow_small=False,allow_text=False,allow_force=False):
         self.label.setText(text)
         self.stop_btn.hide()
         self.small_btn.setVisible(allow_small)
         self.text_btn.setVisible(allow_text)
+        self.force_btn.setVisible(allow_force)
         self.show()
-        self._timer.start(8000 if allow_small or allow_text else 2800)
+        self._timer.start(15000 if allow_force else (8000 if allow_small or allow_text else 2800))

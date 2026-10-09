@@ -1,11 +1,14 @@
 """Choose whitespace gutters in either direction before a geometric fallback."""
 from __future__ import annotations
 
-from PySide6.QtCore import QRect
+from PySide6.QtCore import QRect, Qt
 from PySide6.QtGui import QImage
 
 
 def _gutter(tile: QImage, horizontal: bool) -> tuple[int, int] | None:
+    original_length = tile.height() if horizontal else tile.width()
+    if max(tile.width(), tile.height()) > 512:
+        tile = tile.scaled(512, 512, Qt.KeepAspectRatio, Qt.FastTransformation)
     tile = tile.convertToFormat(QImage.Format_RGB888)
     width, height, pitch = tile.width(), tile.height(), tile.bytesPerLine()
     blob = bytes(tile.constBits())
@@ -31,7 +34,8 @@ def _gutter(tile: QImage, horizontal: bool) -> tuple[int, int] | None:
         return None
     # Prefer a broad gutter near the centre over isolated gaps in a sentence.
     start,end = max(runs, key=lambda r: (r[1]-r[0])/length - abs((r[0]+r[1])/2-length/2)/length*.25)
-    return (start+end)//2, end-start
+    scale = original_length / length
+    return round((start+end)/2 * scale), round((end-start)*scale)
 
 
 def split_region(image: QImage, rect: QRect) -> tuple[QRect,QRect]:

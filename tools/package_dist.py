@@ -68,7 +68,9 @@ def main() -> int:
     m = build_manifest(DIST, __version__, f"PPT Doctor v{__version__}")
     (DIST / MANIFEST_NAME).write_text(json.dumps(m, ensure_ascii=False, indent=0), encoding="utf-8")
 
-    out = ROOT / "dist" / f"PPT-Doctor-v{__version__}.zip"
+    from pptx_finder.editions import read_edition, package_suffix
+    suffix = package_suffix(read_edition(DIST))
+    out = ROOT / "dist" / f"PPT-Doctor-v{__version__}{suffix}.zip"
     if out.exists():
         out.unlink()
     n = 0
