@@ -170,3 +170,42 @@ def test_force_quit_defers_until_storage_transaction_finishes(qtbot,monkeypatch,
         qtbot.waitUntil(lambda:window._closing)
         qtbot.waitUntil(lambda:bool(quit_called))
         conn.close()
+
+
+def test_tray_exit_action_uses_safe_quit_and_hides_tray_only_after_transaction(qtbot,monkeypatch,tmp_path):
+    from PySide6.QtCore import QObject, Signal
+    from PySide6.QtGui import QAction
+    from PySide6.QtWidgets import QApplication
+    from pptx_finder import db, app as app_mod
+    from pptx_finder.ui.bg_task import BackgroundTask
+    class App(QObject):
+        aboutToQuit=Signal()
+        def quit(self):
+            quit_called.append(True)
+            self.aboutToQuit.emit()
+    app=App()
+    conn=db.connect(tmp_path/'index.db')
+    window=MainWindow(conn=conn,do_index=False,roots=[])
+    qtbot.addWidget(window)
+    quit_called=[]
+    tray_hidden=[]
+    tray=SimpleNamespace(hide=lambda:tray_hidden.append(True))
+    action=QAction('退出',window)
+    app_mod._connect_tray_quit(app,window,tray,action)
+    monkeypatch.setattr(QApplication,'quit',app.quit)
+    started,finish=threading.Event(),threading.Event()
+    task=BackgroundTask(lambda:(started.set(),finish.wait(5)),'vault-storage-configure')
+    window._bg_tasks.append(task)
+    task.finished.connect(lambda:window._bg_tasks.remove(task))
+    task.start()
+    qtbot.waitUntil(started.is_set)
+    try:
+        action.trigger()
+        assert quit_called==tray_hidden==[]
+        assert not window._closing
+    finally:
+        finish.set()
+        qtbot.waitUntil(lambda:window._closing)
+        qtbot.waitUntil(lambda:bool(quit_called))
+        conn.close()
+    assert tray_hidden==[True]

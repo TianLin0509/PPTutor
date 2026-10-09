@@ -133,6 +133,13 @@ def _make_icon() -> QIcon:
     return QIcon(pm)
 
 
+def _connect_tray_quit(app, win, tray, action) -> None:
+    # All real exits use MainWindow's storage-transaction completion barrier.
+    # Keep the tray available while an asynchronous quit is pending.
+    action.triggered.connect(win.force_quit)
+    app.aboutToQuit.connect(tray.hide)
+
+
 def _open_version_window(owner, version_mgr, *, window_cls=None):
     windows = getattr(owner, "_version_windows", None)
     if windows is None:
@@ -824,13 +831,7 @@ def main() -> int:
         daemon=True,
     ).start()
 
-    def _real_quit() -> None:
-        win._to_tray_on_close = False
-        win._shutdown()
-        tray.hide()
-        app.quit()
-
-    act_quit.triggered.connect(_real_quit)
+    _connect_tray_quit(app, win, tray, act_quit)
     menu.addAction(act_show)
     menu.addSeparator()
     menu.addAction(act_rescan)
