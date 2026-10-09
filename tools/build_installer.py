@@ -189,8 +189,9 @@ def check_dist() -> int:
 def main(argv=None) -> int:
     global DIST
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--full-ocr", action="store_true", default=True,
-                        help="兼容旧命令；安装包始终内置 OCR，首次转字无需下载")
+    parser.add_argument('--edition', choices=('base','ocr','full'), help='基础版、文字识别版、完整版')
+    parser.add_argument("--full-ocr", action="store_true",
+                        help="兼容旧命令：内置 OCR；同时指定公式组件时构建完整版")
     parser.add_argument("--ocr-component", type=Path, default=ROOT / "dist" / "ocr",
                         help="含 component.json/component.zip 的离线组件目录")
     parser.add_argument("--dist", type=Path, default=DIST,
@@ -198,13 +199,17 @@ def main(argv=None) -> int:
     parser.add_argument('--formula-component',type=Path,help='含 component.json/component.zip 的公式离线组件')
     args = parser.parse_args(argv)
     DIST = args.dist.resolve()
+    edition = args.edition or ('full' if args.full_ocr and args.formula_component else
+                               'ocr' if args.full_ocr else 'base')
     rc = check_dist()
     if rc:
         return rc
-    if args.full_ocr:
+    if edition in ('ocr', 'full'):
         try:
             bundle_ocr(args.ocr_component, DIST)
-            if args.formula_component:
+            if edition == 'full':
+                if not args.formula_component:
+                    raise ValueError('完整版必须指定 --formula-component')
                 bundle_ocr(args.formula_component,DIST,'formula','pptdoctor-formula.exe')
         except (OSError, ValueError, KeyError, zipfile.BadZipFile) as exc:
             print(f"[!] 完整包 OCR 准备失败：{exc}")
@@ -212,6 +217,12 @@ def main(argv=None) -> int:
         rc = check_dist()
         if rc:
             return rc
+    for name, expected in [('ocr', edition != 'base'), ('formula', edition == 'full')]:
+        bundle = DIST / '_internal' / name
+        if not expected and any(bundle.glob('*')):
+            print(f'[!] {edition} 安装源混入 {name} 组件，请使用独立构建目录')
+            return 1
+    (DIST / '_internal' / 'edition.json').write_text(json.dumps({'edition':edition}), encoding='utf-8')
     iscc = find_iscc()
     if iscc is None:
         print("[!] 找不到 ISCC.exe。装 Inno Setup 6，或用 ISCC 环境变量指定路径：")
@@ -220,15 +231,13 @@ def main(argv=None) -> int:
         return 2
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    full = (DIST / "_internal" / "ocr").is_dir()
-    suffix = "-Full" if full else ""
+    suffix = '-' + edition.title()
     out = OUT_DIR / f"PPT-Doctor-Setup-v{__version__}{suffix}.exe"
     if out.exists():
         out.unlink()
 
     cmd = [str(iscc), f"/DAppVersion={__version__}", f"/DAppSourceDir={DIST}", str(ISS)]
-    if full:
-        cmd.insert(2, "/DFullOcr=1")
+    cmd.insert(2, '/DEdition=' + edition.title())
     print(f"[*] {iscc}")
     print(f"[*] 版本 v{__version__}（来自 pptx_finder.__version__）")
     proc = subprocess.run(cmd, cwd=str(ROOT / "tools"), capture_output=True, text=True)

@@ -32,6 +32,7 @@ def recognize_image(image,*,cancelled=None,recognizer=None):
         source=Path(directory)/'source.png'
         source.write_bytes(encode(image,'PNG'))
         check()
-        rows=(recognizer or imgtext_ocr.recognize_one)(source)
+        rows=(recognizer(source) if recognizer is not None else
+              imgtext_ocr.recognize_one_cached(source, cancelled=cancelled))
         check()
         return ordered_text(rows)

@@ -51,7 +51,7 @@ def test_small_mode_auto_copies_all_without_opening_a_result_dialog(qtbot,tmp_pa
     win._small_selected(detailed_image(320,180))
     qtbot.waitUntil(lambda:bool(files) and not win._busy,timeout=15000)
     assert not win.isVisible() and originals==[]
-    assert len(files[0])>1 and all(p.stat().st_size<=50000 for p in files[0])
+    assert len(files[0])==1 and all(p.stat().st_size<=50000 for p in files[0])
 
 
 def test_visual_guard_rejects_erased_text_and_accepts_identical_image(qapp):

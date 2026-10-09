@@ -60,8 +60,8 @@ def copy_image(image, *, hwnd=0, cancelled=None) -> None:
         QGuiApplication.clipboard().setImage(image)
 
 
-def store_parts(parts: list[ImagePart], root: Path) -> list[Path]:
-    if not parts or any(p.size > MAX_BYTES or p.size == 0 for p in parts):
+def store_parts(parts: list[ImagePart], root: Path, *, max_bytes: int | None = MAX_BYTES) -> list[Path]:
+    if not parts or any(p.size == 0 or (max_bytes is not None and p.size > max_bytes) for p in parts):
         raise ValueError("分图尚未满足每张 50 KB 的限制")
     batch = root / ('shot-' + uuid.uuid4().hex)
     batch.mkdir(parents=True, exist_ok=False)
@@ -90,8 +90,9 @@ def hdrop_payload(paths: list[Path]) -> bytes:
     return struct.pack('<IiiII', 20, 0, 0, 0, 1) + ('\0'.join(names) + '\0\0').encode('utf-16-le')
 
 
-def copy_files(paths: list[Path], *, hwnd=0, cancelled=None) -> None:
-    if not paths or any(not p.is_file() or not 0 < p.stat().st_size <= MAX_BYTES for p in paths):
+def copy_files(paths: list[Path], *, hwnd=0, cancelled=None, max_bytes: int | None = MAX_BYTES) -> None:
+    if not paths or any(not p.is_file() or p.stat().st_size <= 0 or
+                        (max_bytes is not None and p.stat().st_size > max_bytes) for p in paths):
         raise ValueError("图片文件丢失或超过 50 KB，请重新处理截图")
     if sys.platform == 'win32':
         import win32clipboard as cb

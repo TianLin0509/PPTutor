@@ -1917,6 +1917,9 @@ class MainWindow(QMainWindow):
         name = QLabel("PPT Doctor")
         name.setObjectName("gtName")
         ver = QLabel(f"v{__version__}")
+        if getattr(sys, 'frozen', False):
+            from ..editions import current_edition, LABELS
+            ver.setText(f'v{__version__} · {LABELS[current_edition()]}')
         ver.setObjectName("gtVer")
         self.gt_theme = QLabel(dict(theme.THEMES).get(self._theme, self._theme))
         self.gt_theme.setObjectName("gtTheme")
@@ -2034,7 +2037,7 @@ class MainWindow(QMainWindow):
         用 QCursor.pos 的逻辑坐标而不是 lParam 的物理坐标，避免高 DPI 缩放下错位；
         右侧按钮区不回 HTCAPTION，否则窗口按钮点不动。
         """
-        if _WIN and et == "windows_generic_MSG":
+        if _WIN and et in ("windows_generic_MSG", b"windows_generic_MSG"):
             try:
                 msg = wintypes.MSG.from_address(int(message))
             except Exception:  # noqa: BLE001
@@ -6700,6 +6703,8 @@ class MainWindow(QMainWindow):
         screenshot = getattr(self, "_screenshot_window", None)
         if screenshot is not None:
             screenshot.close()
+        from ..ocr_session import session as ocr_session
+        ocr_session.close()
         # The updater exits through ``force_quit`` instead of the tray action.
         # Keep optional watchers/version reconciliation tied to the window's
         # single shutdown path so an update can never leave background threads

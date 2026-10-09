@@ -8,12 +8,12 @@ from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QGuiApplication, QImage, QPixmap
 from PySide6.QtWidgets import (
     QDialog, QFileDialog, QFrame, QHBoxLayout, QLabel, QPushButton,
-    QScrollArea, QVBoxLayout, QWidget,
+    QScrollArea, QSpinBox, QVBoxLayout, QWidget,
 )
 
 from ..config import cache_dir, data_dir
 from .. import __version__
-from ..screenshots.encoding import CaptureCancelled, ImagePart, compress
+from ..screenshots.encoding import CaptureCancelled, ImagePart, compress, force_limit
 from ..screenshots.delivery import copy_files, copy_image, export_files, store_parts
 from .bg_task import BackgroundTask
 from .screenshot_overlay import ScreenshotOverlay
@@ -38,6 +38,7 @@ class ScreenshotWindow(QDialog):
         self._notice = ScreenshotNotice()
         self._notice.stop_requested.connect(self._stop_scroll)
         self._notice.small_requested.connect(lambda: self.process_image(self._preview_image))
+        self._notice.force_requested.connect(self.force_result)
         self._scroll = None
         self._silent = False
         self._output_root = output_root or cache_dir() / 'screenshots'
@@ -90,7 +91,7 @@ class ScreenshotWindow(QDialog):
         for button in [self.repeat_btn,self.shortcuts_btn,self.text_result_btn,self.formula_result_btn,self.record_result_btn]:tools.addWidget(button)
         tools.addStretch(1)
         root.addLayout(tools)
-        self.status = QLabel('框选后选择：✓ 普通截图、滚动截图、录制 GIF、小图模式（每张 ≤50 KB），或识别公式。')
+        self.status = QLabel('框选后选择：✓ 普通截图、滚动截图、录制 GIF、小图模式，或识别公式。')
         self.status.setWordWrap(True)
         self.status.setStyleSheet('background: #f6f8fb; color: #475467; border: 1px solid #e9edf3; border-radius: 10px; padding: 12px 14px;')
         root.addWidget(self.status)
@@ -114,6 +115,22 @@ class ScreenshotWindow(QDialog):
         self.card_layout.setContentsMargins(0, 0, 0, 0)
         scroll.setWidget(self.cards)
         root.addWidget(scroll)
+        settings = QHBoxLayout()
+        settings.addWidget(QLabel('小图配置'))
+        settings.addWidget(QLabel('最多'))
+        self.parts_limit = QSpinBox()
+        self.parts_limit.setRange(1, 16)
+        self.parts_limit.setSuffix(' 张')
+        self.parts_limit.setValue(8)
+        settings.addWidget(self.parts_limit)
+        settings.addWidget(QLabel('每张目标'))
+        self.size_limit = QSpinBox()
+        self.size_limit.setRange(2, 1000)
+        self.size_limit.setSuffix(' KB')
+        self.size_limit.setValue(50)
+        settings.addWidget(self.size_limit)
+        settings.addWidget(QLabel('先保留分辨率；强制达标时才缩小图片'), 1)
+        root.addLayout(settings)
         actions = QHBoxLayout()
         self.copy_btn = QPushButton('复制全部图片')
         self.copy_btn.setObjectName('gotoBtn')
@@ -126,8 +143,10 @@ class ScreenshotWindow(QDialog):
         self.small_btn = QPushButton('将原图转为小图')
         self.small_btn.clicked.connect(lambda: self.process_image(self._preview_image))
         actions.addWidget(self.small_btn)
+        self.force_btn = QPushButton('强制达标（可降分辨率）')
+        self.force_btn.clicked.connect(self.force_result)
+        actions.addWidget(self.force_btn)
         actions.addStretch(1)
-        actions.addWidget(QLabel('清晰优先 · 原始分辨率 · 50,000 字节 / 张'))
         root.addLayout(actions)
         hint = QLabel('复制的是 PNG / JPEG 图片文件；多图粘贴取决于目标网页支持。不支持时可保存后上传。')
         hint.setWordWrap(True)
@@ -154,6 +173,9 @@ class ScreenshotWindow(QDialog):
         self.copy_btn.setEnabled(not busy and has_result)
         self.save_btn.setEnabled(not busy and has_result)
         self.small_btn.setEnabled(not busy and not self._preview_image.isNull())
+        self.force_btn.setEnabled(not busy and bool(self._parts))
+        self.parts_limit.setEnabled(not busy)
+        self.size_limit.setEnabled(not busy)
         self.parts_scroll.setVisible(bool(self._parts))
         for button in self.cards.findChildren(QPushButton):
             button.setEnabled(not busy)
@@ -172,7 +194,7 @@ class ScreenshotWindow(QDialog):
         if self._silent:
             self._notice.label.setText(text)
 
-    def process_image(self, image: QImage, *, show_result=True):
+    def process_image(self, image: QImage, *, show_result=True, strict=False):
         if image.isNull() or self._busy:
             return False
         self._closed = False
@@ -183,6 +205,9 @@ class ScreenshotWindow(QDialog):
         serial = self._serial
         self._cancel = Event()
         cancel = self._cancel
+        previous_parts = list(self._parts)
+        max_parts, max_bytes = self.parts_limit.value(), self.size_limit.value() * 1000
+        self._result_limit = max_bytes
         self._paths = []
         self._parts = []
         self._clear_cards()
@@ -199,10 +224,15 @@ class ScreenshotWindow(QDialog):
 
         def work():
             try:
-                parts = compress(image, cancelled=cancel, progress=progress.emit)
+                parts = (previous_parts if strict and previous_parts and len(previous_parts) <= max_parts
+                         else compress(image, max_parts=max_parts, max_bytes=max_bytes,
+                                       cancelled=cancel, progress=progress.emit))
+                if strict:
+                    parts = force_limit(image, parts, max_bytes=max_bytes,
+                                        cancelled=cancel, progress=progress.emit)
                 if cancel.is_set():
                     raise CaptureCancelled()
-                paths = store_parts(parts, root)
+                paths = store_parts(parts, root, max_bytes=max_bytes if strict else None)
                 return parts, paths, ''
             except CaptureCancelled:
                 return [], [], '已取消'
@@ -228,6 +258,13 @@ class ScreenshotWindow(QDialog):
 
         self._run(work, done, 'screenshot-compress')
         return True
+
+    def force_result(self):
+        return self.process_image(self._preview_image, show_result=not self._silent, strict=True)
+
+    def _set_small_limits(self, count, kb):
+        self.parts_limit.setValue(count)
+        self.size_limit.setValue(kb)
 
     def _clear_cards(self):
         while self.card_layout.count():
@@ -273,7 +310,7 @@ class ScreenshotWindow(QDialog):
         writer = self._clipboard_writer
         if writer is copy_files:
             hwnd = int(self.winId())
-            writer = lambda paths: copy_files(paths, hwnd=hwnd, cancelled=cancel)
+            writer = lambda paths: copy_files(paths, hwnd=hwnd, cancelled=cancel, max_bytes=None)
         self._set_busy(True)
         self.status.setText('正在复制图片文件…')
 
@@ -296,9 +333,13 @@ class ScreenshotWindow(QDialog):
                 self.show()
             else:
                 sizes = ' / '.join(f'{p.stat().st_size / 1000:.2f}' for p in paths)
-                self.status.setText(f'已复制 {len(paths)} 张图片文件 · {sizes} KB · 可 Ctrl+V 尝试粘贴。')
+                limit = getattr(self, '_result_limit', 50000)
+                oversized = sum(p.stat().st_size > limit for p in paths)
+                detail = (f'{oversized} 张超过 {limit / 1000:g} KB，先尝试上传；不通过再点击强制达标。'
+                          if oversized else f'每张 ≤{limit / 1000:g} KB。')
+                self.status.setText(f'已复制 {len(paths)} 张图片文件 · {sizes} KB · {detail}')
                 if self._silent:
-                    self._notice.complete(f'已复制 {len(paths)} 张小图 · 每张 ≤50 KB · Ctrl+V 粘贴')
+                    self._notice.complete(f'已复制 {len(paths)} 张 · Ctrl+V 粘贴 · {detail}', allow_force=bool(oversized))
 
         self._run(copy, done, 'screenshot-copy')
 
@@ -417,7 +458,9 @@ class ScreenshotWindow(QDialog):
             if image.isNull():
                 continue
             initial=matching_region(saved,screen,image) if self._repeat else None
-            overlay = ScreenshotOverlay(image, geometry,initial_selection=initial)
+            overlay = ScreenshotOverlay(image, geometry,initial_selection=initial,
+                                        small_limits=(self.parts_limit.value(), self.size_limit.value()))
+            overlay.small_limits_selected.connect(self._set_small_limits)
             if initial is not None:active=overlay
             def remember(area,s=screen,im=image):
                 try:self._preferences.update(region=binding(s,im,area))

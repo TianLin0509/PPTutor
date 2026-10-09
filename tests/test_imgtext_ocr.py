@@ -229,3 +229,13 @@ def test_fetch_component_manifest_raises_when_all_sources_fail(monkeypatch):
     monkeypatch.setattr("urllib.request.urlopen", boom)
     with pytest.raises(imgtext_ocr.OcrUnavailable):
         imgtext_ocr.fetch_component_manifest()
+
+
+def test_ocr_download_uses_newer_component_and_its_own_archive_source(monkeypatch):
+    def fetch(req, timeout=0):
+        url=req.full_url
+        version='1.1.0' if 'github.com' in url else '1.0.0'
+        return io.BytesIO(json.dumps({'version':version,'files':{'a':{'hash':'x'}}}).encode())
+    monkeypatch.setattr('urllib.request.urlopen',fetch)
+    manifest=imgtext_ocr.fetch_component_manifest()
+    assert manifest['version']=='1.1.0' and 'github.com' in manifest['_base']

@@ -6,7 +6,7 @@
   独立 exe 之后，基础包可以按需下载；完整包则把同一套侧车放在安装目录内。
   副作用还挺好：识别崩了也只崩侧车，主程序照常。
 
-一次调用可以处理多张图（模型加载只付一次）。侧车不常驻，用完即退，不占内存。
+批量转换用完即退；截图连续识别复用模型，空闲 45 秒自动释放。
 """
 from __future__ import annotations
 
@@ -163,6 +163,24 @@ def recognize_one(image) -> list[dict]:
     return recognize([path]).get(path, [])
 
 
+def recognize_one_cached(image, *, cancelled=None) -> list[dict]:
+    """Screenshot OCR: reuse compatible models briefly, support old components."""
+    version = installed_version()
+    try:
+        compatible = tuple(int(p) for p in version.split('.')) >= (1, 1, 0)
+    except ValueError:
+        compatible = False
+    if not compatible:
+        return recognize_one(image)
+    cmd = command()
+    if cmd is None:
+        raise OcrUnavailable('识别组件尚未安装')
+    from .ocr_session import session
+    path = str(Path(image).resolve())
+    rows = session.recognize(cmd, [path], cancelled=cancelled)[path]
+    return [{'text': r['text'], 'box': tuple(r['box']), 'score': float(r.get('score', 1))} for r in rows]
+
+
 # ---------- 按需下载 ----------
 #: 组件清单与内容寻址块的地址。与增量更新同源、同格式，因此下面直接复用
 #: updater 里那套「逐块 sha256 校验 + 非法路径整批拒绝」的逻辑，不再写一遍。
@@ -174,7 +192,7 @@ COMPONENT_MANIFEST = "component.json"
 #: 时，下载按钮就是死的。GitHub Release 是同一个仓库的官方分发位，不需要额外凭据，
 #: 拿来做兜底最省事。两个源用的是同一份清单、同一套两层 sha256 校验，安全性一致。
 COMPONENT_FALLBACK_URL = (
-    "https://github.com/TianLin0509/PPTutor/releases/download/ocr-v1.0.0")
+    "https://github.com/TianLin0509/PPTutor/releases/download/ocr-v1.1.0")
 
 
 def component_base_urls() -> list[str]:
@@ -197,6 +215,8 @@ def fetch_component_manifest(timeout: float = 8.0) -> dict:
     import urllib.request
 
     last = None
+    best = None
+    from .updater import _ver_tuple
     for base in component_base_urls():
         try:
             req = urllib.request.Request(base + "/" + COMPONENT_MANIFEST,
@@ -205,10 +225,13 @@ def fetch_component_manifest(timeout: float = 8.0) -> dict:
                 data = _json.loads(response.read().decode("utf-8"))
             if isinstance(data, dict) and data.get("files"):
                 data["_base"] = base
-                return data
+                if best is None or _ver_tuple(data.get('version', '')) > _ver_tuple(best.get('version', '')):
+                    best = data
         except Exception as exc:      # noqa: BLE001 逐个源试，最后一个失败才抛
             last = exc
             log.info("识别组件清单取不到（%s）：%s", base, exc)
+    if best is not None:
+        return best
     raise OcrUnavailable(f"识别组件清单不可达：{last}")
 
 

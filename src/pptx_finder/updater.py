@@ -60,22 +60,24 @@ class UpdateSource:
         return self.package_url.format(version=version) if self.package_url else ""
 
 
-def update_sources(base_url: str) -> list[UpdateSource]:
+def update_sources(base_url: str, *, edition='full') -> list[UpdateSource]:
+    from .editions import manifest_name, package_suffix
+    remote_name = manifest_name(edition)
     base = (base_url or "").rstrip("/")
     out = []
     if base:
         out.append(UpdateSource(
             label="self-hosted",
-            manifest_url=f"{base}/{MANIFEST_NAME}",
+            manifest_url=f"{base}/{remote_name}",
             block_url=base + "/files/{hash}",
         ))
     out.append(UpdateSource(
         label="github-release",
-        manifest_url=f"{GITHUB_RELEASE_LATEST}/{MANIFEST_NAME}",
+        manifest_url=f"{GITHUB_RELEASE_LATEST}/{remote_name}",
         block_url=GITHUB_RELEASE_LATEST + "/{hash}",
         # GitHub 的资产是平铺的，没有 files/ 子目录；块就以 sha256 为资产名上传。
         # 落后好几版的用户需要的块可能没随最新一版发布，那时回落到整包。
-        package_url=GITHUB_RELEASE_LATEST + "/PPT-Doctor-v{version}.zip",
+        package_url=GITHUB_RELEASE_LATEST + "/PPT-Doctor-v{version}" + package_suffix(edition) + '.zip',
     ))
     return out
 
@@ -137,6 +139,9 @@ def build_manifest(
             continue
         files[rel] = {"hash": _sha256_file(p), "size": p.stat().st_size}
     manifest = {"version": str(version), "notes": notes, "files": files}
+    from .editions import MARKER, read_edition
+    if (dist_dir / MARKER).is_file():
+        manifest['edition'] = read_edition(dist_dir)
     entry = str(entry or "").strip() or _detect_entry(files)
     if entry:
         manifest["entry"] = entry
@@ -597,10 +602,16 @@ def check_for_update(
     if not local:
         return None
     best: UpdateInfo | None = None
-    for source in update_sources(base_url):
+    from .editions import current_edition
+    # The installer may switch editions while retaining an older local manifest.
+    # Its marker is authoritative; the manifest only supplies hashes/version.
+    edition = current_edition()
+    for source in update_sources(base_url, edition=edition):
         try:
             remote = fetch_manifest_from(
                 source, timeout=timeout, response_callback=response_callback)
+            if remote.get('edition', 'full') != edition:
+                raise UnsafeManifestError('更新包版本类型与当前安装不符')
             info = compare(local, remote)
         except Exception:  # noqa: BLE001 单个源不可达不该拖垮整次检查
             continue
