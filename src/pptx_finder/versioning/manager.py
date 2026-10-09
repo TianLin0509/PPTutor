@@ -17,11 +17,13 @@ from ..config import (
     get_version_vault_dir,
     get_vault_max_mb,
     set_version_vault_dir,
+    set_vault_max_mb,
+    validate_version_vault_dir,
 )
 from ..path_policy import explicit_project_output_roots, is_project_output_path
 from ..scanner import iter_ppt_files
 from ..text_tokenize import build_fts_match_exact
-from . import store, vault
+from . import capacity, store, vault
 
 SESSION_GAP_SEC = 30 * 60
 KEEP_PER_DOC = 100
@@ -246,6 +248,13 @@ class VersionManager:
         )
         self._vault_maintenance_stop = threading.Event()
         self._restore_last_error = ""
+        self._storage_data_bytes = None
+        self._storage_cache_root = ""
+        self._storage_last_error = ""
+        self._storage_check_signature = None
+        self._storage_checked_at = 0.0
+        self._storage_measured_at = 0.0
+        self._storage_data_version = None
 
     # ---------- Snapshot identity ----------
     def snapshot_now(
@@ -269,24 +278,53 @@ class VersionManager:
             return None
         try:
             with self._vault_location_lock:
+                with self._lock:
+                    self._check_storage_admission(preserve_version_ids)
                 with vault.stable_snapshot_source(path) as snapshot_source:
                     content_hash = vault.file_hash(snapshot_source)
-                    with self._lock:
+                    with self._lock, vault._VAULT_MIGRATION_LOCK:
+                        self._check_storage_admission(preserve_version_ids)
                         doc_id, base_version, content_hash = self._snapshot_identity(
                             path,
                             content_hash=content_hash,
                         )
                         sid = self._session_id_for_doc(doc_id)
-                        vid = vault.snapshot(
-                            self._conn,
-                            path,
-                            sid,
-                            doc_id=doc_id,
-                            base_version=base_version,
-                            content_hash=content_hash,
-                            source_path=snapshot_source,
-                        )
+                        with vault.track_object_growth() as growth:
+                            try:
+                                vid = vault.snapshot(
+                                    self._conn, path, sid, doc_id=doc_id,
+                                    base_version=base_version, content_hash=content_hash,
+                                    source_path=snapshot_source,
+                                )
+                            except BaseException:
+                                # A failed commit may leave recoverable orphan objects.
+                                # Never reuse the pre-write capacity estimate afterwards.
+                                self._storage_data_bytes = None
+                                raise
                         if vid:
+                            try:
+                                self._accept_snapshot_storage(
+                                    doc_id, vid, growth, preserve_version_ids,
+                                    previous_version_id=base_version['version_id'] if base_version else None,
+                                )
+                            except vault.VaultCapacityError:
+                                self._storage_data_bytes = None
+                                raise
+                            except Exception as exc:
+                                self._storage_data_bytes = None
+                                cleanup_error = ''
+                                try:
+                                    discarded = self._discard_snapshot_candidate(doc_id, vid)
+                                    if discarded.get('aborted') or discarded.get('errors'):
+                                        cleanup_error = ' 本次候选数据回收未完成；请查看版本库体检。'
+                                except Exception as cleanup_exc:
+                                    cleanup_error = f' 本次候选回收未完成：{cleanup_exc}；请检查版本库。'
+                                    logging.getLogger(__name__).exception('unaccepted snapshot cleanup failed')
+                                self._storage_last_error = (
+                                    f'版本库容量检查未完成，本次留版未确认：{exc}。'
+                                    '已有恢复点保留。' + cleanup_error
+                                )
+                                raise vault.VaultCapacityError(self._storage_last_error) from exc
                             self._enforce_quota(
                                 doc_id,
                                 preserve_version_ids=preserve_version_ids,
@@ -302,6 +340,194 @@ class VersionManager:
             except Exception:  # noqa: BLE001
                 logging.getLogger(__name__).warning("on_snapshot callback raised", exc_info=True)
         return vid
+
+    # ---------- Capacity: immediate configuration and bounded admission ----------
+    def _measure_storage(self):
+        with vault._VAULT_MIGRATION_LOCK:
+            return self._measure_storage_locked()
+
+    def _measure_storage_locked(self):
+        result = capacity.usage()
+        root = Path(result['directory'])
+        self._storage_cache_root = str(root)
+        self._storage_data_bytes = max(0, result['saved_bytes'] - capacity.db_bytes(root))
+        self._storage_measured_at = time.monotonic()
+        self._storage_data_version = self._conn.execute('PRAGMA data_version').fetchone()[0]
+        return result
+
+    def _storage_cache_stale(self):
+        return (self._storage_data_bytes is None
+                or self._storage_cache_root != str(vault._vault_dir_no_create())
+                or time.monotonic() - self._storage_measured_at >= 30
+                or self._storage_data_version != self._conn.execute('PRAGMA data_version').fetchone()[0])
+
+    def _storage_bytes(self):
+        root = vault._vault_dir_no_create()
+        if self._storage_cache_stale():
+            return self._measure_storage()['saved_bytes']
+        return self._storage_data_bytes + capacity.db_bytes(root)
+
+    def _capacity_error(self, size, limit, *, rejected=False):
+        message = (
+            f"版本库容量不足：当前 {size / 1024**3:.2f} GB，上限 {limit / 1024**3:g} GB。"
+            + ("本次新版本未保存；" if rejected else "新增留版已暂停；")
+            + "已有历史仍可恢复，请在版本管理中调整容量或存储位置。"
+        )
+        self._storage_last_error = message
+        return vault.VaultCapacityError(message)
+
+    def _check_storage_admission(self, preserve_version_ids=None):
+        limit = int(get_vault_max_mb()) * 1024**2
+        if not limit:
+            return
+        try:
+            size = self._storage_bytes()
+            signature = (self._storage_cache_root, limit)
+            if size >= limit and (self._storage_check_signature != signature
+                                  or time.monotonic() - self._storage_checked_at >= 30):
+                state = self._apply_storage_limit_locked(preserve_version_ids)
+                size = state['saved_bytes']
+            if size >= limit:
+                raise self._capacity_error(size, limit)
+        except vault.VaultCapacityError:
+            raise
+        except OSError as exc:
+            self._storage_last_error = f"无法检查版本库容量，新增留版已暂停：{exc}"
+            raise vault.VaultCapacityError(self._storage_last_error) from exc
+
+    def _accept_snapshot_storage(self, doc_id, version_id, growth, preserve_version_ids=None,
+                                 *, previous_version_id=None):
+        limit = int(get_vault_max_mb()) * 1024**2
+        if not limit:
+            self._storage_data_bytes = None
+            self._storage_last_error = ''
+            return
+        # Count new objects plus this manifest/full fallback, never source PPTX
+        # sizes: cross-document dedup makes source sizes unsuitable for quota.
+        added = growth['bytes']
+        for artifact in (vault._manifest_path(doc_id, version_id), vault.version_file(doc_id, version_id)):
+            if artifact.is_file():
+                added += artifact.stat().st_size
+        if growth['unknown'] or self._storage_cache_stale():
+            size = self._measure_storage()['saved_bytes']
+        else:
+            self._storage_data_bytes += added
+            size = self._storage_bytes()
+            if size > limit:
+                size = self._measure_storage()['saved_bytes']
+        if size <= limit:
+            self._storage_last_error = ''
+            return
+        protected = set(preserve_version_ids or ()) | {version_id}
+        if previous_version_id:
+            protected.add(previous_version_id)
+        # Try rotating eligible older history, but keep both the candidate and
+        # its predecessor until acceptance. Rejection cannot erase the last
+        # recovery point which existed before this save.
+        state = self._apply_storage_limit_locked(protected)
+        if state['saved_bytes'] <= limit:
+            self._storage_last_error = ''
+            return
+        # Reject only our unannounced new version. Do this before per-document
+        # retention, so a failed admission cannot remove an older recovery point.
+        gc = self._discard_snapshot_candidate(doc_id, version_id)
+        state = self._measure_storage()
+        error = self._capacity_error(state['saved_bytes'], limit, rejected=True)
+        if gc.get('aborted') or gc.get('errors'):
+            self._storage_last_error += ' 容量回收因版本库完整性或文件占用问题未完成，请查看库体检。'
+            error = vault.VaultCapacityError(self._storage_last_error)
+        raise error
+
+    def _discard_snapshot_candidate(self, doc_id, version_id):
+        store.delete_version(self._conn, version_id)
+        latest = store.latest_version(self._conn, doc_id)
+        store.set_latest(self._conn, doc_id, latest['version_id'] if latest else '')
+        self._conn.commit()
+        vault.delete_version_artifacts(doc_id, version_id)
+        gc = vault.collect_garbage(self._conn, dry_run=False)
+        vault.maintain_db(self._conn)
+        self._storage_data_bytes = None
+        return gc
+
+    def storage_status(self) -> dict:
+        # UI always invokes this in a background task. Location serialization
+        # keeps the scan coherent without blocking ordinary read connections.
+        with self._vault_location_lock, self._lock:
+            state = self._measure_storage()
+            limit = int(get_vault_max_mb()) * 1024**2
+            state.update(max_bytes=limit, blocked=bool(limit and state['saved_bytes'] >= limit),
+                         last_error=self._storage_last_error)
+            return state
+
+    def _apply_storage_limit_locked(self, preserve_version_ids=None):
+        with vault._VAULT_MIGRATION_LOCK:
+            return self._apply_storage_limit_serialized(preserve_version_ids)
+
+    def _apply_storage_limit_serialized(self, preserve_version_ids=None):
+        # Reclaim empty DB pages and checkpoint WAL before treating DB bytes
+        # as fixed overhead. Otherwise a large but mostly empty DB would make
+        # us delete healthy history that already fits after safe hygiene.
+        hygiene_before = vault.maintain_db(self._conn)
+        state = self._measure_storage()
+        limit = int(get_vault_max_mb()) * 1024**2
+        relevant = vault.budget_relevant_bytes()
+        # DB/WAL and retained migration material now consume capacity too.
+        fixed = max(0, state['saved_bytes'] - relevant)
+        budget = max(1, limit-fixed) if limit else 0
+        if limit and state['saved_bytes'] >= limit and hygiene_before.get('error'):
+            result = {'evicted_versions': 0, 'converged': False, 'aborted': True,
+                      'reason': 'database_maintenance_failed'}
+        else:
+            result = vault.enforce_size_budget(self._conn, max_bytes=budget,
+                                              preserve_version_ids=preserve_version_ids)
+        hygiene = vault.maintain_db(self._conn)
+        state = self._measure_storage()
+        blocked = bool(limit and state['saved_bytes'] >= limit)
+        if blocked:
+            self._capacity_error(state['saved_bytes'], limit)
+            if hygiene_before.get('error'):
+                self._storage_last_error += ' 数据库空间回收未完成：' + str(hygiene_before['error'])
+            gc = result.get('gc') or result.get('preflight') or {}
+            if result.get('aborted') or gc.get('aborted') or gc.get('errors'):
+                self._storage_last_error += ' 容量回收因版本库完整性或文件占用问题未完成，请查看库体检。'
+        else:
+            self._storage_last_error = ''
+        state.update(max_bytes=limit, blocked=blocked, last_error=self._storage_last_error,
+                     evicted_versions=result['evicted_versions'], budget=result,
+                     db_hygiene=hygiene, db_hygiene_before=hygiene_before)
+        self._storage_check_signature = (self._storage_cache_root, limit)
+        self._storage_checked_at = time.monotonic()
+        return state
+
+    def apply_storage_limit(self) -> dict:
+        """Apply a changed limit now, independently of weekly maintenance."""
+        with self._vault_location_lock, self._lock:
+            return self._apply_storage_limit_locked()
+
+    def set_storage_limit(self, max_mb: int) -> dict:
+        """Serialize config changes with captures; settings call this off UI."""
+        if int(max_mb) < 0:
+            raise ValueError('容量上限不能为负数')
+        with self._vault_location_lock, self._lock, vault._VAULT_MIGRATION_LOCK:
+            set_vault_max_mb(int(max_mb))
+            return self._apply_storage_limit_locked()
+
+    def configure_storage(self, path: str, max_mb: int, *, migrate=True, progress_cb=None) -> dict:
+        from ..config import data_dir
+        if int(max_mb) < 0:
+            raise ValueError('容量上限不能为负数')
+        raw = str(path or '').strip()
+        destination = Path(os.path.abspath(raw or str(data_dir()/'vault')))
+        error = validate_version_vault_dir(str(destination))
+        if error:
+            raise ValueError(error)
+        current = Path(self._db_path).parent if self._db_path else vault._vault_dir_no_create()
+        if os.path.normcase(str(destination)) != os.path.normcase(str(current)):
+            if migrate:
+                self.migrate_vault_dir(destination, progress_cb=progress_cb, config_value=raw)
+            else:
+                self.switch_vault_dir(destination, config_value=raw)
+        return self.set_storage_limit(max_mb)
 
     def move_path(self, src_path: str, dest_path: str) -> bool:
         """Bind a filesystem move/rename to the existing doc id when possible."""
@@ -1030,6 +1256,10 @@ class VersionManager:
                     "current file is invalid; restoring healthy version without pre-snapshot: %s",
                     path,
                 )
+            except vault.VaultCapacityError as exc:
+                self._restore_last_error = (str(exc) + ' 无法为当前文件留底，因此未覆盖当前文件；'
+                                            '可以先导出此历史版本。')
+                return False
         return vault.rebuild_to(
             owner_doc_id,
             version_id,
@@ -1328,6 +1558,7 @@ class VersionManager:
     # ---------- Watcher lifecycle ----------
     def start(self, *, watch: bool = True) -> None:
         self.scan_deleted()
+        self.apply_storage_limit()
         if watch:
             self._start_watcher()
         self._start_reconcile_loop()
@@ -1412,7 +1643,6 @@ class VersionManager:
             #   2) 版本库体积是整目录遍历（真实 3.4GB 库约 2 秒）。
             # 探测结果可能在进锁前变旧：reap 在真正删除前会逐个复核路径是否复活。
             ghost_probe = None
-            measured_bytes = None
             if heavy_due:
                 probe_conn = None
                 try:
@@ -1423,10 +1653,6 @@ class VersionManager:
                 finally:
                     if probe_conn is not None:
                         probe_conn.close()
-                try:
-                    measured_bytes = vault.budget_relevant_bytes()
-                except OSError:
-                    measured_bytes = None
 
             with self._lock:
                 if heavy_due:
@@ -1443,18 +1669,16 @@ class VersionManager:
                         # 与旧实现（mark 之后再探一次）的结论一致，且更保守。
                         ghosts=ghost_probe,
                     )
-                    # 容量上限：超了才按从老到新驱逐健康版本（分支基/隔离豁免）。
-                    budget = vault.enforce_size_budget(
-                        self._conn,
-                        max_bytes=int(get_vault_max_mb()) * 1024 * 1024,
-                        measured_bytes=measured_bytes,
-                    )
+                    # Budget includes the DB and preserved migration material;
+                    # weekly maintenance and immediate settings use one policy.
+                    budget = self._apply_storage_limit_locked()['budget']
                     # GC performs its own structural safety gate under the
                     # manager lock. Quarantined legacy full snapshots do not
                     # make unrelated live objects unsafe to collect.
                     garbage = vault.collect_garbage(self._conn, dry_run=False)
                     # 删行之后回收库文件本身：FTS 合并 + 条件 VACUUM + WAL 截断。
                     db_hygiene = vault.maintain_db(self._conn)
+                    self._storage_data_bytes = None
                 else:
                     ghosts_marked = 0
                     ghosts = {

@@ -38,6 +38,7 @@ from .ui.main_window import MainWindow
 from .ui.version_bridge import VersionBridge
 from .versioning import autostart
 from .versioning.manager import VersionManager
+from .versioning.vault import VaultCapacityError
 from .versioning.watcher import VaultWatcher, default_watch_paths
 
 WM_HOTKEY = 0x0312
@@ -151,6 +152,9 @@ def _open_version_window(owner, version_mgr, *, window_cls=None):
                 windows.remove(window)
 
     if window_cls is None:
+        prompt = getattr(owner, '_prompt_version_storage', None)
+        if callable(prompt):
+            prompt()
         from .ui.version_window import VersionWindow
         window_cls = VersionWindow
     window = window_cls(version_mgr)
@@ -304,6 +308,7 @@ class _FeatureRuntime:
         self._watcher_error = ""
         self._version_error = ""
         self._version_running = False
+        self._capacity_notice = ''
 
     def allowed_exts(self) -> tuple[str, ...]:
         return enabled_index_exts(self.document_enabled)
@@ -381,6 +386,14 @@ class _FeatureRuntime:
             return
         try:
             version_id = self._manager.snapshot_now(path)
+        except VaultCapacityError as exc:
+            message = str(exc)
+            if message != self._capacity_notice:
+                self._capacity_notice = message
+                self._version_error = message
+                self._report_runtime_error(message)
+            self._bridge.emit_content_changed(path)
+            return  # Capacity is not a transient save race: do not retry four times.
         except Exception:  # noqa: BLE001 watcher owns the bounded retry policy
             logging.getLogger(__name__).warning("version snapshot failed", exc_info=True)
             # Search freshness is independent from version retention, so still
@@ -391,6 +404,9 @@ class _FeatureRuntime:
             self._bridge.emit_content_changed(path)
             raise
         # A failed snapshot must never make the searchable index stale.
+        if version_id and self._capacity_notice:
+            self._capacity_notice = ''
+            self._version_error = ''
         if not version_id:
             self._bridge.emit_content_changed(path)
 

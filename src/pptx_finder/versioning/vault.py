@@ -11,6 +11,7 @@ import gzip
 import threading
 from collections import OrderedDict
 from contextlib import contextmanager
+from contextvars import ContextVar
 import json
 import logging
 import os
@@ -43,6 +44,7 @@ _VERIFIED_OBJECT_CAP = 4096
 _VERIFIED_OBJECT_PATHS: OrderedDict[str, None] = OrderedDict()
 _VERIFIED_LOCK = threading.Lock()
 _VAULT_MIGRATION_LOCK = threading.RLock()
+_OBJECT_GROWTH = ContextVar('vault_object_growth', default=None)
 _STABLE_COPY_RETRY_DELAYS_SEC = (0.15, 0.4, 0.9)
 _STREAM_CHUNK_BYTES = 1 << 20
 
@@ -91,6 +93,39 @@ class SnapshotSourceError(OSError):
 
 class SnapshotSourceChangedError(SnapshotSourceError):
     """The source changed while it was being copied."""
+
+
+class VaultCapacityError(SnapshotSourceError):
+    """Capacity rejected this save; existing recovery points are untouched."""
+
+
+@contextmanager
+def track_object_growth():
+    """Count only newly installed physical bytes, retaining all hash semantics."""
+    result = {'bytes': 0, 'unknown': False}
+    token = _OBJECT_GROWTH.set(result)
+    try:
+        yield result
+    finally:
+        _OBJECT_GROWTH.reset(token)
+
+
+def _object_size_before_install(path):
+    result = _OBJECT_GROWTH.get()
+    if result is None:
+        return None
+    try:
+        return path.stat().st_size
+    except FileNotFoundError:
+        return 0
+    except OSError:
+        result['unknown'] = True
+        return 0
+
+
+def _note_object_install(previous_size, size):
+    if previous_size is not None:
+        _OBJECT_GROWTH.get()['bytes'] += max(0, size - previous_size)
 
 
 class InvalidSnapshotError(SnapshotSourceError):
@@ -264,7 +299,9 @@ def _write_object_atomic(objects: Path, filename: str, data: bytes) -> None:
             out.flush()
             os.fsync(out.fileno())
         dest = objects / filename
+        previous_size = _object_size_before_install(dest)
         os.replace(tmp, dest)
+        _note_object_install(previous_size, len(data))
         tmp = ""
         _verified_mark(str(dest))
     finally:
@@ -335,7 +372,10 @@ def _install_object_stream(source, *, part_name: str = "") -> str:
         if _existing_object(objects, object_hash):
             return object_hash
         dest = objects / object_hash
+        previous_size = _object_size_before_install(dest)
+        size = os.stat(tmp).st_size
         os.replace(tmp, dest)
+        _note_object_install(previous_size, size)
         _verified_mark(str(dest))
         return object_hash
     finally:
@@ -1814,6 +1854,7 @@ def enforce_size_budget(
     conn, *, max_bytes: int,
     keep_per_active_doc: int = _SIZE_BUDGET_KEEP_PER_ACTIVE_DOC,
     measured_bytes: int | None = None,
+    preserve_version_ids: set[str] | None = None,
 ) -> dict:
     """容量上限：超出时按 ts 从老到新驱逐健康版本，随后对象级 GC。
 
@@ -1878,7 +1919,7 @@ def enforce_size_budget(
     if total > budget:
         # 豁免地板估计：全部可驱逐候选的 size 总和之外的部分永远降不下去。
         branch_bases = _branch_base_ids(conn)
-        protected = branch_bases | survivor_version_ids(conn, keep_per_active_doc)
+        protected = branch_bases | survivor_version_ids(conn, keep_per_active_doc) | set(preserve_version_ids or ())
         result["protected_versions"] = len(protected)
         claimable = 0
         for row in conn.execute(
@@ -1894,7 +1935,7 @@ def enforce_size_budget(
         # 保底线每轮重算：上一轮驱逐后某文档的「最新 N 个」会变（少于 N 个时全保）
         protected = _branch_base_ids(conn) | survivor_version_ids(
             conn, keep_per_active_doc
-        )
+        ) | set(preserve_version_ids or ())
         result["protected_versions"] = len(protected)
         over_by = total - budget
         min_progress = max(
