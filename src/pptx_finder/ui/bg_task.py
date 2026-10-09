@@ -37,6 +37,7 @@ _INTERACTIVE_LABELS = {
     "ppt-slim-open",
     "copy-page-text",
     "autostart-toggle", "version-retention-update",
+    "vault-storage-status", "vault-storage-configure", "vault-capacity-update",
 }
 _gate_cv = threading.Condition()
 _active_slots = 0

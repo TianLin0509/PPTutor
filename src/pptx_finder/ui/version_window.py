@@ -32,6 +32,7 @@ except Exception:  # noqa: BLE001
 
 from .bg_task import BackgroundTask
 from .path_helpers import ensure_pptx_suffix
+from .vault_storage_dialog import VaultStorageDialog, supports_storage, storage_summary
 
 
 def _fmt_ts(ts: float) -> str:
@@ -82,6 +83,7 @@ class VersionWindow(QWidget):
         self._version_preview_tasks: list[BackgroundTask] = []
         self._version_preview_inflight: set[str] = set()
         self._file_tasks: list[BackgroundTask] = []
+        self._storage_tasks: list[BackgroundTask] = []
         self._closing_owner = parent
         self._parent_bg_tasks = getattr(parent, "_bg_tasks", None)
         if not isinstance(self._parent_bg_tasks, list):
@@ -102,6 +104,17 @@ class VersionWindow(QWidget):
         root = QVBoxLayout(self)
         root.setContentsMargins(14, 12, 14, 12)
         root.setSpacing(10)
+
+        storage_row = QHBoxLayout()
+        self.storage_label = QLabel('正在读取版本库容量…')
+        self.storage_label.setWordWrap(True)
+        storage_row.addWidget(self.storage_label, 1)
+        self.storage_settings = QPushButton('容量与存储位置…')
+        self.storage_settings.clicked.connect(self._open_storage_settings)
+        storage_row.addWidget(self.storage_settings)
+        self.storage_label.setVisible(supports_storage(manager))
+        self.storage_settings.setVisible(supports_storage(manager))
+        root.addLayout(storage_row)
 
         # 顶：跨版本内容搜索
         top = QHBoxLayout()
@@ -183,6 +196,45 @@ class VersionWindow(QWidget):
         self._update_file_ops_state()
         self._apply_glass()
         self.schedule_reload_docs()
+        self._storage_timer = None
+        if supports_storage(manager):
+            self._storage_timer = QTimer(self)
+            self._storage_timer.setInterval(60000)
+            self._storage_timer.timeout.connect(self._refresh_storage)
+            self._refresh_storage()
+            self._storage_timer.start()
+
+    def _open_storage_settings(self):
+        VaultStorageDialog(self._mgr, self).exec()
+        self._refresh_storage()
+
+    def _refresh_storage(self):
+        if self._storage_tasks or not self._ui_alive():
+            return
+        if self._storage_timer is not None and self._storage_timer.isActive() and not self.isVisible():
+            return
+        def read():
+            try:
+                return {'ok': True, 'state': self._mgr.storage_status()}
+            except Exception as exc:
+                import logging
+                logging.getLogger(__name__).warning('version storage status unavailable', exc_info=True)
+                return {'ok': False, 'error': str(exc)}
+        task = BackgroundTask(read, 'vault-storage-status', None)
+        self._track_bg_task(task, self._storage_tasks)
+        def ready(result):
+            if not self._ui_alive():
+                return
+            if not isinstance(result, dict) or not result.get('ok'):
+                self.storage_label.setText('容量无法读取：' + str((result or {}).get('error', '任务未完成')))
+                return
+            state = result['state']
+            self.storage_label.setText(storage_summary(state))
+            self.storage_label.setToolTip(state['directory'] + '\n' + str(state.get('last_error') or ''))
+            self.storage_label.setStyleSheet('color:#b54708;' if state.get('blocked') or state.get('last_error') else '')
+        task.done.connect(ready)
+        task.finished.connect(lambda: self._forget_bg_task(task, self._storage_tasks))
+        task.start()
 
     def _apply_glass(self) -> None:
         """玻璃质感：给独立窗口套当前主题的纯色窗底（默认透明底在深色主题下显得「挫」）。
@@ -223,6 +275,8 @@ class VersionWindow(QWidget):
 
     def closeEvent(self, event):  # noqa: N802
         self._closing = True
+        if self._storage_timer is not None:
+            self._storage_timer.stop()
         self._docs_load_token += 1
         self._search_token += 1
         self._versions_load_token += 1

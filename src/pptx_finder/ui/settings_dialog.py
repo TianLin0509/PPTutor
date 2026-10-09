@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import logging
 import os
 import platform
 import re
@@ -200,6 +201,7 @@ class SettingsDialog(QDialog):
         self._retention_update_token = 0
         self._retention_update_inflight = False
         self._vault_size_inflight = False
+        self._vault_size_generation = 0
         self._closing = False
         self.setObjectName("settingsWin")
         self.setWindowTitle("设置 · PPT Doctor")
@@ -351,7 +353,7 @@ class SettingsDialog(QDialog):
             index = self.vault_max.count() - 1
         self.vault_max.setCurrentIndex(index)
         self.vault_max.setToolTip(
-            "超出后由每周维护按从老到新驱逐健康版本；隔离与分支基版本始终保留。"
+            "立即检查容量并清理可回收旧版；受保护的恢复点仍超限时暂停新增留版。"
         )
         self.vault_max.currentIndexChanged.connect(self._apply_vault_max)
         vault_max_row.addWidget(self.vault_max, 1)
@@ -616,21 +618,63 @@ class SettingsDialog(QDialog):
             self._vault_dir_result.setText("版本库正忙，请稍后重试。")
 
     def _apply_vault_max(self, _index: int) -> None:
-        # 纯配置写入；下一次每周维护按新上限执行，不打扰运行中的版本管理器
-        set_vault_max_mb(int(self.vault_max.currentData() or 0))
+        limit = int(self.vault_max.currentData() or 0)
+        from .vault_storage_dialog import supports_storage, storage_summary
+        if not supports_storage(self._mgr):
+            set_vault_max_mb(limit)
+            return
+        self._vault_limit_inflight = True
+        self._vault_size_generation += 1
+        self._sync_feature_controls()
+        self._vault_size_label.setText('正在按新上限检查容量…')
+        def apply_limit():
+            try:
+                return {'ok': True, 'state': self._mgr.set_storage_limit(limit)}
+            except Exception as exc:
+                logging.getLogger(__name__).error('vault capacity update failed', exc_info=True)
+                return {'ok': False, 'error': str(exc)}
+        task = BackgroundTask(apply_limit, 'vault-capacity-update', None)
+        self._track_diag_task(task)
+        def ready(result):
+            if not self._ui_alive():
+                return
+            if not isinstance(result, dict) or not result.get('ok'):
+                self._vault_size_label.setText('容量检查未完成：' + str((result or {}).get('error', '任务未完成')))
+            else:
+                self._vault_size_label.setText(storage_summary(result['state']))
+        def finished():
+            self._forget_diag_task(task)
+            self._vault_limit_inflight = False
+            if self._ui_alive():
+                self._sync_feature_controls()
+        task.done.connect(ready)
+        task.finished.connect(finished)
+        task.start()
 
     def _refresh_vault_size(self) -> None:
         if self._vault_size_inflight:
             return
         self._vault_size_inflight = True
-        task = BackgroundTask(_vault_size_bytes_off_ui, "vault-size-measure", None)
+        from .vault_storage_dialog import supports_storage
+        token = self._vault_size_generation
+        def read_size():
+            if supports_storage(self._mgr):
+                return self._mgr.storage_status()
+            return _vault_size_bytes_off_ui()
+        task = BackgroundTask(read_size, "vault-size-measure", None)
         self._track_diag_task(task)
-        task.done.connect(self._on_vault_size_ready)
+        task.done.connect(lambda result: self._on_vault_size_ready(result, token))
         task.finished.connect(lambda task=task: self._finish_vault_size(task))
         task.start()
 
-    def _on_vault_size_ready(self, result: object) -> None:
+    def _on_vault_size_ready(self, result: object, token=None) -> None:
+        if token is not None and token != self._vault_size_generation:
+            return
         if not self._ui_alive() or not _qt_is_valid(getattr(self, "_vault_size_label", None)):
+            return
+        if isinstance(result, dict):
+            from .vault_storage_dialog import storage_summary
+            self._vault_size_label.setText(storage_summary(result))
             return
         if not isinstance(result, int):
             self._vault_size_label.setText("当前版本库占用：暂不可用")
@@ -742,6 +786,12 @@ class SettingsDialog(QDialog):
             pass
 
     def _toggle_feature(self, key: str, enabled: bool) -> None:
+        if key == 'version_management' and enabled:
+            from .vault_storage_dialog import VaultStorageDialog, supports_storage
+            if supports_storage(self._mgr):
+                if VaultStorageDialog(self._mgr, self).exec() != QDialog.Accepted:
+                    self.apply_runtime_feature_state(key, False)
+                    return
         setters = {
             "version_management": set_version_management_enabled,
             "document_search": set_document_search_enabled,
@@ -760,7 +810,7 @@ class SettingsDialog(QDialog):
                 version_on and not self._retention_update_inflight
             )
         if hasattr(self, "vault_max"):
-            self.vault_max.setEnabled(version_on)
+            self.vault_max.setEnabled(version_on and not getattr(self, '_vault_limit_inflight', False))
         if hasattr(self, "stat") and not version_on:
             self.stat.setText("版本管理已关闭；已有历史数据不会删除。")
 

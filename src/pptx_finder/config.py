@@ -538,6 +538,14 @@ def set_vault_max_mb(limit: int) -> None:
     update_ui_settings(vault_max_mb=max(0, int(limit)))
 
 
+def get_vault_storage_confirmed() -> bool:
+    return load_ui_settings().get('vault_storage_setup_version') == 1
+
+
+def set_vault_storage_confirmed() -> None:
+    update_ui_settings(vault_storage_setup_version=1)
+
+
 def get_hotkey() -> str:
     """当前全局唤起热键：用户覆盖值优先，否则默认 GLOBAL_HOTKEY。"""
     v = load_ui_settings().get("hotkey")

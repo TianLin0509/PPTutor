@@ -2111,6 +2111,17 @@ class MainWindow(QMainWindow):
                 return key
         return ""
 
+    def _prompt_version_storage(self) -> None:
+        from ..config import get_vault_storage_confirmed
+        from .vault_storage_dialog import VaultStorageDialog, supports_storage
+        manager = getattr(self, '_version_mgr', None)
+        if (getattr(self, '_version_storage_prompted', False)
+                or get_vault_storage_confirmed() or not supports_storage(manager)):
+            return
+        self._version_storage_prompted = True
+        # Cancelling the setup must never hide the user's existing history.
+        VaultStorageDialog(manager, self).exec()
+
     def _ensure_version_page(self) -> bool:
         """版本页懒加载：首次进入才构造嵌入的 VersionWindow（parent=主窗，随主窗关闭）。"""
         if self._version_page_win is not None:
@@ -2118,6 +2129,7 @@ class MainWindow(QMainWindow):
         mgr = getattr(self, "_version_mgr", None)
         if mgr is None:
             return False
+        self._prompt_version_storage()
         from .version_window import VersionWindow
         win = VersionWindow(mgr, self, embedded=True)
         self._version_page_lay.addWidget(win)
@@ -6683,8 +6695,24 @@ class MainWindow(QMainWindow):
         helper 的 Wait-Process 才会返回、继续替换。
         """
         self._to_tray_on_close = False
+        self._storage_force_quit = True
         self.close()
-        QApplication.quit()
+        if not getattr(self, '_storage_quit_pending', False):
+            QApplication.quit()
+
+    def _storage_transaction_pending(self) -> bool:
+        return any(getattr(task, '_label', '') in {
+            'vault-storage-configure', 'vault-capacity-update'
+        } for task in self._bg_tasks)
+
+    def _finish_storage_quit(self) -> None:
+        if self._storage_transaction_pending():
+            QTimer.singleShot(100, self._finish_storage_quit)
+            return
+        self._storage_quit_pending = False
+        self.close()
+        if getattr(self, '_storage_force_quit', False):
+            QApplication.quit()
 
     def closeEvent(self, e):  # noqa: N802
         # 关到托盘也要存：那是最常见的「关窗」动作，不存的话下次从托盘唤起又变回默认尺寸。
@@ -6692,6 +6720,13 @@ class MainWindow(QMainWindow):
         if self._to_tray_on_close:
             e.ignore()
             self.hide()
+            return
+        if self._storage_transaction_pending():
+            e.ignore()
+            self.statusBar().showMessage('正在安全完成版本库设置，完成后自动退出…')
+            if not getattr(self, '_storage_quit_pending', False):
+                self._storage_quit_pending = True
+                QTimer.singleShot(100, self._finish_storage_quit)
             return
         self._shutdown()
         e.accept()

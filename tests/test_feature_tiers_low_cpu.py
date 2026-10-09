@@ -39,6 +39,12 @@ def test_advanced_features_default_off_and_basic_exts(monkeypatch, tmp_path):
 
 def test_settings_feature_toggles_persist_and_notify(monkeypatch, qtbot, tmp_path):
     monkeypatch.setenv("PPTX_FINDER_DATA_DIR", str(tmp_path / "cfg"))
+    from PySide6.QtWidgets import QDialog
+    from pptx_finder.ui import vault_storage_dialog
+    class AcceptedStorageChoice:
+        def __init__(self, *_args): pass
+        def exec(self): return QDialog.Accepted
+    monkeypatch.setattr(vault_storage_dialog, 'VaultStorageDialog', AcceptedStorageChoice)
     manager = VersionManager()
     calls = []
     dlg = SettingsDialog(
