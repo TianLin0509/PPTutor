@@ -3,14 +3,15 @@ from pathlib import Path
 import logging
 
 from PySide6.QtCore import QSize, Qt
-from PySide6.QtGui import QIcon
+from PySide6.QtGui import QIcon, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
     QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMessageBox, QPushButton, QVBoxLayout, QWidget,
+    QMenu, QPushButton, QVBoxLayout, QWidget,
 )
 
 from ..materials import MaterialLibrary
+from . import owner_actions
 from .bg_task import BackgroundTask
 
 log = logging.getLogger(__name__)
@@ -48,6 +49,9 @@ class MaterialWindow(QWidget):
         self.capture_btn = QPushButton("从剪贴板收藏")
         self.capture_btn.setObjectName("primary")
         self.capture_btn.clicked.connect(self._capture)
+        # 填好名称或分类直接回车 = 收藏
+        self.name_edit.returnPressed.connect(self._capture)
+        self.category_edit.returnPressed.connect(self._capture)
         capture.addWidget(self.name_edit, 2)
         capture.addWidget(self.category_edit, 2)
         capture.addWidget(self.capture_btn)
@@ -74,6 +78,17 @@ class MaterialWindow(QWidget):
         self.list_widget.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.list_widget.itemSelectionChanged.connect(self._sync)
         self.list_widget.itemDoubleClicked.connect(lambda _: self._copy())
+        # 右键菜单 + 常规快捷键：Ctrl+C 复制、Delete 移出、F2 改名（和资源管理器一致）
+        self.list_widget.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.list_widget.customContextMenuRequested.connect(self._context_menu)
+        self._shortcuts = []
+        for keys, slot in ((QKeySequence(QKeySequence.Copy), self._copy),
+                           (QKeySequence(QKeySequence.Delete), self._delete),
+                           (QKeySequence("F2"), self._edit)):
+            sc = QShortcut(keys, self.list_widget)
+            sc.setContext(Qt.WidgetShortcut)
+            sc.activated.connect(slot)
+            self._shortcuts.append(sc)
         root.addWidget(self.list_widget, 1)
         row = QHBoxLayout()
         self.copy_btn = QPushButton("复制素材")
@@ -99,6 +114,10 @@ class MaterialWindow(QWidget):
         self.status.setWordWrap(True)
         self.status.setTextFormat(Qt.PlainText)
         root.addWidget(self.status)
+        self.open_export_btn = QPushButton("打开导出所在文件夹")
+        self.open_export_btn.clicked.connect(self._open_export_folder)
+        self.open_export_btn.hide()
+        root.addWidget(self.open_export_btn, 0, Qt.AlignLeft)
         self._run(self.library.list, self._loaded, "读取素材库")
 
     def _selected(self):
@@ -208,6 +227,8 @@ class MaterialWindow(QWidget):
         layout.addRow("名称", name)
         layout.addRow("分类", category)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("保存")
+        buttons.button(QDialogButtonBox.Cancel).setText("取消")
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
         layout.addRow(buttons)
@@ -218,7 +239,10 @@ class MaterialWindow(QWidget):
 
     def _delete(self):
         ids = self._selected()
-        if ids and QMessageBox.question(self, "移出素材库", f"将选中的 {len(ids)} 个素材移出素材库？") == QMessageBox.Yes:
+        if self._busy:
+            return
+        if ids and owner_actions.ask(self, "移出素材库", f"将选中的 {len(ids)} 个素材移出素材库？",
+                                     "移出", "取消"):
             self._run(lambda: self.library.delete(ids),
                       lambda _: self._refresh_after("已移出素材库；文件保留在素材库的 .trash 目录。"), "移出素材")
 
@@ -236,9 +260,36 @@ class MaterialWindow(QWidget):
         if path:
             if not path.lower().endswith(".pptx"):
                 path += ".pptx"
-            self._run(lambda: self.library.export_pack(ids, Path(path)),
-                      lambda _: self.status.setText(f"已导出 {len(ids)} 个素材：{path}\n同事可直接用 PowerPoint 打开，或导入素材库。"),
-                      "导出素材包")
+            def exported(_):
+                self.status.setText(f"已导出 {len(ids)} 个素材：{path}\n同事可直接用 PowerPoint 打开，或导入素材库。")
+                self._exported_path = path
+                self.open_export_btn.show()
+
+            self._run(lambda: self.library.export_pack(ids, Path(path)), exported, "导出素材包")
+
+    def _context_menu(self, pos):
+        item = self.list_widget.itemAt(pos)
+        if item is None or self._busy:
+            return
+        if not item.isSelected():
+            self.list_widget.clearSelection()
+            item.setSelected(True)
+        n = len(self._selected())
+        menu = QMenu(self)
+        act = menu.addAction("复制素材（回 PPT 粘贴）\tCtrl+C", self._copy)
+        act.setEnabled(n == 1)
+        act = menu.addAction("编辑名称 / 分类\tF2", self._edit)
+        act.setEnabled(n == 1)
+        menu.addAction("导出选中素材…", self._export)
+        menu.addSeparator()
+        menu.addAction("移出素材库\tDelete", self._delete)
+        self._last_menu = menu
+        owner_actions.popup(menu, self.list_widget.viewport().mapToGlobal(pos))
+
+    def _open_export_folder(self):
+        path = getattr(self, "_exported_path", "")
+        if path:
+            owner_actions.open_folder(self, path)
 
     def closeEvent(self, event):
         if self._tasks:

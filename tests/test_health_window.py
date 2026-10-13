@@ -80,7 +80,7 @@ def test_health_window_recycle_recycles_redundant(qtbot, monkeypatch):
         return {"ok": True, "recycled": len(paths), "failed": [], "freed_bytes": 2000}
 
     # 自动确认 + 吞掉结果弹窗
-    monkeypatch.setattr(hw.QMessageBox, "question", lambda *a, **k: hw.QMessageBox.Yes)
+    monkeypatch.setattr(hw.owner_actions, "ask", lambda *a, **k: True)
     monkeypatch.setattr(hw.QMessageBox, "information", lambda *a, **k: None)
 
     scans = [_report_with_dups(), _report_clean()]   # 回收后第二次扫描返回干净
@@ -112,7 +112,7 @@ def test_health_window_notifies_parent_after_recycle(qtbot, monkeypatch):
             "freed_bytes": 2000,
         }
 
-    monkeypatch.setattr(hw.QMessageBox, "question", lambda *a, **k: hw.QMessageBox.Yes)
+    monkeypatch.setattr(hw.owner_actions, "ask", lambda *a, **k: True)
     monkeypatch.setattr(hw.QMessageBox, "information", lambda *a, **k: None)
 
     scans = [_report_with_dups(), _report_clean()]
@@ -147,9 +147,9 @@ def test_recycle_all_collects_all_groups_beyond_show_limit(qtbot, monkeypatch):
 
     def _yes(_w, _t, msg, *a, **k):
         asked.append(msg)
-        return hw.QMessageBox.Yes
+        return True
 
-    monkeypatch.setattr(hw.QMessageBox, "question", _yes)
+    monkeypatch.setattr(hw.owner_actions, "ask", _yes)
     monkeypatch.setattr(hw.QMessageBox, "information", lambda *a, **k: None)
 
     win = hw.HealthWindow({"win": "#101010", "acc": "#0A84FF"}, lambda: rep, recycle)
@@ -176,7 +176,7 @@ def test_recycle_progress_signal_updates_bar(qtbot, monkeypatch):
         return {"ok": True, "recycled": len(paths), "recycled_paths": list(paths),
                 "failed": [], "freed_bytes": 100 * len(paths)}
 
-    monkeypatch.setattr(hw.QMessageBox, "question", lambda *a, **k: hw.QMessageBox.Yes)
+    monkeypatch.setattr(hw.owner_actions, "ask", lambda *a, **k: True)
     monkeypatch.setattr(hw.QMessageBox, "information", lambda *a, **k: None)
 
     win = hw.HealthWindow({"win": "#101010", "acc": "#0A84FF"}, lambda: rep, recycle)

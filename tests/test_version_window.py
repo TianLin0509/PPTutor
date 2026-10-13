@@ -2075,9 +2075,9 @@ def test_version_window_restore_runs_in_background(qtbot, monkeypatch):
     monkeypatch.setattr(version_window_mod, "BackgroundTask", FakeTask, raising=False)
     monkeypatch.setattr(version_window_mod.QMessageBox, "information", lambda *args: infos.append(args))
     monkeypatch.setattr(
-        version_window_mod.QMessageBox,
-        "question",
-        lambda *args: questions.append(args) or version_window_mod.QMessageBox.Yes,
+        version_window_mod.owner_actions,
+        "ask",
+        lambda *args, **kwargs: questions.append(args) or True,
     )
     monkeypatch.setattr(version_window_mod.os.path, "exists", lambda _path: True)
     mgr = FakeVersionManager()
@@ -2136,7 +2136,7 @@ def test_version_window_restore_does_not_probe_path_on_ui_thread(qtbot, monkeypa
             tasks.append(self)
 
     monkeypatch.setattr(version_window_mod, "BackgroundTask", FakeTask, raising=False)
-    monkeypatch.setattr(version_window_mod.QMessageBox, "question", lambda *args: version_window_mod.QMessageBox.Yes)
+    monkeypatch.setattr(version_window_mod.owner_actions, "ask", lambda *args, **kwargs: True)
     monkeypatch.setattr(version_window_mod.os.path, "exists", lambda path: exists_calls.append(path) or True)
     mgr = FakeVersionManager()
     win = VersionWindow(mgr)
@@ -2168,9 +2168,9 @@ def test_version_window_restore_skips_confirm_when_file_op_active(qtbot, monkeyp
     win.ver_list.setCurrentRow(0)
     win._active_file_op = True
     monkeypatch.setattr(
-        version_window_mod.QMessageBox,
-        "question",
-        lambda *args: confirms.append(args) or version_window_mod.QMessageBox.Yes,
+        version_window_mod.owner_actions,
+        "ask",
+        lambda *args, **kwargs: confirms.append(args) or True,
     )
 
     win._restore()
