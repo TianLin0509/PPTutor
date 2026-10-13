@@ -1943,6 +1943,11 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+Down"), self, activated=lambda: self._step_hit(1))
         QShortcut(QKeySequence("Ctrl+Up"), self, activated=lambda: self._step_hit(-1))
         QShortcut(QKeySequence("Ctrl+L"), self, activated=self._focus_search)
+        # 和资源管理器一致：选中结果按 Ctrl+C 复制文件本体（可直接粘贴到邮件/聊天），Ctrl+Shift+C 复制路径
+        copy_file = QShortcut(QKeySequence.Copy, self.result_list, activated=self._act_copy_clipboard)
+        copy_file.setContext(Qt.WidgetWithChildrenShortcut)
+        copy_path = QShortcut(QKeySequence("Ctrl+Shift+C"), self.result_list, activated=self._act_copy_path)
+        copy_path.setContext(Qt.WidgetWithChildrenShortcut)
 
     def _focus_search(self) -> None:
         self.focus_search()
@@ -1982,6 +1987,7 @@ class MainWindow(QMainWindow):
         pr.setSpacing(8)
         self.path_label = QLabel("← 选中左侧结果查看预览")
         self.path_label.setObjectName("pathLabel")
+        self.path_label.setTextFormat(Qt.PlainText)  # 文件名里的 & < > 原样显示
         self.path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.path_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         pr.addWidget(self.path_label, 1)
@@ -2414,7 +2420,7 @@ class MainWindow(QMainWindow):
             return
         # 文件名作标题——一眼先看到「哪份 PPT」；所在文件夹放到下方元信息行
         d, f = os.path.split(r.path)
-        self.path_label.setText(html.escape(f))
+        self.path_label.setText(f)
         self.path_label.setToolTip(r.path)
         self.copy_path_btn.show()
         self.copy_text_btn.show()
@@ -3381,6 +3387,11 @@ class MainWindow(QMainWindow):
             b.clicked.connect(lambda _=False, k=key: self._apply_suggestion(k))
             v.addWidget(b, 0, Qt.AlignCenter)
             self._sugg_btns[key] = b
+        self._clear_facet_btn = QPushButton("清除全部筛选")
+        self._clear_facet_btn.setObjectName("suggBtn")
+        self._clear_facet_btn.clicked.connect(lambda: self.facet_panel._clear_all())
+        self._clear_facet_btn.hide()
+        v.addWidget(self._clear_facet_btn, 0, Qt.AlignCenter)
         self._diagnose_btn = QPushButton("查看健康诊断")
         self._diagnose_btn.setObjectName("suggBtn")
         self._diagnose_btn.setToolTip("查看索引库、扫描范围、数据目录和 PowerPoint 状态")
@@ -3517,6 +3528,7 @@ class MainWindow(QMainWindow):
         for key, btn in self._sugg_btns.items():
             btn.setVisible(key in sugg)
         self._sugg_btns["query"].hide()
+        self._clear_facet_btn.hide()
         self.empty_hint.show()
         self._set_empty_query_suggestion_async(query)
 
@@ -3534,6 +3546,7 @@ class MainWindow(QMainWindow):
         self._empty_query_suggestion = ""
         for btn in self._sugg_btns.values():
             btn.hide()
+        self._clear_facet_btn.hide()
         self.empty_hint.show()
 
     def _hide_empty_hint(self, *, invalidate_status: bool = True) -> None:
@@ -3738,6 +3751,8 @@ class MainWindow(QMainWindow):
             lay.addWidget(note)
         lst = QListWidget()
         lst.setObjectName("unreadableDirsList")
+        lst.setToolTip("双击打开该文件夹")
+        lst.itemDoubleClicked.connect(lambda it: self._open_folder_in_explorer(it.text()))
         lst.addItems(paths)
         lay.addWidget(lst, 1)
         btns = QHBoxLayout()
@@ -3821,6 +3836,10 @@ class MainWindow(QMainWindow):
     def _locate_health_item(self, path: str, name: str) -> None:
         """体检条目点击定位：切搜索页 + 仅文件名模式 + 按去扩展名的文件名搜索
         （走正常搜索链，结果首条自动选中即预览）。健康页 embedded 时由 HealthWindow 鸭子类型回调。"""
+        if path:
+            # 重复组里全是同名文件：必须按完整路径选中，按文件名搜默认第一条会定位到别的副本
+            self.preview_path_in_search(path)
+            return
         base = os.path.splitext((name or os.path.basename(path or "")).strip())[0].strip()
         if not base:
             return
@@ -4471,6 +4490,7 @@ class MainWindow(QMainWindow):
         self._set_empty_index_status_async()
         for btn in self._sugg_btns.values():
             btn.hide()
+        self._clear_facet_btn.show()
         self.empty_hint.show()
 
     def _refresh_facets(self) -> None:
@@ -4929,8 +4949,14 @@ class MainWindow(QMainWindow):
             return
         dest = ensure_pptx_suffix(dest)
         self._toast("正在导出...")
-        self._run_bg(lambda: self._version_mgr.export(path, version_id, dest),
-                     lambda ok: self._toast("已导出" if ok else "导出失败"), "export")
+        def _after(ok, dest=dest):
+            if ok:
+                self._toast_with_action(f"已导出到 {os.path.basename(dest)}", "打开所在文件夹",
+                                        lambda: self._open_folder_path(dest))
+            else:
+                self._toast("导出失败")
+
+        self._run_bg(lambda: self._version_mgr.export(path, version_id, dest), _after, "export")
 
     def _act_goto_page(self, page_no: int) -> None:
         if self._preview_interaction_blocked():
@@ -5660,6 +5686,20 @@ class MainWindow(QMainWindow):
         self._do_search()
         self._switch_page("search")
 
+    def _open_folder_in_explorer(self, folder: str) -> None:
+        """打开文件夹本身（不是「文件所在文件夹」），后台执行，网络盘不卡界面。"""
+        def _after(ok):
+            if not ok:
+                self._toast("打不开这个文件夹（可能没有权限或已不存在）")
+
+        def _open():
+            if not os.path.isdir(folder):
+                return False
+            os.startfile(folder)  # type: ignore[attr-defined]
+            return True
+
+        self._run_bg(_open, _after, "open")
+
     def _open_folder_path(self, path: str) -> None:
         def _after(ok):
             if ok is None:
@@ -5791,6 +5831,13 @@ class MainWindow(QMainWindow):
 
         self._run_bg(lambda: os.path.exists(path), _after, "copy-exists")
 
+    def _copy_file_with_toast(self, path: str) -> None:
+        # 存在性检查放后台（网络盘上 exists 可能卡住界面），与「复制到剪贴板」按钮同一条路
+        self._clipboard_copy_token += 1
+        self._check_clipboard_file_exists_bg(path, self._clipboard_copy_token)
+        self._set_file_clipboard(path)
+        self._toast("已复制文件，可直接粘贴到邮件或聊天窗口")
+
     def _set_file_clipboard(self, path: str) -> None:
         QApplication.clipboard().setMimeData(_file_mime_for_path(path))
 
@@ -5918,7 +5965,9 @@ class MainWindow(QMainWindow):
             menu.addAction("📜 在版本管理中查看版本历史", lambda _checked=False, r=r:
                            self._open_version_window_for(path=r.path))
         menu.addSeparator()
-        menu.addAction("复制完整路径", lambda _checked=False, r=r, gen=render_gen:
+        menu.addAction("复制文件（可粘贴到邮件 / 聊天）\tCtrl+C", lambda _checked=False, r=r, gen=render_gen:
+                       self._run_context_menu_action(gen, lambda: self._copy_file_with_toast(r.path)))
+        menu.addAction("复制完整路径\tCtrl+Shift+C", lambda _checked=False, r=r, gen=render_gen:
                        self._run_context_menu_action(
                            gen,
                            lambda: self._copy_text_with_toast(r.path, "已复制完整路径")))
@@ -5948,6 +5997,20 @@ class MainWindow(QMainWindow):
         x = (self.width() - lbl.width()) // 2
         y = self.height() - lbl.height() - 64  # 鎮簬鐘舵€佹爮涓婃柟
         lbl.move(max(8, x), max(8, y))
+
+    def _toast_with_action(self, msg: str, action_text: str, action) -> None:
+        """带一个可点动作的提示（如「打开所在文件夹」）：停留更久，点了就执行。"""
+        from PySide6.QtWidgets import QMessageBox
+        box = QMessageBox(self)
+        box.setWindowTitle("PPT Doctor")
+        box.setIcon(QMessageBox.Information)
+        box.setText(msg)
+        act = box.addButton(action_text, QMessageBox.AcceptRole)
+        box.addButton("知道了", QMessageBox.RejectRole)
+        box.setDefaultButton(act)
+        box.setWindowModality(Qt.NonModal)
+        box.buttonClicked.connect(lambda b: action() if b is act else None)
+        box.show()
 
     def _toast(self, msg: str) -> None:
         self._toast_hide_token += 1
