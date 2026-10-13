@@ -44,6 +44,9 @@ def test_failure_or_timeout_surfaces_and_reaps(server, path):
     try:
         with pytest.raises(OcrUnavailable):session.recognize(server, [path])
         assert session._process is None
+        # 恢复那一次要重新起识别进程：0.4 秒只够空闲机器，全量测试满负荷时会误报超时
+        # （2026-10-13 合并闸门实测）。超时语义已由上一行验证，这里只验证「能恢复」。
+        session.timeout = 15
         assert session.recognize(server, ['a'])['a']
     finally:session.close()
 
