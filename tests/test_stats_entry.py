@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QObject, Signal
-from PySide6.QtWidgets import QToolButton, QWidget
+from PySide6.QtWidgets import QAbstractButton, QWidget
 
 from pptx_finder import db
 from pptx_finder import stats
@@ -34,7 +34,7 @@ def test_report_entry_button_in_nav_rail(qtbot, tmp_path):
     # 报告入口统一收编到左侧导航轨（顶栏图标按钮已随 A6 工具栏瘦身移除）
     rail = win.findChild(QWidget, "navRail")
     assert rail is not None
-    btns = [b for b in rail.findChildren(QToolButton) if b.accessibleName() == "打开胶片报告"]
+    btns = [b for b in rail.findChildren(QAbstractButton) if b.accessibleName() == "打开胶片报告"]
     assert len(btns) == 1
     assert "胶片报告" in btns[0].toolTip()
     assert not btns[0].icon().isNull()

@@ -91,7 +91,7 @@ def _parse_errors(records: list[str]) -> list[str]:
 
 
 def _polished_gtname() -> QLabel:
-    """模板前段规则 QLabel#gtName { font-size:13px; font-weight:700 } 的活体探针。"""
+    """模板前段规则 QLabel#gtName { font-size:15px; font-weight:700 } 的活体探针。"""
     lab = QLabel("x")
     lab.setObjectName("gtName")
     lab.ensurePolished()
@@ -107,34 +107,19 @@ def mgr():
 
 # ---------------------------------------------------------------- 缩放幂等 / 确定性
 
-def test_scale_1_byte_safe_vs_git_head():
-    """scale=1.0 + 默认字族：除 3 条有意改的 mono 字族声明外与 HEAD 逐字节一致。
+def test_scale_1_leaves_every_font_size_untouched():
+    """scale=1.0 + 默认字族：字号缩放一个字节都不改。
 
-    有意差异（字体功能顺带补的 CJK 回退，不是缩放误伤）：
-    gtVer / kpiNum / legPc 三条的 font-family 值。任何 font-size 字节差异即失败。
+    原先拿样式表和 git HEAD 逐字节比——合并脚本测试时 HEAD 仍是旧主干，任何有意的
+    样式改动（v2.0 白色工作台）在闸门里都必挂。真正要守的是「倍率 1.0 不碰字号」，
+    所以改为：输出里每条 font-size 与模板字面值逐条相同、顺序相同。
     """
-    head = _load_head_theme()
-    allowed_rules = ("QLabel#gtVer", "QLabel#kpiNum", "QLabel#legPc")
+    template_sizes = re.findall(r"font-size:\s*([0-9.]+)px", theme._QSS.template)
+    assert template_sizes
     for name in THEME_NAMES:
-        old, new = head.build_qss(name), theme.build_qss(name, "", 1.0)
+        new = theme.build_qss(name, "", 1.0)
         assert theme.build_qss(name) == new  # 缺省参数 = 显式 1.0
-        if old == new:
-            continue
-        diff = [
-            line for line in difflib.unified_diff(
-                old.splitlines(), new.splitlines(), lineterm="")
-            if line.startswith(("+", "-")) and not line.startswith(("+++", "---"))
-        ]
-        assert diff, name
-        # diff 行只允许是那 3 条规则，且剥离 font-family 段后 '-' 组与 '+' 组逐字节相等
-        # （即这些行里唯一的变化是字族回退链，font-size 等其余声明一个字符都不许动）
-        for line in diff:
-            assert line[1:].lstrip().startswith(allowed_rules), (
-                f"{name} 出现预期外 diff 行: {line[:120]}"
-            )
-        minus = sorted(re.sub(r"font-family: [^;}]*;?", "", l[1:]) for l in diff if l.startswith("-"))
-        plus = sorted(re.sub(r"font-family: [^;}]*;?", "", l[1:]) for l in diff if l.startswith("+"))
-        assert minus == plus, f"{name} diff 行除 font-family 外还有变化: {diff}"
+        assert re.findall(r"font-size:\s*([0-9.]+)px", new) == template_sizes, name
 
 
 # 模板 13 个字号值 × 两档倍率的实测取整表（2026-08-14 实测锁定）。
@@ -192,7 +177,7 @@ def test_malicious_family_stylesheet_survives(qapp, qt_warnings, family):
     theme.apply_to_app(qapp, "atelier", family, 1.0)
     lab = _polished_gtname()
     assert not _parse_errors(qt_warnings), f"Qt 拒收样式表: {_parse_errors(qt_warnings)[:1]}"
-    assert lab.font().pixelSize() == 13 and lab.font().bold(), (
+    assert lab.font().pixelSize() == 15 and lab.font().bold(), (
         f"样式表被击穿：pixelSize={lab.font().pixelSize()} bold={lab.font().bold()}"
     )
 
@@ -254,7 +239,7 @@ qInstallMessageHandler(
 
 def probe():
     lab = QLabel("x")
-    lab.setObjectName("gtName")   # 模板规则：font-size 13px / font-weight 700
+    lab.setObjectName("gtName")   # 模板规则：font-size 15px / font-weight 700
     lab.ensurePolished()
     return lab
 

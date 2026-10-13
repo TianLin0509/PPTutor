@@ -285,7 +285,7 @@ class DashboardView(QWidget):
     # ---------- 布局 ----------
     def _build(self) -> None:
         root = QVBoxLayout(self)
-        root.setContentsMargins(2, 2, 2, 2)
+        root.setContentsMargins(24, 18, 24, 18)  # v2.0：页面贴边铺满后由概览自己留白
         root.setSpacing(14)
 
         head = QHBoxLayout()

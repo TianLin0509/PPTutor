@@ -31,7 +31,7 @@ def _win(qtbot, tmp_path):
     db.init_db(conn)
     win = MainWindow(conn=conn, render_worker=StubRender(), do_index=False)
     qtbot.addWidget(win)
-    win.resize(1200, 760)
+    win.resize(1500, 820)  # 宽于 1360：侧栏显示品牌文字
     win.show()
     qtbot.waitExposed(win)
     return win

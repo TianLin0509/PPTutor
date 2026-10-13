@@ -45,7 +45,8 @@ def test_nav_rail_exists_and_default_page_is_dashboard(qtbot, tmp_path):
 
     rail = win.findChild(QWidget, "navRail")
     assert rail is not None
-    assert rail.width() == 56
+    # v2.0 整高侧栏：宽窗口图标 + 文字，窄窗口（<1360）自动收成图标列
+    assert rail.width() in (win._RAIL_W, win._RAIL_COMPACT_W)
     assert set(win._rail_page_btns) == {"search", "dashboard", "version", "health"}
     assert win.rail_report_btn is not None
     assert win.rail_settings_btn is not None
@@ -159,3 +160,25 @@ def test_nav_rail_has_an_imgtext_entry(qtbot, tmp_path, monkeypatch):
                         lambda owner, **kw: opened.__setitem__("n", opened["n"] + 1))
     btn.click()
     assert opened["n"] == 1, "点了没反应"
+
+
+def test_rail_collapses_to_icons_on_narrow_window_and_shows_unread_dot(qtbot, tmp_path):
+    """v2.0：1920x1080@150% 只有约 1280 逻辑宽，侧栏要自动收成图标列给内容让位。"""
+    win = _win(qtbot, tmp_path)
+    win.show()
+    qtbot.waitExposed(win)
+    rail = win.findChild(QWidget, "navRail")
+    win.resize(1500, 820)
+    qtbot.waitUntil(lambda: rail.width() == win._RAIL_W, timeout=2000)
+    assert win.rail_settings_btn.text().strip() == "设置"
+    win.resize(1150, 760)
+    qtbot.waitUntil(lambda: rail.width() == win._RAIL_COMPACT_W, timeout=2000)
+    assert win.rail_settings_btn.text() == ""
+    assert win.rail_settings_btn.toolTip()  # 只剩图标时靠悬停说明
+    assert win.width() <= 1200  # 搜索页最小宽度不再把整窗顶到 1400+
+
+    win.set_settings_unread(True, "2.0.1")
+    assert win._settings_dot.isVisible()
+    assert "2.0.1" in win.rail_settings_btn.toolTip()
+    win.set_settings_unread(False)
+    assert not win._settings_dot.isVisible()
