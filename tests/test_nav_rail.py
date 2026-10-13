@@ -130,16 +130,16 @@ def test_version_rail_button_follows_feature_flag(qtbot, tmp_path):
     assert btn.isHidden()
 
 
-def test_locate_health_item_switches_to_search_filename_mode(qtbot, tmp_path):
-    """体检条目点击定位：切搜索页 + 仅文件名模式 + 去扩展名的文件名作为查询文本。"""
+def test_locate_health_item_switches_to_search_and_targets_exact_path(qtbot, tmp_path):
+    """体检条目点击定位：切搜索页，并按完整路径选中（重复组全是同名文件，按名字选会选错副本）。"""
     win = _win(qtbot, tmp_path)
 
     win._locate_health_item("/docs/昇腾 汇报.pptx", "昇腾 汇报.pptx")
 
     assert win._current_page_key() == "search"
     assert win._rail_page_btns["search"].isChecked()
-    assert win.mode.currentIndex() == 1
-    assert win.search_box.text() == "昇腾 汇报"
+    assert win.search_box.text() == "昇腾 汇报.pptx"
+    assert win._pending_select_path in (None, "/docs/昇腾 汇报.pptx")
 
 
 def test_nav_rail_has_an_imgtext_entry(qtbot, tmp_path, monkeypatch):
