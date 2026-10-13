@@ -15,14 +15,21 @@ from . import theme
 
 
 def _welcome_logo(size: int = 60) -> QPixmap:
+    """欢迎页用程序自己的吉祥物 logo（与任务栏图标一致），按 3 倍分辨率缩放，高分屏不糊。"""
+    from ..config import resource_path
+    logo = QPixmap(str(resource_path("assets", "logo.png")))
+    if not logo.isNull():
+        ratio = 3.0
+        logo = logo.scaled(round(size * ratio), round(size * ratio), Qt.KeepAspectRatio,
+                           Qt.SmoothTransformation)
+        logo.setDevicePixelRatio(ratio)
+        return logo
     pm = QPixmap(size, size)
     pm.fill(Qt.transparent)
     p = QPainter(pm)
     p.setRenderHint(QPainter.Antialiasing)
     p.setBrush(Qt.NoBrush)
-    p.setPen(QPen(QColor("#E3B572"), 2.6))
-    p.drawRoundedRect(6, 10, 48, 40, 11, 11)
-    p.setPen(QPen(QColor("#5D9BFF"), 2.6))
+    p.setPen(QPen(QColor("#2563EB"), 2.6))
     p.drawEllipse(20, 22, 18, 18)
     p.drawLine(34, 36, 46, 48)
     p.end()
@@ -63,7 +70,7 @@ class WelcomeOverlay(QWidget):
         logo.setAlignment(Qt.AlignCenter)
         cl.addWidget(logo, 0, Qt.AlignHCenter)
 
-        title = QLabel('欢迎使用 <span style="color:#E3B572">PPT Doctor</span>')
+        title = QLabel('欢迎使用 <span style="color:#2563EB">PPT Doctor</span>')
         title.setObjectName("wTitle")
         title.setTextFormat(Qt.RichText)
         title.setAlignment(Qt.AlignCenter)
