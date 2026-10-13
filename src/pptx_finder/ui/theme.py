@@ -377,7 +377,8 @@ QFrame#typeRail { background: transparent; }
 
 /* 仪表盘首屏（零搜索默认视图） */
 QWidget#dashView { background: transparent; }
-QFrame#dashCard { background: $panel; border: 1px solid $bd; border-radius: ${radius}px; }
+QFrame#dashCard, QFrame#dashCardLink { background: $panel; border: 1px solid $bd; border-radius: ${radius}px; }
+QFrame#dashCardLink:hover { border-color: rgba($hl_r,$hl_g,$hl_b,0.55); background: $sel; }
 QLabel#dashTitle { color: $ink1; font-size: 21px; font-weight: 800; background: transparent; }
 QLabel#dashSub { color: $ink3; font-size: 12.5px; background: transparent; }
 QLabel#kpiNum { color: $acc; font-size: 27px; font-weight: 800; font-family: $mono_family; background: transparent; }

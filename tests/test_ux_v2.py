@@ -76,3 +76,21 @@ def test_ctrl_c_on_results_copies_the_file(qtbot, tmp_path):
     win._block_if_file_op_active = lambda: False
     copy.activated.emit()
     qtbot.waitUntil(lambda: bool(called), timeout=2000)
+
+
+def test_dashboard_kpi_cards_are_entrances(qtbot, tmp_path):
+    from PySide6.QtCore import QPoint
+    from PySide6.QtWidgets import QFrame
+    win = _win(qtbot, tmp_path)
+    cards = [w for w in win.dashboard.findChildren(QFrame) if w.objectName() == "dashCardLink"]
+    assert len(cards) >= 5  # 4 张 KPI + 健康横条
+    for c in cards:
+        assert c.cursor().shape() == Qt.PointingHandCursor
+    qtbot.mouseClick(cards[0], Qt.LeftButton, pos=QPoint(5, 5))
+    assert win._current_page_key() == "search"
+
+
+def test_folder_label_keeps_same_named_folders_apart():
+    from pptx_finder.ui.dashboard_view import _folder_label
+    assert _folder_label(r"D:\项目A\汇报\a.pptx") == "项目A/汇报"
+    assert _folder_label(r"D:\项目B\汇报\b.pptx") == "项目B/汇报"

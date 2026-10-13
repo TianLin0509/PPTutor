@@ -186,7 +186,7 @@ class _HBars(QWidget):
         ar, ag, ab = _rgb_of(tok)
         n = len(data)
         rowh = min(rct.height() / n, 40)  # 文件夹少时不把一根条撑满整卡
-        bx = 96
+        bx = min(170, max(96, int(rct.width() * 0.32)))
         bw = rct.width() - bx - 44
         if bw <= 0:
             p.end()
@@ -196,7 +196,9 @@ class _HBars(QWidget):
             y = i * rowh + (rowh - h) / 2
             p.setPen(QColor(_ink(tok, 1)))
             p.setFont(QFont("Microsoft YaHei", 9))
-            p.drawText(QRectF(0, i * rowh, bx - 8, rowh), Qt.AlignRight | Qt.AlignVCenter, str(lab))
+            fm = p.fontMetrics()
+            p.drawText(QRectF(0, i * rowh, bx - 8, rowh), Qt.AlignRight | Qt.AlignVCenter,
+                       fm.elidedText(str(lab), Qt.ElideLeft, bx - 8))
             p.setPen(Qt.NoPen)
             p.setBrush(QColor(ar, ag, ab, 38))
             p.drawRoundedRect(QRectF(bx, y, bw, h), h / 2, h / 2)
@@ -311,9 +313,11 @@ class DashboardView(QWidget):
         self._kpi_nums: list[QLabel] = []
         self._kpi_labs: list[QLabel] = []
         self._kpi_subs: list[QLabel] = []
-        for _ in range(4):
-            card = QFrame()
-            card.setObjectName("dashCard")
+        kpi_tips = ("查看最近修改的 PPT", "打开版本管理，挑一份回到旧版本",
+                    "去搜索：任意一页里的字都能搜到", "查看最近修改的 PPT")
+        for i in range(4):
+            card = _ClickCard(lambda i=i: self._open_kpi(i))
+            card.setToolTip(kpi_tips[i])
             cl = QVBoxLayout(card)
             cl.setContentsMargins(18, 14, 18, 14)
             cl.setSpacing(2)
@@ -409,10 +413,7 @@ class DashboardView(QWidget):
 
     def _build_health_banner(self) -> QFrame:
         """库健康横条：一眼看见重复/僵尸/可回收，点击直达体检中心。"""
-        w = QFrame()
-        w.setObjectName("dashCard")
-        w.setCursor(Qt.PointingHandCursor)
-        w.mousePressEvent = lambda _e: self._open_health()  # 整条可点
+        w = _ClickCard(self._open_health)  # 整条可点
         w.setToolTip("点击打开库体检中心：重复回收 / 僵尸 / 终版诅咒 / 解析失败")
         lay = QHBoxLayout(w)
         lay.setContentsMargins(18, 12, 18, 12)
@@ -439,6 +440,20 @@ class DashboardView(QWidget):
         arrow.setStyleSheet("font-size:24px;font-weight:700;background:transparent;")
         lay.addWidget(arrow)
         return w
+
+    def _open_kpi(self, i: int) -> None:
+        """KPI 卡片是入口：文档数/本周改动 → 最近修改列表；可回退 → 版本页；页数 → 去搜索。"""
+        win = self._win
+        if i == 1:
+            if callable(getattr(win, "_version_feature_enabled", None)) and win._version_feature_enabled():
+                win._switch_page("version")
+            elif callable(getattr(win, "_toast", None)):
+                win._toast("版本管理还没开启，可在设置 → 功能里打开")
+            return
+        if callable(getattr(win, "_switch_page", None)):
+            win._switch_page("search")
+        if i == 2 and callable(getattr(win, "focus_search", None)):
+            win.focus_search()
 
     def _open_health(self) -> None:
         fn = getattr(self._win, "_open_health_center", None)
@@ -600,7 +615,7 @@ class DashboardView(QWidget):
         week_start = (now - datetime.timedelta(days=now.weekday())).date()
         recent_week = 0
         for r in rows:
-            folder = os.path.basename(os.path.dirname(r["path"])) or "根目录"
+            folder = _folder_label(r["path"])
             folder_counts[folder] = folder_counts.get(folder, 0) + 1
             try:
                 dt = datetime.datetime.fromtimestamp(r["mtime"])
@@ -640,7 +655,7 @@ class DashboardView(QWidget):
                 (f"{rollback_docs:,}" if version_available else "—", "可回退 PPT",
                  f"已留版 {protected:,} · 共 {total_versions:,} 版" if version_available else "版本数据未加载"),
                 (f"{page_count:,}", "PPT 页", "命中即定位"),
-                (f"{recent_week:,}", "本周改动", "近 7 日活跃"),
+                (f"{recent_week:,}", "本周改动", "周一至今"),
             ],
             "folders": top_folders,
             # 「新鲜度」环图：全库按最后修改时间分档（原来这里复用了文件夹分布，和下方柱图是同一份数据）
@@ -697,7 +712,7 @@ class DashboardView(QWidget):
         week_start = (now - datetime.timedelta(days=now.weekday())).date()
         recent_week = 0
         for r in rows:
-            folder = os.path.basename(os.path.dirname(r["path"])) or "根目录"
+            folder = _folder_label(r["path"])
             folder_counts[folder] = folder_counts.get(folder, 0) + 1
             try:
                 dt = datetime.datetime.fromtimestamp(r["mtime"])
@@ -719,7 +734,7 @@ class DashboardView(QWidget):
             (f"{rollback_docs:,}" if version_available else "—", "可回退 PPT",
              f"已留版 {protected:,} · 共 {total_versions:,} 版" if version_available else "版本数据未加载"),
             (f"{page_count:,}", "PPT 页", "命中即定位"),
-            (f"{recent_week:,}", "本周改动", "近 7 日活跃"),
+            (f"{recent_week:,}", "本周改动", "周一至今"),
         ]
         self._folders = top_folders
         # 主题分布：复用文件夹分布当"分布"语义（真实可得；无则占位）
@@ -821,6 +836,24 @@ class DashboardView(QWidget):
         self._render_health(getattr(self, "_health", None))
 
 
+class _ClickCard(QFrame):
+    """可点的卡片：手型光标 + 悬停浮起（QSS #dashCardLink），单击执行入口动作。"""
+
+    def __init__(self, on_click):
+        super().__init__()
+        self.setObjectName("dashCardLink")
+        self.setAttribute(Qt.WA_Hover, True)
+        self.setCursor(Qt.PointingHandCursor)
+        self._on_click = on_click
+
+    def mousePressEvent(self, e):  # noqa: N802
+        if e.button() == Qt.LeftButton:
+            self._on_click()
+            e.accept()
+            return
+        super().mousePressEvent(e)
+
+
 class _RecentRow(QFrame):
     """「最近活跃」一行：单击在搜索页预览，双击用 PowerPoint 打开，右键更多操作。"""
 
@@ -861,10 +894,23 @@ class _RecentRow(QFrame):
         menu.addAction("打开文件", lambda: win._open_file_path(self.path))
         menu.addAction("在搜索页预览", lambda: win.preview_path_in_search(self.path))
         menu.addAction("打开所在文件夹", lambda: win._open_folder_path(self.path))
+        if getattr(win, "_version_mgr", None) is not None:
+            menu.addAction("查看版本历史", lambda: win._open_version_window_for(path=self.path))
         menu.addSeparator()
+        menu.addAction("复制文件（可粘贴到邮件 / 聊天）", lambda: win._copy_file_with_toast(self.path))
         menu.addAction("复制完整路径", lambda: (QApplication.clipboard().setText(self.path),
                                             win._toast("已复制完整路径")))
         menu.exec(e.globalPos())
+
+
+def _folder_label(path: str) -> str:
+    """「上一级/文件夹」：不同位置的同名文件夹（如两个「汇报」）不再并成一根柱。"""
+    d = os.path.dirname(path)
+    name = os.path.basename(d)
+    parent = os.path.basename(os.path.dirname(d))
+    if not name:
+        return "根目录"
+    return f"{parent}/{name}" if parent else name
 
 
 def _age_buckets(conn) -> list[tuple[str, int]]:
