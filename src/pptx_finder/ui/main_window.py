@@ -1554,6 +1554,9 @@ class MainWindow(QMainWindow):
         self.detail_panel.preview_requested.connect(self._request_version_preview)
         self.detail_panel.page_requested.connect(self._act_goto_page)
         self.detail_panel.slim_requested.connect(self._open_slim_window)
+        self.detail_panel.copy_path_requested.connect(
+            lambda p: self._copy_text_with_toast(p, "已复制完整路径"))
+        self.detail_panel.open_folder_requested.connect(self._open_folder_path)
         split.setStretchFactor(0, 5)
         split.setStretchFactor(1, 6)
         split.setSizes([520, 660])
