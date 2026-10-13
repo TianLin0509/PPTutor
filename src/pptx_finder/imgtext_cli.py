@@ -47,8 +47,19 @@ def run_imgtext(argv: list[str]) -> int:
     if want_install and not imgtext_ocr.is_installed():
         _emit("识别组件未安装，开始下载…")
         try:
-            version = imgtext_ocr.install(
-                progress=lambda d, t: None, cancel=lambda: False)
+            from .netfetch import describe_progress
+            shown = {"step": -1}
+
+            def _status(st):
+                total = st.get("total") or 0
+                if "attempts" in st or not total:
+                    return
+                step = int(st.get("received", 0) * 10 / total)
+                if step != shown["step"]:
+                    shown["step"] = step
+                    _emit(describe_progress(st, "识别组件"))
+
+            version = imgtext_ocr.install(status=_status, cancel=lambda: False)
             _emit(f"识别组件安装完成: {version}")
         except Exception as exc:  # noqa: BLE001
             _emit(f"识别组件安装失败: {type(exc).__name__}: {exc}")

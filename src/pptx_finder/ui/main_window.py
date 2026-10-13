@@ -50,7 +50,7 @@ from ..config import (
 from ..models import FileResult
 from ..path_policy import explicit_project_output_roots
 from ..query_explain import explain_query, mode_label, suggestion_keys
-from . import theme
+from . import icons as _icons, theme, window_drag
 from .bg_task import BackgroundTask
 from .index_worker import IndexWorker
 from .index_activity_bar import IndexActivityBar
@@ -76,16 +76,20 @@ _log = logging.getLogger(__name__)
 
 
 def _make_icon(draw, color: str = "#8A8A8A", size: int = 18) -> QIcon:
-    pm = QPixmap(size, size)
+    # 按 3 倍分辨率画再声明缩放比：225% 缩放的屏幕上不再发虚
+    ratio = 3.0
+    pm = QPixmap(round(size * ratio), round(size * ratio))
     pm.fill(Qt.transparent)
     p = QPainter(pm)
     p.setRenderHint(QPainter.Antialiasing)
+    p.scale(ratio, ratio)
     pen = QPen(QColor(color), max(1.7, size * 0.075))
     pen.setCapStyle(Qt.RoundCap)
     p.setPen(pen)
     p.setBrush(Qt.NoBrush)
     draw(p)
     p.end()
+    pm.setDevicePixelRatio(ratio)
     return QIcon(pm)
 
 
@@ -555,6 +559,85 @@ class _TypeBar(QWidget):
         self.setToolTip(f"{self._label}：已建 {built:,} / 发现 {total:,}")
 
 
+_TYPE_BADGE_COLORS = {
+    ".pptx": ("#D24726", "P"), ".ppt": ("#D24726", "P"), ".pptm": ("#D24726", "P"),
+    ".potx": ("#D24726", "P"), ".docx": ("#2B579A", "W"), ".doc": ("#2B579A", "W"),
+    ".pdf": ("#E5252A", "PDF"), ".xlsx": ("#1D6F42", "X"), ".xls": ("#1D6F42", "X"),
+}
+_TYPE_BADGE_CACHE: dict[tuple, QPixmap] = {}
+
+
+def _type_badge_pixmap(ext: str, is_dir: bool, w: int = 30, h: int = 36) -> QPixmap:
+    """结果卡片左侧的文件类型徽标：一页折角纸 + 类型色 + 字母。
+
+    不画封面缩略图（解码预算留给右侧大图），但给每行一个稳定的视觉锚点，
+    PPT / Word / PDF 一眼可分。按 3 倍分辨率画，高分屏不糊。
+    """
+    key = ((ext or "").lower(), bool(is_dir), w, h)
+    pm = _TYPE_BADGE_CACHE.get(key)
+    if pm is not None:
+        return pm
+    ratio = 3.0
+    pm = QPixmap(round(w * ratio), round(h * ratio))
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.scale(ratio, ratio)
+    from PySide6.QtGui import QPainterPath, QFont
+    if is_dir:
+        color, text = QColor("#F2B233"), ""
+        path = QPainterPath()
+        path.moveTo(2, 9)
+        path.lineTo(2, 7)
+        path.quadTo(2, 5, 4, 5)
+        path.lineTo(11, 5)
+        path.lineTo(14, 8.5)
+        path.lineTo(w - 4, 8.5)
+        path.quadTo(w - 2, 8.5, w - 2, 10.5)
+        path.lineTo(w - 2, h - 7)
+        path.quadTo(w - 2, h - 5, w - 4, h - 5)
+        path.lineTo(4, h - 5)
+        path.quadTo(2, h - 5, 2, h - 7)
+        path.closeSubpath()
+        p.fillPath(path, color)
+    else:
+        hexcol, text = _TYPE_BADGE_COLORS.get((ext or "").lower(), ("#98A2B3", ""))
+        color = QColor(hexcol)
+        fold = 8
+        path = QPainterPath()
+        path.moveTo(4, 1)
+        path.lineTo(w - 2 - fold, 1)
+        path.lineTo(w - 2, 1 + fold)
+        path.lineTo(w - 2, h - 4)
+        path.quadTo(w - 2, h - 1, w - 5, h - 1)
+        path.lineTo(5, h - 1)
+        path.quadTo(2, h - 1, 2, h - 4)
+        path.lineTo(2, 4)
+        path.quadTo(2, 1, 5, 1)
+        path.closeSubpath()
+        light = QColor(color)
+        light.setAlpha(34)
+        p.fillPath(path, light)
+        p.setPen(QPen(color, 1.2))
+        p.drawPath(path)
+        corner = QPainterPath()
+        corner.moveTo(w - 2 - fold, 1)
+        corner.lineTo(w - 2 - fold, 1 + fold)
+        corner.lineTo(w - 2, 1 + fold)
+        p.drawPath(corner)
+        label = text or ((ext or "").lstrip(".")[:3].upper() or "?")
+        f = QFont("Segoe UI")
+        f.setBold(True)
+        f.setPixelSize(12 if len(label) == 1 else 8)
+        p.setFont(f)
+        p.setPen(color)
+        p.drawText(QRect(2, 12, w - 4, h - 14), Qt.AlignCenter, label)
+    p.end()
+    pm.setDevicePixelRatio(ratio)
+    _TYPE_BADGE_CACHE[key] = pm
+    return pm
+
+
 class ResultItem(QWidget):
     """单条结果卡片：文件名 + 命中页码胶囊 + 高亮片段 + 修改时间。
 
@@ -584,8 +667,13 @@ class ResultItem(QWidget):
             self.setToolTip("同一文件存在于这些路径：\n" + "\n".join(dup_paths))
 
         outer = QHBoxLayout(self)
-        outer.setContentsMargins(11 + (24 if is_member else 0), 9, 12, 9)  # 历史版本行左缩进，视觉归属上方组主卡
-        outer.setSpacing(0)
+        outer.setContentsMargins(12 + (24 if is_member else 0), 10, 12, 10)  # 历史版本行左缩进，视觉归属上方组主卡
+        outer.setSpacing(12)
+        badge = QLabel()
+        badge.setObjectName("typeBadge")
+        badge.setPixmap(_type_badge_pixmap(r.ext or os.path.splitext(r.path)[1], bool(r.is_dir)))
+        badge.setFixedSize(30, 36)
+        outer.addWidget(badge, 0, Qt.AlignTop)
         lay = QVBoxLayout()
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(4)
@@ -719,9 +807,7 @@ class ResultItem(QWidget):
             if len(dup_paths) > 1:
                 tm = f"{tm} · 同一文件 · {len(dup_paths)} 个位置"
             t = QLabel(tm)
-            t.setStyleSheet(
-                f"font-size:11px;color:{tok['ink4']};background:transparent;"
-                'font-family:"Consolas","Microsoft YaHei UI";')
+            t.setStyleSheet(f"font-size:11.5px;color:{tok['ink4']};background:transparent;")
             # 位置那段是省略过的，悬停给完整路径（多副本时列全部位置）
             t.setToolTip("\n".join(dup_paths) if len(dup_paths) > 1 else r.path)
             lay.addWidget(t)
@@ -811,7 +897,7 @@ class ResultItem(QWidget):
             bg, bar = t["hover"], t["bd2"]
         else:
             bg, bar = "transparent", "transparent"
-        self.setStyleSheet(f"ResultItem{{background:{bg};border-radius:{t['radius']}px;border-left:3px solid {bar};}}")
+        self.setStyleSheet(f"ResultItem{{background:{bg};border-radius:8px;border-left:3px solid {bar};}}")
 
 
 class _PopupHideFilter(QObject):
@@ -879,7 +965,7 @@ class MainWindow(QMainWindow):
             app_icon = QIcon(_asset_path("app.ico"))
         self.setWindowIcon(app_icon)
         self._restore_window_geometry()
-        self._title_h = 52  # 自绘玻璃标题栏高度（nativeEvent 拖动区 / 缩放边判定用）
+        self._title_h = 64  # 自绘顶栏高度（搜索行；空白处可按住拖动窗口）
         self.setWindowFlag(Qt.FramelessWindowHint, True)  # 无边框 → 自绘玻璃标题栏
 
         self._theme = _load_theme()
@@ -1157,6 +1243,15 @@ class MainWindow(QMainWindow):
             self._updater = UpdateController(
                 self.update_chip, update_base_url(), self.force_quit, self)
             QTimer.singleShot(4000, self._updater.start_check)
+            # 有没看过的新版本 → 侧栏「设置」挂红点；侧栏版本号可点开更新中心
+            self._updater.unread_changed.connect(self.set_settings_unread)
+            if getattr(self, "gt_ver", None) is not None:
+                self.gt_ver.setCursor(Qt.PointingHandCursor)
+                self.gt_ver.setToolTip("点击检查更新")
+                self.gt_ver.installEventFilter(self)
+            # 上次一键更新的结果（成功 / 已回滚）只提示一次
+            QTimer.singleShot(2500, lambda: self._updater is not None
+                              and self._updater.announce_last_result(self._toast))
         QTimer.singleShot(0, self._start_ui_loop_monitor)
         app = QApplication.instance()
         if app is not None:
@@ -1312,11 +1407,17 @@ class MainWindow(QMainWindow):
     def _build_ui(self) -> None:
         central = AuroraCentral(self)  # 自绘极光底（读 self._tok），objectName 为 "central"
         self._central = central
-        root = QVBoxLayout(central)
+        # v2.0 白色工作台：左侧整高侧栏（品牌 + 导航 + 工具 + 主题），右侧是顶栏与页面
+        outer = QHBoxLayout(central)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        right_col = QWidget()
+        right_col.setObjectName("mainColumn")
+        root = QVBoxLayout(right_col)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        root.addWidget(self._build_glass_title())  # 无边框窗口的自绘玻璃标题栏
+        root.addWidget(self._build_glass_title())  # 无边框窗口的自绘顶栏（搜索 + 窗口按钮）
 
         # 合一工具栏后，topBar 仅承载搜索语法提示行（hint 隐藏时高度为 0）
         top = QWidget()
@@ -1332,6 +1433,8 @@ class MainWindow(QMainWindow):
         root.addWidget(top)
 
         split = QSplitter(Qt.Horizontal)
+        split.setObjectName("mainSplit")
+        split.setHandleWidth(5)
         left = QWidget()
         left.setObjectName("listPane")
         ll = QVBoxLayout(left)
@@ -1405,6 +1508,11 @@ class MainWindow(QMainWindow):
         )
         self.case_sensitive_btn.toggled.connect(self._on_case_sensitive_changed)
         hr.addWidget(self.case_sensitive_btn, 0)
+        # 窄窗口时排序/匹配下拉可以收窄，结果计数可以省略号截断，不把整窗最小宽度顶高
+        for w in (self.sort_combo, self.sort_secondary, self.match_mode_combo):
+            w.setMinimumWidth(100)
+        self.result_count.setMinimumWidth(40)
+        self.result_count.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.list_head.hide()
         ll.addWidget(self.list_head)
         self.result_list = QListWidget()
@@ -1446,6 +1554,9 @@ class MainWindow(QMainWindow):
         self.detail_panel.preview_requested.connect(self._request_version_preview)
         self.detail_panel.page_requested.connect(self._act_goto_page)
         self.detail_panel.slim_requested.connect(self._open_slim_window)
+        self.detail_panel.copy_path_requested.connect(
+            lambda p: self._copy_text_with_toast(p, "已复制完整路径"))
+        self.detail_panel.open_folder_requested.connect(self._open_folder_path)
         split.setStretchFactor(0, 5)
         split.setStretchFactor(1, 6)
         split.setSizes([520, 660])
@@ -1474,7 +1585,7 @@ class MainWindow(QMainWindow):
             container = QWidget()
             container.setObjectName(f"page_{key}")
             cl = QVBoxLayout(container)
-            cl.setContentsMargins(0, 0, 0, 0)
+            cl.setContentsMargins(16, 10, 16, 10)
             cl.setSpacing(0)
             self._pages[key] = container
         self._version_page_lay = self._pages["version"].layout()
@@ -1486,18 +1597,12 @@ class MainWindow(QMainWindow):
         wrap = QWidget()
         wrap.setObjectName("contentWrap")
         wl = QVBoxLayout(wrap)
-        wl.setContentsMargins(16, 6, 16, 10)  # 中间内容区四周留白，不贴窗口边
+        wl.setContentsMargins(0, 0, 0, 0)  # 白色工作台：面板贴边铺满，用细分隔线区分
         wl.addWidget(self._page_stack)
+        root.addWidget(wrap, 1)
 
-        # 身体行：最左 56px 导航轨 + 页面区
-        body = QWidget()
-        body.setObjectName("bodyRow")
-        bl = QHBoxLayout(body)
-        bl.setContentsMargins(0, 0, 0, 0)
-        bl.setSpacing(0)
-        bl.addWidget(self._build_nav_rail())
-        bl.addWidget(wrap, 1)
-        root.addWidget(body, 1)
+        outer.addWidget(self._build_nav_rail())
+        outer.addWidget(right_col, 1)
 
         self.setCentralWidget(central)
 
@@ -1562,105 +1667,185 @@ class MainWindow(QMainWindow):
         self._init_spinner()
         self._install_shortcuts()
 
-    # ---------- 左侧导航轨（页面切换 + 报告/设置入口） ----------
+    # ---------- 左侧导航栏（品牌 + 页面切换 + 工具入口 + 主题） ----------
+    _RAIL_W = 188
+
     def _build_nav_rail(self) -> QWidget:
-        """56px 导航轨：顶部 logo，中部页面按钮（搜索/概览/版本/健康），底部动作（报告/设置）。"""
+        """整高侧栏：品牌在顶，四个页面（搜索/概览/版本/健康），工具（截图/转字/素材/报告/设置），主题在底。"""
         rail = QWidget()
         rail.setObjectName("navRail")
-        rail.setFixedWidth(56)
+        rail.setFixedWidth(self._RAIL_W)
         lay = QVBoxLayout(rail)
-        lay.setContentsMargins(0, 10, 0, 10)
-        lay.setSpacing(6)
-        logo = QLabel("◆")
+        lay.setContentsMargins(12, 16, 12, 12)
+        lay.setSpacing(2)
+
+        brand = QWidget()
+        brand.setObjectName("railBrand")
+        bl = QHBoxLayout(brand)
+        bl.setContentsMargins(6, 0, 0, 0)
+        bl.setSpacing(10)
+        logo = QLabel()
         logo.setObjectName("railLogo")
-        logo.setAlignment(Qt.AlignCenter)
-        lay.addWidget(logo)
-        lay.addSpacing(6)
-        self._rail_page_btns: dict[str, QToolButton] = {}
-        for key, label, tip in (("search", "搜索", "搜索"),
+        logo_pm = QPixmap(_asset_path("logo.png"))
+        if not logo_pm.isNull():
+            ratio = 3.0
+            logo_pm = logo_pm.scaled(round(34 * ratio), round(34 * ratio),
+                                     Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            logo_pm.setDevicePixelRatio(ratio)
+            logo.setPixmap(logo_pm)
+        logo.setFixedSize(34, 34)
+        bl.addWidget(logo)
+        names = QVBoxLayout()
+        names.setContentsMargins(0, 0, 0, 0)
+        names.setSpacing(0)
+        name = QLabel("PPT Doctor")
+        name.setObjectName("gtName")
+        ver = QLabel(f"v{__version__}")
+        if getattr(sys, 'frozen', False):
+            from ..editions import current_edition, LABELS
+            ver.setText(f'v{__version__} · {LABELS[current_edition()]}')
+        ver.setObjectName("gtVer")
+        self.gt_ver = ver
+        names.addWidget(name)
+        names.addWidget(ver)
+        bl.addLayout(names, 1)
+        self._rail_brand_text = (name, ver)
+        lay.addWidget(brand)
+        lay.addSpacing(18)
+
+        self._rail_page_btns: dict[str, QPushButton] = {}
+        for key, label, tip in (("search", "搜索", "搜索 PPT 内容与文件名"),
                                 ("dashboard", "概览", "库概览"),
                                 ("version", "版本", "版本管理"),
                                 ("health", "健康", "库健康体检")):
             btn = self._mk_rail_btn(label, tip)
             btn.setCheckable(True)
             btn.clicked.connect(lambda _checked=False, k=key: self._switch_page(k))
-            lay.addWidget(btn, 0, Qt.AlignHCenter)
+            lay.addWidget(btn)
             self._rail_page_btns[key] = btn
-        lay.addStretch(1)
-        # 「图片转可编辑文字」原来只在托盘右键菜单里，主窗口一个入口都没有——
-        # 连做这个功能的人自己都找不到。放进导航轨底部的动作区，与报告/设置同组。
-        self.rail_screenshot_btn = self._mk_rail_btn("截图", "框选任意区域：普通截图、滚动截图、小图模式（每张 ≤50 KB）")
+        lay.addSpacing(14)
+        sep = QFrame()
+        sep.setObjectName("railSep")
+        sep.setFixedHeight(1)
+        lay.addWidget(sep)
+        lay.addSpacing(14)
+        self.rail_screenshot_btn = self._mk_rail_btn("截图", "框选任意区域：普通截图、滚动截图、小图模式（每张 ≤50 KB）、录制 GIF")
         self.rail_screenshot_btn.setAccessibleName("截图")
         self.rail_screenshot_btn.clicked.connect(self._open_screenshot_from_rail)
-        lay.addWidget(self.rail_screenshot_btn, 0, Qt.AlignHCenter)
+        lay.addWidget(self.rail_screenshot_btn)
         self.rail_imgtext_btn = self._mk_rail_btn("转字", "图片转可编辑文字")
         self.rail_imgtext_btn.setAccessibleName("图片转可编辑文字")
         self.rail_imgtext_btn.clicked.connect(self._open_imgtext_from_rail)
-        lay.addWidget(self.rail_imgtext_btn, 0, Qt.AlignHCenter)
+        lay.addWidget(self.rail_imgtext_btn)
         self.rail_material_btn = self._mk_rail_btn("素材", "收藏形状、图标与图片，分享 PPTX 素材包")
         self.rail_material_btn.setAccessibleName("素材库")
         self.rail_material_btn.clicked.connect(self._open_materials_from_rail)
-        lay.addWidget(self.rail_material_btn, 0, Qt.AlignHCenter)
+        lay.addWidget(self.rail_material_btn)
         self.rail_report_btn = self._mk_rail_btn("报告", "我的胶片报告")
         self.rail_report_btn.setAccessibleName("打开胶片报告")
         self.rail_report_btn.clicked.connect(self._open_report_from_rail)
-        lay.addWidget(self.rail_report_btn, 0, Qt.AlignHCenter)
+        lay.addWidget(self.rail_report_btn)
         self.rail_settings_btn = self._mk_rail_btn("设置", "打开设置")
         self.rail_settings_btn.setAccessibleName("设置")
         self.rail_settings_btn.clicked.connect(self._open_settings_from_button)
-        lay.addWidget(self.rail_settings_btn, 0, Qt.AlignHCenter)
+        lay.addWidget(self.rail_settings_btn)
+        # 设置上的未读红点：有新版本、用户还没看过时亮（同一版本只自动弹一次窗）
+        self._settings_dot = QLabel(self.rail_settings_btn)
+        self._settings_dot.setObjectName("railDot")
+        self._settings_dot.setFixedSize(8, 8)
+        self._settings_dot.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self._settings_dot.hide()
+        lay.addStretch(1)
+        sep2 = QFrame()
+        sep2.setObjectName("railSep")
+        sep2.setFixedHeight(1)
+        lay.addWidget(sep2)
+        lay.addSpacing(6)
+        self.theme_btn = self._mk_rail_btn("主题", "切换界面主题")
+        self.theme_btn.setAccessibleName("主题")
+        self.theme_btn.clicked.connect(self._show_theme_menu)
+        lay.addWidget(self.theme_btn)
         cur = self._current_page_key()
         for k, btn in self._rail_page_btns.items():
             btn.setChecked(k == cur)
         self._sync_version_rail_btn()
         self._refresh_rail_icons()
+        self._nav_rail = rail
         return rail
 
-    def _mk_rail_btn(self, label: str, tip: str) -> QToolButton:
-        """导航轨 40×40 按钮：图标在上 + 9px 小字（QSS #railBtn 承担底色/checked 态）。"""
-        b = QToolButton()
+    _RAIL_COMPACT_W = 64
+    _RAIL_COMPACT_BELOW = 1360
+
+    def _set_rail_compact(self, compact: bool) -> None:
+        """侧栏两种形态：宽（图标 + 文字）/ 窄（只有图标，悬停出说明）。"""
+        rail = getattr(self, "_nav_rail", None)
+        if rail is None or getattr(self, "_rail_compact", None) == compact:
+            return
+        self._rail_compact = compact
+        rail.setFixedWidth(self._RAIL_COMPACT_W if compact else self._RAIL_W)
+        margin = 10 if compact else 12
+        rail.layout().setContentsMargins(margin, 16, margin, 12)
+        for w in getattr(self, "_rail_brand_text", ()):
+            w.setVisible(not compact)
+        for btn in getattr(self, "_rail_all_btns", ()):
+            label = btn.property("railLabel") or ""
+            btn.setText("" if compact else "  " + label)
+            btn.setProperty("compact", compact)
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+        if getattr(self, "_settings_dot", None) is not None and self._settings_dot.isVisible():
+            self.set_settings_unread(True, getattr(self, "_settings_unread_version", ""))
+
+    def _mk_rail_btn(self, label: str, tip: str) -> QPushButton:
+        """侧栏条目：图标 + 文字横排，整行可点；选中态的底色与左侧强调条由 QSS #railBtn 承担。"""
+        b = QPushButton("  " + label)  # 图标与文字之间的间距（QSS 没有 icon-spacing）
         b.setObjectName("railBtn")
-        b.setFixedSize(40, 40)
-        b.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
-        b.setText(label)
+        b.setProperty("railLabel", label)
+        self._rail_all_btns = getattr(self, "_rail_all_btns", []) + [b]
+        b.setFixedHeight(40)
         b.setToolTip(tip)
         b.setCursor(Qt.PointingHandCursor)
+        b.setIconSize(QSize(18, 18))
+        b.setFocusPolicy(Qt.TabFocus)  # 鼠标点完不留焦点框，键盘 Tab 仍可达
         return b
 
+    def set_settings_unread(self, unread: bool, version: str = "") -> None:
+        """设置入口的红点：有没看过的新版本时亮。"""
+        dot = getattr(self, "_settings_dot", None)
+        btn = getattr(self, "rail_settings_btn", None)
+        if dot is None or btn is None:
+            return
+        self._settings_unread_version = version if unread else ""
+        if unread:
+            if getattr(self, "_rail_compact", False):
+                dot.move(btn.width() - 14, 6)
+            else:
+                dot.move(btn.width() - 22, (btn.height() - dot.height()) // 2)
+            dot.show()
+            dot.raise_()
+            btn.setToolTip(f"打开设置 · 有新版本 v{version}" if version else "打开设置 · 有新版本")
+        else:
+            dot.hide()
+            btn.setToolTip("打开设置")
+
     def _refresh_rail_icons(self) -> None:
-        """rail 图标色跟随主题与 checked 态：checked 用 acc，其余 ink3（QSS 只管底色与文字色）。"""
+        """侧栏图标色跟随主题与选中态：选中用强调色，其余用次级灰。"""
         btns = getattr(self, "_rail_page_btns", None)
         if not btns:
             return
         acc = self._tok["acc"]
         ink = self._tok["ink3"]
-        for key, factory in (("search", _icon_search), ("dashboard", _icon_dash),
-                             ("version", _icon_history), ("health", _icon_health)):
+        for key, name in (("search", "search"), ("dashboard", "dashboard"),
+                          ("version", "version"), ("health", "health")):
             btn = btns.get(key)
             if btn is not None:
-                btn.setIcon(factory(acc if btn.isChecked() else ink, 16))
-                btn.setIconSize(QSize(16, 16))
-        screenshot = getattr(self, "rail_screenshot_btn", None)
-        if screenshot is not None:
-            from .screenshot_icon import screenshot_icon
-            screenshot.setIcon(screenshot_icon(ink, 16))
-            screenshot.setIconSize(QSize(16, 16))
-        imgtext = getattr(self, "rail_imgtext_btn", None)
-        if imgtext is not None:
-            imgtext.setIcon(_icon_folder(ink, 16))
-            imgtext.setIconSize(QSize(16, 16))
-        materials = getattr(self, "rail_material_btn", None)
-        if materials is not None:
-            materials.setIcon(_icon_folder(ink, 16))
-            materials.setIconSize(QSize(16, 16))
-        report = getattr(self, "rail_report_btn", None)
-        if report is not None:
-            report.setIcon(_icon_film(ink, 16))
-            report.setIconSize(QSize(16, 16))
-        settings = getattr(self, "rail_settings_btn", None)
-        if settings is not None:
-            settings.setIcon(_icon_settings(ink, 16))
-            settings.setIconSize(QSize(16, 16))
+                btn.setIcon(_icons.icon(name, acc if btn.isChecked() else ink, 18))
+        for attr, name in (("rail_screenshot_btn", "screenshot"), ("rail_imgtext_btn", "imgtext"),
+                           ("rail_material_btn", "materials"), ("rail_report_btn", "report"),
+                           ("rail_settings_btn", "settings"), ("theme_btn", "theme")):
+            btn = getattr(self, attr, None)
+            if btn is not None:
+                btn.setIcon(_icons.icon(name, ink, 18))
 
     def _open_screenshot_from_rail(self) -> None:
         from .screenshot_window import open_screenshot
@@ -1761,6 +1946,11 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+Down"), self, activated=lambda: self._step_hit(1))
         QShortcut(QKeySequence("Ctrl+Up"), self, activated=lambda: self._step_hit(-1))
         QShortcut(QKeySequence("Ctrl+L"), self, activated=self._focus_search)
+        # 和资源管理器一致：选中结果按 Ctrl+C 复制文件本体（可直接粘贴到邮件/聊天），Ctrl+Shift+C 复制路径
+        copy_file = QShortcut(QKeySequence.Copy, self.result_list, activated=self._act_copy_clipboard)
+        copy_file.setContext(Qt.WidgetWithChildrenShortcut)
+        copy_path = QShortcut(QKeySequence("Ctrl+Shift+C"), self.result_list, activated=self._act_copy_path)
+        copy_path.setContext(Qt.WidgetWithChildrenShortcut)
 
     def _focus_search(self) -> None:
         self.focus_search()
@@ -1794,37 +1984,41 @@ class MainWindow(QMainWindow):
         head = QWidget()
         head.setObjectName("previewHeadBar")
         hv = QVBoxLayout(head)
-        hv.setContentsMargins(2, 0, 2, 4)
-        hv.setSpacing(5)
+        hv.setContentsMargins(4, 2, 2, 2)
+        hv.setSpacing(4)
         pr = QHBoxLayout()
         pr.setSpacing(8)
         self.path_label = QLabel("← 选中左侧结果查看预览")
         self.path_label.setObjectName("pathLabel")
+        self.path_label.setTextFormat(Qt.PlainText)  # 文件名里的 & < > 原样显示
         self.path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.path_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         pr.addWidget(self.path_label, 1)
-        self.copy_text_btn = QPushButton("复制本页文字")
-        self.copy_text_btn.setObjectName("linkBtn")
+        self.copy_text_btn = QPushButton(" 复制本页文字")
+        self.copy_text_btn.setObjectName("headerBtn")
         self.copy_text_btn.setToolTip("复制当前预览页的文字（取自已索引内容，无需打开 PowerPoint）")
         self.copy_text_btn.clicked.connect(self._act_copy_page_text)
         self.copy_text_btn.hide()
-        self.copy_path_btn = QPushButton("复制路径")
-        self.copy_path_btn.setObjectName("linkBtn")
+        self.copy_path_btn = QPushButton(" 复制路径")
+        self.copy_path_btn.setObjectName("headerBtn")
         self.copy_path_btn.clicked.connect(self._act_copy_path)
         self.copy_path_btn.hide()
         # 头部动作收敛为一行：两枚文字链；详情/大纲/版本入口已并入下方 Tab 条
         pr.addWidget(self.copy_text_btn, 0)
         pr.addWidget(self.copy_path_btn, 0)
         hv.addLayout(pr)
+        # 元信息（大小 · 页数 · 修改时间 · 所在文件夹）紧跟文件名，Tab 之上
+        self.meta_label = QLabel("")
+        self.meta_label.setObjectName("metaLabel")
+        self.meta_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        hv.addWidget(self.meta_label)
         lay.addWidget(head)
 
         # Tab1「预览」内容体：metaLabel + 原图画布 + 命中页分段缩略图 + 命中导航 + 操作行
         body = QWidget()
         bl = QVBoxLayout(body)
         bl.setContentsMargins(0, 0, 0, 0)
-        bl.setSpacing(8)
-        self.meta_label = QLabel("")
-        self.meta_label.setObjectName("metaLabel")
-        bl.addWidget(self.meta_label)
+        bl.setSpacing(10)
 
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
@@ -1835,6 +2029,8 @@ class MainWindow(QMainWindow):
         self.image_label.setObjectName("previewImage")
         self.image_label.setAlignment(Qt.AlignCenter)
         self.scroll.setWidget(self.image_label)
+        # 预览区的点击/双击/滚轮都有含义（缩放、翻页），整块不参与按住拖窗
+        self.scroll.setProperty(window_drag.NO_DRAG_PROP, True)
         # 预览区滚轮 = 按原始页序翻页（看前几页判断是不是要找的 PPT）
         self.scroll.viewport().installEventFilter(self)
         self.image_label.installEventFilter(self)
@@ -1849,15 +2045,16 @@ class MainWindow(QMainWindow):
         bl.addWidget(thumb_wrap)
 
         nav = QHBoxLayout()
-        self.prev_btn = QPushButton("‹ 上一命中页")
+        self.prev_btn = QPushButton(" 上一命中页")
         self.prev_btn.setObjectName("navBtn")
         self.prev_btn.setToolTip("上一处命中页　(Ctrl+↑)")
         self.prev_btn.clicked.connect(lambda: self._step_hit(-1))
         self.page_label = QLabel("—")
         self.page_label.setObjectName("pageLabel")
         self.page_label.setAlignment(Qt.AlignCenter)
-        self.next_btn = QPushButton("下一命中页 ›")
+        self.next_btn = QPushButton(" 下一命中页")
         self.next_btn.setObjectName("navBtn")
+        self.next_btn.setLayoutDirection(Qt.RightToLeft)  # 箭头在文字右侧
         self.next_btn.setToolTip("下一处命中页　(Ctrl+↓)")
         self.next_btn.clicked.connect(lambda: self._step_hit(1))
         nav.addWidget(self.prev_btn)
@@ -1866,18 +2063,22 @@ class MainWindow(QMainWindow):
         bl.addLayout(nav)
 
         ops = QHBoxLayout()
-        self.goto_btn = QPushButton("打开并跳到此页")
+        self.goto_btn = QPushButton(" 打开并跳到此页")
         self.goto_btn.setObjectName("primary")
         self.goto_btn.clicked.connect(self._act_goto)
-        self.open_btn = QPushButton("打开文件")
+        self.open_btn = QPushButton(" 打开文件")
         self.open_btn.clicked.connect(self._act_open)
-        self.folder_btn = QPushButton("打开文件夹")
+        self.folder_btn = QPushButton(" 打开文件夹")
         self.folder_btn.clicked.connect(self._act_folder)
-        self.clip_btn = QPushButton("复制到剪贴板")
+        self.clip_btn = QPushButton(" 复制到剪贴板")
         self.clip_btn.setToolTip("复制文件到剪贴板，可直接粘贴到邮件 / 聊天 / 资源管理器")
         self.clip_btn.clicked.connect(self._act_copy_clipboard)
         for b in (self.goto_btn, self.open_btn, self.folder_btn, self.clip_btn):
             b.setMinimumHeight(38)
+            # 窄窗口时允许按钮收窄（否则四个按钮的文字宽度会把整窗最小宽度顶到 1400+）
+            b.setMinimumWidth(64)
+            b.setIconSize(QSize(16, 16))
+            b.setCursor(Qt.PointingHandCursor)
             ops.addWidget(b)
         bl.addLayout(ops)
         # 预览卡 = 头部 + 四 Tab（预览/大纲/版本/详情）；详情数据管线沿用 _update_detail
@@ -1910,32 +2111,13 @@ class MainWindow(QMainWindow):
         tb.setObjectName("glassTitle")
         tb.setFixedHeight(self._title_h)
         lay = QHBoxLayout(tb)
-        lay.setContentsMargins(16, 0, 6, 0)
-        lay.setSpacing(9)
-        dot = QLabel("◆")
-        dot.setObjectName("gtDot")
-        name = QLabel("PPT Doctor")
-        name.setObjectName("gtName")
-        ver = QLabel(f"v{__version__}")
-        if getattr(sys, 'frozen', False):
-            from ..editions import current_edition, LABELS
-            ver.setText(f'v{__version__} · {LABELS[current_edition()]}')
-        ver.setObjectName("gtVer")
-        self.gt_theme = QLabel(dict(theme.THEMES).get(self._theme, self._theme))
+        lay.setContentsMargins(20, 0, 0, 0)
+        lay.setSpacing(10)
+        self.gt_theme = QLabel(dict(theme.THEMES).get(self._theme, self._theme), tb)
         self.gt_theme.setObjectName("gtTheme")
-        self.gt_theme.hide()  # 当前主题已由工具栏按钮显示，标题栏不重复占位
-        self.update_chip = QPushButton("")  # 增量更新 chip：发现新版才显示，非模态、不打断搜索
-        self.update_chip.setObjectName("updateChip")
-        self.update_chip.setCursor(Qt.PointingHandCursor)
-        self.update_chip.hide()
-        lay.addWidget(dot)
-        lay.addWidget(name)
-        lay.addWidget(ver)
-        lay.addWidget(self.gt_theme)
-        lay.addWidget(self.update_chip)
-        lay.addSpacing(2)
+        self.gt_theme.hide()  # 当前主题名已在侧栏「主题」按钮的提示里
 
-        # —— 合一工具栏中部：搜索框是窗口的物理中心 ——
+        # —— 搜索框是顶栏的主角 ——
         self.search_box = QLineEdit()
         self.search_box.setObjectName("searchBox")
         self.search_box.setPlaceholderText("搜索 PPT 内容 / 文件名…")
@@ -1943,8 +2125,8 @@ class MainWindow(QMainWindow):
             '多词完整短语优先；空格 = 同时含；"引号" = 只搜短语'
         )
         self.search_box.setFixedHeight(_SEARCH_BOX_METRICS[0])  # 见 _sync_search_bar_metrics
-        self.search_box.setMaximumWidth(680)
-        self.search_box.addAction(_icon_search(), QLineEdit.LeadingPosition)
+        self.search_box.setMaximumWidth(760)
+        self._search_icon_act = self.search_box.addAction(_icon_search(), QLineEdit.LeadingPosition)
         self._clear_act = self.search_box.addAction(_icon_clear(), QLineEdit.TrailingPosition)
         self._clear_act.setVisible(False)
         self._clear_act.setToolTip("清空")
@@ -1979,34 +2161,64 @@ class MainWindow(QMainWindow):
         self._rebuild_type_filter()
         self.type_filter.currentIndexChanged.connect(self._on_scope_changed)
         self.type_filter.setFixedHeight(_SEARCH_CTRL_METRICS[0])
+        self.type_filter.setMinimumWidth(96)
         lay.addWidget(self.type_filter)
         self.mode = QComboBox()
         self._rebuild_mode_filter()
         self.mode.setFixedHeight(_SEARCH_CTRL_METRICS[0])
+        self.mode.setMinimumWidth(110)
         self.mode.currentIndexChanged.connect(self._do_search)
         lay.addWidget(self.mode)
+        self.search_btn = QPushButton("搜索")
+        self.search_btn.setObjectName("primary")
+        self.search_btn.setCursor(Qt.PointingHandCursor)
+        self.search_btn.setToolTip("立即搜索（输入时也会自动搜索）")
+        self.search_btn.setFixedHeight(_SEARCH_CTRL_METRICS[0])
+        self.search_btn.setMinimumWidth(78)
+        self.search_btn.clicked.connect(self._do_search)
+        lay.addWidget(self.search_btn)
         self._sync_mode_for_scope()
         self._sync_search_bar_metrics()  # 大字号下不让搜索行把字切掉半截
-        lay.addSpacing(2)
+        lay.addStretch(0)
+        lay.addSpacing(12)
+        # 下载中 / 已就绪才出现的更新提示（「有新版本」改由一次性弹窗 + 设置红点提醒）
+        self.update_chip = QPushButton("")
+        self.update_chip.setObjectName("updateChip")
+        self.update_chip.setCursor(Qt.PointingHandCursor)
+        self.update_chip.hide()
+        lay.addWidget(self.update_chip)
 
-        # —— 右侧：低频功能一律图标化（悬停出说明），视觉主次让位给搜索 ——
-        # 设置/报告入口已收编到左侧导航轨，工具栏只留主题键 + 窗口控制键
-        self.theme_btn = self._mk_title_icon_btn("切换界面主题")
-        self.theme_btn.setAccessibleName("主题")
-        self.theme_btn.clicked.connect(self._show_theme_menu)
-        lay.addWidget(self.theme_btn)
-        lay.addSpacing(2)
-        for txt, slot, oid, tip in (("—", self.showMinimized, "winMin", "最小化"),
-                                    ("□", self._win_toggle_max, "winMax", "最大化 / 还原"),
-                                    ("×", self.close, "winClose", "关闭")):
-            btn = QPushButton(txt)
+        # —— 右上角窗口按钮：矢量图标，整列贴顶 ——
+        win_box = QWidget()
+        win_box.setObjectName("winBox")
+        wl = QHBoxLayout(win_box)
+        wl.setContentsMargins(0, 0, 0, 0)
+        wl.setSpacing(0)
+        self._win_btns: dict[str, QPushButton] = {}
+        for icon_name, slot, oid, tip in (("minimize", self.showMinimized, "winMin", "最小化"),
+                                          ("maximize", self._win_toggle_max, "winMax", "最大化 / 还原"),
+                                          ("close", self.close, "winClose", "关闭")):
+            btn = QPushButton()
             btn.setObjectName(oid)
-            btn.setFixedSize(46, self._title_h)
+            btn.setFixedSize(46, 36)
+            btn.setIconSize(QSize(14, 14))
+            btn.setFocusPolicy(Qt.NoFocus)
             btn.setCursor(Qt.PointingHandCursor)
             btn.setToolTip(tip)
             btn.clicked.connect(slot)
-            lay.addWidget(btn)
+            wl.addWidget(btn)
+            self._win_btns[oid] = btn
+        lay.addWidget(win_box, 0, Qt.AlignTop)
         return tb
+
+    def _refresh_window_buttons(self) -> None:
+        btns = getattr(self, "_win_btns", None)
+        if not btns:
+            return
+        ink = self._tok["ink3"]
+        btns["winMin"].setIcon(_icons.icon("minimize", ink, 14, 1.5))
+        btns["winMax"].setIcon(_icons.icon("restore" if self.isMaximized() else "maximize", ink, 14, 1.5))
+        btns["winClose"].setIcon(_icons.icon("close", ink, 14, 1.5))
 
     def _win_toggle_max(self) -> None:
         self.showNormal() if self.isMaximized() else self.showMaximized()
@@ -2032,51 +2244,14 @@ class MainWindow(QMainWindow):
             pass
 
     def nativeEvent(self, et, message):  # noqa: N802
-        """WM_NCHITTEST：标题栏区回 HTCAPTION（可拖动、双击最大化、支持 Snap），四边与角回缩放码。
+        """WM_NCHITTEST：空白处回 HTCAPTION（按住拖动、双击最大化、贴边 Snap），四边与角回缩放码。
 
-        用 QCursor.pos 的逻辑坐标而不是 lParam 的物理坐标，避免高 DPI 缩放下错位；
-        右侧按钮区不回 HTCAPTION，否则窗口按钮点不动。
+        判定逻辑在 window_drag：坐标取自消息本身而不是 QCursor.pos，空白 = 光标下不是交互控件。
         """
         if _WIN and et in ("windows_generic_MSG", b"windows_generic_MSG"):
-            try:
-                msg = wintypes.MSG.from_address(int(message))
-            except Exception:  # noqa: BLE001
-                return super().nativeEvent(et, message)
-            if msg.message == 0x0084:  # WM_NCHITTEST
-                pos = self.mapFromGlobal(QCursor.pos())
-                x, y, w, h, b = pos.x(), pos.y(), self.width(), self.height(), 6
-                if not self.isMaximized():
-                    L = x < b
-                    Rr = x > w - b
-                    Tp = y < b
-                    Bt = y > h - b
-                    if Tp and L:
-                        return True, 13   # HTTOPLEFT
-                    if Tp and Rr:
-                        return True, 14   # HTTOPRIGHT
-                    if Bt and L:
-                        return True, 16   # HTBOTTOMLEFT
-                    if Bt and Rr:
-                        return True, 17   # HTBOTTOMRIGHT
-                    if L:
-                        return True, 10   # HTLEFT
-                    if Rr:
-                        return True, 11   # HTRIGHT
-                    if Tp:
-                        return True, 12   # HTTOP
-                    if Bt:
-                        return True, 15   # HTBOTTOM
-                # 标题栏拖动区：避开顶部 b 缩放边 + 右侧 146px 窗口按钮区
-                if b <= y < self._title_h and x < w - 146:
-                    # 合一工具栏：搜索框/下拉/按钮等交互控件区域必须回 HTCLIENT，
-                    # 否则点击会被系统当成标题栏拖拽，控件收不到鼠标事件。
-                    child = self.childAt(pos)
-                    wgt = child
-                    while wgt is not None and wgt is not self:
-                        if isinstance(wgt, (QLineEdit, QComboBox, QPushButton, QToolButton)):
-                            return super().nativeEvent(et, message)
-                        wgt = wgt.parentWidget()
-                    return True, 2        # HTCAPTION
+            hit = window_drag.native_hit_test(self, message)
+            if hit is not None:
+                return hit
         return super().nativeEvent(et, message)
 
     # ---------- 主区页面切换（导航轨 + _show_* 统一入口） ----------
@@ -2215,6 +2390,21 @@ class MainWindow(QMainWindow):
         self.result_list.clear()
         self._set_ops_enabled(False)
 
+    def _refresh_preview_icons(self) -> None:
+        """预览区按钮的线条图标跟随主题；主按钮用白色。"""
+        t = getattr(self, "_tok", None)
+        if t is None:
+            return
+        ink = t["ink2"]
+        for attr, name, color in (("copy_text_btn", "copy", ink), ("copy_path_btn", "link", ink),
+                                  ("prev_btn", "arrow_left", ink), ("next_btn", "arrow_right", ink),
+                                  ("goto_btn", "open", t["acctext"]), ("open_btn", "file", ink),
+                                  ("folder_btn", "folder", ink), ("clip_btn", "clipboard", ink)):
+            btn = getattr(self, attr, None)
+            if btn is not None:
+                btn.setIcon(_icons.icon(name, color, 16))
+                btn.setIconSize(QSize(16, 16))
+
     def _update_preview_header(self, r: FileResult | None) -> None:
         """预览顶栏：完整路径（可复制）+ 大小 · 页数 · 修改时间。"""
         if r is None:
@@ -2231,12 +2421,9 @@ class MainWindow(QMainWindow):
             self.copy_path_btn.hide()
             self.copy_text_btn.hide()
             return
-        # 面包屑式路径：目录弱化、文件名加粗——一眼先看到「哪份 PPT」，再看「在哪」
+        # 文件名作标题——一眼先看到「哪份 PPT」；所在文件夹放到下方元信息行
         d, f = os.path.split(r.path)
-        self.path_label.setText(
-            f'<span style="color:{self._tok["ink4"]}">{html.escape(_elide_middle(d, 56))}{os.sep}</span>'
-            f'<span style="color:{self._tok["ink1"]};font-weight:600">{html.escape(f)}</span>'
-        )
+        self.path_label.setText(f)
         self.path_label.setToolTip(r.path)
         self.copy_path_btn.show()
         self.copy_text_btn.show()
@@ -2249,7 +2436,9 @@ class MainWindow(QMainWindow):
         tm = _fmt_mtime(r.mtime)
         if tm:
             parts.append(f"修改于 {tm}")
-        self.meta_label.setText("　·　".join(parts))
+        if d:
+            parts.append(_elide_middle(d, 60))
+        self.meta_label.setText("  ·  ".join(parts))
 
     # ---------- 主题 ----------
     def showEvent(self, e):  # noqa: N802
@@ -2350,14 +2539,11 @@ class MainWindow(QMainWindow):
 
     def _refresh_toolbar_icons(self) -> None:
         """合一工具栏与导航轨图标色跟随主题（ink3 静默灰），checked/hover 色由 QSS 承担。"""
-        c = self._tok["ink3"]
-        for btn, factory in (
-            (getattr(self, "theme_btn", None), _icon_theme),
-        ):
-            if btn is not None:
-                btn.setIcon(factory(c, 16))
-                btn.setIconSize(QSize(16, 16))
+        if getattr(self, "_search_icon_act", None) is not None:
+            self._search_icon_act.setIcon(_icons.icon("search", self._tok["ink3"], 16))
         self._refresh_rail_icons()
+        self._refresh_window_buttons()
+        self._refresh_preview_icons()
 
     def _show_theme_menu(self) -> None:
         """顶栏主题按钮 → 弹出主题菜单（当前主题打勾）。"""
@@ -3204,6 +3390,11 @@ class MainWindow(QMainWindow):
             b.clicked.connect(lambda _=False, k=key: self._apply_suggestion(k))
             v.addWidget(b, 0, Qt.AlignCenter)
             self._sugg_btns[key] = b
+        self._clear_facet_btn = QPushButton("清除全部筛选")
+        self._clear_facet_btn.setObjectName("suggBtn")
+        self._clear_facet_btn.clicked.connect(lambda: self.facet_panel._clear_all())
+        self._clear_facet_btn.hide()
+        v.addWidget(self._clear_facet_btn, 0, Qt.AlignCenter)
         self._diagnose_btn = QPushButton("查看健康诊断")
         self._diagnose_btn.setObjectName("suggBtn")
         self._diagnose_btn.setToolTip("查看索引库、扫描范围、数据目录和 PowerPoint 状态")
@@ -3340,6 +3531,7 @@ class MainWindow(QMainWindow):
         for key, btn in self._sugg_btns.items():
             btn.setVisible(key in sugg)
         self._sugg_btns["query"].hide()
+        self._clear_facet_btn.hide()
         self.empty_hint.show()
         self._set_empty_query_suggestion_async(query)
 
@@ -3357,6 +3549,7 @@ class MainWindow(QMainWindow):
         self._empty_query_suggestion = ""
         for btn in self._sugg_btns.values():
             btn.hide()
+        self._clear_facet_btn.hide()
         self.empty_hint.show()
 
     def _hide_empty_hint(self, *, invalidate_status: bool = True) -> None:
@@ -3460,7 +3653,27 @@ class MainWindow(QMainWindow):
         btn.setToolTip(f"把搜索词改成：{suggestion}")
         btn.show()
 
+    def _open_update_center(self) -> None:
+        upd = getattr(self, "_updater", None)
+        if upd is not None and hasattr(upd, "open_dialog"):
+            upd.open_dialog()
+
     def _open_settings_from_button(self) -> None:
+        # 有新版本时，「设置」先给一个小菜单：第一项就是这个版本的更新（同 AI Hub 的设置菜单）
+        upd = getattr(self, "_updater", None)
+        pending = upd.pending_version() if upd is not None and hasattr(upd, "pending_version") else ""
+        if pending:
+            menu = QMenu(self)
+            act_update = menu.addAction(_icons.icon("update", self._tok["acc"], 16), f"有新版本 v{pending}，查看更新")
+            act_update.triggered.connect(self._open_update_center)
+            act_settings = menu.addAction(_icons.icon("settings", self._tok["ink3"], 16), "打开设置")
+            act_settings.triggered.connect(self._open_settings_dialog_now)
+            btn = self.rail_settings_btn
+            menu.exec(btn.mapToGlobal(btn.rect().topRight()))
+            return
+        self._open_settings_dialog_now()
+
+    def _open_settings_dialog_now(self) -> None:
         cb = self._open_settings_cb
         if callable(cb):
             cb()
@@ -3541,6 +3754,8 @@ class MainWindow(QMainWindow):
             lay.addWidget(note)
         lst = QListWidget()
         lst.setObjectName("unreadableDirsList")
+        lst.setToolTip("双击打开该文件夹")
+        lst.itemDoubleClicked.connect(lambda it: self._open_folder_in_explorer(it.text()))
         lst.addItems(paths)
         lay.addWidget(lst, 1)
         btns = QHBoxLayout()
@@ -3624,6 +3839,10 @@ class MainWindow(QMainWindow):
     def _locate_health_item(self, path: str, name: str) -> None:
         """体检条目点击定位：切搜索页 + 仅文件名模式 + 按去扩展名的文件名搜索
         （走正常搜索链，结果首条自动选中即预览）。健康页 embedded 时由 HealthWindow 鸭子类型回调。"""
+        if path:
+            # 重复组里全是同名文件：必须按完整路径选中，按文件名搜默认第一条会定位到别的副本
+            self.preview_path_in_search(path)
+            return
         base = os.path.splitext((name or os.path.basename(path or "")).strip())[0].strip()
         if not base:
             return
@@ -4091,6 +4310,12 @@ class MainWindow(QMainWindow):
         return -1
 
     def _select_first(self, *, delayed_preview: bool = False) -> None:
+        # 从概览「最近活跃」点进来的那份文件优先选中（按文件名搜出多条时不跳到别的同名稿）
+        pending = getattr(self, "_pending_select_path", None)
+        if pending:
+            self._pending_select_path = None
+            if self._select_path(pending, delayed_preview=delayed_preview):
+                return
         row = self._first_selectable_row()
         if row >= 0:
             if delayed_preview:
@@ -4268,6 +4493,7 @@ class MainWindow(QMainWindow):
         self._set_empty_index_status_async()
         for btn in self._sugg_btns.values():
             btn.hide()
+        self._clear_facet_btn.show()
         self.empty_hint.show()
 
     def _refresh_facets(self) -> None:
@@ -4726,8 +4952,14 @@ class MainWindow(QMainWindow):
             return
         dest = ensure_pptx_suffix(dest)
         self._toast("正在导出...")
-        self._run_bg(lambda: self._version_mgr.export(path, version_id, dest),
-                     lambda ok: self._toast("已导出" if ok else "导出失败"), "export")
+        def _after(ok, dest=dest):
+            if ok:
+                self._toast_with_action(f"已导出到 {os.path.basename(dest)}", "打开所在文件夹",
+                                        lambda: self._open_folder_path(dest))
+            else:
+                self._toast("导出失败")
+
+        self._run_bg(lambda: self._version_mgr.export(path, version_id, dest), _after, "export")
 
     def _act_goto_page(self, page_no: int) -> None:
         if self._preview_interaction_blocked():
@@ -5220,6 +5452,8 @@ class MainWindow(QMainWindow):
 
     def resizeEvent(self, e):  # noqa: N802
         super().resizeEvent(e)
+        # 窄窗口（如 1920x1080@150% 的 1280 逻辑宽）侧栏收成图标列，给搜索结果和预览让出宽度
+        self._set_rail_compact(self.width() < self._RAIL_COMPACT_BELOW)
         # Smooth QPixmap scaling is deliberately expensive. Windows emits a
         # resize event for every drag pixel; doing the transform in every event
         # made the whole app stutter at high DPI. Keep the previous frame while
@@ -5241,6 +5475,8 @@ class MainWindow(QMainWindow):
     def changeEvent(self, e):  # noqa: N802
         if e.type() == QEvent.ActivationChange and self._cur_item_widget is not None:
             self._cur_item_widget.set_selected(True, self.isActiveWindow())
+        if e.type() == QEvent.WindowStateChange:
+            self._refresh_window_buttons()
         super().changeEvent(e)
 
     # ---------- 窗口几何记忆 ----------
@@ -5340,6 +5576,9 @@ class MainWindow(QMainWindow):
             if callable(cb):
                 cb()
             return True
+        if obj is getattr(self, "gt_ver", None) and et == QEvent.MouseButtonPress:
+            self._open_update_center()  # 侧栏版本号 → 更新中心（检查更新）
+            return True
         if obj is getattr(self, "status_warn_label", None) and et == QEvent.MouseButtonPress:
             self._open_unreadable_dirs_dialog()  # 状态栏警示点击 → 无权限文件夹详情
             return True
@@ -5431,6 +5670,38 @@ class MainWindow(QMainWindow):
 
         if self._run_bg(lambda: self._open_file_after_preview_release(path), _after, "open"):
             self._toast("正在打开文件…")
+
+    def preview_path_in_search(self, path: str) -> None:
+        """概览「最近活跃」等入口：切到搜索页并选中这份文件（右侧出预览）。
+
+        概览页本身就挂着「最近修改」结果；那里找到就直接选中，找不到（例如列表被筛选过）
+        就按文件名搜一次再选中，保证用户点了就有反应。
+        """
+        if self._closing or not path:
+            return
+        if not self.search_box.text().strip() and self._results:
+            self._switch_page("search")
+            if self._select_path(path):
+                return
+        name = os.path.basename(path)
+        self._pending_select_path = path
+        self.search_box.setText(name)
+        self._do_search()
+        self._switch_page("search")
+
+    def _open_folder_in_explorer(self, folder: str) -> None:
+        """打开文件夹本身（不是「文件所在文件夹」），后台执行，网络盘不卡界面。"""
+        def _after(ok):
+            if not ok:
+                self._toast("打不开这个文件夹（可能没有权限或已不存在）")
+
+        def _open():
+            if not os.path.isdir(folder):
+                return False
+            os.startfile(folder)  # type: ignore[attr-defined]
+            return True
+
+        self._run_bg(_open, _after, "open")
 
     def _open_folder_path(self, path: str) -> None:
         def _after(ok):
@@ -5563,6 +5834,13 @@ class MainWindow(QMainWindow):
 
         self._run_bg(lambda: os.path.exists(path), _after, "copy-exists")
 
+    def _copy_file_with_toast(self, path: str) -> None:
+        # 存在性检查放后台（网络盘上 exists 可能卡住界面），与「复制到剪贴板」按钮同一条路
+        self._clipboard_copy_token += 1
+        self._check_clipboard_file_exists_bg(path, self._clipboard_copy_token)
+        self._set_file_clipboard(path)
+        self._toast("已复制文件，可直接粘贴到邮件或聊天窗口")
+
     def _set_file_clipboard(self, path: str) -> None:
         QApplication.clipboard().setMimeData(_file_mime_for_path(path))
 
@@ -5690,7 +5968,9 @@ class MainWindow(QMainWindow):
             menu.addAction("📜 在版本管理中查看版本历史", lambda _checked=False, r=r:
                            self._open_version_window_for(path=r.path))
         menu.addSeparator()
-        menu.addAction("复制完整路径", lambda _checked=False, r=r, gen=render_gen:
+        menu.addAction("复制文件（可粘贴到邮件 / 聊天）\tCtrl+C", lambda _checked=False, r=r, gen=render_gen:
+                       self._run_context_menu_action(gen, lambda: self._copy_file_with_toast(r.path)))
+        menu.addAction("复制完整路径\tCtrl+Shift+C", lambda _checked=False, r=r, gen=render_gen:
                        self._run_context_menu_action(
                            gen,
                            lambda: self._copy_text_with_toast(r.path, "已复制完整路径")))
@@ -5720,6 +6000,20 @@ class MainWindow(QMainWindow):
         x = (self.width() - lbl.width()) // 2
         y = self.height() - lbl.height() - 64  # 鎮簬鐘舵€佹爮涓婃柟
         lbl.move(max(8, x), max(8, y))
+
+    def _toast_with_action(self, msg: str, action_text: str, action) -> None:
+        """带一个可点动作的提示（如「打开所在文件夹」）：停留更久，点了就执行。"""
+        from PySide6.QtWidgets import QMessageBox
+        box = QMessageBox(self)
+        box.setWindowTitle("PPT Doctor")
+        box.setIcon(QMessageBox.Information)
+        box.setText(msg)
+        act = box.addButton(action_text, QMessageBox.AcceptRole)
+        box.addButton("知道了", QMessageBox.RejectRole)
+        box.setDefaultButton(act)
+        box.setWindowModality(Qt.NonModal)
+        box.buttonClicked.connect(lambda b: action() if b is act else None)
+        box.show()
 
     def _toast(self, msg: str) -> None:
         self._toast_hide_token += 1

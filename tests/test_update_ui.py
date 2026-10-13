@@ -191,8 +191,9 @@ def test_update_late_checked_ignored_after_update_found(qtbot):
     ctrl._on_check_done()
 
     assert ctrl._state == "available"
-    assert chip.isVisible()
-    assert "0.9.2" in chip.text()
+    # v2.0：「有新版本」不再常驻标题栏 chip，改由弹窗 + 设置入口红点提醒
+    assert chip.isHidden()
+    assert ctrl.pending_version() == "0.9.2"
 
 
 def test_update_late_check_failed_ignored_after_update_found(qtbot):
@@ -206,8 +207,8 @@ def test_update_late_check_failed_ignored_after_update_found(qtbot):
     ctrl._on_check_failed("TimeoutError: late timeout")
 
     assert ctrl._state == "available"
-    assert chip.isVisible()
-    assert "0.9.2" in chip.text()
+    assert chip.isHidden()
+    assert ctrl.pending_version() == "0.9.2"
 
 
 def test_update_check_not_started_after_parent_closing(monkeypatch, qtbot):

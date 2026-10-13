@@ -379,3 +379,39 @@ def test_dashboard_late_payload_ignored_after_parent_closing(qtbot, monkeypatch)
     tasks[-1].done.emit(_payload())
 
     assert applied == []
+
+
+def test_recent_rows_preview_on_click_and_open_on_double_click(qtbot, tmp_path, monkeypatch):
+    """用户反馈（2026-10-13）：概览「最近活跃」里的 PPT 双击打不开。"""
+    from PySide6.QtCore import QObject, QPoint, Qt, Signal
+    from pptx_finder import db
+    from pptx_finder.ui.main_window import MainWindow
+
+    class StubRender(QObject):
+        rendered = Signal(int, str)
+
+        def request(self, *a, **k):
+            pass
+
+    conn = db.connect(tmp_path / "i.db")
+    db.init_db(conn)
+    deck = tmp_path / "季度汇报.pptx"
+    deck.write_bytes(b"x")
+    db.upsert_file(conn, path=str(deck), name=deck.name, ext=".pptx", size=1,
+                   mtime=deck.stat().st_mtime, content_hash="h", page_count=3,
+                   status="ok", error="", indexed_at=0)
+    conn.commit()
+    win = MainWindow(conn=conn, render_worker=StubRender(), do_index=False)
+    qtbot.addWidget(win)
+    opened = []
+    monkeypatch.setattr(win, "_open_file_path", lambda p: opened.append(p))
+    win.dashboard.refresh(force=True)
+    qtbot.waitUntil(lambda: any(getattr(w, "path", "") == str(deck)
+                                for w in win.dashboard.findChildren(QObject)), timeout=5000)
+    row = next(w for w in win.dashboard.findChildren(QObject) if getattr(w, "path", "") == str(deck))
+    assert row.cursor().shape() == Qt.PointingHandCursor
+    qtbot.mouseDClick(row, Qt.LeftButton, pos=QPoint(10, 10))
+    assert opened == [str(deck)]
+    qtbot.mouseClick(row, Qt.LeftButton, pos=QPoint(10, 10))
+    qtbot.waitUntil(lambda: win._current_page_key() == "search", timeout=3000)
+    qtbot.waitUntil(lambda: win._cur is not None and win._cur.path == str(deck), timeout=5000)

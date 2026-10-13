@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QMessageBox,
     QPushButton,
     QSplitter,
@@ -30,6 +31,7 @@ except Exception:  # noqa: BLE001
     def _qt_is_valid(_obj) -> bool:
         return True
 
+from . import owner_actions
 from .bg_task import BackgroundTask
 from .path_helpers import ensure_pptx_suffix
 from .vault_storage_dialog import VaultStorageDialog, supports_storage, storage_summary
@@ -93,6 +95,9 @@ class VersionWindow(QWidget):
         self._pending_versions_after_file_op: tuple[int, str, object] | None = None
         self._closing = False
         self._all_docs: list[dict] = []
+        self._pending_focus: str | None = None   # 外部跳转要选中的文档路径（列表铺好再选）
+        self._pending_focus_name = ""
+        self._doc_population_done = False
         self._doc_filter_signature: tuple | None = None
         self._doc_filter_token = 0
         self._doc_population_token = 0
@@ -146,9 +151,19 @@ class VersionWindow(QWidget):
         self.doc_scope.currentIndexChanged.connect(self._apply_doc_filter)
         doc_filter_row.addWidget(self.doc_scope)
         ll.addLayout(doc_filter_row)
+        self.btn_clear_filter = QPushButton("清空筛选")
+        self.btn_clear_filter.setToolTip("清空文件名筛选，并显示全部受管文档")
+        self.btn_clear_filter.clicked.connect(self.clear_doc_filter)
+        self.btn_clear_filter.hide()
+        ll.addWidget(self.btn_clear_filter)
         self.doc_list = QListWidget()
         self.doc_list.setUniformItemSizes(True)
         self.doc_list.currentItemChanged.connect(self._on_doc)
+        # 双击打开文件、右键更多操作（和搜索结果列表的手感一致）
+        self.doc_list.itemDoubleClicked.connect(self._on_doc_double_clicked)
+        self.doc_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.doc_list.customContextMenuRequested.connect(self._doc_context_menu)
+        self.doc_list.setToolTip("双击打开文件 · 右键更多操作")
         ll.addWidget(self.doc_list, 1)
         split.addWidget(left)
 
@@ -162,6 +177,10 @@ class VersionWindow(QWidget):
         self.ver_list = QListWidget()
         self.ver_list.setUniformItemSizes(True)
         self.ver_list.currentItemChanged.connect(lambda *_args: self._on_version_selection_changed())
+        # 双击某个版本 = 生成它的预览；右键 = 预览 / 恢复 / 导出
+        self.ver_list.itemDoubleClicked.connect(self._on_version_double_clicked)
+        self.ver_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.ver_list.customContextMenuRequested.connect(self._version_context_menu)
         rl.addWidget(self.ver_list, 1)
         preview_row = QHBoxLayout()
         self.version_preview = QLabel("选择版本后可生成预览")
@@ -185,7 +204,13 @@ class VersionWindow(QWidget):
         self.btn_recover = QPushButton("找回文件")
         self.btn_recover.clicked.connect(self._recover)
         self.btn_recover.setVisible(False)
-        for b in (self.btn_restore, self.btn_export, self.btn_recover):
+        # 导出成功后出现：一键打开导出文件所在文件夹
+        self.btn_open_export = QPushButton("打开导出所在文件夹")
+        self.btn_open_export.hide()
+        self._last_export_path = ""
+        self.btn_open_export.clicked.connect(
+            lambda: self._last_export_path and owner_actions.open_folder(self, self._last_export_path))
+        for b in (self.btn_restore, self.btn_export, self.btn_recover, self.btn_open_export):
             ops.addWidget(b)
         ops.addStretch(1)
         rl.addLayout(ops)
@@ -456,6 +481,9 @@ class VersionWindow(QWidget):
         self._forget_bg_task(task, self._docs_tasks)
         if self._docs_inflight_token == token:
             self._docs_inflight_token = None
+            # 读完时列表若已铺完，补判一次外部跳转的目标（铺列表发生在 done、早于这里）
+            if getattr(self, "_doc_population_done", False):
+                self._finish_pending_focus(population_done=True)
 
     def _load_docs(self) -> list[dict]:
         if hasattr(self._mgr, "list_docs_details"):
@@ -520,16 +548,27 @@ class VersionWindow(QWidget):
         ]
         self._doc_population_token += 1
         population_token = self._doc_population_token
+        self._doc_population_done = False
         self.doc_list.clear()
+        filtered = bool(query) or scope != "all"
+        self.btn_clear_filter.setVisible(filtered)
         if not docs:
             self._cur_doc = None
             self.ver_list.clear()
-            self._clear_version_preview("没有匹配的版本文档")
-            it = QListWidgetItem("没有匹配的版本文档")
+            if filtered and self._all_docs:
+                # 有文档、只是被筛选挡住了：别说成「没有版本历史」，那像数据丢了
+                self._clear_version_preview("没有匹配的文档")
+                it = QListWidgetItem("没有匹配的文档 · 点下方「清空筛选」查看全部")
+                self.right_title.setText("没有匹配的文档")
+            else:
+                self._clear_version_preview("还没有可恢复的版本历史")
+                it = QListWidgetItem("还没有受管文档")
+                self.right_title.setText("还没有可恢复的版本历史")
             it.setData(Qt.UserRole, None)
             self.doc_list.addItem(it)
-            self.right_title.setText("还没有可恢复的版本历史")
             self._update_file_ops_state()
+            self._doc_population_done = True
+            self._finish_pending_focus(population_done=True)
             return
         selected_row = next(
             (row for row, d in enumerate(docs) if selected and d["doc_id"] == selected),
@@ -557,7 +596,9 @@ class VersionWindow(QWidget):
             it.setData(Qt.UserRole, (d["doc_id"], d["path"], d["status"]))
             self.doc_list.addItem(it)
         self.doc_list.setUpdatesEnabled(True)
-        if self.doc_list.currentRow() < 0 and selected_row < end:
+        if self._select_pending_focus():
+            pass
+        elif self.doc_list.currentRow() < 0 and selected_row < end:
             self.doc_list.setCurrentRow(selected_row)
         if end < len(docs):
             QTimer.singleShot(
@@ -565,6 +606,9 @@ class VersionWindow(QWidget):
                 lambda token=token, docs=docs, start=end, selected_row=selected_row:
                     self._append_doc_population_batch(token, docs, start, selected_row),
             )
+        else:
+            self._doc_population_done = True
+            self._finish_pending_focus(population_done=True)
 
     def _on_doc(self, cur, prev=None) -> None:
         if not self._ui_alive():
@@ -802,7 +846,7 @@ class VersionWindow(QWidget):
                     + "\n\n"
                     + msg
                 )
-        if QMessageBox.question(self, "恢复", msg) != QMessageBox.Yes:
+        if not owner_actions.ask(self, "恢复", msg, "恢复此版本", "取消"):
             self._finish_restore_prepare(prev_title)
             return
 
@@ -854,8 +898,9 @@ class VersionWindow(QWidget):
                 lambda: self._mgr.export(path, vid, dest),
                 "导出",
                 "正在导出版本…",
-                "已导出",
+                f"已导出到：\n{dest}",
                 "导出失败",
+                ok_folder=dest,
             )
 
     def _recover(self) -> None:
@@ -899,7 +944,7 @@ class VersionWindow(QWidget):
         return fail_text
 
     def _run_file_op(self, label: str, fn, title: str, busy_text: str,
-                     ok_text: str, fail_text: str, on_ok=None) -> None:
+                     ok_text: str, fail_text: str, on_ok=None, ok_folder: str = "") -> None:
         if self._block_if_file_op_active():
             return
         prev_title = self.right_title.text()
@@ -925,6 +970,9 @@ class VersionWindow(QWidget):
             ok = bool(result)
             if self.right_title.text() in (busy_text, self._FILE_OP_BUSY_NOTICE):
                 self.right_title.setText(prev_title)
+            if ok and ok_folder:
+                self._last_export_path = ok_folder
+                self.btn_open_export.show()
             QMessageBox.information(
                 self, title, ok_text if ok else self._failure_text(fail_text))
             if ok and on_ok is not None:
@@ -952,28 +1000,136 @@ class VersionWindow(QWidget):
         )
 
     def focus_doc(self, path: str) -> None:
-        """外部跳转：选中匹配该路径的受管文档（列表若还在后台加载则稍后重试一次）。"""
+        """外部跳转（搜索结果右键「查看版本历史」）：选中这份文件。
+
+        先清空筛选、范围设回「全部」——否则用户之前输过的筛选词会把目标挡住，
+        跳过来什么都没选中。列表分批加载、或还在后台读取时，等加载到再选中；
+        确实没有这份文件时明确说「还没有历史版本」，而不是静默。
+        """
         if not path:
             return
-        target = os.path.abspath(str(path))
-
-        def _try() -> bool:
-            for i in range(self.doc_list.count()):
-                it = self.doc_list.item(i)
-                data = it.data(Qt.UserRole)
-                if isinstance(data, tuple) and len(data) >= 2 and data[1]:
-                    try:
-                        if os.path.abspath(str(data[1])) == target:
-                            self.doc_list.setCurrentRow(i)
-                            return True
-                    except (OSError, ValueError):
-                        pass
-            return False
-
-        if not _try():
-            QTimer.singleShot(450, _try)   # 文档列表可能还在后台加载
+        self._pending_focus = os.path.normcase(os.path.abspath(str(path)))
+        self._pending_focus_name = os.path.basename(str(path))
         self.raise_()
         self.activateWindow()
+        changed = False
+        if self.doc_filter.text():
+            self.doc_filter.blockSignals(True)
+            self.doc_filter.clear()
+            self.doc_filter.blockSignals(False)
+            changed = True
+        if self.doc_scope.currentIndex() != 0:
+            self.doc_scope.blockSignals(True)
+            self.doc_scope.setCurrentIndex(0)
+            self.doc_scope.blockSignals(False)
+            changed = True
+        if changed:
+            self._doc_filter_signature = None
+            self._apply_doc_filter()
+            return
+        if self._select_pending_focus():
+            return
+        loading = self._docs_inflight_token is not None
+        if not loading and self.doc_list.count() >= len(self._all_docs):
+            self._finish_pending_focus(population_done=True)
+
+    def _select_pending_focus(self) -> bool:
+        target = getattr(self, "_pending_focus", None)
+        if not target:
+            return False
+        for i in range(self.doc_list.count()):
+            data = self.doc_list.item(i).data(Qt.UserRole)
+            if isinstance(data, tuple) and len(data) >= 2 and data[1]:
+                try:
+                    if os.path.normcase(os.path.abspath(str(data[1]))) == target:
+                        self._pending_focus = None
+                        self.doc_list.setCurrentRow(i)
+                        self.doc_list.scrollToItem(self.doc_list.item(i))
+                        return True
+                except (OSError, ValueError):
+                    pass
+        return False
+
+    def _finish_pending_focus(self, *, population_done: bool) -> None:
+        if not getattr(self, "_pending_focus", None) or not population_done:
+            return
+        if self._docs_inflight_token is not None:
+            return  # 文档还在后台读取，读完会重新铺列表，那时再判
+        if self._select_pending_focus():
+            return
+        name = getattr(self, "_pending_focus_name", "") or "这份文件"
+        self._pending_focus = None
+        text = f"「{name}」还没有历史版本：改存一次后会自动留版"
+        self.right_title.setText(text)
+        owner_actions.notify(self, text)
+
+    def clear_doc_filter(self) -> None:
+        self.doc_filter.blockSignals(True)
+        self.doc_filter.clear()
+        self.doc_filter.blockSignals(False)
+        self.doc_scope.blockSignals(True)
+        self.doc_scope.setCurrentIndex(0)
+        self.doc_scope.blockSignals(False)
+        self._doc_filter_signature = None
+        self._apply_doc_filter()
+
+    # ---------- 列表双击 / 右键 ----------
+    def _doc_item_path(self, item) -> str:
+        data = item.data(Qt.UserRole) if item is not None else None
+        if isinstance(data, tuple) and len(data) >= 2 and data[1]:
+            return str(data[1])
+        return ""
+
+    def _on_doc_double_clicked(self, item) -> None:
+        path = self._doc_item_path(item)
+        if not path:
+            return
+        data = item.data(Qt.UserRole)
+        if len(data) >= 3 and data[2] == "deleted":
+            owner_actions.notify(self, "这份文件已删除，可以点「找回文件」从版本库重建")
+            return
+        owner_actions.open_file(self, path)
+
+    def _doc_context_menu(self, pos) -> None:
+        item = self.doc_list.itemAt(pos)
+        path = self._doc_item_path(item)
+        if not path:
+            return
+        self.doc_list.setCurrentItem(item)
+        deleted = item.data(Qt.UserRole)[2] == "deleted"
+        menu = QMenu(self)
+        act_open = menu.addAction("打开文件", lambda: owner_actions.open_file(self, path))
+        act_open.setEnabled(not deleted)
+        if owner_actions.find_owner(self) is not None:
+            act_prev = menu.addAction("在搜索页预览", lambda: owner_actions.preview_in_search(self, path))
+            act_prev.setEnabled(not deleted)
+        menu.addAction("打开所在文件夹", lambda: owner_actions.open_folder(self, path))
+        if deleted:
+            menu.addAction("找回文件", self._recover)
+        menu.addSeparator()
+        menu.addAction("复制完整路径", lambda: owner_actions.copy_text(self, path))
+        self._last_menu = menu
+        owner_actions.popup(menu, self.doc_list.viewport().mapToGlobal(pos))
+
+    def _on_version_double_clicked(self, item) -> None:
+        if item is None or not item.data(Qt.UserRole):
+            return
+        self.ver_list.setCurrentItem(item)
+        self._preview_selected_version()
+
+    def _version_context_menu(self, pos) -> None:
+        item = self.ver_list.itemAt(pos)
+        if item is None or not item.data(Qt.UserRole):
+            return
+        self.ver_list.setCurrentItem(item)
+        menu = QMenu(self)
+        menu.addAction("生成预览", self._preview_selected_version)
+        act_restore = menu.addAction("恢复此版本（覆盖当前）", self._restore)
+        act_restore.setEnabled(self.btn_restore.isEnabled())
+        act_export = menu.addAction("导出此版本…", self._export)
+        act_export.setEnabled(self.btn_export.isEnabled())
+        self._last_menu = menu
+        owner_actions.popup(menu, self.ver_list.viewport().mapToGlobal(pos))
 
     def search_history(self, query: str) -> None:
         """外部跳转：在跨版本搜框里直接搜某词。"""

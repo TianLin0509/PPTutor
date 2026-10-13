@@ -458,6 +458,9 @@ class SettingsDialog(QDialog):
         self.index_roots_list.setMaximumHeight(90)
         for root in get_index_roots():
             self._append_index_root_item(root)
+        # 已保存的根：关窗时与列表比对，判断是否有没点「保存」的改动
+        self._index_roots_saved = tuple(self._index_root_items())
+        self._close_after_roots_save = False
         lay.addWidget(self.index_roots_list)
         net_row = QHBoxLayout()
         self.index_root_edit = QLineEdit()
@@ -757,6 +760,7 @@ class SettingsDialog(QDialog):
             )
             return
         set_index_roots([root for root, _ok, _reach, _msg in result])
+        self._index_roots_saved = tuple(root for root, _ok, _reach, _msg in result)
         # 回写列表：不可达的根标警告样式，但允许保存（网络盘时通时断）
         self.index_roots_list.clear()
         warnings = 0
@@ -770,6 +774,10 @@ class SettingsDialog(QDialog):
         if warnings:
             note += f" {warnings} 个路径当前不可达，其可用时会自动纳入。"
         self._index_roots_result.setText(note)
+        if getattr(self, "_close_after_roots_save", False):
+            # 关窗时选了「保存」：保存成功后再关
+            self._close_after_roots_save = False
+            QTimer.singleShot(0, self.close)
 
     def _finish_index_roots_validate(self, task) -> None:
         self._forget_diag_task(task)
@@ -784,6 +792,47 @@ class SettingsDialog(QDialog):
                 self._set_index_root_editing_enabled(True)
         except RuntimeError:
             pass
+
+    def _index_roots_dirty(self) -> bool:
+        saved = getattr(self, "_index_roots_saved", None)
+        return saved is not None and tuple(self._index_root_items()) != saved
+
+    def _confirm_close_with_unsaved_roots(self) -> bool:
+        """有没点「保存」的索引目录改动时先问一句。返回 True = 可以关窗。"""
+        if self._closing or not self.isVisible() or not self._index_roots_dirty():
+            return True
+        choice = self._ask_unsaved_index_roots()
+        if choice == "discard":
+            # 视为已处理：closeEvent 之后 QDialog 还会走一次 reject，不能再问第二遍
+            self._index_roots_saved = tuple(self._index_root_items())
+            return True
+        if choice == "save":
+            self._close_after_roots_save = True
+            self._apply_index_roots()
+        return False
+
+    def _ask_unsaved_index_roots(self) -> str:
+        """返回 save / discard / back。"""
+        box = QMessageBox(QMessageBox.Question, "索引目录未保存",
+                          "你添加或删除了索引目录，但还没有点「保存」。\n现在关闭，这些改动不会生效。",
+                          QMessageBox.NoButton, self)
+        save_btn = box.addButton("保存", QMessageBox.AcceptRole)
+        discard_btn = box.addButton("放弃改动", QMessageBox.DestructiveRole)
+        back_btn = box.addButton("返回", QMessageBox.RejectRole)
+        box.setDefaultButton(save_btn)
+        box.setEscapeButton(back_btn)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is save_btn:
+            return "save"
+        if clicked is discard_btn:
+            return "discard"
+        return "back"
+
+    def reject(self):  # noqa: D401 - Esc / 关闭按钮都走这里
+        if not self._confirm_close_with_unsaved_roots():
+            return
+        super().reject()
 
     def _toggle_feature(self, key: str, enabled: bool) -> None:
         if key == 'version_management' and enabled:
@@ -902,6 +951,20 @@ class SettingsDialog(QDialog):
         )
         self.vault_audit_btn.clicked.connect(self._check_vault_repository)
         head.addWidget(self.vault_audit_btn)
+        # 检查更新：打开与主窗口同一个更新弹窗（多源、进度、各源结果）
+        self.check_update_btn = QPushButton("检查更新")
+        self.check_update_btn.setObjectName("checkUpdateBtn")
+        updater_ctl = getattr(self._diagnostic_parent, "_updater", None)
+        if updater_ctl is not None and hasattr(updater_ctl, "open_dialog"):
+            pending = updater_ctl.pending_version() if hasattr(updater_ctl, "pending_version") else ""
+            if pending:
+                self.check_update_btn.setText(f"⬆ 有新版本 v{pending}")
+            self.check_update_btn.setToolTip("查询 GitHub 与备用服务器上的最新版本")
+            self.check_update_btn.clicked.connect(lambda: updater_ctl.open_dialog())
+        else:
+            self.check_update_btn.setEnabled(False)
+            self.check_update_btn.setToolTip("源码运行的开发版不检查更新；安装版可用")
+        head.addWidget(self.check_update_btn)
         refresh = QPushButton("刷新")
         refresh.clicked.connect(self.schedule_diagnostics_refresh)
         head.addWidget(refresh)
@@ -1295,6 +1358,9 @@ class SettingsDialog(QDialog):
         self._refresh_vault_size()
 
     def closeEvent(self, event):  # noqa: N802
+        if not self._confirm_close_with_unsaved_roots():
+            event.ignore()
+            return
         # Closing the settings panel should never block on a COM diagnostic.
         # QDialog close hides the window; running tasks are kept alive by
         # self._diag_tasks and clean themselves up via their finished signal.

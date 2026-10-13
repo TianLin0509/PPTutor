@@ -95,6 +95,13 @@ class ScreenshotWindow(QDialog):
         self.status.setWordWrap(True)
         self.status.setStyleSheet('background: #f6f8fb; color: #475467; border: 1px solid #e9edf3; border-radius: 10px; padding: 12px 14px;')
         root.addWidget(self.status)
+        # 保存成功后出现：一键打开所在文件夹（原来只给一行路径文字）
+        self.open_saved_btn = QPushButton('打开所在文件夹')
+        self.open_saved_btn.setCursor(Qt.PointingHandCursor)
+        self.open_saved_btn.hide()
+        self._saved_target = ''
+        self.open_saved_btn.clicked.connect(self._open_saved_folder)
+        root.addWidget(self.open_saved_btn, 0, Qt.AlignLeft)
         self.preview = QLabel('截图预览')
         self.preview.setAlignment(Qt.AlignCenter)
         self.preview.setMinimumHeight(160)
@@ -369,7 +376,8 @@ class ScreenshotWindow(QDialog):
                 try:
                     from ..screenshots.encoding import encode
                     data = encode(image,'PNG')
-                    with Path(filename).open('xb') as output:
+                    # 'wb'：另存为对话框已经问过要不要替换；'xb' 会让用户选了「替换」反而报 File exists
+                    with Path(filename).open('wb') as output:
                         output.write(data)
                     return ''
                 except Exception as exc:
@@ -378,7 +386,9 @@ class ScreenshotWindow(QDialog):
                 if self._closed or serial!=self._serial:
                     return
                 self._set_busy(False)
-                self.status.setText(f'原图保存失败：{error}' if error is None or error else f'原图已保存：{filename}')
+                failed = error is None or bool(error)
+                self.status.setText(f'原图保存失败：{error}' if failed else f'原图已保存：{filename}')
+                self._show_saved_target('' if failed else filename)
             self._run(save_original,saved,'screenshot-original-save')
             return
         directory = QFileDialog.getExistingDirectory(self, '选择图片保存目录')
@@ -403,10 +413,22 @@ class ScreenshotWindow(QDialog):
             self._set_busy(False)
             if result is None or result[1]:
                 self.status.setText(f'保存失败：{result[1] if result else "请重试"}')
+                self._show_saved_target('')
             else:
                 self.status.setText(f'已保存 {len(result[0])} 张图片到 {directory}')
+                saved = list(result[0] or [])
+                self._show_saved_target(str(saved[0]) if saved else directory)
 
         self._run(work, done, 'screenshot-save')
+
+    def _show_saved_target(self, target: str) -> None:
+        self._saved_target = str(target or '')
+        self.open_saved_btn.setVisible(bool(self._saved_target))
+
+    def _open_saved_folder(self) -> None:
+        if self._saved_target:
+            from . import owner_actions
+            owner_actions.open_folder(self, self._saved_target)
 
     def _configure_shortcuts(self):
         from PySide6.QtWidgets import QApplication

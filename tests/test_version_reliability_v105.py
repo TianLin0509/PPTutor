@@ -22,6 +22,7 @@ def _isolated_version_data_dir(monkeypatch, tmp_path):
 
 def test_autostart_sync_rewrites_enabled_link_target(monkeypatch):
     writes: list[bool] = []
+    monkeypatch.setattr(app, "_autostart_sync_allowed", lambda: True)
     monkeypatch.setattr(app, "get_autostart", lambda: True)
     monkeypatch.setattr(app.autostart, "is_enabled", lambda: True)
     monkeypatch.setattr(
@@ -36,6 +37,7 @@ def test_autostart_sync_rewrites_enabled_link_target(monkeypatch):
 
 def test_autostart_sync_removes_stale_link_when_preference_is_off(monkeypatch):
     writes: list[bool] = []
+    monkeypatch.setattr(app, "_autostart_sync_allowed", lambda: True)
     monkeypatch.setattr(app, "get_autostart", lambda: False)
     monkeypatch.setattr(app.autostart, "is_enabled", lambda: False)
     monkeypatch.setattr(

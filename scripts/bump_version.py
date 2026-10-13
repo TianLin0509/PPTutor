@@ -31,6 +31,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sys
 from pathlib import Path
@@ -172,6 +173,10 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--set", dest="target", help="指定版本号，形如 1.6.0")
     ap.add_argument("--print", dest="show", action="store_true", help="只打印当前版本")
     args = ap.parse_args(argv)
+    # 主/次版本号是维护者的决定（如 2026-10-13 田哥定的 v2.0）：合并脚本只会 patch +1，
+    # 这时由维护者在跑合并前设 PPTX_BUMP_SET=2.0.0，本次合并就落在指定版本上。
+    if not args.target and not args.show and os.environ.get("PPTX_BUMP_SET", "").strip():
+        args.target = os.environ["PPTX_BUMP_SET"].strip()
 
     cur = current_version()
     if args.show:

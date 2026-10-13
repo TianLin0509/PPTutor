@@ -45,7 +45,7 @@ def test_build_qss_default_font_matches_legacy_hardcode():
     qss = theme.build_qss("atelier")
     assert 'font-family: "Microsoft YaHei UI", "Segoe UI", "PingFang SC", sans-serif;' in qss
     assert "font-size: 13px" in qss
-    assert qss.count('"Consolas", "Microsoft YaHei UI"') == 9
+    assert qss.count('"Consolas", "Microsoft YaHei UI"') == 8  # v2.0 预览元信息改用正文字体
     assert theme.build_qss("atelier", font_family="", font_scale=1.0) == qss
 
 

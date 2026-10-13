@@ -12,7 +12,7 @@ import uuid
 import logging
 from pathlib import Path
 
-from PySide6.QtCore import QStandardPaths, Qt
+from PySide6.QtCore import QStandardPaths, Qt, Signal
 from PySide6.QtGui import QGuiApplication, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QFileDialog,
@@ -61,6 +61,8 @@ def prune_paste_dir(keep: int = PASTE_KEEP) -> int:
 
 
 class ImgTextWindow(QWidget):
+    #: 组件下载进度（后台线程发，主线程改进度条）：(百分比, 文案)
+    component_progress = Signal(int, str)
     """一张图 -> 一页 PPTX。识别组件按需下载，没装时只提示、不阻塞窗口打开。"""
 
     def __init__(self, tok: dict, parent=None, *, source: str = ""):
@@ -158,8 +160,22 @@ class ImgTextWindow(QWidget):
         self._insert_btn = QPushButton("新增一页到 PPT…")
         self._insert_btn.setEnabled(False)
         self._insert_btn.clicked.connect(self._choose_target)
+        # 生成的 PPTX 原来藏在缓存目录、文件名是随机码，用户根本找不到——给出三个出口
+        self._open_result_btn = QPushButton("打开生成的 PPTX")
+        self._open_result_btn.setEnabled(False)
+        self._open_result_btn.clicked.connect(self._open_result)
+        self._open_folder_btn = QPushButton("打开所在文件夹")
+        self._open_folder_btn.setEnabled(False)
+        self._open_folder_btn.clicked.connect(self._open_folder)
+        self._save_as_btn = QPushButton("另存为…")
+        self._save_as_btn.setToolTip("把生成的可编辑 PPTX 保存到你选的位置（缓存里的结果 7 天后会自动清理）")
+        self._save_as_btn.setEnabled(False)
+        self._save_as_btn.clicked.connect(self._save_result_as)
         outputs.addWidget(self._copy_btn)
         outputs.addWidget(self._insert_btn)
+        outputs.addWidget(self._open_result_btn)
+        outputs.addWidget(self._open_folder_btn)
+        outputs.addWidget(self._save_as_btn)
         outputs.addStretch()
         root.addLayout(outputs)
 
@@ -177,8 +193,10 @@ class ImgTextWindow(QWidget):
         self._convert_btn.setEnabled(bool(self._source) and ready and not self._busy)
         self._pick_btn.setEnabled(not self._busy)
         self._paste_btn.setEnabled(not self._busy)
-        self._copy_btn.setEnabled(bool(self._result_path) and not self._busy)
-        self._insert_btn.setEnabled(bool(self._result_path) and not self._busy)
+        has_result = bool(self._result_path) and not self._busy
+        for btn in (self._copy_btn, self._insert_btn, self._open_result_btn,
+                    self._open_folder_btn, self._save_as_btn):
+            btn.setEnabled(has_result)
 
     def _install_component(self) -> None:
         if self._busy:
@@ -190,15 +208,35 @@ class ImgTextWindow(QWidget):
         self._progress.setValue(0)
         self._progress.setFormat("正在下载识别组件… %p%")
         self._progress.show()
+        if not getattr(self, "_progress_wired", False):
+            self._progress_wired = True
+            self.component_progress.connect(self._on_component_progress)
+
+        from ..netfetch import describe_progress
 
         def work():
-            def on_progress(done, total):
-                pct = int(done * 100 / max(1, total))
-                self._progress.setValue(pct)
-            return imgtext_ocr.install(progress=on_progress,
-                                       cancel=lambda: self._cancel_download or self._closing)
+            def on_status(st):
+                if "attempts" in st:
+                    return
+                total = st.get("total") or 0
+                pct = int(st.get("received", 0) * 100 / total) if total else 0
+                self.component_progress.emit(pct, describe_progress(st, "识别组件"))
+            try:
+                return imgtext_ocr.install(status=on_status,
+                                           cancel=lambda: self._cancel_download or self._closing)
+            except InterruptedError:
+                return None
+            except Exception as exc:  # noqa: BLE001 原因要带回主线程显示
+                logging.getLogger(__name__).info("识别组件下载失败：%s", exc)
+                return exc
 
         self._start(work, self._on_component_installed, "imgtext-install")
+
+    def _on_component_progress(self, pct: int, text: str) -> None:
+        if self._closing:
+            return
+        self._progress.setValue(max(0, min(100, int(pct))))
+        self._progress.setFormat(text.replace("%", "%%") + " · %p%")
 
     def _on_component_installed(self, result: object) -> None:
         self._busy = False
@@ -206,6 +244,9 @@ class ImgTextWindow(QWidget):
         self._component_btn.setEnabled(True)
         if isinstance(result, str) and result:
             self._status.setText(f"识别组件已就绪（版本 {result}），之后完全离线。")
+        elif isinstance(result, BaseException) and str(result):
+            # 多源下载失败时消息里逐个列了各源原因（如「被公司代理拦截」），原样给用户看
+            self._status.setText(f"识别组件下载失败：{result}")
         else:
             self._status.setText("识别组件下载失败；稍后重试，或在健康诊断里查看原因。")
         self._refresh_component_state()
@@ -434,11 +475,44 @@ class ImgTextWindow(QWidget):
 
     def _open_result(self) -> None:
         if self._result_path:
-            actions.open_file(self._result_path)
+            from . import owner_actions
+            owner_actions.open_file(self, self._result_path)
 
     def _open_folder(self) -> None:
         if self._result_path:
-            actions.open_folder(self._result_path)
+            from . import owner_actions
+            owner_actions.open_folder(self, self._result_path)
+
+    def _save_result_as(self) -> None:
+        if not self._result_path or self._busy:
+            return
+        base = os.path.splitext(os.path.basename(self._source or "图片转文字"))[0] or "图片转文字"
+        dest, _f = QFileDialog.getSaveFileName(
+            self, "另存为可编辑 PPTX", os.path.join(os.path.expanduser("~"), "Desktop", base + "_可编辑.pptx"),
+            "PowerPoint (*.pptx)")
+        if not dest:
+            return
+        if not dest.lower().endswith(".pptx"):
+            dest += ".pptx"
+        source = self._result_path
+
+        def work():
+            import shutil
+            try:
+                shutil.copyfile(source, dest)
+                return {"dest": dest}
+            except OSError as exc:
+                return {"error": str(exc)}
+
+        def done(payload):
+            if isinstance(payload, dict) and payload.get("dest"):
+                self._saved_copy = payload["dest"]
+                self._status.setText(f"已另存为：{payload['dest']}")
+            else:
+                err = payload.get("error") if isinstance(payload, dict) else "请重试"
+                self._status.setText(f"另存失败：{err}")
+
+        self._start(work, done, "imgtext-save-as")
 
     # ---------- 后台任务 ----------
     def _start(self, fn, done, label: str) -> None:

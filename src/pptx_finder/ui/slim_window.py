@@ -23,6 +23,7 @@ except Exception:  # noqa: BLE001
         return True
 
 from .. import slim
+from . import owner_actions
 from .bg_task import BackgroundTask
 
 
@@ -92,6 +93,14 @@ class SlimWindow(QWidget):
         root.addWidget(scroll, 1)
 
         foot = QHBoxLayout()
+        # 生成后出现：一键打开副本所在文件夹（原来只在提示框里给一行路径）
+        self._open_out_btn = QPushButton("打开副本所在文件夹")
+        self._open_out_btn.setObjectName("suggBtn")
+        self._open_out_btn.hide()
+        self._last_output = ""
+        self._open_out_btn.clicked.connect(
+            lambda: self._last_output and owner_actions.open_folder(self, self._last_output))
+        foot.addWidget(self._open_out_btn)
         foot.addStretch(1)
         self._make_btn = QPushButton("生成瘦身副本")
         self._make_btn.setObjectName("primary")
@@ -252,6 +261,8 @@ class SlimWindow(QWidget):
             hook = None
         if callable(hook):
             hook(result)
+        self._last_output = str(result.output_path)
+        self._open_out_btn.show()
         QMessageBox.information(
             self,
             "瘦身完成",

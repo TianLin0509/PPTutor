@@ -40,29 +40,31 @@ def _mk(bg, blobs, acc, acc2, ink, light=False):
              is_light=light,  # 主题明暗标志：系统标题栏深浅、对比度判定用（替代旧的硬编码主题名清单）
              canvas=("#F8FAFD" if light else "#17171F"),  # report_overlay 浮层卡片背景（不透明）依赖 canvas
              hl_bg=f"rgba({A},0.26)", hl_fg=acc)  # 命中词高亮：旧玻璃主题维持原视觉
+    d["rail"] = d["panel2"]  # v2.0 侧栏底色：玻璃主题沿用次级面板
     return d
 
 
 def _mk_atelier(light: bool) -> dict:
     """静白 / 静黑：不透明层级、无光团、荧光黄命中、灰阶徽章。"""
     if light:
-        acc, accd = "#0A6CFF", "#0857CC"
+        # v2.0 白色工作台（田哥 2026-10-05 选定 E1 白色版）：冷灰中性色 + 单一品牌蓝
+        acc, accd = "#2563EB", "#1D4ED8"
         d = dict(
-            win="#F5F5F7", appbg="#F5F5F7", base="transparent", blobs=[],
-            panel="#FFFFFF", panel2="#FFFFFF", field="#F0F0F2",
-            hover="rgba(29,29,31,0.045)", sel="#EEF3FA", selblur="rgba(29,29,31,0.055)",
-            bd="#E3E3E7", bd2="#ECECEE",
-            ink1="#1D1D1F", ink2="#494B50", ink3="#6E6E73", ink4="#A0A0A5",
-            acc=acc, accd=accd, acctext="#FFFFFF", grn="#1E9E4A",
-            scroll="rgba(60,60,67,0.30)", scrollh="rgba(60,60,67,0.55)",
-            canvas="#F0F0F2", is_light=True,
+            win="#F5F7FA", appbg="#F5F7FA", base="transparent", blobs=[],
+            panel="#FFFFFF", panel2="#FFFFFF", field="#F2F4F7", rail="#F8FAFC",
+            hover="rgba(16,24,40,0.045)", sel="#EEF4FF", selblur="rgba(16,24,40,0.06)",
+            bd="#E1E5EB", bd2="#EAECF0",
+            ink1="#1D2939", ink2="#344054", ink3="#667085", ink4="#98A2B3",
+            acc=acc, accd=accd, acctext="#FFFFFF", grn="#12A150",
+            scroll="rgba(52,64,84,0.28)", scrollh="rgba(52,64,84,0.50)",
+            canvas="#F2F4F7", is_light=True,
             hl_bg="rgba(255,224,110,0.85)", hl_fg="#3A3423",  # 荧光笔黄：命中词唯一的非灰非蓝
         )
     else:
         acc, accd = "#0A84FF", "#3D9BFF"
         d = dict(
             win="#1B1B1E", appbg="#1B1B1E", base="transparent", blobs=[],
-            panel="#252529", panel2="#232327", field="#2E2E33",
+            panel="#252529", panel2="#232327", field="#2E2E33", rail="#202024",
             hover="rgba(255,255,255,0.06)", sel="rgba(10,132,255,0.20)", selblur="rgba(255,255,255,0.07)",
             bd="rgba(255,255,255,0.11)", bd2="rgba(255,255,255,0.065)",
             ink1="#F5F5F7", ink2="#D0D0D5", ink3="#98989F", ink4="#6A6A70",
@@ -139,37 +141,44 @@ QToolTip { background: $win; color: $ink1; border: 1px solid $bd; border-radius:
 
 /* 合一工具栏（无边框窗口自绘标题栏：品牌 + 搜索 + 筛选 + 图标按钮 + 窗口控制） */
 QWidget#glassTitle { background: $panel; border-bottom: 1px solid $bd2; }
+QWidget#mainColumn { background: $panel; }
 QLabel#gtDot { color: $acc; font-size: 12px; background: transparent; }
-QLabel#gtName { color: $ink1; font-size: 13px; font-weight: 700; background: transparent; }
-QLabel#gtVer { color: $ink4; font-size: 10.5px; font-family: $mono_family; background: transparent; }
+QLabel#gtName { color: $ink1; font-size: 15px; font-weight: 700; background: transparent; }
+QLabel#gtVer { color: $ink4; font-size: 11px; font-family: $mono_family; background: transparent; }
 QLabel#gtTheme { color: $ink3; font-size: 12px; background: transparent; }
-QPushButton#updateChip { background: $acc; color: #FFFFFF; border: none; border-radius: 9px; padding: 3px 11px; font-size: 11px; font-weight: 600; }
+QPushButton#updateChip { background: $acc; color: #FFFFFF; border: none; border-radius: 8px; padding: 6px 10px; font-size: 12px; font-weight: 600; }
 QPushButton#updateChip:hover { background: $accd; }
 QPushButton#updateChip:disabled { background: rgba($hl_r,$hl_g,$hl_b,0.45); color: $ink3; }
-QPushButton#winMin, QPushButton#winMax, QPushButton#winClose { background: transparent; border: none; border-radius: 0; color: $ink3; font-size: 13px; }
+QPushButton#winMin, QPushButton#winMax, QPushButton#winClose { background: transparent; border: none; border-radius: 0; color: $ink3; font-size: 13px; padding: 0; }
 QPushButton#winMin:hover, QPushButton#winMax:hover { background: $hover; color: $ink1; }
 QPushButton#winClose:hover { background: #E81123; color: #FFFFFF; }
 
-/* 左侧导航轨：页面切换（搜索/概览/版本/健康）+ 低频动作（报告/设置） */
-QWidget#navRail { background: $panel; border-right: 1px solid $bd2; }
-QLabel#railLogo { color: $acc; font-size: 13px; background: transparent; }
-QToolButton#railBtn {
-  background: transparent; border: 1px solid transparent; border-radius: 9px;
-  color: $ink3; font-size: 9px; padding: 2px 0;
+/* 左侧导航栏：品牌 + 页面切换（搜索/概览/版本/健康）+ 工具（截图/转字/素材/报告/设置）+ 主题 */
+QWidget#navRail { background: $rail; border-right: 1px solid $bd2; }
+QWidget#railBrand { background: transparent; }
+QLabel#railLogo { background: transparent; }
+QPushButton#railBtn {
+  background: transparent; border: none; border-radius: 8px; text-align: left;
+  padding: 0 12px; color: $ink2; font-size: 14px;
 }
-QToolButton#railBtn:hover { background: $hover; }
-QToolButton#railBtn:checked { background: $sel; color: $acc; }
+QPushButton#railBtn:hover { background: $hover; color: $ink1; }
+QPushButton#railBtn:pressed { background: $sel; }
+QPushButton#railBtn:checked { background: $sel; color: $acc; font-weight: 700; }
+QPushButton#railBtn:focus { border: none; }
+QPushButton#railBtn[compact="true"] { text-align: center; padding: 0; }
+QFrame#railSep { background: $bd2; border: none; }
+QLabel#railDot { background: #F04438; border-radius: 4px; }
 
 /* 顶栏（合一后仅承载搜索语法提示行，默认隐藏） */
 QWidget#topBar { background: $panel; border: none; }
 
 /* 搜索框：灰槽内嵌，聚焦时抬为面板底 + 焦点环（macOS 搜索语言） */
 QLineEdit#searchBox {
-  background: $field; border: 1.5px solid transparent; border-radius: 9px;
-  padding: 0 12px; font-size: 14.5px; color: $ink1; selection-background-color: $acc; selection-color: $acctext;
+  background: $panel; border: 1px solid $bd; border-radius: 8px;
+  padding: 0 10px; font-size: 14.5px; color: $ink1; selection-background-color: $acc; selection-color: $acctext;
 }
-QLineEdit#searchBox:hover { background: $hover; }
-QLineEdit#searchBox:focus { border-color: $acc; background: $panel; }
+QLineEdit#searchBox:hover { border-color: rgba($hl_r,$hl_g,$hl_b,0.45); }
+QLineEdit#searchBox:focus { border: 1.5px solid $acc; background: $panel; }
 QLabel#queryHint { color: $ink3; font-size: 11.5px; background: transparent; padding: 4px 4px 2px 14px; }
 
 /* 下拉：与按钮同形制（控件圆角 8） */
@@ -234,11 +243,13 @@ QListWidget#resultList::item { border: none; margin: 0; padding: 0; background: 
 QListWidget#resultList::item:selected { background: transparent; }
 
 /* 预览卡 */
-QWidget#previewPanel { background: $panel; border: 1px solid $bd; border-radius: ${radius}px; }
+QWidget#previewPanel { background: $panel; border: none; border-radius: 0; }
 QWidget#previewHeadBar { background: transparent; }
-QLabel#previewImage { background: $canvas; border: 1px solid $bd2; border-radius: 10px; }
-QLabel#pathLabel { color: $ink3; font-size: 12px; }
-QLabel#metaLabel { color: $ink4; font-size: 11.5px; font-family: $mono_family; }
+QLabel#previewImage { background: $canvas; border: 1px solid $bd2; border-radius: 8px; }
+QLabel#pathLabel { color: $ink1; font-size: 18px; font-weight: 700; background: transparent; }
+QLabel#metaLabel { color: $ink3; font-size: 12px; background: transparent; }
+QPushButton#headerBtn { background: $panel; border: 1px solid $bd; border-radius: 7px; padding: 5px 12px; color: $ink2; font-size: 12px; }
+QPushButton#headerBtn:hover { background: $hover; color: $ink1; border-color: rgba($hl_r,$hl_g,$hl_b,0.45); }
 QPushButton#linkBtn { background: transparent; border: none; border-radius: 6px; padding: 3px 8px; color: $ink3; font-size: 11.5px; font-weight: 600; }
 QPushButton#linkBtn:hover { background: $hover; color: $acc; }
 QPushButton#detailAction {
@@ -249,7 +260,7 @@ QPushButton#detailAction:hover { background: $hover; color: $ink1; }
 QPushButton#detailAction:checked { background: $sel; border-color: $acc; color: $acc; }
 
 /* 左列表卡 */
-QWidget#listPane { background: $panel2; border: 1px solid $bd; border-radius: ${radius}px; }
+QWidget#listPane { background: $panel; border: none; border-radius: 0; }
 QWidget#listHeadBar { background: transparent; }
 QLabel#sectionHead { color: $ink3; font-size: 11px; font-weight: 700; padding: 9px 12px 4px; background: transparent; }
 
@@ -333,13 +344,13 @@ QToolButton#thumb:hover { background: $hover; color: $ink1; }
 QToolButton#thumb:checked { background: $panel; border: 1.5px solid $acc; color: $acc; font-weight: 600; }
 
 /* 命中页导航：轻量文字按钮 */
-QPushButton#navBtn { background: transparent; border: none; border-radius: 6px; padding: 4px 10px; color: $ink3; font-size: 12px; }
+QPushButton#navBtn { background: $panel; border: 1px solid $bd; border-radius: 7px; padding: 6px 14px; color: $ink2; font-size: 12.5px; }
 QPushButton#navBtn:hover { background: $hover; color: $ink1; }
-QPushButton#navBtn:disabled { color: $ink4; background: transparent; }
+QPushButton#navBtn:disabled { color: $ink4; background: $panel; border-color: $bd2; }
 QLabel#pageLabel { color: $ink3; font-size: 12px; font-family: $mono_family; background: transparent; }
 
 /* 状态栏 */
-QStatusBar#statusBar { background: $panel2; border-top: 1px solid $bd2; color: $ink3; }
+QStatusBar#statusBar { background: $panel; border-top: 1px solid $bd2; color: $ink3; }
 QStatusBar#statusBar QLabel { color: $ink3; font-size: 12px; background: transparent; }
 QLabel#kbd { color: $ink2; background: $field; border: 1px solid $bd2; border-bottom: 2px solid $bd2; border-radius: 5px; padding: 1px 7px; font-size: 10.5px; font-weight: 600; font-family: $mono_family; }
 QLabel#verShield { color: $grn; font-size: 11.5px; font-weight: 600; background: transparent; padding: 0 6px; }
@@ -366,7 +377,8 @@ QFrame#typeRail { background: transparent; }
 
 /* 仪表盘首屏（零搜索默认视图） */
 QWidget#dashView { background: transparent; }
-QFrame#dashCard { background: $panel; border: 1px solid $bd; border-radius: ${radius}px; }
+QFrame#dashCard, QFrame#dashCardLink { background: $panel; border: 1px solid $bd; border-radius: ${radius}px; }
+QFrame#dashCardLink:hover { border-color: rgba($hl_r,$hl_g,$hl_b,0.55); background: $sel; }
 QLabel#dashTitle { color: $ink1; font-size: 21px; font-weight: 800; background: transparent; }
 QLabel#dashSub { color: $ink3; font-size: 12.5px; background: transparent; }
 QLabel#kpiNum { color: $acc; font-size: 27px; font-weight: 800; font-family: $mono_family; background: transparent; }
@@ -376,6 +388,7 @@ QLabel#dashCardT { color: $ink2; font-size: 13px; font-weight: 700; background: 
 QLabel#legName { color: $ink2; font-size: 12px; background: transparent; }
 QLabel#legPc { color: $ink3; font-size: 12px; font-weight: 700; font-family: $mono_family; background: transparent; }
 QFrame#dashRec { background: $field; border: 1px solid $bd2; border-radius: 9px; }
+QFrame#dashRec:hover { background: $sel; border-color: rgba($hl_r,$hl_g,$hl_b,0.35); }
 QLabel#recName { color: $ink1; font-size: 12px; font-weight: 600; background: transparent; }
 QLabel#recTime { color: $ink4; font-size: 11px; background: transparent; }
 QLabel#recVer { color: $acc; font-size: 11px; font-weight: 700; background: transparent; }
@@ -383,6 +396,8 @@ QLabel#healthLink { background: transparent; }  /* 库体检可点病灶条目�
 
 /* 分隔条 */
 QSplitter::handle { background: transparent; }
+QSplitter#mainSplit::handle:horizontal { width: 5px; background: $panel; border-left: 1px solid $bd2; }
+QSplitter#mainSplit::handle:horizontal:hover { background: rgba($hl_r,$hl_g,$hl_b,0.10); }
 QSplitter::handle:horizontal { width: 8px; }
 QSplitter::handle:vertical { height: 8px; }
 QSplitter::handle:hover { background: rgba($hl_r,$hl_g,$hl_b,0.12); border-radius: 3px; }
@@ -454,7 +469,7 @@ QLabel#toast {
 """)
 
 # substitute 只替换字符串 $var，TOKENS 里的 blobs(list) 会被忽略（不影响 QSS）
-_QSS_KEYS = ("win", "base", "appbg", "panel", "panel2", "field", "hover", "sel", "selblur",
+_QSS_KEYS = ("win", "base", "appbg", "panel", "panel2", "field", "rail", "hover", "sel", "selblur",
              "ink1", "ink2", "ink3", "ink4", "bd", "bd2", "acc", "accd", "acctext", "grn",
              "scroll", "scrollh", "hl_r", "hl_g", "hl_b", "radius", "canvas")
 

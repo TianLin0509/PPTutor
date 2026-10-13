@@ -46,7 +46,16 @@ _MODS = {"CTRL": 0x0002, "CONTROL": 0x0002, "ALT": 0x0001, "SHIFT": 0x0004, "WIN
 HOTKEY_ID = 1
 
 
+def _autostart_sync_allowed() -> bool:
+    """隔离数据目录 = 测试 / 验收 / 体验副本在跑。开机自启是整台机器只有一份的快捷方式，
+    这类实例改写它会让用户的开机自启指向一个临时目录里的 exe（2026-10-13 实测踩到）。"""
+    return not os.environ.get("PPTX_FINDER_DATA_DIR", "").strip()
+
+
 def _sync_autostart_preference() -> bool:
+    if not _autostart_sync_allowed():
+        logging.getLogger(__name__).info("isolated data dir: leave the Startup shortcut alone")
+        return False
     desired = get_autostart()
     try:
         # A versioned green-install folder moves on every release.  Merely
@@ -677,12 +686,33 @@ def _apply_global_hotkey(app, win, spec: str) -> bool:
     return ok
 
 
+def _install_qt_chinese(app) -> bool:
+    """加载 Qt 自带的简体中文翻译：确认框不再是 Yes/No、输入框右键菜单不再是英文。
+
+    打包配置本来就保留了 qtbase_zh_CN.qm，只是从没加载过。
+    """
+    from PySide6.QtCore import QLibraryInfo, QTranslator
+    import PySide6
+
+    candidates = [QLibraryInfo.path(QLibraryInfo.TranslationsPath),
+                  os.path.join(os.path.dirname(PySide6.__file__), "translations")]
+    for folder in candidates:
+        tr = QTranslator(app)
+        if folder and tr.load("qtbase_zh_CN", folder):
+            app.installTranslator(tr)
+            app._qt_zh_translator = tr  # 防 GC
+            return True
+    logging.getLogger(__name__).info("qtbase_zh_CN translation not found")
+    return False
+
+
 def main() -> int:
     multiprocessing.freeze_support()  # PyInstaller 下多进程必需
     from .logging_setup import configure_logging
     configure_logging()
     log = logging.getLogger(__name__)
     app = QApplication(sys.argv)
+    _install_qt_chinese(app)
 
     # 单实例：已有实例在跑则通知其显示窗口并退出本实例（防重复全盘索引、数据库抢锁）
     singleton_name = _singleton_name()
