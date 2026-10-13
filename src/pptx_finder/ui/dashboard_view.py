@@ -140,7 +140,7 @@ class _Donut(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         rct = QRectF(self.rect())
-        size = min(rct.width(), rct.height()) - 12
+        size = min(rct.width(), rct.height(), 230) - 12  # 封顶：大窗口下环不会撑成一大坨
         if size <= 0:
             p.end()
             return
@@ -158,11 +158,11 @@ class _Donut(QWidget):
         p.setPen(QColor(_ink(tok, 0)))
         p.setFont(QFont("Consolas", max(8, int(size * 0.14)), QFont.Bold))
         p.drawText(QRectF(cx - size / 2, cy - size * 0.16, size, size * 0.2),
-                   Qt.AlignCenter, str(len(data)))
+                   Qt.AlignCenter, f"{int(total):,}")
         p.setPen(QColor(_ink(tok, 2)))
         p.setFont(QFont("Microsoft YaHei", max(8, int(size * 0.052))))
         p.drawText(QRectF(cx - size / 2, cy + size * 0.02, size, size * 0.16),
-                   Qt.AlignCenter, "热门分布")
+                   Qt.AlignCenter, "份 PPT")
         p.end()
 
 
@@ -185,15 +185,15 @@ class _HBars(QWidget):
         mx = max((v for _, v in data), default=1) or 1
         ar, ag, ab = _rgb_of(tok)
         n = len(data)
-        rowh = rct.height() / n
+        rowh = min(rct.height() / n, 40)  # 文件夹少时不把一根条撑满整卡
         bx = 96
         bw = rct.width() - bx - 44
         if bw <= 0:
             p.end()
             return
         for i, (lab, v) in enumerate(data):
-            y = i * rowh + rowh * 0.22
-            h = rowh * 0.4
+            h = min(rowh * 0.4, 14)
+            y = i * rowh + (rowh - h) / 2
             p.setPen(QColor(_ink(tok, 1)))
             p.setFont(QFont("Microsoft YaHei", 9))
             p.drawText(QRectF(0, i * rowh, bx - 8, rowh), Qt.AlignRight | Qt.AlignVCenter, str(lab))
@@ -225,6 +225,13 @@ class _Spark(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         rct = QRectF(self.rect())
+        if not any(week):
+            p = QPainter(self)
+            p.setPen(QColor(_ink(self._view._tok(), 3)))
+            p.setFont(QFont("Microsoft YaHei", 9))
+            p.drawText(QRectF(self.rect()), Qt.AlignCenter, "本周还没有改动过的 PPT")
+            p.end()
+            return
         mx = max(week) or 1
         n = len(week)
         ar, ag, ab = _rgb_of(tok)
