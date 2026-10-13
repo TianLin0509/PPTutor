@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QFrame,
     QMessageBox,
     QPlainTextEdit,
     QProgressDialog,
@@ -220,9 +221,11 @@ class SettingsDialog(QDialog):
 
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_guard_tab(), "功能")
+        self.tabs.addTab(self._build_components_tab(), "组件")
         self.tabs.addTab(self._build_health_tab(), "健康诊断")
         self.tabs.addTab(self._build_powerpoint_tab(), "PowerPoint")
         lay.addWidget(self.tabs, 1)
+        self.tabs.currentChanged.connect(self._on_settings_tab_changed)
         self._sync_feature_controls()
 
     def _ui_alive(self) -> bool:
@@ -929,6 +932,221 @@ class SettingsDialog(QDialog):
             self._font_result.setText("✓ 已生效；部分卡片的固定字号样式不受影响。")
         else:
             self._font_result.setText("已保存（重启后生效）；部分卡片的固定字号样式不受影响。")
+
+    # ---------- 可选组件（v2.0.1：基础版按需下载） ----------
+    def _build_components_tab(self) -> QWidget:
+        from .. import components
+        from .component_center import component_center
+
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(12, 12, 12, 12)
+        lay.setSpacing(12)
+        title = QLabel("可选组件")
+        title.setStyleSheet("font-weight:700;font-size:15px;")
+        lay.addWidget(title)
+        desc = QLabel("基础版不预装识别组件，用到时下载一次，之后在本机离线识别，图片不上传。"
+                      "下载和软件更新走同一套：GitHub 优先，连不上自动换备用服务器。")
+        desc.setWordWrap(True)
+        desc.setObjectName("emptyMeta")
+        lay.addWidget(desc)
+
+        self._component_rows: dict[str, dict] = {}
+        for comp in components.ALL:
+            card = QFrame()
+            card.setObjectName("card")
+            row = QHBoxLayout(card)
+            row.setContentsMargins(14, 12, 14, 12)
+            row.setSpacing(12)
+            text = QVBoxLayout()
+            text.setSpacing(2)
+            name = QLabel(comp.name)
+            name.setStyleSheet("font-weight:700;font-size:14px;")
+            purpose = QLabel("用于" + comp.purpose)
+            purpose.setObjectName("emptyMeta")
+            status = QLabel("")
+            status.setObjectName(f"componentStatus_{comp.key}")
+            status.setWordWrap(True)
+            status.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            text.addWidget(name)
+            text.addWidget(purpose)
+            text.addWidget(status)
+            row.addLayout(text, 1)
+            download = QPushButton("")
+            download.clicked.connect(lambda _=False, k=comp.key: self._component_download(k))
+            remove = QPushButton("卸载")
+            remove.setToolTip("删除本机解压出来的组件、释放磁盘空间；需要时可以再下载")
+            remove.clicked.connect(lambda _=False, k=comp.key: self._component_uninstall(k))
+            row.addWidget(download, 0, Qt.AlignVCenter)
+            row.addWidget(remove, 0, Qt.AlignVCenter)
+            lay.addWidget(card)
+            self._component_rows[comp.key] = {"status": status, "download": download,
+                                              "remove": remove, "size": None, "busy": False,
+                                              "note": ""}
+        hint = QLabel("公司网络连不上 GitHub 和备用服务器时，可以改装「完整版」安装包，它已内置全部组件。")
+        hint.setWordWrap(True)
+        hint.setObjectName("emptyMeta")
+        lay.addWidget(hint)
+        lay.addStretch(1)
+        component_center().state_changed.connect(self._on_component_state)
+        self._components_measured = False
+        self._refresh_components()
+        return page
+
+    def _on_component_state(self, key: str) -> None:
+        if self._closing or not _qt_is_valid(self):
+            return
+        from .component_center import component_center
+        done = component_center().snapshot(key)["phase"] == "done"
+        self._refresh_components(measure=done and self._components_measured)
+
+    def _refresh_components(self, *, measure: bool = False) -> None:
+        from .. import components
+        from .component_center import component_center
+
+        center = component_center()
+        for key, row in getattr(self, "_component_rows", {}).items():
+            if not _qt_is_valid(row["status"]):
+                return
+            comp = components.info(key)
+            snap = center.snapshot(key)
+            phase = snap["phase"]
+            moving = phase in ("checking", "downloading", "installing")
+            installed = components.is_installed(key)
+            is_bundled = components.bundled(key)
+            version = components.installed_version(key)
+            size = row["size"]
+            if row["busy"]:
+                text = "正在卸载…"
+            elif moving:
+                st = snap["status"] or {}
+                total = st.get("total") or snap["bytes"] or 0
+                pct = f" {int(st.get('received', 0) * 100 / total)}%" if total else ""
+                text = {"checking": "正在查询下载源…", "installing": "正在校验并解压…"}.get(
+                    phase, f"正在下载{pct}")
+                row["download"].setText("查看进度")
+            elif installed:
+                text = "已安装" + (f" v{version}" if version else "")
+                if size:
+                    text += f" · 占用 {_format_size_text(size)}"
+                if is_bundled:
+                    text += " · 随安装包内置"
+                row["download"].setText("查看")
+            elif is_bundled:
+                text = "安装包已内置，第一次使用时自动解压（不联网）"
+                row["download"].setText("现在解压")
+            else:
+                text = f"未安装 · 下载约 {comp.approx_mb} MB"
+                if phase == "error":
+                    text += " · 上次下载失败，点「下载」查看原因并重试"
+                row["download"].setText("下载")
+            if row["note"] and not moving and not row["busy"]:
+                text += " · " + row["note"]
+            row["status"].setText(text)
+            primary = not installed or moving
+            if row["download"].objectName() != ("primary" if primary else ""):
+                row["download"].setObjectName("primary" if primary else "")
+                row["download"].style().unpolish(row["download"])
+                row["download"].style().polish(row["download"])
+            # 内置的文字识别组件跟着安装包走，卸了下次用又会自动解压，不给卸载按钮
+            row["remove"].setVisible(installed and not (key == "ocr" and is_bundled))
+            row["remove"].setEnabled(not (moving or row["busy"]))
+            row["download"].setEnabled(not row["busy"])
+        if measure:
+            self._measure_components()
+
+    def _measure_components(self) -> None:
+        from .. import components
+
+        def measure():
+            return {c.key: components.disk_bytes(c.key) for c in components.ALL}
+
+        task = BackgroundTask(measure, "component-size", None)
+        self._track_diag_task(task)
+        task.done.connect(self._on_component_sizes)
+        task.finished.connect(lambda task=task: self._forget_diag_task(task))
+        task.start()
+
+    def _on_component_sizes(self, result: object) -> None:
+        if not isinstance(result, dict) or self._closing or not _qt_is_valid(self):
+            return
+        for key, size in result.items():
+            row = self._component_rows.get(key)
+            if row is not None:
+                row["size"] = size
+        self._refresh_components()
+
+    def _component_download(self, key: str) -> None:
+        from .. import components
+        from .component_center import component_center
+        center = component_center()
+        self._component_rows[key]["note"] = ""
+        if components.is_installed(key) or center.busy(key):
+            center.open_dialog(key, self)
+        else:
+            center.request(key, self)
+
+    def _confirm_component_uninstall(self, key: str) -> bool:
+        from .. import components
+        comp = components.info(key)
+        size = self._component_rows[key]["size"]
+        tail = "（完整版会从安装包自动解压，不联网）。" if components.bundled(key) else "。"
+        box = QMessageBox(QMessageBox.Question, f"卸载{comp.name}",
+                          f"删除本机的{comp.name}" + (f"，释放约 {_format_size_text(size)}" if size else "")
+                          + f"？\n之后再用{comp.purpose}时需要重新下载" + tail,
+                          QMessageBox.NoButton, self)
+        ok_btn = box.addButton("卸载", QMessageBox.DestructiveRole)
+        back_btn = box.addButton("取消", QMessageBox.RejectRole)
+        box.setDefaultButton(back_btn)
+        box.setEscapeButton(back_btn)
+        box.exec()
+        return box.clickedButton() is ok_btn
+
+    def _component_uninstall(self, key: str) -> None:
+        from .. import components
+        from .component_center import component_center
+        if component_center().busy(key) or not self._confirm_component_uninstall(key):
+            return
+        row = self._component_rows[key]
+        row["busy"] = True
+        row["note"] = ""
+        self._refresh_components()
+
+        def work():
+            try:
+                return components.uninstall(key)
+            except Exception as exc:  # noqa: BLE001 原因带回界面
+                return exc
+
+        task = BackgroundTask(work, "component-uninstall", None)
+        self._track_diag_task(task)
+        task.done.connect(lambda result, k=key: self._on_component_uninstalled(k, result))
+        task.finished.connect(lambda task=task: self._forget_diag_task(task))
+        task.start()
+
+    def _on_component_uninstalled(self, key: str, result: object) -> None:
+        if self._closing or not _qt_is_valid(self):
+            return
+        row = self._component_rows[key]
+        row["busy"] = False
+        row["size"] = None
+        if isinstance(result, BaseException):
+            row["note"] = f"卸载失败：{result}"
+        elif isinstance(result, int) and result:
+            row["note"] = f"已卸载，释放 {_format_size_text(result)}"
+        self._refresh_components(measure=self._components_measured)
+
+    def _on_settings_tab_changed(self, index: int) -> None:
+        # 组件占用要遍历上千个文件：切到「组件」页才在后台量，不拖慢设置页打开
+        if self.tabs.tabText(index) == "组件" and not self._components_measured:
+            self._components_measured = True
+            self._measure_components()
+
+    def show_tab(self, name: str) -> None:
+        for i in range(self.tabs.count()):
+            if self.tabs.tabText(i) == name:
+                self.tabs.setCurrentIndex(i)
+                return
 
     def _build_health_tab(self) -> QWidget:
         page = QWidget()

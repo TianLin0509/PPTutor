@@ -259,7 +259,9 @@ def fetch_manifest_from_sources(sources: list[tuple[str, str]], timeout: float =
             log.info("%s清单取不到（%s）：%s", what, base, reason)
     if not found:
         detail = "；".join(f"{c['name']}：{c['reason']}" for c in checks)
-        raise OcrUnavailable(f"{what}清单不可达：{detail}")
+        err = OcrUnavailable(f"{what}清单不可达：{detail}")
+        err.checks = checks  # 界面逐个源列出原因
+        raise err
     best = max(found, key=lambda item: _ver_tuple(item[2].get("version", "")))
     version = best[2].get("version", "")
     data = dict(best[2])

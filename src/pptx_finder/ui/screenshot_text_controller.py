@@ -2,7 +2,7 @@
 from threading import Event
 from PySide6.QtCore import QObject, Signal
 from PySide6.QtGui import QImage
-from .. import imgtext_ocr
+from .. import components, imgtext_ocr
 from ..screenshots.text import recognize_image
 from ..screenshots.delivery import copy_text
 from .screenshot_text import ScreenshotText
@@ -46,7 +46,7 @@ class ScreenshotTextController(QObject):
         owner._paths=[];owner._parts=[];owner._clear_cards();owner._update_preview()
         if self.recognizer is None and not imgtext_ocr.is_installed():
             self.dialog.install_btn.show()
-            self.dialog.status.setText('需要本地识别组件（约 80 MB）。点击下载后自动识别；截图留在本机。')
+            self.dialog.status.setText(f'需要本地识别组件（约 {components.OCR.approx_mb} MB）。点击下载，装好后自动识别；截图留在本机。')
             self.show()
             return
         self.dialog.install_btn.hide()
@@ -108,6 +108,20 @@ class ScreenshotTextController(QObject):
         owner._run(work,done,'screenshot-text-copy')
 
     def install(self):
+        """组件随安装包内置时本地解压（原地显示进度）；否则打开组件下载窗口，装好后自动识别。"""
+        if components.bundled('ocr'):
+            return self._install_local()
+        from .component_center import component_center
+        source=self.source.copy()
+        def ready():
+            # 下载期间用户可能关了结果窗口或又截了别的图：只在原图仍在等组件时接着识别
+            if self.owner._closed or self.owner._busy or not self.dialog.isVisible():return
+            if self.source.isNull() or self.source!=source:return
+            self.start(self.source)
+        component_center().request('ocr',self.dialog,on_ready=ready)
+        self.dialog.status.setText('正在下载本地识别组件（可在下载窗口查看进度、取消）；装好后自动识别。')
+
+    def _install_local(self):
         owner=self.owner
         if owner._busy:return
         owner._closed=False
@@ -115,7 +129,7 @@ class ScreenshotTextController(QObject):
         self._active_serial=serial
         owner._cancel=Event();cancel=owner._cancel
         owner._set_busy(True);self.dialog.set_busy(True)
-        self.dialog.status.setText('正在下载本地识别组件…')
+        self.dialog.status.setText('正在准备本地识别组件…')
         progress=self.progress
         from ..netfetch import describe_progress
         def work():
