@@ -205,14 +205,17 @@ def component_center() -> ComponentCenter:
     """整个程序共用一个下载中心（挂在 QApplication 上，窗口关了也继续下载）。"""
     global _center
     if _center is None:
-        _center = ComponentCenter(QApplication.instance())
-        _center.destroyed.connect(_forget)
+        center = ComponentCenter(QApplication.instance())
+        center.destroyed.connect(lambda *_a, c=center: _forget(c))
+        _center = center
     return _center
 
 
-def _forget(*_args) -> None:
+def _forget(center) -> None:
+    """只忘掉被销毁的那一个：旧实例延迟销毁时不能把已换上的新实例也清掉。"""
     global _center
-    _center = None
+    if _center is center:
+        _center = None
 
 
 def reset_for_tests() -> None:

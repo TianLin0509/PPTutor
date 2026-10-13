@@ -36,6 +36,19 @@ def _hidden(dlg):
 
 
 # ---------- 组件接口 ----------
+def test_stale_center_destroyed_later_does_not_drop_current(qtbot, qapp):
+    from PySide6.QtCore import QCoreApplication, QEvent
+    cc.reset_for_tests()
+    old = cc.component_center()
+    cc.reset_for_tests()                      # old 只是 deleteLater，还没真正销毁
+    current = cc.component_center()
+    assert current is not old
+    QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+    qtbot.wait(10)
+    assert cc.component_center() is current
+    cc.reset_for_tests()
+
+
 def test_component_catalog_and_hint_sizes_match_published_archives():
     assert [c.key for c in components.ALL] == ["ocr", "formula"]
     # 发布的组件压缩包：文字识别 85,544,805 字节、公式 457,567,111 字节（按 1024² 取整）
