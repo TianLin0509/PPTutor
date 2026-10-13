@@ -353,7 +353,7 @@ class DashboardView(QWidget):
         return w, layout
 
     def _topic_card(self) -> QFrame:
-        w, layout = self._card("主题分布")
+        w, layout = self._card("新鲜度 · 按最后修改时间")
         row = QHBoxLayout()
         self._donut = _Donut(self)
         row.addWidget(self._donut, 1)
@@ -386,7 +386,7 @@ class DashboardView(QWidget):
         return w
 
     def _folder_card(self) -> QFrame:
-        w, layout = self._card("库构成 · 按文件夹")
+        w, layout = self._card("最近改动集中在 · 按文件夹")
         self._hbars = _HBars(self)
         layout.addWidget(self._hbars, 1)
         return w
@@ -609,15 +609,17 @@ class DashboardView(QWidget):
             rest = sum(v for _, v in folders_sorted[5:])
             top_folders = folders_sorted[:4] + [("其他", rest)]
 
-        recents: list[tuple[str, str, str]] = []
+        recents: list[tuple[str, str, str, str]] = []
+        age_buckets: list[tuple[str, int]] = []
         if conn is not None:
             from .. import db
             try:
-                for fr in db.recent_files(conn, limit=5, exts=PPT_EXTS):
+                for fr in db.recent_files(conn, limit=6, exts=PPT_EXTS):
                     recents.append((fr.name, _rel_time(fr.mtime),
-                                    f"{fr.page_count}页" if fr.page_count else ""))
+                                    f"{fr.page_count}页" if fr.page_count else "", fr.path))
             except Exception:  # noqa: BLE001
                 _log.warning("recent_files failed in dashboard", exc_info=True)
+            age_buckets = _age_buckets(conn)
 
         health_summary = _scan_health_summary(conn)
 
@@ -634,7 +636,8 @@ class DashboardView(QWidget):
                 (f"{recent_week:,}", "本周改动", "近 7 日活跃"),
             ],
             "folders": top_folders,
-            "topics": top_folders,
+            # 「新鲜度」环图：全库按最后修改时间分档（原来这里复用了文件夹分布，和下方柱图是同一份数据）
+            "topics": age_buckets or top_folders,
             "week": week if any(week) else [0] * 7,
             "week_shield_text": (
                 f"🛡 已留版 {protected} 份 · {rollback_docs} 份可回退" if version_available
@@ -720,15 +723,16 @@ class DashboardView(QWidget):
             else "🛡 改存即自动留版，随时回到旧版本")
 
         # 最近活跃列表（取真实最近文件名 + 相对时间）
-        recents: list[tuple[str, str, str]] = []
+        recents: list[tuple[str, str, str, str]] = []
         if conn is not None:
             from .. import db
             try:
-                for fr in db.recent_files(conn, limit=5, exts=PPT_EXTS):
+                for fr in db.recent_files(conn, limit=6, exts=PPT_EXTS):
                     recents.append((fr.name, _rel_time(fr.mtime),
-                                    f"{fr.page_count}页" if fr.page_count else ""))
+                                    f"{fr.page_count}页" if fr.page_count else "", fr.path))
             except Exception:  # noqa: BLE001
                 _log.warning("recent_files failed in dashboard", exc_info=True)
+            self._topics = _age_buckets(conn) or top_folders
         self._recent = recents
 
     def _apply_data(self) -> None:
@@ -758,16 +762,16 @@ class DashboardView(QWidget):
             if it.widget():
                 it.widget().deleteLater()
         if self._recent:
-            for name, tm, ver in self._recent:
-                it = QFrame()
-                it.setObjectName("dashRec")
+            for rec in self._recent:
+                name, tm, ver = rec[0], rec[1], rec[2]
+                path = rec[3] if len(rec) > 3 else ""
+                it = _RecentRow(self._win, path)
                 il = QHBoxLayout(it)
                 il.setContentsMargins(11, 8, 12, 8)
                 il.setSpacing(8)
                 disp = name if len(name) < 18 else name[:16] + "…"
                 nm = QLabel(disp)
                 nm.setObjectName("recName")
-                nm.setToolTip(name)
                 tml = QLabel(tm)
                 tml.setObjectName("recTime")
                 vr = QLabel(ver)
@@ -808,6 +812,84 @@ class DashboardView(QWidget):
                 ch.update()
         self._restyle()
         self._render_health(getattr(self, "_health", None))
+
+
+class _RecentRow(QFrame):
+    """「最近活跃」一行：单击在搜索页预览，双击用 PowerPoint 打开，右键更多操作。"""
+
+    def __init__(self, win, path: str):
+        super().__init__()
+        self.setObjectName("dashRec")
+        self._win = win
+        self.path = path
+        self.setAttribute(Qt.WA_Hover, True)
+        if path:
+            self.setCursor(Qt.PointingHandCursor)
+            self.setToolTip(f"{path}\n单击预览 · 双击打开 · 右键更多")
+
+    def mousePressEvent(self, e):  # noqa: N802
+        if e.button() == Qt.LeftButton and self.path:
+            fn = getattr(self._win, "preview_path_in_search", None)
+            if callable(fn):
+                fn(self.path)
+            e.accept()
+            return
+        super().mousePressEvent(e)
+
+    def mouseDoubleClickEvent(self, e):  # noqa: N802
+        if e.button() == Qt.LeftButton and self.path:
+            fn = getattr(self._win, "_open_file_path", None)
+            if callable(fn):
+                fn(self.path)
+            e.accept()
+            return
+        super().mouseDoubleClickEvent(e)
+
+    def contextMenuEvent(self, e):  # noqa: N802
+        if not self.path:
+            return
+        from PySide6.QtWidgets import QApplication, QMenu
+        win = self._win
+        menu = QMenu(self)
+        menu.addAction("打开文件", lambda: win._open_file_path(self.path))
+        menu.addAction("在搜索页预览", lambda: win.preview_path_in_search(self.path))
+        menu.addAction("打开所在文件夹", lambda: win._open_folder_path(self.path))
+        menu.addSeparator()
+        menu.addAction("复制完整路径", lambda: (QApplication.clipboard().setText(self.path),
+                                            win._toast("已复制完整路径")))
+        menu.exec(e.globalPos())
+
+
+def _age_buckets(conn) -> list[tuple[str, int]]:
+    """全库 PPT 按最后修改时间分档：本周 / 本月 / 半年内 / 一年内 / 更早（SQL 一次算完）。"""
+    if conn is None:
+        return []
+    now = time.time()
+    day = 86400
+    week_start = datetime.datetime.combine(
+        (datetime.datetime.now() - datetime.timedelta(days=datetime.datetime.now().weekday())).date(),
+        datetime.time()).timestamp()
+    edges = [("本周", week_start), ("本月", now - 30 * day), ("半年内", now - 182 * day),
+             ("一年内", now - 365 * day)]
+    try:
+        exts = tuple(e.lower() for e in PPT_EXTS)
+        marks = ",".join("?" * len(exts))
+        row = conn.execute(
+            "SELECT "
+            "SUM(CASE WHEN mtime >= ? THEN 1 ELSE 0 END), "
+            "SUM(CASE WHEN mtime < ? AND mtime >= ? THEN 1 ELSE 0 END), "
+            "SUM(CASE WHEN mtime < ? AND mtime >= ? THEN 1 ELSE 0 END), "
+            "SUM(CASE WHEN mtime < ? AND mtime >= ? THEN 1 ELSE 0 END), "
+            f"SUM(CASE WHEN mtime < ? THEN 1 ELSE 0 END) FROM files WHERE lower(ext) IN ({marks})",
+            (edges[0][1], edges[0][1], edges[1][1], edges[1][1], edges[2][1],
+             edges[2][1], edges[3][1], edges[3][1], *exts),
+        ).fetchone()
+    except Exception:  # noqa: BLE001
+        _log.warning("age buckets failed in dashboard", exc_info=True)
+        return []
+    labels = [e[0] for e in edges] + ["更早"]
+    counts = [int(v or 0) for v in row] if row else []
+    return [(lab, n) for lab, n in zip(labels, counts) if n]
 
 
 def _rel_time(ts: float) -> str:

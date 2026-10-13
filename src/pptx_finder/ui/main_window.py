@@ -4288,6 +4288,12 @@ class MainWindow(QMainWindow):
         return -1
 
     def _select_first(self, *, delayed_preview: bool = False) -> None:
+        # 从概览「最近活跃」点进来的那份文件优先选中（按文件名搜出多条时不跳到别的同名稿）
+        pending = getattr(self, "_pending_select_path", None)
+        if pending:
+            self._pending_select_path = None
+            if self._select_path(pending, delayed_preview=delayed_preview):
+                return
         row = self._first_selectable_row()
         if row >= 0:
             if delayed_preview:
@@ -5635,6 +5641,24 @@ class MainWindow(QMainWindow):
 
         if self._run_bg(lambda: self._open_file_after_preview_release(path), _after, "open"):
             self._toast("正在打开文件…")
+
+    def preview_path_in_search(self, path: str) -> None:
+        """概览「最近活跃」等入口：切到搜索页并选中这份文件（右侧出预览）。
+
+        概览页本身就挂着「最近修改」结果；那里找到就直接选中，找不到（例如列表被筛选过）
+        就按文件名搜一次再选中，保证用户点了就有反应。
+        """
+        if self._closing or not path:
+            return
+        if not self.search_box.text().strip() and self._results:
+            self._switch_page("search")
+            if self._select_path(path):
+                return
+        name = os.path.basename(path)
+        self._pending_select_path = path
+        self.search_box.setText(name)
+        self._do_search()
+        self._switch_page("search")
 
     def _open_folder_path(self, path: str) -> None:
         def _after(ok):

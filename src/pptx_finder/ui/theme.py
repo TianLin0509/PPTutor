@@ -387,6 +387,7 @@ QLabel#dashCardT { color: $ink2; font-size: 13px; font-weight: 700; background: 
 QLabel#legName { color: $ink2; font-size: 12px; background: transparent; }
 QLabel#legPc { color: $ink3; font-size: 12px; font-weight: 700; font-family: $mono_family; background: transparent; }
 QFrame#dashRec { background: $field; border: 1px solid $bd2; border-radius: 9px; }
+QFrame#dashRec:hover { background: $sel; border-color: rgba($hl_r,$hl_g,$hl_b,0.35); }
 QLabel#recName { color: $ink1; font-size: 12px; font-weight: 600; background: transparent; }
 QLabel#recTime { color: $ink4; font-size: 11px; background: transparent; }
 QLabel#recVer { color: $acc; font-size: 11px; font-weight: 700; background: transparent; }
