@@ -46,7 +46,16 @@ _MODS = {"CTRL": 0x0002, "CONTROL": 0x0002, "ALT": 0x0001, "SHIFT": 0x0004, "WIN
 HOTKEY_ID = 1
 
 
+def _autostart_sync_allowed() -> bool:
+    """隔离数据目录 = 测试 / 验收 / 体验副本在跑。开机自启是整台机器只有一份的快捷方式，
+    这类实例改写它会让用户的开机自启指向一个临时目录里的 exe（2026-10-13 实测踩到）。"""
+    return not os.environ.get("PPTX_FINDER_DATA_DIR", "").strip()
+
+
 def _sync_autostart_preference() -> bool:
+    if not _autostart_sync_allowed():
+        logging.getLogger(__name__).info("isolated data dir: leave the Startup shortcut alone")
+        return False
     desired = get_autostart()
     try:
         # A versioned green-install folder moves on every release.  Merely

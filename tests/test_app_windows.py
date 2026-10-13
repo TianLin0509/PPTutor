@@ -89,6 +89,7 @@ def test_settings_dialog_from_app_receives_rescan_callback(qtbot):
 
 def test_sync_autostart_preference_enables_default(monkeypatch, tmp_path):
     monkeypatch.setenv("PPTX_FINDER_DATA_DIR", str(tmp_path / "cfg"))
+    monkeypatch.setattr(app_mod, "_autostart_sync_allowed", lambda: True)
     calls = []
     monkeypatch.setattr(app_mod.autostart, "is_enabled", lambda: False)
     monkeypatch.setattr(app_mod.autostart, "set_enabled", lambda on: calls.append(on) or True)
@@ -98,8 +99,17 @@ def test_sync_autostart_preference_enables_default(monkeypatch, tmp_path):
     assert calls == [True]
 
 
+def test_isolated_instance_never_rewrites_startup_shortcut(monkeypatch, tmp_path):
+    monkeypatch.setenv("PPTX_FINDER_DATA_DIR", str(tmp_path / "cfg"))
+    calls = []
+    monkeypatch.setattr(app_mod.autostart, "set_enabled", lambda on: calls.append(on) or True)
+    assert app_mod._sync_autostart_preference() is False
+    assert calls == []
+
+
 def test_sync_autostart_preference_respects_user_disabled(monkeypatch, tmp_path):
     monkeypatch.setenv("PPTX_FINDER_DATA_DIR", str(tmp_path / "cfg"))
+    monkeypatch.setattr(app_mod, "_autostart_sync_allowed", lambda: True)
     config.set_autostart(False)
     calls = []
     monkeypatch.setattr(app_mod.autostart, "is_enabled", lambda: True)
