@@ -275,8 +275,9 @@ class ComponentDialog(QDialog):
         titles.setSpacing(0)
         self.title = QLabel(f"下载{self.info.name}")
         self.title.setObjectName("auTitle")
-        self.sub = QLabel(f"用于{self.info.purpose} · 装好后在本机离线识别，图片不上传")
+        self.sub = QLabel(f"用于{self.info.purpose}，本机离线识别")
         self.sub.setObjectName("auSub")
+        self.sub.setWordWrap(True)   # 公式组件的用途较长，卡片定宽，不换行会被截掉
         titles.addWidget(self.title)
         titles.addWidget(self.sub)
         head.addLayout(titles, 1)

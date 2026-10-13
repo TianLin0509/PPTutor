@@ -275,3 +275,12 @@ def test_imgtext_window_download_button_uses_center(qtbot, center, monkeypatch):
     win._component_btn.click()
     assert calls and calls[0][0] == "ocr"
     assert "82 MB" in win._component_btn.text()
+
+
+def test_dialog_subtitle_wraps_instead_of_being_cut(qtbot, center, monkeypatch):
+    monkeypatch.setattr(components, "is_installed", lambda key: False)
+    dlg = _hidden(cc.ComponentDialog(center, "formula"))
+    qtbot.addWidget(dlg)
+    dlg.show()
+    assert dlg.sub.wordWrap()
+    assert dlg.sub.width() >= dlg.sub.fontMetrics().horizontalAdvance(dlg.sub.text()) or dlg.sub.height() > dlg.sub.fontMetrics().height() * 1.5
