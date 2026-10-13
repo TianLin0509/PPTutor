@@ -1,5 +1,5 @@
 """A separate, on-demand local formula runtime. Screenshots never leave the PC."""
-import json,os,shutil,urllib.request,uuid
+import json,os,shutil,uuid
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from ..config import data_dir
@@ -42,14 +42,18 @@ def is_installed():
     except (ValueError,TypeError,OSError):return False
 
 
+def sources():
+    """GitHub（formula-v1.0.0 tag）在前，自建服务器 /pptutor/formula 作备用。"""
+    from .. import imgtext_ocr
+    return imgtext_ocr.component_sources('formula',RELEASE_BASE)
+
+
 def fetch_manifest():
-    with urllib.request.urlopen(RELEASE_BASE+'/component.json',timeout=30) as response:
-        payload=json.loads(response.read(2*1024*1024).decode('utf-8'))
-    payload['_base']=RELEASE_BASE
-    return payload
+    from .. import imgtext_ocr
+    return imgtext_ocr.fetch_manifest_from_sources(sources(),30,'公式组件')
 
 
-def install(*,progress=None,cancelled=None,manifest=None,archive_path=None):
+def install(*,progress=None,cancelled=None,manifest=None,archive_path=None,status=None):
     from .. import imgtext_ocr
     if cancelled is not None and cancelled.is_set():raise CaptureCancelled()
     bundled=bundled_dir() if manifest is None else None
@@ -64,7 +68,8 @@ def install(*,progress=None,cancelled=None,manifest=None,archive_path=None):
     pointer=root/('active-'+uuid.uuid4().hex+'.json')
     try:
         version=imgtext_ocr.install(payload,progress=progress,cancel=(cancelled.is_set if cancelled else None),
-                                   archive_path=archive_path,target_dir=destination)
+                                   archive_path=archive_path,target_dir=destination,
+                                   status=status,what='公式组件')
         if cancelled is not None and cancelled.is_set():raise CaptureCancelled()
         if not (destination/'pptdoctor-formula.exe').is_file():raise ValueError('公式组件安装不完整')
         pointer.write_text(json.dumps({'runtime':name,'version':version}),encoding='utf-8')

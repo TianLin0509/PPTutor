@@ -902,6 +902,20 @@ class SettingsDialog(QDialog):
         )
         self.vault_audit_btn.clicked.connect(self._check_vault_repository)
         head.addWidget(self.vault_audit_btn)
+        # 检查更新：打开与主窗口同一个更新弹窗（多源、进度、各源结果）
+        self.check_update_btn = QPushButton("检查更新")
+        self.check_update_btn.setObjectName("checkUpdateBtn")
+        updater_ctl = getattr(self._diagnostic_parent, "_updater", None)
+        if updater_ctl is not None and hasattr(updater_ctl, "open_dialog"):
+            pending = updater_ctl.pending_version() if hasattr(updater_ctl, "pending_version") else ""
+            if pending:
+                self.check_update_btn.setText(f"⬆ 有新版本 v{pending}")
+            self.check_update_btn.setToolTip("查询 GitHub 与备用服务器上的最新版本")
+            self.check_update_btn.clicked.connect(lambda: updater_ctl.open_dialog())
+        else:
+            self.check_update_btn.setEnabled(False)
+            self.check_update_btn.setToolTip("源码运行的开发版不检查更新；安装版可用")
+        head.addWidget(self.check_update_btn)
         refresh = QPushButton("刷新")
         refresh.clicked.connect(self.schedule_diagnostics_refresh)
         head.addWidget(refresh)

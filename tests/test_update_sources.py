@@ -50,7 +50,8 @@ def test_there_is_always_a_github_source_even_without_a_base_url():
     assert "github-release" in labels
 
 
-def test_self_hosted_comes_first_but_github_is_always_present():
+def test_an_explicit_custom_base_comes_first_but_github_is_always_present():
+    """显式给的地址（测试/灰度用的环境变量）排在最前面；GitHub 永远在。"""
     sources = updater.update_sources(BASE)
     assert [s.label for s in sources] == ["self-hosted", "github-release"]
 
@@ -66,10 +67,29 @@ def test_source_urls_have_the_expected_shape():
     assert github.package("1.5.5").endswith("/PPT-Doctor-v1.5.5.zip")
 
 
-def test_only_github_offers_a_whole_package_fallback():
+def test_every_source_offers_a_whole_package_fallback():
+    """v2.0 起每次发版把整包也同步到自建服务器，两个源都能整包兜底。"""
     self_hosted, github = updater.update_sources(BASE)
-    assert self_hosted.package("1.5.5") == ""
-    assert github.package("1.5.5")
+    assert self_hosted.package("1.5.5") == BASE + "/PPT-Doctor-v1.5.5.zip"
+    assert github.package("1.5.5").endswith("/PPT-Doctor-v1.5.5.zip")
+    base_edition = updater.update_sources(BASE, edition="base")[0]
+    assert base_edition.package("1.5.5").endswith("/PPT-Doctor-v1.5.5-Base.zip")
+
+
+def test_default_base_puts_github_first():
+    """生产默认（自建源地址 = 内置默认值）：GitHub 在前，自建服务器作备用。"""
+    from pptx_finder.config import _DEFAULT_UPDATE_URL
+    labels = [s.label for s in updater.update_sources(_DEFAULT_UPDATE_URL)]
+    assert labels == ["github-release", "self-hosted"]
+    names = [s.name for s in updater.update_sources(_DEFAULT_UPDATE_URL)]
+    assert names == ["GitHub", "备用服务器"]
+
+
+def test_multiple_custom_bases_and_no_github_switch(monkeypatch):
+    monkeypatch.setenv("PPTX_FINDER_UPDATE_NO_GITHUB", "1")
+    sources = updater.update_sources("http://a.invalid/x;http://b.invalid/y")
+    assert [s.manifest_url for s in sources] == [
+        "http://a.invalid/x/manifest.json", "http://b.invalid/y/manifest.json"]
 
 
 # ---- 选源：版本最高，而不是第一个连得上 ----

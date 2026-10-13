@@ -191,8 +191,9 @@ def test_component_base_urls_has_a_github_fallback():
     """主源不可达时下载按钮不能变成死的——GitHub Release 是同仓库的官方分发位。"""
     urls = imgtext_ocr.component_base_urls()
     assert len(urls) >= 2
-    assert urls[0].endswith("/ocr")
-    assert "github.com" in urls[-1]
+    # v2.0：生产默认 GitHub 在前、自建服务器（/ocr）作备用
+    assert "github.com" in urls[0]
+    assert urls[-1].endswith("/ocr")
 
 
 def test_fetch_component_manifest_falls_back_to_the_next_source(monkeypatch):
@@ -204,7 +205,7 @@ def test_fetch_component_manifest_falls_back_to_the_next_source(monkeypatch):
         url = req.full_url if hasattr(req, "full_url") else str(req)
         seen.append(url)
         if "github.com" not in url:
-            raise OSError("primary down")
+            raise OSError("self-hosted down")
         payload = _json.dumps({"version": "9.9.9", "files": {"a": {"hash": "x"}}})
         return io.BytesIO(payload.encode("utf-8"))
 
