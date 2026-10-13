@@ -160,8 +160,22 @@ class ImgTextWindow(QWidget):
         self._insert_btn = QPushButton("新增一页到 PPT…")
         self._insert_btn.setEnabled(False)
         self._insert_btn.clicked.connect(self._choose_target)
+        # 生成的 PPTX 原来藏在缓存目录、文件名是随机码，用户根本找不到——给出三个出口
+        self._open_result_btn = QPushButton("打开生成的 PPTX")
+        self._open_result_btn.setEnabled(False)
+        self._open_result_btn.clicked.connect(self._open_result)
+        self._open_folder_btn = QPushButton("打开所在文件夹")
+        self._open_folder_btn.setEnabled(False)
+        self._open_folder_btn.clicked.connect(self._open_folder)
+        self._save_as_btn = QPushButton("另存为…")
+        self._save_as_btn.setToolTip("把生成的可编辑 PPTX 保存到你选的位置（缓存里的结果 7 天后会自动清理）")
+        self._save_as_btn.setEnabled(False)
+        self._save_as_btn.clicked.connect(self._save_result_as)
         outputs.addWidget(self._copy_btn)
         outputs.addWidget(self._insert_btn)
+        outputs.addWidget(self._open_result_btn)
+        outputs.addWidget(self._open_folder_btn)
+        outputs.addWidget(self._save_as_btn)
         outputs.addStretch()
         root.addLayout(outputs)
 
@@ -179,8 +193,10 @@ class ImgTextWindow(QWidget):
         self._convert_btn.setEnabled(bool(self._source) and ready and not self._busy)
         self._pick_btn.setEnabled(not self._busy)
         self._paste_btn.setEnabled(not self._busy)
-        self._copy_btn.setEnabled(bool(self._result_path) and not self._busy)
-        self._insert_btn.setEnabled(bool(self._result_path) and not self._busy)
+        has_result = bool(self._result_path) and not self._busy
+        for btn in (self._copy_btn, self._insert_btn, self._open_result_btn,
+                    self._open_folder_btn, self._save_as_btn):
+            btn.setEnabled(has_result)
 
     def _install_component(self) -> None:
         if self._busy:
@@ -459,11 +475,44 @@ class ImgTextWindow(QWidget):
 
     def _open_result(self) -> None:
         if self._result_path:
-            actions.open_file(self._result_path)
+            from . import owner_actions
+            owner_actions.open_file(self, self._result_path)
 
     def _open_folder(self) -> None:
         if self._result_path:
-            actions.open_folder(self._result_path)
+            from . import owner_actions
+            owner_actions.open_folder(self, self._result_path)
+
+    def _save_result_as(self) -> None:
+        if not self._result_path or self._busy:
+            return
+        base = os.path.splitext(os.path.basename(self._source or "图片转文字"))[0] or "图片转文字"
+        dest, _f = QFileDialog.getSaveFileName(
+            self, "另存为可编辑 PPTX", os.path.join(os.path.expanduser("~"), "Desktop", base + "_可编辑.pptx"),
+            "PowerPoint (*.pptx)")
+        if not dest:
+            return
+        if not dest.lower().endswith(".pptx"):
+            dest += ".pptx"
+        source = self._result_path
+
+        def work():
+            import shutil
+            try:
+                shutil.copyfile(source, dest)
+                return {"dest": dest}
+            except OSError as exc:
+                return {"error": str(exc)}
+
+        def done(payload):
+            if isinstance(payload, dict) and payload.get("dest"):
+                self._saved_copy = payload["dest"]
+                self._status.setText(f"已另存为：{payload['dest']}")
+            else:
+                err = payload.get("error") if isinstance(payload, dict) else "请重试"
+                self._status.setText(f"另存失败：{err}")
+
+        self._start(work, done, "imgtext-save-as")
 
     # ---------- 后台任务 ----------
     def _start(self, fn, done, label: str) -> None:

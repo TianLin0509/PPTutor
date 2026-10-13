@@ -22,6 +22,7 @@ except Exception:  # noqa: BLE001
         return True
 
 from .. import actions, db, stats
+from . import owner_actions
 from .bg_task import BackgroundTask
 from .heatmap import HeatmapWidget
 
@@ -411,6 +412,18 @@ class ReportOverlay(QWidget):
             f"border-radius:7px;padding:5px 12px;font-weight:600;}}")
         self.export_btn.clicked.connect(self._export_clicked)
         head.addWidget(self.export_btn)
+        # 导出成功后出现：打开图片所在文件夹
+        self.open_export_btn = QPushButton("打开所在文件夹")
+        self.open_export_btn.setCursor(Qt.PointingHandCursor)
+        self.open_export_btn.setStyleSheet(
+            f"QPushButton{{background:{tok['field']};color:{tok['ink2']};border:1px solid {tok['bd']};"
+            f"border-radius:7px;padding:5px 11px;font-weight:600;}}"
+            f"QPushButton:hover{{border-color:{tok['acc']};color:{tok['acc']};}}")
+        self.open_export_btn.hide()
+        self._last_export_path = ""
+        self.open_export_btn.clicked.connect(
+            lambda: self._last_export_path and owner_actions.open_folder(self, self._last_export_path))
+        head.addWidget(self.open_export_btn)
         self.close_btn = QPushButton("✕")
         self.close_btn.setText("×")
         self.close_btn.setFixedSize(34, 34)
@@ -953,7 +966,8 @@ class ReportOverlay(QWidget):
                     f"border:1px solid {tok['bd']};border-radius:7px;padding:3px 9px;}}"
                     f"QPushButton:hover{{color:{tok['acc']};border-color:{tok['acc']};}}"
                 )
-                locate.clicked.connect(lambda _=False, p=str(path): actions.open_folder(p))
+                # 后台打开：网络盘上 explorer 慢，不能卡住浮层
+                locate.clicked.connect(lambda _=False, p=str(path): owner_actions.open_folder(self, p))
                 row.addWidget(locate)
             lay.addLayout(row)
         return card
@@ -1062,7 +1076,7 @@ class ReportOverlay(QWidget):
                     f"border:1px solid {tok['bd']};border-radius:7px;padding:3px 9px;}}"
                     f"QPushButton:hover{{color:{tok['acc']};border-color:{tok['acc']};}}"
                 )
-                locate.clicked.connect(lambda _=False, p=str(path): actions.open_folder(p))
+                locate.clicked.connect(lambda _=False, p=str(path): owner_actions.open_folder(self, p))
                 row.addWidget(locate)
             card.layout().addLayout(row)
         return card
@@ -1384,7 +1398,10 @@ class ReportOverlay(QWidget):
         self.export_btn.setText(old_text)
         if self._report_ready_for_export:
             self.export_btn.setEnabled(True)
-        QMessageBox.information(self, "导出图片", "已导出图片" if ok else "导出失败")
+        if ok:
+            self._last_export_path = path
+            self.open_export_btn.show()
+        QMessageBox.information(self, "导出图片", f"已导出图片：\n{path}" if ok else "导出失败")
 
     def export_png(self, path: str) -> bool:
         return bool(self._grab_full_report_pixmap().save(path))

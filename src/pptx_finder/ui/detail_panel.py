@@ -40,12 +40,25 @@ def _vget(v, key, default=""):
         return default
 
 
+class _ClickLabel(QLabel):
+    clicked = Signal()
+
+    def mousePressEvent(self, e):  # noqa: N802
+        if e.button() == Qt.LeftButton:
+            self.clicked.emit()
+            e.accept()
+            return
+        super().mousePressEvent(e)
+
+
 class DetailPanel(QWidget):
     restore_requested = Signal(str, str)  # path, version_id
     export_requested = Signal(str, str)
     preview_requested = Signal(str)
     page_requested = Signal(int)          # 大纲点击 → 跳到该页
     slim_requested = Signal(str)          # 单文件 PPT 瘦身体检
+    copy_path_requested = Signal(str)     # 详情 Tab「复制路径」→ 主窗复制并 toast
+    open_folder_requested = Signal(str)   # 详情 Tab「打开所在文件夹」→ 主窗后台打开
 
     def __init__(self, tok: dict, parent=None):
         super().__init__(parent)
@@ -137,6 +150,24 @@ class DetailPanel(QWidget):
         self._path_label.setWordWrap(True)
         self._path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         lay.addWidget(self._path_label)
+        # 路径原来只能拖选复制；给两个直接的出口
+        path_ops = QHBoxLayout()
+        path_ops.setSpacing(8)
+        self._copy_path_btn = QPushButton("复制路径")
+        self._copy_path_btn.setObjectName("verBtn")
+        self._copy_path_btn.clicked.connect(
+            lambda: self._path and self.copy_path_requested.emit(str(self._path)))
+        self._open_folder_btn = QPushButton("打开所在文件夹")
+        self._open_folder_btn.setObjectName("verBtn")
+        self._open_folder_btn.clicked.connect(
+            lambda: self._path and self.open_folder_requested.emit(str(self._path)))
+        path_ops.addWidget(self._copy_path_btn)
+        path_ops.addWidget(self._open_folder_btn)
+        path_ops.addStretch(1)
+        self._path_ops = QWidget()
+        self._path_ops.setLayout(path_ops)
+        self._path_ops.hide()
+        lay.addWidget(self._path_ops)
         lay.addStretch(1)
         return scroll
 
@@ -158,6 +189,7 @@ class DetailPanel(QWidget):
         self._path = None
         self._meta_label.setText("← 选中左侧文件查看详情")
         self._path_label.setText("")
+        self._path_ops.hide()
         self._sync_slim_button()
         self._clear(self._version_box)
         self._version_nodes = []
@@ -195,6 +227,7 @@ class DetailPanel(QWidget):
             parts.append("版本管理未开启")
         self._meta_label.setText("　·　".join(parts))
         self._path_label.setText(str(r.path))
+        self._path_ops.show()
         self._path_label.setToolTip(str(r.path))
 
         self._clear(self._version_box)
@@ -240,7 +273,11 @@ class DetailPanel(QWidget):
         top.addWidget(title)
         top.addStretch(1)
         br = QPushButton("恢复")
-        br.setObjectName("verBtnPri" if is_latest else "verBtn")
+        # 最新一版通常就是当前文件：不用主色引导用户去点它
+        br.setObjectName("verBtn")
+        if is_latest:
+            br.setToolTip("这一版就是最近一次保存的内容，通常与当前文件相同；"
+                          "只有当前文件损坏或被改乱时才需要恢复")
         br.clicked.connect(lambda _=False, _v=vid: self.restore_requested.emit(self._path, _v))
         be = QPushButton("导出")
         be.setObjectName("verBtn")
@@ -266,8 +303,12 @@ class DetailPanel(QWidget):
 
         preview = QHBoxLayout()
         preview.setSpacing(8)
-        thumb = QLabel("点击生成预览")
+        thumb = _ClickLabel("点击生成预览")
         thumb.setObjectName("verPreview")
+        if vid:
+            # 框上写着「点击生成预览」，那就真的能点
+            thumb.setCursor(Qt.PointingHandCursor)
+            thumb.clicked.connect(lambda _v=vid: self.preview_requested.emit(_v))
         thumb.setFixedSize(150, 84)
         thumb.setAlignment(Qt.AlignCenter)
         thumb.setToolTip("历史版本第 1 页预览，用于判断是否恢复这一版")

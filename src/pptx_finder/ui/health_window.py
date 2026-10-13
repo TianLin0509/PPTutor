@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -31,6 +32,7 @@ except Exception:  # noqa: BLE001
 from .. import actions  # 独立窗（embedded=False）拿不到主窗钩子时的降级：资源管理器定位文件
 from .. import health
 from ..health import human_bytes
+from . import owner_actions
 from .bg_task import BackgroundTask
 from .index_activity_bar import IndexActivityBar
 
@@ -342,7 +344,8 @@ class HealthWindow(QWidget):
         if callable(hook):
             hook(path, name)
             return
-        actions.open_folder(path)
+        # 后台打开：网络盘上 explorer 慢，不能卡住界面
+        owner_actions.open_folder(self, path)
 
     def _add_example_links(self, lay: QVBoxLayout, examples) -> None:
         for ex in examples[:_EXAMPLE_SHOW_LIMIT]:
@@ -369,7 +372,37 @@ class HealthWindow(QWidget):
                 "保留：" + g.keep_path
                 + "\n送回收站其余 " + str(g.redundant) + " 份：\n" + "\n".join(g.paths[1:]))
             row_g.addWidget(cb, 1)
+            # 回收前要看得到：要送回收站的是哪几份（原来只藏在复选框的悬停提示里）
+            toggle = QToolButton()
+            toggle.setObjectName("dupToggle")
+            toggle.setCheckable(True)
+            toggle.setText(f"▸ 查看要回收的 {g.redundant} 份")
+            toggle.setCursor(Qt.PointingHandCursor)
+            row_g.addWidget(toggle)
             lay.addLayout(row_g)
+            copies = QWidget()
+            copies.setObjectName("dupCopies")
+            cl = QVBoxLayout(copies)
+            cl.setContentsMargins(22, 0, 0, 4)
+            cl.setSpacing(2)
+            for cp in g.paths[1:]:
+                line = QHBoxLayout()
+                line.setSpacing(6)
+                tag = QLabel("送回收站")
+                tag.setStyleSheet("color:#B4472F;font-size:11px;background:transparent;")
+                line.addWidget(tag)
+                line.addWidget(self._mk_link(os.path.basename(cp), cp))
+                folder = QLabel(os.path.dirname(cp))
+                folder.setStyleSheet("font-size:11px;background:transparent;")
+                folder.setObjectName("detailMuted")
+                line.addWidget(folder, 1)
+                cl.addLayout(line)
+            copies.hide()
+            toggle.toggled.connect(
+                lambda on, w=copies, t=toggle, n=g.redundant: (
+                    w.setVisible(on),
+                    t.setText(("▾ 收起" if on else f"▸ 查看要回收的 {n} 份"))))
+            lay.addWidget(copies)
             self._dup_checks.append((cb, g))
         if len(groups) > len(shown):
             lay.addWidget(self._muted(f"（仅列出可回收最多的前 {len(shown)} 组，共 {len(groups)} 组）"))
@@ -474,7 +507,7 @@ class HealthWindow(QWidget):
             return
         msg = (f"将把 {len(paths)} 份冗余副本送入系统回收站（每组保留 1 份），"
                f"预计回收 {human_bytes(freed_est)}。\n\n文件进回收站，可随时还原。继续？")
-        if QMessageBox.question(self, "一键回收重复", msg) != QMessageBox.Yes:
+        if not owner_actions.ask(self, "一键回收重复", msg, "送回收站", "取消"):
             return
         self._start_recycle(paths)
 
@@ -495,7 +528,7 @@ class HealthWindow(QWidget):
             return
         msg = (f"将把全部 {len(r.duplicate_groups)} 组共 {len(paths)} 份冗余副本送入系统回收站"
                f"（每组保留 1 份），预计回收 {human_bytes(freed_est)}。\n\n文件进回收站，可随时还原。继续？")
-        if QMessageBox.question(self, "全部回收重复", msg) != QMessageBox.Yes:
+        if not owner_actions.ask(self, "全部回收重复", msg, "全部送回收站", "取消"):
             return
         self._start_recycle(paths)
 
