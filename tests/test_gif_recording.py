@@ -404,6 +404,36 @@ def test_queue_overload_is_visible_in_recording_progress(qtbot, tmp_path):
     _writers.discard(engine.writer)
 
 
+def _screen_capture_available() -> bool:
+    """当前桌面能不能抓屏：不可见的测试桌面（CreateDesktop 建的）上 BitBlt 必然失败。"""
+    import ctypes
+    from ctypes import wintypes
+    user32, gdi32 = ctypes.WinDLL("user32"), ctypes.WinDLL("gdi32")
+    user32.GetDC.restype = wintypes.HDC
+    user32.GetDC.argtypes = [wintypes.HWND]
+    gdi32.CreateCompatibleDC.restype = wintypes.HDC
+    gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
+    gdi32.CreateCompatibleBitmap.restype = wintypes.HBITMAP
+    gdi32.CreateCompatibleBitmap.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int]
+    gdi32.SelectObject.argtypes = [wintypes.HDC, wintypes.HGDIOBJ]
+    gdi32.BitBlt.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                             wintypes.HDC, ctypes.c_int, ctypes.c_int, wintypes.DWORD]
+    gdi32.DeleteObject.argtypes = [wintypes.HGDIOBJ]
+    gdi32.DeleteDC.argtypes = [wintypes.HDC]
+    user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
+    screen = user32.GetDC(None)
+    mem = gdi32.CreateCompatibleDC(screen)
+    bmp = gdi32.CreateCompatibleBitmap(screen, 1, 1)
+    gdi32.SelectObject(mem, bmp)
+    ok = bool(gdi32.BitBlt(mem, 0, 0, 1, 1, screen, 0, 0, 0x00CC0020))
+    gdi32.DeleteObject(bmp)
+    gdi32.DeleteDC(mem)
+    user32.ReleaseDC(None, screen)
+    return ok
+
+
+@pytest.mark.skipif(__import__("sys").platform == "win32" and not _screen_capture_available(),
+                    reason="当前桌面不能抓屏（不可见测试桌面）；打包自检在正常会话里另行验证")
 def test_frozen_gif_selftest_uses_the_runtime_encoder_and_preview(qtbot, tmp_path):
     import json
     from pptx_finder.screenshots.gif_selftest import main
