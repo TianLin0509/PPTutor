@@ -9,7 +9,7 @@ SourceList 是独立小部件，识别组件下载失败时也用它列出各源
 from __future__ import annotations
 
 from PySide6.QtCore import QPoint, Qt, QUrl
-from PySide6.QtGui import QColor, QDesktopServices, QIcon
+from PySide6.QtGui import QPixmap, QColor, QDesktopServices, QIcon
 from PySide6.QtWidgets import (
     QDialog, QFrame, QGraphicsDropShadowEffect, QHBoxLayout, QLabel, QLayout, QProgressBar,
     QPushButton, QVBoxLayout, QWidget,
@@ -122,6 +122,7 @@ class SourceList(QFrame):
                 sep = QFrame()
                 sep.setObjectName("auSrcSep")
                 self._lay.addWidget(sep)
+                sep.show()
             row = QWidget()
             rl = QHBoxLayout(row)
             rl.setContentsMargins(12, 7, 12, 7)
@@ -137,6 +138,7 @@ class SourceList(QFrame):
             rl.addWidget(n, 0, Qt.AlignTop)
             rl.addWidget(t, 1)
             self._lay.addWidget(row)
+            row.show()  # 父窗口已显示时，新加的行要显式 show，否则要等下一轮事件循环才出现
         self.setVisible(bool(self.rows))
 
 
@@ -201,9 +203,16 @@ class UpdateDialog(QDialog):
         head = QHBoxLayout()
         head.setSpacing(12)
         icon = QLabel()
-        app_icon = parent.windowIcon() if parent is not None else QIcon()
-        if not app_icon.isNull():
-            icon.setPixmap(app_icon.pixmap(34, 34))
+        from ..config import resource_path
+        logo = QPixmap(str(resource_path("assets", "logo.png")))
+        if not logo.isNull():
+            logo = logo.scaled(102, 102, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            logo.setDevicePixelRatio(3.0)
+            icon.setPixmap(logo)
+        else:
+            app_icon = parent.windowIcon() if parent is not None else QIcon()
+            if not app_icon.isNull():
+                icon.setPixmap(app_icon.pixmap(34, 34))
         icon.setFixedSize(34, 34)
         head.addWidget(icon)
         titles = QVBoxLayout()

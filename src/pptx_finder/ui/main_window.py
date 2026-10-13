@@ -1243,6 +1243,12 @@ class MainWindow(QMainWindow):
             self._updater = UpdateController(
                 self.update_chip, update_base_url(), self.force_quit, self)
             QTimer.singleShot(4000, self._updater.start_check)
+            # 有没看过的新版本 → 侧栏「设置」挂红点；侧栏版本号可点开更新中心
+            self._updater.unread_changed.connect(self.set_settings_unread)
+            if getattr(self, "gt_ver", None) is not None:
+                self.gt_ver.setCursor(Qt.PointingHandCursor)
+                self.gt_ver.setToolTip("点击检查更新")
+                self.gt_ver.installEventFilter(self)
             # 上次一键更新的结果（成功 / 已回滚）只提示一次
             QTimer.singleShot(2500, lambda: self._updater is not None
                               and self._updater.announce_last_result(self._toast))
@@ -3631,7 +3637,27 @@ class MainWindow(QMainWindow):
         btn.setToolTip(f"把搜索词改成：{suggestion}")
         btn.show()
 
+    def _open_update_center(self) -> None:
+        upd = getattr(self, "_updater", None)
+        if upd is not None and hasattr(upd, "open_dialog"):
+            upd.open_dialog()
+
     def _open_settings_from_button(self) -> None:
+        # 有新版本时，「设置」先给一个小菜单：第一项就是这个版本的更新（同 AI Hub 的设置菜单）
+        upd = getattr(self, "_updater", None)
+        pending = upd.pending_version() if upd is not None and hasattr(upd, "pending_version") else ""
+        if pending:
+            menu = QMenu(self)
+            act_update = menu.addAction(_icons.icon("update", self._tok["acc"], 16), f"有新版本 v{pending}，查看更新")
+            act_update.triggered.connect(self._open_update_center)
+            act_settings = menu.addAction(_icons.icon("settings", self._tok["ink3"], 16), "打开设置")
+            act_settings.triggered.connect(self._open_settings_dialog_now)
+            btn = self.rail_settings_btn
+            menu.exec(btn.mapToGlobal(btn.rect().topRight()))
+            return
+        self._open_settings_dialog_now()
+
+    def _open_settings_dialog_now(self) -> None:
         cb = self._open_settings_cb
         if callable(cb):
             cb()
@@ -5514,6 +5540,9 @@ class MainWindow(QMainWindow):
             cb = self._open_settings_cb  # 状态栏热键标签点击 → 打开设置（#2）
             if callable(cb):
                 cb()
+            return True
+        if obj is getattr(self, "gt_ver", None) and et == QEvent.MouseButtonPress:
+            self._open_update_center()  # 侧栏版本号 → 更新中心（检查更新）
             return True
         if obj is getattr(self, "status_warn_label", None) and et == QEvent.MouseButtonPress:
             self._open_unreadable_dirs_dialog()  # 状态栏警示点击 → 无权限文件夹详情
