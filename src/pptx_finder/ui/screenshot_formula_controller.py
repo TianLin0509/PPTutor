@@ -116,6 +116,19 @@ class ScreenshotFormulaController(QObject):
         self.owner._run(work,done,'screenshot-formula-copy')
 
     def install(self):
+        """完整版内置组件：原地解压（不联网）；基础版：打开组件下载窗口，装好后自动识别。"""
+        if formula_component.bundled_dir():
+            return self._install_local()
+        from .component_center import component_center
+        source=self.source.copy()
+        def ready():
+            if self.owner._closed or self.owner._busy or not self.dialog.isVisible():return
+            if self.source.isNull() or self.source!=source:return
+            self.start(self.source)
+        component_center().request('formula',self.dialog,on_ready=ready)
+        self.dialog.status.setText('正在下载公式识别组件（可在下载窗口查看进度、取消）；装好后自动识别。')
+
+    def _install_local(self):
         if self.owner._busy:return
         serial,cancel,hwnd=self._begin('正在准备公式识别组件…');progress=self.progress
         from ..netfetch import describe_progress

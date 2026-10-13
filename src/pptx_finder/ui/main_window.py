@@ -3689,7 +3689,7 @@ class MainWindow(QMainWindow):
                 if getattr(dlg, "_closing", False) or not dlg.isVisible():
                     self._settings_dialogs.remove(dlg)
                     continue
-                dlg.tabs.setCurrentIndex(1)
+                dlg.show_tab("健康诊断")
                 dlg.raise_()
                 dlg.activateWindow()
                 return
@@ -3701,7 +3701,7 @@ class MainWindow(QMainWindow):
             on_rescan=self._request_full_rescan,
             on_feature_change=self._feature_change_cb,
         )
-        dlg.tabs.setCurrentIndex(1)
+        dlg.show_tab("健康诊断")
         self._settings_dialogs.append(dlg)
         dlg.destroyed.connect(lambda _=None, d=dlg: self._settings_dialogs.remove(d) if d in self._settings_dialogs else None)
         dlg.show()

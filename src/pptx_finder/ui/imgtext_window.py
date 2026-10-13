@@ -30,7 +30,7 @@ from .. import actions, config, imgtext, imgtext_ocr, ppt_transfer
 from .bg_task import BackgroundTask
 
 ACCEPTED = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
-COMPONENT_HINT_MB = 65
+COMPONENT_HINT_MB = 82   # 与组件下载窗口同口径（MB = 1024²）
 # 粘贴进来的图先落盘（识别管线吃的是路径，不是内存里的 QImage）。放缓存目录下，
 # 那里本来就被索引扫描排除，不会把临时图混进搜索结果。
 PASTE_SUBDIR = "imgtext-paste"
@@ -199,56 +199,42 @@ class ImgTextWindow(QWidget):
             btn.setEnabled(has_result)
 
     def _install_component(self) -> None:
+        """打开与软件更新同款的组件下载窗口（多源、进度、速度、各源结果、可取消）。
+
+        下载由全局下载中心在后台跑：关掉这个窗口也不中断，设置页里看到的是同一个进度。
+        """
         if self._busy:
             return
-        self._busy = True
-        self._cancel_download = False
-        self._component_btn.setEnabled(False)
-        self._progress.setRange(0, 100)
-        self._progress.setValue(0)
-        self._progress.setFormat("正在下载识别组件… %p%")
-        self._progress.show()
-        if not getattr(self, "_progress_wired", False):
-            self._progress_wired = True
-            self.component_progress.connect(self._on_component_progress)
+        from .component_center import component_center
+        center = component_center()
+        if not getattr(self, "_center_wired", False):
+            self._center_wired = True
+            center.state_changed.connect(self._on_center_state)
+        center.request("ocr", self, on_ready=self._on_component_installed)
 
-        from ..netfetch import describe_progress
+    def _on_center_state(self, key: str) -> None:
+        if key != "ocr" or self._closing:
+            return
+        from .component_center import component_center
+        snap = component_center().snapshot("ocr")
+        phase = snap["phase"]
+        if phase in ("checking", "downloading", "installing"):
+            self._component_btn.setText("查看下载进度")
+            self._component_label.setText("正在下载识别组件，可以关掉下载窗口，下载在后台继续。")
+        elif phase == "error":
+            self._component_btn.setText("重新下载识别组件")
+            self._component_label.setText("识别组件下载失败：" + (snap["error"] or "原因未知"))
+        else:
+            self._component_btn.setText(f"下载识别组件（约 {COMPONENT_HINT_MB} MB）")
+            self._refresh_component_state()
 
-        def work():
-            def on_status(st):
-                if "attempts" in st:
-                    return
-                total = st.get("total") or 0
-                pct = int(st.get("received", 0) * 100 / total) if total else 0
-                self.component_progress.emit(pct, describe_progress(st, "识别组件"))
-            try:
-                return imgtext_ocr.install(status=on_status,
-                                           cancel=lambda: self._cancel_download or self._closing)
-            except InterruptedError:
-                return None
-            except Exception as exc:  # noqa: BLE001 原因要带回主线程显示
-                logging.getLogger(__name__).info("识别组件下载失败：%s", exc)
-                return exc
-
-        self._start(work, self._on_component_installed, "imgtext-install")
-
-    def _on_component_progress(self, pct: int, text: str) -> None:
+    def _on_component_installed(self) -> None:
         if self._closing:
             return
-        self._progress.setValue(max(0, min(100, int(pct))))
-        self._progress.setFormat(text.replace("%", "%%") + " · %p%")
-
-    def _on_component_installed(self, result: object) -> None:
-        self._busy = False
-        self._progress.hide()
-        self._component_btn.setEnabled(True)
-        if isinstance(result, str) and result:
-            self._status.setText(f"识别组件已就绪（版本 {result}），之后完全离线。")
-        elif isinstance(result, BaseException) and str(result):
-            # 多源下载失败时消息里逐个列了各源原因（如「被公司代理拦截」），原样给用户看
-            self._status.setText(f"识别组件下载失败：{result}")
-        else:
-            self._status.setText("识别组件下载失败；稍后重试，或在健康诊断里查看原因。")
+        from .. import components
+        version = components.installed_version("ocr")
+        self._status.setText(f"识别组件已就绪（版本 {version}），之后完全离线。" if version
+                             else "识别组件已就绪，之后完全离线。")
         self._refresh_component_state()
 
     # ---------- 选图 ----------

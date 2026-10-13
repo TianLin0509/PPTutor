@@ -32,7 +32,8 @@ def test_settings_builds_with_basic_mode_defaults(qtbot, mgr, monkeypatch, tmp_p
     assert not dlg.document_feature.isChecked()
     assert not dlg.grouping_feature.isChecked()
     assert "已关闭" in dlg.stat.text()
-    assert dlg.tabs.count() == 3
+    assert dlg.tabs.count() == 4
+    assert [dlg.tabs.tabText(i) for i in range(4)] == ["功能", "组件", "健康诊断", "PowerPoint"]
     assert "data_dir:" in dlg.diagnostic_text.toPlainText()
     assert "diagnostic_summary:" in dlg.diagnostic_text.toPlainText()
     assert "index:" in dlg.diagnostic_text.toPlainText()
@@ -431,7 +432,7 @@ def test_health_rescan_button_invokes_callback(qtbot, mgr):
     dlg = SettingsDialog(mgr, on_rescan=lambda: calls.append("rescan"))
     qtbot.addWidget(dlg)
 
-    dlg.tabs.setCurrentIndex(1)
+    dlg.show_tab("健康诊断")
     assert dlg.rescan_btn.text() == "重新扫描索引"
     assert dlg.rescan_btn.isEnabled()
 

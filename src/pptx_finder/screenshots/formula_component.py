@@ -42,6 +42,14 @@ def is_installed():
     except (ValueError,TypeError,OSError):return False
 
 
+def installed_version():
+    pointer=component_dir()/'active.json'
+    try:
+        record=json.loads(pointer.read_text(encoding='utf-8'))
+        return str(record.get('version','')) if isinstance(record,dict) else ''
+    except (OSError,ValueError):return ''
+
+
 def sources():
     """GitHub（formula-v1.0.0 tag）在前，自建服务器 /pptutor/formula 作备用。"""
     from .. import imgtext_ocr

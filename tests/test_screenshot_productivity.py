@@ -149,9 +149,10 @@ def test_stale_install_progress_cannot_override_new_task(qtbot,tmp_path):
 
 
 def test_closing_component_install_allows_new_capture_to_install_again(qtbot,tmp_path,monkeypatch):
-    from pptx_finder import imgtext_ocr
+    from pptx_finder import components, imgtext_ocr
     win=window(qtbot,tmp_path,lambda text:None,None);jobs=[]
     monkeypatch.setattr(imgtext_ocr,'is_installed',lambda:False)
+    monkeypatch.setattr(components,'bundled',lambda key:True)   # 内置组件：原地解压路径
     monkeypatch.setattr(win,'_run',lambda fn,cb,label:jobs.append((fn,cb)))
     monkeypatch.setattr(win,'_take_frames',lambda:None)
     win._text_selected(image());win._text.install()
@@ -251,15 +252,28 @@ def test_clipboard_error_retains_editable_text(qtbot,tmp_path):
 
 
 def test_missing_component_and_download_failure_are_visible(qtbot,tmp_path,monkeypatch):
-    from pptx_finder import imgtext_ocr
+    """基础版：缺组件时给下载入口；下载失败在组件下载窗口里逐源写明原因。"""
+    from pptx_finder import components, imgtext_ocr
+    from pptx_finder.ui import component_center as cc
+    cc.reset_for_tests()
     written=[];win=window(qtbot,tmp_path,written.append,None)
     monkeypatch.setattr(imgtext_ocr,'is_installed',lambda:False)
+    monkeypatch.setattr(components,'bundled',lambda key:False)
     win._text_selected(image())
     assert win._text.dialog.install_btn.isVisible() and not written
-    def fail(**kwargs):raise RuntimeError('网络不可用')
-    monkeypatch.setattr(imgtext_ocr,'install',fail)
-    win._text.install();qtbot.waitUntil(lambda:not win._busy)
-    assert '网络不可用' in win._text.dialog.status.text() and not written
+    def fail(key):
+        err=imgtext_ocr.OcrUnavailable('识别组件清单不可达：GitHub：网络不可用')
+        err.checks=[{'name':'GitHub','ok':False,'reason':'网络不可用'}]
+        raise err
+    monkeypatch.setattr(components,'fetch_manifest',fail)
+    win._text.install()
+    center=cc.component_center()
+    dlg=center._dialogs['ocr'];dlg.setAttribute(Qt.WA_DontShowOnScreen,True)
+    qtbot.waitUntil(lambda:center.snapshot('ocr')['phase']=='error')
+    assert '网络不可用' in dlg.msg.text() and dlg.btn_manual.isVisible() and not written
+    assert any('网络不可用' in text for _n,_s,text in dlg.sources.rows)
+    assert not win._busy
+    dlg.close();cc.reset_for_tests()
 
 
 @pytest.mark.parametrize('spec',['S','Ctrl+Ctrl+S','Ctrl+F12','Ctrl+Alt','Ctrl+S, Ctrl+R'])

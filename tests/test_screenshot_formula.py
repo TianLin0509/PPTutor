@@ -159,8 +159,10 @@ def test_progress_from_cancelled_install_does_not_override_new(qtbot,tmp_path,mo
 
 
 def test_missing_component_after_owner_close_can_retry_install(qtbot,tmp_path,monkeypatch):
+    # 完整版：组件随安装包内置，原地解压（不走下载窗口）
     win=window(qtbot,tmp_path);win._formula.recognizer=component.recognize
     monkeypatch.setattr(component,'is_installed',lambda:False);jobs=[]
+    monkeypatch.setattr(component,'bundled_dir',lambda:tmp_path)
     monkeypatch.setattr(win,'_run',lambda fn,cb,label:jobs.append((fn,cb)))
     win._formula.start(image());win._formula.install();assert win._busy
     win.close();win._formula.start(image())
@@ -225,3 +227,28 @@ def test_preview_removes_blank_margins_without_trimming_formula(qapp):
     result=trim_white(source)
     assert result.width()<150 and result.height()<100
     assert result.pixelColor(16,16)==QColor('black')
+
+
+def test_base_edition_formula_install_opens_download_window_and_resumes(qtbot,tmp_path,monkeypatch):
+    """基础版：点「下载公式识别组件」打开组件下载窗口；装好后原图自动开始识别。"""
+    from pptx_finder.ui import component_center as cc
+    win=window(qtbot,tmp_path);win._formula.recognizer=component.recognize
+    installed=[False]
+    monkeypatch.setattr(component,'is_installed',lambda:installed[0])
+    monkeypatch.setattr(component,'bundled_dir',lambda:None)
+    requests=[]
+    class FakeCenter:
+        def request(self,key,parent=None,on_ready=None,**kw):requests.append((key,parent,on_ready))
+    monkeypatch.setattr(cc,'component_center',lambda:FakeCenter())
+    win._formula.start(image())
+    assert win._formula.dialog.install_btn.isVisible()
+    win._formula.install()
+    assert not win._busy and requests and requests[0][0]=='formula' and requests[0][1] is win._formula.dialog
+    assert '下载窗口' in win._formula.dialog.status.text()
+    started=[]
+    monkeypatch.setattr(win._formula,'start',lambda im:started.append(im))
+    installed[0]=True;requests[0][2]()
+    assert len(started)==1
+    # 结果窗口已关：组件装好也不再自动识别
+    win._formula.dialog.hide();requests[0][2]()
+    assert len(started)==1
