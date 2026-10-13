@@ -53,6 +53,12 @@ class UpdateSource:
     block_url: str                # 含 "{hash}"
     package_url: str = ""         # 含 "{version}"；空 = 该源没有整包兜底
 
+    @property
+    def name(self) -> str:
+        """界面上显示的源名：「GitHub」「备用服务器」。"""
+        from .netfetch import source_name
+        return source_name(self.label)
+
     def block(self, sha256: str) -> str:
         return self.block_url.format(hash=sha256)
 
@@ -60,26 +66,50 @@ class UpdateSource:
         return self.package_url.format(version=version) if self.package_url else ""
 
 
+def _is_default_base(base: str) -> bool:
+    from .config import _DEFAULT_UPDATE_URL
+    return base.rstrip("/") == _DEFAULT_UPDATE_URL.rstrip("/")
+
+
 def update_sources(base_url: str, *, edition='full') -> list[UpdateSource]:
+    """更新源列表，**按下载时的尝试顺序**排好。
+
+    v2.0 起（对照 AI Hub 的公司实测）：默认 GitHub 在前、自建服务器作备用。GitHub 在公网
+    和公司网络都直连可达；自建源以后每次发版同步，挂掉或被代理拦截时自动换下一个。
+    显式给了别的地址（环境变量 PPTX_FINDER_UPDATE_URL，测试/灰度用）时，它排在最前面；
+    多个地址用分号隔开；PPTX_FINDER_UPDATE_NO_GITHUB=1 时不加 GitHub（本机端到端测试用）。
+    """
     from .editions import manifest_name, package_suffix
     remote_name = manifest_name(edition)
-    base = (base_url or "").rstrip("/")
-    out = []
-    if base:
-        out.append(UpdateSource(
-            label="self-hosted",
+    suffix = package_suffix(edition)
+    bases = [b.strip().rstrip("/") for b in str(base_url or "").split(";") if b.strip()]
+    hosted = []
+    for i, base in enumerate(bases):
+        hosted.append(UpdateSource(
+            label="self-hosted" if i == 0 else f"self-hosted-{i + 1}",
             manifest_url=f"{base}/{remote_name}",
             block_url=base + "/files/{hash}",
+            package_url=base + "/PPT-Doctor-v{version}" + suffix + ".zip",
         ))
-    out.append(UpdateSource(
+    github = UpdateSource(
         label="github-release",
         manifest_url=f"{GITHUB_RELEASE_LATEST}/{remote_name}",
         block_url=GITHUB_RELEASE_LATEST + "/{hash}",
         # GitHub 的资产是平铺的，没有 files/ 子目录；块就以 sha256 为资产名上传。
         # 落后好几版的用户需要的块可能没随最新一版发布，那时回落到整包。
-        package_url=GITHUB_RELEASE_LATEST + "/PPT-Doctor-v{version}" + package_suffix(edition) + '.zip',
-    ))
-    return out
+        package_url=GITHUB_RELEASE_LATEST + "/PPT-Doctor-v{version}" + suffix + '.zip',
+    )
+    if os.environ.get("PPTX_FINDER_UPDATE_NO_GITHUB", "").strip() in ("1", "true", "yes"):
+        return hosted
+    if bases and all(_is_default_base(b) for b in bases):
+        return [github] + hosted
+    return hosted + [github]
+
+
+def _source_for_base(base_url: str) -> UpdateSource:
+    """只给了一个地址的老调用方式（download_delta(base, info) 且 info 没带源）。"""
+    hosted = [s for s in update_sources(base_url) if s.label.startswith("self-hosted")]
+    return hosted[0] if hosted else update_sources(base_url)[0]
 
 
 class BlockUnavailableError(RuntimeError):
@@ -94,6 +124,11 @@ class UpdateInfo:
     deleted: list           # [relpath] 远端已移除、本地应删
     raw: dict = field(default_factory=dict)  # 远端完整清单（落地为新本地 manifest）
     source: UpdateSource | None = None       # 这份更新是从哪个源比出来的
+    sources: list = field(default_factory=list)   # 有这一版的全部源（按尝试顺序），下载时逐个回落
+    checks: list = field(default_factory=list)    # 查版本时每个源的结果（SourceCheck）
+    attempts: list = field(default_factory=list)  # 下载时每个源的结果（netfetch.Attempt.as_dict）
+    used_source: UpdateSource | None = None       # 实际下载成功的源
+    kind: str = "incremental"                     # incremental / package（块缺失时回落整包）
 
     @property
     def total_bytes(self) -> int:
@@ -278,15 +313,60 @@ def _fetch_manifest_url(
     timeout: float = _CHECK_TIMEOUT,
     response_callback=None,
 ) -> dict:
+    from .netfetch import SourceFailure, fmt_bytes, looks_like_web_page
     req = urllib.request.Request(url, headers={"Cache-Control": "no-cache"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         if response_callback is not None:
             response_callback(r)
         try:
-            return json.loads(r.read().decode("utf-8"))
+            raw = r.read(8 * 1024 * 1024)
         finally:
             if response_callback is not None:
                 response_callback(None)
+        headers = getattr(r, "headers", None)
+        try:
+            ctype = (headers.get("Content-Type") if headers is not None else "") or ""
+        except AttributeError:
+            ctype = ""
+    if looks_like_web_page(ctype, raw):
+        raise SourceFailure(f"收到的是网页（{fmt_bytes(len(raw))}）而不是版本清单，可能被公司代理拦截")
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as e:
+        raise SourceFailure(f"版本清单无效：{e}"[:120]) from e
+    if not isinstance(data, dict):
+        raise SourceFailure("版本清单无效：不是 JSON 对象")
+    return data
+
+
+@dataclass
+class SourceCheck:
+    """查版本时一个源的结果，界面逐条显示。"""
+
+    label: str
+    name: str
+    ok: bool
+    version: str = ""
+    reason: str = ""
+    ms: int = 0
+
+    def as_dict(self) -> dict:
+        return {"label": self.label, "name": self.name, "ok": self.ok,
+                "version": self.version, "reason": self.reason, "ms": self.ms}
+
+
+@dataclass
+class CheckReport:
+    """一次检查的完整结果：最佳更新（可能没有）+ 各源状态。"""
+
+    best: "UpdateInfo | None"
+    checks: list
+    current: str = ""
+    error: str = ""          # 全部源都连不上 / 未打包等，给界面的人话
+
+    @property
+    def all_failed(self) -> bool:
+        return bool(self.checks) and not any(c.ok for c in self.checks)
 
 
 def download_delta(base_url: str, info: UpdateInfo, staging: Path,
@@ -300,15 +380,24 @@ def download_delta(base_url: str, info: UpdateInfo, staging: Path,
     避免下载线程「运行中被析构」崩溃。
     """
     sanitize_entries(info)  # 越界条目在落盘之前就整批拦下
-    source = info.source or update_sources(base_url)[0]
+    source = info.source or _source_for_base(base_url)
     staging = Path(staging)
     staging.mkdir(parents=True, exist_ok=True)
     total = info.total_bytes
     done = 0
+    from .netfetch import SourceFailure, check_response_is_not_page, fmt_bytes, \
+        looks_like_web_page
     for rel, h, _size in info.changed:
         if cancel is not None and cancel():
             raise InterruptedError("下载已取消")
-        h = _safe_hash(h, rel)  # 块名直接拼进 URL，落到这一刻才校验
+        h = _safe_hash(h, rel)
+        existing = staging / safe_relpath(rel)
+        if existing.is_file() and _sha256_file(existing) == h:
+            # 上一个源已经下好并校验过的块，换源时不必重下
+            done += int(_size or 0)
+            if progress:
+                progress(done, total)
+            continue  # 块名直接拼进 URL，落到这一刻才校验
         url = source.block(h)
         dest = staging / safe_relpath(rel)
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -320,16 +409,23 @@ def download_delta(base_url: str, info: UpdateInfo, staging: Path,
                 # 该块没随最新一版发布（用户落后好几版）。不是错误，换整包。
                 raise BlockUnavailableError(f"{rel} 的块在 {source.label} 上取不到") from e
             raise
+        got_bytes = 0
+        head = b""
         with opened as r, open(dest, "wb") as f:
             if response_callback is not None:
                 response_callback(r)
+            # 公司代理会把文件换成几 KB 的拦截网页：拿到响应头就先认出来
+            check_response_is_not_page(r, int(_size or 0) or None)
             while True:
                 chunk = r.read(_BUF)
                 if not chunk:
                     break
+                if not head:
+                    head = chunk[:256]
                 f.write(chunk)
                 hasher.update(chunk)
                 done += len(chunk)
+                got_bytes += len(chunk)
                 if progress:
                     progress(done, total)
                 if cancel is not None and cancel():
@@ -338,6 +434,8 @@ def download_delta(base_url: str, info: UpdateInfo, staging: Path,
             response_callback(None)
         got = hasher.hexdigest()
         if got != h:
+            if got_bytes < 256 * 1024 and looks_like_web_page("", head):
+                raise SourceFailure(f"收到 {fmt_bytes(got_bytes)} 的网页而不是更新文件，可能被公司代理拦截")
             raise ValueError(f"哈希校验失败 {rel}：期望 {h[:12]}… 实得 {got[:12]}…")
     if info.raw:
         (staging / MANIFEST_NAME).write_text(
@@ -364,7 +462,9 @@ def download_package(info: UpdateInfo, staging: Path,
     url = source.package(info.version)
     tmp = staging / "_package.zip"
     done = 0
+    from .netfetch import check_response_is_not_page
     with urllib.request.urlopen(url, timeout=timeout) as r, open(tmp, "wb") as f:
+        check_response_is_not_page(r, None, "安装包")
         total = int(r.headers.get("Content-Length") or 0)
         while True:
             if cancel is not None and cancel():
@@ -407,21 +507,74 @@ def download_package(info: UpdateInfo, staging: Path,
 
 def download_update(base_url: str, info: UpdateInfo, staging: Path,
                     progress=None, timeout: float = _DL_TIMEOUT, cancel=None,
-                    response_callback=None) -> Path:
-    """先试增量，块取不到就整包。UI 只需要调这一个。
+                    response_callback=None, on_status=None, on_attempts=None) -> Path:
+    """按顺序逐个源下载，一个源不行就写明原因换下一个。UI 只需要调这一个。
 
-    实测相邻两版之间只有 2 个文件真的变（exe 5.8 MB + base_library.zip 1.3 MB），
-    增量 7.0 MB / 全量 91.3 MB = 7.6%——所以增量这条路值得留，整包只是兜底。
+    每个源内部：先试增量块，块取不到（用户落后好几版）就下该源的整包。实测相邻两版
+    之间只有 2 个文件真的变（exe 5.8 MB + base_library.zip 1.3 MB），增量 7.0 MB /
+    全量 91.3 MB = 7.6%——所以增量这条路值得留，整包只是兜底。
+
+    on_status(dict)：进度快照（源名、已收/总字节、平滑速度、剩余秒数）。
+    on_attempts(list[dict])：每个源开始/结束时，全部源的结果（给弹窗的源列表）。
+    全部源失败抛 netfetch.AllSourcesFailed（消息里逐个列出原因）。
     """
-    try:
-        return download_delta(base_url, info, staging, progress=progress,
-                              timeout=timeout, cancel=cancel,
-                              response_callback=response_callback)
-    except BlockUnavailableError:
-        # 半截的 staging 会让 helper 的 preflight 直接放弃本次更新，先清干净
-        shutil.rmtree(staging, ignore_errors=True)
-        return download_package(info, staging, progress=progress,
-                                timeout=timeout, cancel=cancel)
+    from .netfetch import AllSourcesFailed, Attempt, ProgressMeter, reason_of
+
+    sources = list(info.sources or [])
+    if not sources:
+        sources = [info.source or _source_for_base(base_url)]
+    staging = Path(staging)
+    attempts: list[Attempt] = []
+
+    def _emit():
+        info.attempts = [a.as_dict() for a in attempts]
+        if on_attempts is not None:
+            on_attempts(list(info.attempts))
+
+    for source in sources:
+        if cancel is not None and cancel():
+            raise InterruptedError("下载已取消")
+        attempt = Attempt(label=source.label, name=source.name, url=source.manifest_url)
+        attempts.append(attempt)
+        _emit()
+        meter = ProgressMeter(info.total_bytes, source.name)
+
+        def _progress(done, total, meter=meter):
+            if progress:
+                progress(done, total)
+            snap = meter.update(done, total)
+            if snap is not None and on_status is not None:
+                on_status(snap)
+
+        sub = UpdateInfo(version=info.version, notes=info.notes, changed=info.changed,
+                         deleted=info.deleted, raw=info.raw, source=source)
+        try:
+            try:
+                download_delta(base_url, sub, staging, progress=_progress, timeout=timeout,
+                               cancel=cancel, response_callback=response_callback)
+                info.kind = "incremental"
+            except BlockUnavailableError:
+                # 半截的 staging 会让 helper 的 preflight 直接放弃本次更新，先清干净
+                shutil.rmtree(staging, ignore_errors=True)
+                if not source.package_url:
+                    raise
+                meter.total = 0
+                info.kind = "package"
+                download_package(sub, staging, progress=_progress, timeout=timeout,
+                                 cancel=cancel)
+        except InterruptedError:
+            attempt.finish("cancelled", "已取消")
+            _emit()
+            raise
+        except Exception as exc:  # noqa: BLE001 这个源不行，记下原因换下一个
+            attempt.finish("failed", reason_of(exc))
+            _emit()
+            continue
+        attempt.finish("ok", "", meter.received or info.total_bytes)
+        info.used_source = source
+        _emit()
+        return staging
+    raise AllSourcesFailed("下载更新", attempts)
 
 
 # ---------- 应用（Windows 原地替换） ----------
@@ -429,9 +582,18 @@ def download_update(base_url: str, info: UpdateInfo, staging: Path,
 _HELPER_PS1 = r'''param([int]$MainPid, [string]$Plan)
 $script:LogPath = ($env:LOCALAPPDATA + '\pptx-finder\update.log')
 function Log($m){ try { Add-Content -LiteralPath $script:LogPath -Value ((Get-Date -Format o) + '  ' + $m) } catch {} }
+function Result($ok, $rolled, $why){
+  if (-not $script:ResultPath) { return }
+  try {
+    $o = [ordered]@{ version = [string]$script:Version; ok = [bool]$ok; rolled_back = [bool]$rolled; reason = [string]$why }
+    Set-Content -LiteralPath $script:ResultPath -Value ($o | ConvertTo-Json -Compress) -Encoding UTF8
+  } catch { Log "result write: $_" }
+}
 try {
   $p = Get-Content -Raw -LiteralPath $Plan | ConvertFrom-Json
   if ($p.log_path) { $script:LogPath = [string]$p.log_path }
+  $script:ResultPath = [string]$p.result_path
+  $script:Version = [string]$p.version
   Log "helper start pid=$MainPid"
   if ($MainPid -gt 0) { try { Wait-Process -Id $MainPid -Timeout 60 -ErrorAction Stop } catch { Log "wait: $_" } }
   Start-Sleep -Milliseconds 500
@@ -448,6 +610,7 @@ try {
   $swapped = $false
   if ($missing.Count -gt 0) {
     Log ("ABORT preflight: " + $missing.Count + " staged file(s) missing, install untouched")
+    Result $false $false ("missing " + $missing.Count + " staged file(s)")
   } else {
     $backup = Join-Path ([System.IO.Path]::GetTempPath()) ("pptutor_rollback_" + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Force -Path $backup | Out-Null
@@ -479,6 +642,7 @@ try {
         catch { Log "ROLLBACK FAILED $r $_" }
       }
       Log ("ROLLED BACK " + $restore.Count + " file(s) after failure on " + $failed + "; backup kept at " + $backup)
+      Result $false $true ("replace failed: " + $failed)
     } else {
       $swapped = $true
       foreach ($rel in @($p.deletes)) {
@@ -487,6 +651,7 @@ try {
         if (Test-Path -LiteralPath $dst) { try { Remove-Item -LiteralPath $dst -Force } catch { Log "del $rel $_" } }
       }
       Log "swap done -> v$($p.version)"
+      Result $true $false ""
       try { Remove-Item -LiteralPath $backup -Recurse -Force } catch {}
     }
   }
@@ -502,7 +667,7 @@ try {
   # instead of downloading the whole delta again.
   if ($swapped) { try { Remove-Item -LiteralPath $staging -Recurse -Force } catch {} }
   Log "helper done"
-} catch { Log "FATAL $_" }
+} catch { Log "FATAL $_"; Result $false $false ("helper error: " + $_) }
 '''
 
 
@@ -513,6 +678,7 @@ def write_helper(
     relaunch: str,
     *,
     log_path: str | Path | None = None,
+    result_path: str | Path | None = None,
 ) -> dict:
     """把 plan.json + apply.ps1 写到一个独立控制目录（不在 staging 内，免被 helper 自删时连累）。
 
@@ -528,6 +694,7 @@ def write_helper(
         "relaunch": relaunch,
         "version": info.version,
         "log_path": str(log_path) if log_path is not None else "",
+        "result_path": str(result_path) if result_path is not None else "",
     }
     plan_path = ctrl / "plan.json"
     plan_path.write_text(json.dumps(plan, ensure_ascii=False), encoding="utf-8")
@@ -552,7 +719,12 @@ def launch_helper(ps1: str, plan_path: str, main_pid: int | None = None) -> None
 def apply_update(staging: Path, dest: Path, info: UpdateInfo, relaunch: str,
                  main_pid: int | None = None, launch: bool = True) -> dict:
     """生成 helper 并（默认）分离启动。返回 write_helper 的结果（含 plan/路径）。"""
-    h = write_helper(staging, dest, info, relaunch)
+    try:
+        result_path = update_result_path()
+        result_path.unlink(missing_ok=True)
+    except Exception:  # noqa: BLE001
+        result_path = None
+    h = write_helper(staging, dest, info, relaunch, result_path=result_path)
     if launch:
         launch_helper(h["ps1"], h["plan_path"], main_pid)
     return h
@@ -584,43 +756,118 @@ def local_manifest() -> dict | None:
         return None
 
 
-def check_for_update(
+def check_sources(
     base_url: str,
     *,
     timeout: float = _CHECK_TIMEOUT,
     response_callback=None,
-) -> UpdateInfo | None:
-    """供 UI 后台线程调用：非 frozen / 无本地清单 / 全部源都拿不到 → None（不打扰）。
+) -> CheckReport:
+    """各源同时查清单，记下每个源的结果，挑**版本最高**的那份。
 
-    **挑版本最高的源，而不是第一个能连上的源。** 自建源的清单长期停在 v1.2.7；
-    如果按「第一个连得上就用」，那台服务器一天不更新，所有用户就一天收不到更新，
-    而且完全没有报错——正是此前的实际状况。现在只要任一源有更新的版本就能拿到。
+    **挑版本最高的源，而不是第一个能连上的源。** 自建源的清单曾长期停在 v1.2.7；
+    按「第一个连得上就用」，那台服务器一天不更新，所有用户就一天收不到更新，
+    而且完全没有报错。现在只要任一源有更新的版本就能拿到；有同一版本的其它源
+    按顺序排在后面，下载时逐个回落。
     """
+    from concurrent.futures import ThreadPoolExecutor
+    import time as _time
+
+    from .netfetch import reason_of
+
     if not is_frozen():
-        return None
+        return CheckReport(best=None, checks=[], error="开发环境不检查更新")
     local = local_manifest()
     if not local:
-        return None
-    best: UpdateInfo | None = None
+        return CheckReport(best=None, checks=[], error="读不到本机安装清单，无法比对版本")
     from .editions import current_edition
     # The installer may switch editions while retaining an older local manifest.
     # Its marker is authoritative; the manifest only supplies hashes/version.
     edition = current_edition()
-    for source in update_sources(base_url, edition=edition):
+    sources = update_sources(base_url, edition=edition)
+
+    def _one(source):
+        started = _time.monotonic()
         try:
             remote = fetch_manifest_from(
                 source, timeout=timeout, response_callback=response_callback)
             if remote.get('edition', 'full') != edition:
                 raise UnsafeManifestError('更新包版本类型与当前安装不符')
             info = compare(local, remote)
-        except Exception:  # noqa: BLE001 单个源不可达不该拖垮整次检查
-            continue
+            check = SourceCheck(source.label, source.name, True,
+                                str(remote.get("version", "")),
+                                ms=int((_time.monotonic() - started) * 1000))
+            return source, info, check
+        except Exception as exc:  # noqa: BLE001 单个源不可达不该拖垮整次检查
+            reason = "更新包版本类型与当前安装不符" if isinstance(exc, UnsafeManifestError) \
+                else reason_of(exc)
+            return source, None, SourceCheck(source.label, source.name, False, reason=reason,
+                                             ms=int((_time.monotonic() - started) * 1000))
+
+    with ThreadPoolExecutor(max_workers=max(1, len(sources))) as pool:
+        results = list(pool.map(_one, sources))
+    checks = [c for _s, _i, c in results]
+    best: UpdateInfo | None = None
+    for source, info, _check in results:
         if info is None:
             continue
         info.source = source
         if best is None or _ver_tuple(info.version) > _ver_tuple(best.version):
             best = info
-    return best
+    if best is not None:
+        best.sources = [src for src, info, _c in results
+                        if info is not None and info.version == best.version]
+        best.source = best.sources[0]
+        best.checks = checks
+    report = CheckReport(best=best, checks=checks, current=str(local.get("version", "")))
+    if report.all_failed:
+        report.error = "所有更新源都连不上：" + "；".join(f"{c.name}：{c.reason}" for c in checks)
+    return report
+
+
+def check_for_update(
+    base_url: str,
+    *,
+    timeout: float = _CHECK_TIMEOUT,
+    response_callback=None,
+) -> UpdateInfo | None:
+    """兼容入口：只要最佳更新。非 frozen / 无本地清单 / 全部源都拿不到 → None。"""
+    return check_sources(base_url, timeout=timeout, response_callback=response_callback).best
+
+
+# ---------- 上一次更新的结果（helper 写，主程序下次启动读一次） ----------
+def update_result_path() -> Path:
+    from .config import data_dir
+    return data_dir() / "update_result.json"
+
+
+def consume_update_result() -> dict | None:
+    """读出并删除上一次更新的结果：{version, ok, rolled_back, reason}。只提示一次。"""
+    p = update_result_path()
+    if not p.is_file():
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8-sig"))
+    except Exception:  # noqa: BLE001
+        data = None
+    try:
+        p.unlink()
+    except OSError:
+        pass
+    return data if isinstance(data, dict) and data.get("version") else None
+
+
+def describe_update_result(result: dict | None, current_version: str = "") -> str:
+    """把 helper 的结果翻成一句提示。"""
+    if not result:
+        return ""
+    version = str(result.get("version") or "")
+    if result.get("ok"):
+        if current_version and _ver_tuple(current_version) < _ver_tuple(version):
+            return f"⚠ 更新到 v{version} 后启动的仍是旧版本，请重新打开或手动安装"
+        return f"✅ 已更新到 v{version}"
+    reason = str(result.get("reason") or "原因未知")
+    tail = "，已恢复原来的版本" if result.get("rolled_back") else "，原来的版本没有改动"
+    return f"⚠ 更新到 v{version} 没有完成{tail}：{reason}"
 
 
 def run_update_check(argv: list[str]) -> int:
@@ -632,14 +879,23 @@ def run_update_check(argv: list[str]) -> int:
     report = argv[i + 2] if len(argv) > i + 2 else "update_check_report.json"
     data: dict = {"frozen": is_frozen(), "base_url": base_url}
     try:
-        info = check_for_update(base_url)
+        checked = check_sources(base_url)
+        data["checks"] = [c.as_dict() for c in checked.checks]
+        info = checked.best
         if info is None:
             data["update"] = False
+            if checked.error:
+                data["check_error"] = checked.error
         else:
             staging = Path(tempfile.gettempdir()) / "pptutor_update_check"
             shutil.rmtree(staging, ignore_errors=True)
-            download_delta(base_url, info, staging)  # 逐块校验 sha256，能跑通即全部通过
+            try:
+                download_update(base_url, info, staging)  # 逐源回落，逐块校验 sha256
+            finally:
+                data["attempts"] = info.attempts
             data.update(update=True, version=info.version, verified=True,
+                        source=info.used_source.name if info.used_source else "",
+                        kind=info.kind,
                         changed=[r[0] for r in info.changed], deleted=info.deleted,
                         bytes=info.total_bytes, staging=str(staging))
     except Exception as e:  # noqa: BLE001

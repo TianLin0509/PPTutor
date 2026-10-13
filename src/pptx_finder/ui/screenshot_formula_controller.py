@@ -118,8 +118,9 @@ class ScreenshotFormulaController(QObject):
     def install(self):
         if self.owner._busy:return
         serial,cancel,hwnd=self._begin('正在准备公式识别组件…');progress=self.progress
+        from ..netfetch import describe_progress
         def work():
-            try:formula_component.install(cancelled=cancel,progress=lambda a,b:progress.emit(serial,f'下载公式组件：{a/1000000:.1f} / {b/1000000:.1f} MB'));return ''
+            try:formula_component.install(cancelled=cancel,status=lambda st:None if 'attempts' in st else progress.emit(serial,describe_progress(st,'公式组件')));return ''
             except Exception as exc:return str(exc)
         def done(error):
             if not self._valid(serial):return

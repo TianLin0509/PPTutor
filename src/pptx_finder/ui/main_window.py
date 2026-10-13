@@ -1157,6 +1157,9 @@ class MainWindow(QMainWindow):
             self._updater = UpdateController(
                 self.update_chip, update_base_url(), self.force_quit, self)
             QTimer.singleShot(4000, self._updater.start_check)
+            # 上次一键更新的结果（成功 / 已回滚）只提示一次
+            QTimer.singleShot(2500, lambda: self._updater is not None
+                              and self._updater.announce_last_result(self._toast))
         QTimer.singleShot(0, self._start_ui_loop_monitor)
         app = QApplication.instance()
         if app is not None:

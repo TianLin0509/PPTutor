@@ -117,9 +117,10 @@ class ScreenshotTextController(QObject):
         owner._set_busy(True);self.dialog.set_busy(True)
         self.dialog.status.setText('正在下载本地识别组件…')
         progress=self.progress
+        from ..netfetch import describe_progress
         def work():
             try:
-                imgtext_ocr.install(progress=lambda done,total:progress.emit(serial,f'下载识别组件：{done/1000000:.1f} / {total/1000000:.1f} MB'),cancel=cancel.is_set)
+                imgtext_ocr.install(status=lambda st:None if 'attempts' in st else progress.emit(serial,describe_progress(st,'识别组件')),cancel=cancel.is_set)
                 return ''
             except Exception as exc:return str(exc)
         def done(error):

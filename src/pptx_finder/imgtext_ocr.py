@@ -187,59 +187,99 @@ def recognize_one_cached(image, *, cancelled=None) -> list[dict]:
 COMPONENT_MANIFEST = "component.json"
 
 
-#: 主源之外的备用地址：GitHub Release 上的同名资产。
-#: 为什么要备用源：识别组件 80 MB，托管在自建更新源上；那台机器不可达（或还没传）
-#: 时，下载按钮就是死的。GitHub Release 是同一个仓库的官方分发位，不需要额外凭据，
-#: 拿来做兜底最省事。两个源用的是同一份清单、同一套两层 sha256 校验，安全性一致。
+#: GitHub Release 上识别组件的独立 tag（版本节奏与主程序不同步，所以单独打 tag 让 URL 稳定）。
+#: v2.0 起对照 AI Hub：GitHub 在前、自建服务器作备用；两个源同一份清单、同一套两层
+#: sha256 校验，安全性一致。一个源被代理换成拦截网页、超时或 404，自动换下一个。
 COMPONENT_FALLBACK_URL = (
     "https://github.com/TianLin0509/PPTutor/releases/download/ocr-v1.1.0")
 
 
-def component_base_urls() -> list[str]:
+def component_sources(kind: str = "ocr", github_base: str = COMPONENT_FALLBACK_URL
+                      ) -> list[tuple[str, str]]:
+    """[(label, base_url)] 按尝试顺序。显式改了更新地址（测试/灰度）时它排最前。"""
     from .config import update_base_url
-    primary = update_base_url().rstrip("/") + "/ocr"
-    return [primary, COMPONENT_FALLBACK_URL]
+    from .updater import _is_default_base
+    hosted_root = update_base_url().split(";")[0].rstrip("/")
+    hosted = ("self-hosted", hosted_root + "/" + kind)
+    github = ("github-release", github_base)
+    if os.environ.get("PPTX_FINDER_UPDATE_NO_GITHUB", "").strip() in ("1", "true", "yes"):
+        return [hosted]
+    if _is_default_base(hosted_root):
+        return [github, hosted]
+    return [hosted, github]
+
+
+def component_base_urls() -> list[str]:
+    return [base for _label, base in component_sources()]
 
 
 def component_base_url() -> str:
     return component_base_urls()[0]
 
 
-def fetch_component_manifest(timeout: float = 8.0) -> dict:
-    """按顺序试各个源，第一个能取到清单的就用它。
+def fetch_manifest_from_sources(sources: list[tuple[str, str]], timeout: float = 8.0,
+                                what: str = "识别组件") -> dict:
+    """各源都问一遍清单，挑版本最高的；同一版本的其它源按顺序留作下载备用。
 
-    清单里会带上 `_base`，让 install() 从**同一个源**取压缩包——不能出现
-    「清单来自 A、包来自 B」的混搭，那样哈希校验的语义就散了。
+    清单里带上 `_base`（首选源）和 `_bases`（全部可用源），install() 只从这些源取包——
+    不能出现「清单来自 A、包来自不相干的 B」的混搭。`_checks` 记每个源的结果给界面看。
     """
     import json as _json
     import urllib.request
 
-    last = None
-    best = None
+    from .netfetch import SourceFailure, looks_like_web_page, reason_of, source_name
     from .updater import _ver_tuple
-    for base in component_base_urls():
+
+    found = []
+    checks = []
+    for label, base in sources:
         try:
             req = urllib.request.Request(base + "/" + COMPONENT_MANIFEST,
                                          headers={"Cache-Control": "no-cache"})
             with urllib.request.urlopen(req, timeout=timeout) as response:
-                data = _json.loads(response.read().decode("utf-8"))
-            if isinstance(data, dict) and data.get("files"):
-                data["_base"] = base
-                if best is None or _ver_tuple(data.get('version', '')) > _ver_tuple(best.get('version', '')):
-                    best = data
-        except Exception as exc:      # noqa: BLE001 逐个源试，最后一个失败才抛
-            last = exc
-            log.info("识别组件清单取不到（%s）：%s", base, exc)
-    if best is not None:
-        return best
-    raise OcrUnavailable(f"识别组件清单不可达：{last}")
+                raw = response.read(4 * 1024 * 1024)
+                headers = getattr(response, "headers", None)
+            ctype = ""
+            try:
+                ctype = (headers.get("Content-Type") if headers is not None else "") or ""
+            except AttributeError:
+                pass
+            if looks_like_web_page(ctype, raw):
+                raise SourceFailure("收到的是网页而不是组件清单，可能被公司代理拦截")
+            data = _json.loads(raw.decode("utf-8"))
+            if not (isinstance(data, dict) and data.get("files")):
+                raise SourceFailure("组件清单无效")
+            found.append((label, base, data))
+            checks.append({"label": label, "name": source_name(label), "ok": True,
+                           "version": str(data.get("version", "")), "reason": ""})
+        except Exception as exc:      # noqa: BLE001 逐个源试，全部失败才抛
+            reason = reason_of(exc)
+            checks.append({"label": label, "name": source_name(label), "ok": False,
+                           "version": "", "reason": reason})
+            log.info("%s清单取不到（%s）：%s", what, base, reason)
+    if not found:
+        detail = "；".join(f"{c['name']}：{c['reason']}" for c in checks)
+        raise OcrUnavailable(f"{what}清单不可达：{detail}")
+    best = max(found, key=lambda item: _ver_tuple(item[2].get("version", "")))
+    version = best[2].get("version", "")
+    data = dict(best[2])
+    data["_base"] = best[1]
+    data["_bases"] = [(label, base) for label, base, d in found if d.get("version", "") == version]
+    data["_checks"] = checks
+    return data
+
+
+def fetch_component_manifest(timeout: float = 8.0) -> dict:
+    """文字识别组件的清单（多源，挑版本最高）。"""
+    return fetch_manifest_from_sources(component_sources(), timeout, "识别组件")
 
 
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
 
 def install(manifest: dict | None = None, *, progress=None, cancel=None,
-            archive_path: Path | None = None, target_dir: Path | None = None) -> str:
+            archive_path: Path | None = None, target_dir: Path | None = None,
+            status=None, what: str = "识别组件") -> str:
     """下载识别组件并原子安装，返回安装好的版本号。
 
     两层校验：先验整包 sha256，解开后再逐文件对清单里的 sha256。全部就绪之后才
@@ -274,26 +314,51 @@ def install(manifest: dict | None = None, *, progress=None, cancel=None,
     staging = Path(tempfile.mkdtemp(prefix="pptdoctor-ocr-dl-"))
     try:
         bundle = staging / "component.zip"
-        hasher = hashlib.sha256()
-        done = 0
-        base = str(manifest.get("_base") or component_base_url())
-        url = base + "/" + archive_name
-        source = (archive_path.open("rb") if archive_path is not None
-                  else urllib.request.urlopen(url, timeout=60))
-        with source as src, open(bundle, "wb") as out:
-            while True:
-                chunk = src.read(1 << 18)
-                if not chunk:
-                    break
-                out.write(chunk)
-                hasher.update(chunk)
-                done += len(chunk)
+        if archive_path is not None:
+            # 安装包内置的离线组件：本地拷贝，不联网
+            hasher = hashlib.sha256()
+            done = 0
+            with archive_path.open("rb") as src, open(bundle, "wb") as out:
+                while True:
+                    chunk = src.read(1 << 18)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    hasher.update(chunk)
+                    done += len(chunk)
+                    if progress:
+                        progress(done, total)
+                    if cancel is not None and cancel():
+                        raise InterruptedError("下载已取消")
+            if hasher.hexdigest() != archive_hash:
+                raise OcrUnavailable("组件压缩包校验失败")
+        else:
+            from .netfetch import AllSourcesFailed, download_with_fallback
+            bases = manifest.get("_bases") or []
+            if not bases:
+                first = str(manifest.get("_base") or "")
+                known = dict((b, label) for label, b in component_sources())
+                bases = ([(known.get(first, "self-hosted"), first)] if first else []) + [
+                    item for item in component_sources() if item[1] != first]
+            candidates = [(label, base + "/" + archive_name) for label, base in bases]
+            size = int(archive_meta.get("size", 0)) or None
+
+            def _status(st):
                 if progress:
-                    progress(done, total)
-                if cancel is not None and cancel():
-                    raise InterruptedError("下载已取消")
-        if hasher.hexdigest() != archive_hash:
-            raise OcrUnavailable("组件压缩包校验失败")
+                    progress(st.get("received", 0), st.get("total") or total)
+                if status is not None:
+                    status(st)
+
+            try:
+                download_with_fallback(
+                    candidates, bundle, expect_size=size, expect_sha256=archive_hash,
+                    timeout=60, cancel=cancel, on_status=_status, what=what,
+                    on_attempts=(lambda at: status({"attempts": at})) if status else None)
+            except AllSourcesFailed as exc:
+                raise OcrUnavailable(f"{what}下载失败：" + "；".join(
+                    f"{a.name}：{a.reason}" for a in exc.attempts)) from exc
+            if progress:
+                progress(total, total)
 
         unpacked = staging / "unpacked"
         with zipfile.ZipFile(bundle) as z:

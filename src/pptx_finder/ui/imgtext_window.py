@@ -12,7 +12,7 @@ import uuid
 import logging
 from pathlib import Path
 
-from PySide6.QtCore import QStandardPaths, Qt
+from PySide6.QtCore import QStandardPaths, Qt, Signal
 from PySide6.QtGui import QGuiApplication, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QFileDialog,
@@ -61,6 +61,8 @@ def prune_paste_dir(keep: int = PASTE_KEEP) -> int:
 
 
 class ImgTextWindow(QWidget):
+    #: 组件下载进度（后台线程发，主线程改进度条）：(百分比, 文案)
+    component_progress = Signal(int, str)
     """一张图 -> 一页 PPTX。识别组件按需下载，没装时只提示、不阻塞窗口打开。"""
 
     def __init__(self, tok: dict, parent=None, *, source: str = ""):
@@ -190,15 +192,35 @@ class ImgTextWindow(QWidget):
         self._progress.setValue(0)
         self._progress.setFormat("正在下载识别组件… %p%")
         self._progress.show()
+        if not getattr(self, "_progress_wired", False):
+            self._progress_wired = True
+            self.component_progress.connect(self._on_component_progress)
+
+        from ..netfetch import describe_progress
 
         def work():
-            def on_progress(done, total):
-                pct = int(done * 100 / max(1, total))
-                self._progress.setValue(pct)
-            return imgtext_ocr.install(progress=on_progress,
-                                       cancel=lambda: self._cancel_download or self._closing)
+            def on_status(st):
+                if "attempts" in st:
+                    return
+                total = st.get("total") or 0
+                pct = int(st.get("received", 0) * 100 / total) if total else 0
+                self.component_progress.emit(pct, describe_progress(st, "识别组件"))
+            try:
+                return imgtext_ocr.install(status=on_status,
+                                           cancel=lambda: self._cancel_download or self._closing)
+            except InterruptedError:
+                return None
+            except Exception as exc:  # noqa: BLE001 原因要带回主线程显示
+                logging.getLogger(__name__).info("识别组件下载失败：%s", exc)
+                return exc
 
         self._start(work, self._on_component_installed, "imgtext-install")
+
+    def _on_component_progress(self, pct: int, text: str) -> None:
+        if self._closing:
+            return
+        self._progress.setValue(max(0, min(100, int(pct))))
+        self._progress.setFormat(text.replace("%", "%%") + " · %p%")
 
     def _on_component_installed(self, result: object) -> None:
         self._busy = False
@@ -206,6 +228,9 @@ class ImgTextWindow(QWidget):
         self._component_btn.setEnabled(True)
         if isinstance(result, str) and result:
             self._status.setText(f"识别组件已就绪（版本 {result}），之后完全离线。")
+        elif isinstance(result, BaseException) and str(result):
+            # 多源下载失败时消息里逐个列了各源原因（如「被公司代理拦截」），原样给用户看
+            self._status.setText(f"识别组件下载失败：{result}")
         else:
             self._status.setText("识别组件下载失败；稍后重试，或在健康诊断里查看原因。")
         self._refresh_component_state()
