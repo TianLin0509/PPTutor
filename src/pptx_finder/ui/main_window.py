@@ -50,7 +50,7 @@ from ..config import (
 from ..models import FileResult
 from ..path_policy import explicit_project_output_roots
 from ..query_explain import explain_query, mode_label, suggestion_keys
-from . import theme
+from . import theme, window_drag
 from .bg_task import BackgroundTask
 from .index_worker import IndexWorker
 from .index_activity_bar import IndexActivityBar
@@ -1835,6 +1835,8 @@ class MainWindow(QMainWindow):
         self.image_label.setObjectName("previewImage")
         self.image_label.setAlignment(Qt.AlignCenter)
         self.scroll.setWidget(self.image_label)
+        # 预览区的点击/双击/滚轮都有含义（缩放、翻页），整块不参与按住拖窗
+        self.scroll.setProperty(window_drag.NO_DRAG_PROP, True)
         # 预览区滚轮 = 按原始页序翻页（看前几页判断是不是要找的 PPT）
         self.scroll.viewport().installEventFilter(self)
         self.image_label.installEventFilter(self)
@@ -2032,51 +2034,14 @@ class MainWindow(QMainWindow):
             pass
 
     def nativeEvent(self, et, message):  # noqa: N802
-        """WM_NCHITTEST：标题栏区回 HTCAPTION（可拖动、双击最大化、支持 Snap），四边与角回缩放码。
+        """WM_NCHITTEST：空白处回 HTCAPTION（按住拖动、双击最大化、贴边 Snap），四边与角回缩放码。
 
-        用 QCursor.pos 的逻辑坐标而不是 lParam 的物理坐标，避免高 DPI 缩放下错位；
-        右侧按钮区不回 HTCAPTION，否则窗口按钮点不动。
+        判定逻辑在 window_drag：坐标取自消息本身而不是 QCursor.pos，空白 = 光标下不是交互控件。
         """
         if _WIN and et in ("windows_generic_MSG", b"windows_generic_MSG"):
-            try:
-                msg = wintypes.MSG.from_address(int(message))
-            except Exception:  # noqa: BLE001
-                return super().nativeEvent(et, message)
-            if msg.message == 0x0084:  # WM_NCHITTEST
-                pos = self.mapFromGlobal(QCursor.pos())
-                x, y, w, h, b = pos.x(), pos.y(), self.width(), self.height(), 6
-                if not self.isMaximized():
-                    L = x < b
-                    Rr = x > w - b
-                    Tp = y < b
-                    Bt = y > h - b
-                    if Tp and L:
-                        return True, 13   # HTTOPLEFT
-                    if Tp and Rr:
-                        return True, 14   # HTTOPRIGHT
-                    if Bt and L:
-                        return True, 16   # HTBOTTOMLEFT
-                    if Bt and Rr:
-                        return True, 17   # HTBOTTOMRIGHT
-                    if L:
-                        return True, 10   # HTLEFT
-                    if Rr:
-                        return True, 11   # HTRIGHT
-                    if Tp:
-                        return True, 12   # HTTOP
-                    if Bt:
-                        return True, 15   # HTBOTTOM
-                # 标题栏拖动区：避开顶部 b 缩放边 + 右侧 146px 窗口按钮区
-                if b <= y < self._title_h and x < w - 146:
-                    # 合一工具栏：搜索框/下拉/按钮等交互控件区域必须回 HTCLIENT，
-                    # 否则点击会被系统当成标题栏拖拽，控件收不到鼠标事件。
-                    child = self.childAt(pos)
-                    wgt = child
-                    while wgt is not None and wgt is not self:
-                        if isinstance(wgt, (QLineEdit, QComboBox, QPushButton, QToolButton)):
-                            return super().nativeEvent(et, message)
-                        wgt = wgt.parentWidget()
-                    return True, 2        # HTCAPTION
+            hit = window_drag.native_hit_test(self, message)
+            if hit is not None:
+                return hit
         return super().nativeEvent(et, message)
 
     # ---------- 主区页面切换（导航轨 + _show_* 统一入口） ----------

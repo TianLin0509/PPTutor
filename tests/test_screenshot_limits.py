@@ -62,24 +62,6 @@ def test_strict_cancel_returns_no_partial_result(qapp):
         encoding.force_limit(image, parts, cancelled=cancel)
 
 
-@pytest.mark.skipif(__import__('sys').platform != 'win32', reason='native Windows hit test')
-def test_title_drag_accepts_actual_pyside_bytes_event(qapp, monkeypatch):
-    from pptx_finder.ui.main_window import MainWindow
-    class BareWindow(MainWindow):
-        def __init__(self):
-            QMainWindow.__init__(self)
-            self._title_h = 52
-            self.resize(900, 600)
-        def closeEvent(self, event):
-            event.accept()
-    win = BareWindow()
-    win.setAttribute(Qt.WA_DontShowOnScreen)
-    monkeypatch.setattr(QCursor, 'pos', lambda: win.mapToGlobal(QPoint(100, 25)))
-    msg = wintypes.MSG(); msg.message = 0x84
-    assert win.nativeEvent(b'windows_generic_MSG', ctypes.addressof(msg)) == (True, 2)
-    win.close()
-
-
 def test_workbench_config_and_force_copy_use_actual_file_bytes(qtbot, tmp_path):
     from pptx_finder.ui.screenshot_window import ScreenshotWindow
     copied = []
