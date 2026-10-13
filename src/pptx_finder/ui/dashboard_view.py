@@ -228,8 +228,8 @@ class _Spark(QWidget):
         p.setRenderHint(QPainter.Antialiasing)
         rct = QRectF(self.rect())
         if not any(week):
-            p = QPainter(self)
-            p.setPen(QColor(_ink(self._view._tok(), 3)))
+            # 复用上面已开的画笔：同一个控件上再开第二支 QPainter 会直接崩溃
+            p.setPen(QColor(_ink(tok, 3)))
             p.setFont(QFont("Microsoft YaHei", 9))
             p.drawText(QRectF(self.rect()), Qt.AlignCenter, "本周还没有改动过的 PPT")
             p.end()

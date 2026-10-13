@@ -94,3 +94,17 @@ def test_folder_label_keeps_same_named_folders_apart():
     from pptx_finder.ui.dashboard_view import _folder_label
     assert _folder_label(r"D:\项目A\汇报\a.pptx") == "项目A/汇报"
     assert _folder_label(r"D:\项目B\汇报\b.pptx") == "项目B/汇报"
+
+
+def test_dashboard_charts_paint_with_empty_week_and_single_folder(qtbot, tmp_path):
+    """回归：空周时趋势图曾在同一控件上开第二支 QPainter，进程直接崩溃。"""
+    win = _win(qtbot, tmp_path)
+    dv = win.dashboard
+    dv._week = [0] * 7
+    dv._folders = [("项目A/汇报", 3)]
+    dv._topics = [("本周", 0), ("半年内", 3)]
+    dv.resize(1100, 800)
+    for chart in (dv._spark, dv._hbars, dv._donut):
+        chart.resize(400, 200)
+        img = chart.grab()
+        assert not img.isNull()

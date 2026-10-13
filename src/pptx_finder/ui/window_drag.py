@@ -92,13 +92,27 @@ def is_interactive(w: QWidget | None, top: QWidget) -> bool:
     return False
 
 
+_user32 = None
+
+
+def _screen_to_client():
+    """独立的 user32 句柄 + 显式参数类型：HWND 是指针宽度，默认按 C int 传会在
+    句柄值较大时抛 OverflowError——而 nativeEvent 里的异常会直接把进程带崩。"""
+    global _user32
+    if _user32 is None:
+        _user32 = ctypes.WinDLL("user32")
+        _user32.ScreenToClient.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
+        _user32.ScreenToClient.restype = wintypes.BOOL
+    return _user32.ScreenToClient
+
+
 def _logical_client_pos(win: QWidget, lparam: int) -> QPoint | None:
     """把 WM_NCHITTEST 的 lParam（屏幕物理像素）换算成窗口内逻辑坐标。"""
     x = ctypes.c_short(lparam & 0xFFFF).value
     y = ctypes.c_short((lparam >> 16) & 0xFFFF).value
     pt = wintypes.POINT(x, y)
     try:
-        if not ctypes.windll.user32.ScreenToClient(int(win.winId()), ctypes.byref(pt)):
+        if not _screen_to_client()(wintypes.HWND(int(win.winId())), ctypes.byref(pt)):
             return None
     except Exception:  # noqa: BLE001
         return None
@@ -143,11 +157,11 @@ def native_hit_test(win: QWidget, message) -> tuple[bool, int] | None:
         return None
     try:
         msg = wintypes.MSG.from_address(int(message))
-    except Exception:  # noqa: BLE001
+        if msg.message != 0x0084:  # WM_NCHITTEST
+            return None
+        pos = _logical_client_pos(win, int(msg.lParam or 0))
+        if pos is None:
+            return None
+        return True, hit_test(win, pos, maximized=win.isMaximized())
+    except Exception:  # noqa: BLE001 nativeEvent 里抛异常会让整个进程崩溃，宁可交回 Qt
         return None
-    if msg.message != 0x0084:  # WM_NCHITTEST
-        return None
-    pos = _logical_client_pos(win, int(msg.lParam))
-    if pos is None:
-        return None
-    return True, hit_test(win, pos, maximized=win.isMaximized())
