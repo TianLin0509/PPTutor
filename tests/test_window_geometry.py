@@ -105,7 +105,8 @@ def isolated(tmp_path, monkeypatch):
 def test_geometry_round_trips(isolated):
     config.set_window_geometry(12, 34, 1000, 700, maximized=False)
     got = config.get_window_geometry()
-    assert got == {"x": 12, "y": 34, "w": 1000, "h": 700, "maximized": False}
+    assert got == {"x": 12, "y": 34, "w": 1000, "h": 700, "maximized": False,
+                   "v": config.GEOMETRY_VERSION}
 
 
 def test_maximized_flag_round_trips(isolated):
