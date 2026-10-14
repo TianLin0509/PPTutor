@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 import zipfile
@@ -589,6 +590,9 @@ function Result($ok, $rolled, $why){
     Set-Content -LiteralPath $script:ResultPath -Value ($o | ConvertTo-Json -Compress) -Encoding UTF8
   } catch { Log "result write: $_" }
 }
+# Handshake first: the main program waits for this file before it quits. No file
+# means this script never ran, and the program stays open and shows an error.
+try { Set-Content -LiteralPath (Join-Path (Split-Path -Parent $Plan) 'started') -Value $PID } catch {}
 try {
   $p = Get-Content -Raw -LiteralPath $Plan | ConvertFrom-Json
   if ($p.log_path) { $script:LogPath = [string]$p.log_path }
@@ -703,17 +707,53 @@ def write_helper(
     return {"plan": plan, "plan_path": str(plan_path), "ps1": str(ps1), "ctrl": str(ctrl)}
 
 
-def launch_helper(ps1: str, plan_path: str, main_pid: int | None = None) -> None:
-    """分离启动 helper（调用方随后应立即退出，让 helper 接管文件替换）。"""
+class HelperNotStarted(RuntimeError):
+    """更新 helper 没有跑起来（被拦截 / 启动即退出）。主程序此时不能退出。"""
+
+
+#: 等 helper 握手的上限。PowerShell 冷启动在忙的机器上要 1–3 秒。
+HELPER_HANDSHAKE_S = 15.0
+
+_CREATE_NO_WINDOW = 0x08000000
+_CREATE_NEW_PROCESS_GROUP = 0x00000200
+_CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+
+
+def launch_helper(ps1: str, plan_path: str, main_pid: int | None = None,
+                  *, handshake_s: float | None = HELPER_HANDSHAKE_S) -> subprocess.Popen:
+    """启动 helper，并等它确认「已经在跑」再返回；没确认就抛 HelperNotStarted。
+
+    v0.9–v2.0.2 用 DETACHED_PROCESS 启动：PowerShell 5.1 没有控制台时一行不执行就以 0 退出，
+    主程序却照常退出——用户看到「点立即重启，程序关了，没更新也没重开」。现在用
+    CREATE_NO_WINDOW（有隐藏控制台，脚本能跑、也不弹黑框），并且必须等到 helper 写出
+    started 握手文件，主程序才退出；等不到就留在原地报错。
+    """
     pid = os.getpid() if main_pid is None else main_pid
-    flags = (getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-             | getattr(subprocess, "DETACHED_PROCESS", 0))
-    subprocess.Popen(
-        ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden",
-         "-ExecutionPolicy", "Bypass", "-File", ps1,
-         "-MainPid", str(pid), "-Plan", plan_path],
-        creationflags=flags, close_fds=True,
-    )
+    started = Path(plan_path).parent / "started"
+    started.unlink(missing_ok=True)
+    args = ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden",
+            "-ExecutionPolicy", "Bypass", "-File", ps1, "-MainPid", str(pid), "-Plan", plan_path]
+    base = _CREATE_NO_WINDOW | _CREATE_NEW_PROCESS_GROUP
+    kw = dict(close_fds=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+              stderr=subprocess.DEVNULL)
+    try:
+        # 脱离调用方所在的作业对象：有的启动器会在主程序退出时把整个作业里的进程一起杀掉
+        proc = subprocess.Popen(args, creationflags=base | _CREATE_BREAKAWAY_FROM_JOB, **kw)
+    except OSError:
+        proc = subprocess.Popen(args, creationflags=base, **kw)
+    if handshake_s is None:
+        return proc
+    deadline = time.monotonic() + handshake_s
+    while time.monotonic() < deadline:
+        if started.exists():
+            return proc
+        code = proc.poll()
+        if code is not None and not started.exists():
+            raise HelperNotStarted(f"更新程序（PowerShell）启动后立即退出了（退出码 {code}），"
+                                   "可能被系统策略或安全软件拦截")
+        time.sleep(0.05)
+    raise HelperNotStarted(f"等了 {int(handshake_s)} 秒，更新程序（PowerShell）仍没有开始运行，"
+                           "可能被系统策略或安全软件拦截")
 
 
 def apply_update(staging: Path, dest: Path, info: UpdateInfo, relaunch: str,
@@ -726,7 +766,7 @@ def apply_update(staging: Path, dest: Path, info: UpdateInfo, relaunch: str,
         result_path = None
     h = write_helper(staging, dest, info, relaunch, result_path=result_path)
     if launch:
-        launch_helper(h["ps1"], h["plan_path"], main_pid)
+        h["proc"] = launch_helper(h["ps1"], h["plan_path"], main_pid)
     return h
 
 
