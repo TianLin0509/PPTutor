@@ -32,8 +32,9 @@ def test_settings_builds_with_basic_mode_defaults(qtbot, mgr, monkeypatch, tmp_p
     assert not dlg.document_feature.isChecked()
     assert not dlg.grouping_feature.isChecked()
     assert "已关闭" in dlg.stat.text()
-    assert dlg.tabs.count() == 4
-    assert [dlg.tabs.tabText(i) for i in range(4)] == ["功能", "组件", "健康诊断", "PowerPoint"]
+    assert dlg.tabs.count() == 7
+    assert [dlg.tabs.tabText(i) for i in range(7)] == [
+        "常规", "功能", "版本库", "索引范围", "组件", "健康诊断", "PowerPoint"]
     assert "data_dir:" in dlg.diagnostic_text.toPlainText()
     assert "diagnostic_summary:" in dlg.diagnostic_text.toPlainText()
     assert "index:" in dlg.diagnostic_text.toPlainText()

@@ -9,7 +9,7 @@ import re
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QSignalBlocker, Qt, QTimer
+from PySide6.QtCore import QSignalBlocker, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
     QProgressDialog,
     QPushButton,
     QScrollArea,
-    QTabWidget,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -173,6 +173,92 @@ class HotkeyEdit(QLineEdit):
         self.setText(self._spec)
 
 
+class _AutoNote(QLabel):
+    """结果提示：没有文字时不占位置（空着的提示会在卡片里留一大块空白）。"""
+
+    def setText(self, text: str) -> None:  # noqa: N802
+        super().setText(text)
+        self.setVisible(bool(text))
+
+
+class _NavTabs(QWidget):
+    """设置窗口左侧分类 + 右侧页面（v2.0.3 起替代顶部页签）。
+
+    对外保留 QTabWidget 的常用接口（addTab / count / tabText / currentIndex /
+    setCurrentIndex / currentChanged），调用方和测试不用跟着改。
+    """
+
+    currentChanged = Signal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(0)
+        self.nav = QListWidget()
+        self.nav.setObjectName("setNav")
+        self.nav.setFixedWidth(172)
+        self.nav.setFocusPolicy(Qt.NoFocus)
+        self.stack = QStackedWidget()
+        self.stack.setObjectName("setStack")
+        row.addWidget(self.nav)
+        row.addWidget(self.stack, 1)
+        self.nav.currentRowChanged.connect(self._on_row)
+
+    def addTab(self, page: QWidget, text: str) -> int:  # noqa: N802
+        self.stack.addWidget(page)
+        QListWidgetItem(text, self.nav)
+        if self.nav.currentRow() < 0:
+            self.nav.setCurrentRow(0)
+        return self.stack.count() - 1
+
+    def _on_row(self, row: int) -> None:
+        if 0 <= row < self.stack.count():
+            self.stack.setCurrentIndex(row)
+            self.currentChanged.emit(row)
+
+    def count(self) -> int:
+        return self.stack.count()
+
+    def tabText(self, index: int) -> str:  # noqa: N802
+        item = self.nav.item(index)
+        return item.text() if item is not None else ""
+
+    def currentIndex(self) -> int:  # noqa: N802
+        return self.stack.currentIndex()
+
+    def setCurrentIndex(self, index: int) -> None:  # noqa: N802
+        self.nav.setCurrentRow(index)
+
+    def currentWidget(self) -> QWidget:  # noqa: N802
+        return self.stack.currentWidget()
+
+    def widget(self, index: int) -> QWidget:
+        return self.stack.widget(index)
+
+
+def _settings_qss(t: dict) -> str:
+    """设置窗口自己的样式：左侧分类、分组卡片、每项一行（名称 + 说明在左，控件在右）。"""
+    return f"""
+QDialog#settingsWin {{ background: {t['win']}; }}
+QListWidget#setNav {{ background: {t['rail']}; border: none; border-right: 1px solid {t['bd2']};
+    padding: 14px 10px; outline: none; font-size: 14px; }}
+QListWidget#setNav::item {{ height: 38px; padding-left: 12px; border-radius: 8px; color: {t['ink2']}; margin: 1px 0; }}
+QListWidget#setNav::item:hover {{ background: {t['hover']}; }}
+QListWidget#setNav::item:selected {{ background: {t['sel']}; color: {t['acc']}; font-weight: 700; }}
+QStackedWidget#setStack, QWidget#setPage {{ background: {t['win']}; }}
+QScrollArea#setScroll {{ background: transparent; border: none; }}
+QLabel#setPageTitle {{ font-size: 20px; font-weight: 700; color: {t['ink1']}; }}
+QLabel#setPageDesc {{ font-size: 13px; color: {t['ink3']}; }}
+QLabel#setSection {{ font-size: 13px; font-weight: 700; color: {t['ink2']}; padding-top: 6px; }}
+QFrame#setCard {{ background: {t['panel']}; border: 1px solid {t['bd']}; border-radius: 10px; }}
+QFrame#setDivider {{ background: {t['bd2']}; border: none; }}
+QLabel#setRowTitle, QCheckBox#setRowTitle {{ font-size: 14px; font-weight: 600; color: {t['ink1']}; }}
+QLabel#setRowDesc, QLabel#setNote {{ font-size: 12.5px; color: {t['ink3']}; }}
+QLabel#setWarn {{ font-size: 12.5px; color: #9a6a00; }}
+"""
+
+
 class SettingsDialog(QDialog):
     def __init__(
         self,
@@ -206,21 +292,26 @@ class SettingsDialog(QDialog):
         self._closing = False
         self.setObjectName("settingsWin")
         self.setWindowTitle("设置 · PPT Doctor")
-        self.resize(700, 600)
+        self.resize(900, 640)
+        self.setMinimumSize(760, 520)
         try:
             from ..config import get_theme
             from . import theme as _th
-            _t = _th.tok(get_theme())
-            self.setStyleSheet(f"QWidget#settingsWin {{ background: {_t['win']}; }}")
+            self.setStyleSheet(_settings_qss(_th.tok(get_theme())))
         except Exception:  # noqa: BLE001 样式失败不影响功能
             pass
 
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(18, 16, 18, 16)
-        lay.setSpacing(12)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
 
-        self.tabs = QTabWidget()
-        self.tabs.addTab(self._build_guard_tab(), "功能")
+        # v2.0.3：顶部页签 → 左侧分类；原「功能」一页塞了开关、版本库、热键、字体、索引范围，
+        # 内容超宽出横向滚动条、分组也乱，拆成独立分类，每项一行（名称 + 说明在左，控件在右）。
+        self.tabs = _NavTabs()
+        self.tabs.addTab(self._build_general_page(), "常规")
+        self.tabs.addTab(self._build_features_page(), "功能")
+        self.tabs.addTab(self._build_vault_page(), "版本库")
+        self.tabs.addTab(self._build_roots_page(), "索引范围")
         self.tabs.addTab(self._build_components_tab(), "组件")
         self.tabs.addTab(self._build_health_tab(), "健康诊断")
         self.tabs.addTab(self._build_powerpoint_tab(), "PowerPoint")
@@ -241,159 +332,130 @@ class SettingsDialog(QDialog):
         except RuntimeError:
             return False
 
-    def _build_guard_tab(self) -> QWidget:
+    # ---------- 版式小件：页头 / 分组卡片 / 一行设置 ----------
+    def _page(self, title: str, desc: str = "", *, scroll: bool = True):
+        """返回 (外层控件, 内容布局)。内容只纵向滚动，永远不出横向滚动条。"""
         page = QWidget()
+        page.setObjectName("setPage")
         lay = QVBoxLayout(page)
-        lay.setContentsMargins(12, 12, 12, 12)
-        lay.setSpacing(14)
+        lay.setContentsMargins(28, 22, 28, 22)
+        lay.setSpacing(12)
+        head = QLabel(title)
+        head.setObjectName("setPageTitle")
+        lay.addWidget(head)
+        if desc:
+            sub = QLabel(desc)
+            sub.setObjectName("setPageDesc")
+            sub.setWordWrap(True)
+            lay.addWidget(sub)
+        lay.addSpacing(4)
+        if not scroll:
+            return page, lay
+        area = QScrollArea()
+        area.setObjectName("setScroll")
+        area.setWidgetResizable(True)
+        area.setFrameShape(QScrollArea.NoFrame)
+        area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        area.setWidget(page)
+        return area, lay
 
-        title = QLabel("基础模式与高阶功能")
-        title.setStyleSheet("font-weight:700;font-size:15px;")
-        lay.addWidget(title)
+    @staticmethod
+    def _card(lay) -> QVBoxLayout:
+        card = QFrame()
+        card.setObjectName("setCard")
+        inner = QVBoxLayout(card)
+        inner.setContentsMargins(18, 4, 18, 4)
+        inner.setSpacing(0)
+        lay.addWidget(card)
+        return inner
 
-        desc = QLabel(
-            "基础模式始终开启：全盘 PPT 检索 + PPT 统计。下面四项默认关闭，"
-            "只在你确实需要时才占用额外 CPU、磁盘和后台线程。"
-        )
-        desc.setWordWrap(True)
-        lay.addWidget(desc)
+    @staticmethod
+    def _row(card: QVBoxLayout, title, desc="", control=None, *, below=None) -> None:
+        """一行设置。title 可以是文字或 QCheckBox（勾选框本身当标题）；below 放整行宽的控件。"""
+        if card.count():
+            line = QFrame()
+            line.setObjectName("setDivider")
+            line.setFixedHeight(1)
+            card.addWidget(line)
+        box = QVBoxLayout()
+        box.setContentsMargins(0, 12, 0, 12)
+        box.setSpacing(6)
+        top = QHBoxLayout()
+        top.setSpacing(16)
+        text = QVBoxLayout()
+        text.setSpacing(3)
+        if isinstance(title, QWidget):
+            title.setObjectName("setRowTitle")
+            text.addWidget(title)
+        else:
+            label = QLabel(title)
+            label.setObjectName("setRowTitle")
+            text.addWidget(label)
+        if isinstance(desc, QLabel):
+            if not desc.objectName():
+                desc.setObjectName("setRowDesc")
+            desc.setWordWrap(True)
+            text.addWidget(desc)
+        elif desc:
+            d = QLabel(desc)
+            d.setObjectName("setRowDesc")
+            d.setWordWrap(True)
+            text.addWidget(d)
+        top.addLayout(text, 1)
+        if isinstance(control, QWidget):
+            top.addWidget(control, 0, Qt.AlignVCenter)
+        elif control is not None:
+            top.addLayout(control)
+        box.addLayout(top)
+        items = below if isinstance(below, (list, tuple)) else ([below] if below is not None else [])
+        for item in items:
+            if isinstance(item, QWidget):
+                box.addWidget(item)
+            else:
+                box.addLayout(item)
+        card.addLayout(box)
 
-        self.version_feature = QCheckBox("PPT 版本管理（自动留历史版本）")
-        self.version_feature.setChecked(get_version_management_enabled())
-        self.version_feature.setToolTip("开启后才启动全盘保存监听、离线补拍和版本库维护。")
-        self.version_feature.toggled.connect(
-            lambda on: self._toggle_feature("version_management", on)
-        )
-        lay.addWidget(self.version_feature)
+    @staticmethod
+    def _note(text: str = "", name: str = "setNote") -> QLabel:
+        label = _AutoNote()
+        label.setObjectName(name)
+        label.setWordWrap(True)
+        label.setText(text)
+        return label
 
-        self.document_feature = QCheckBox("Word / PDF 内容搜索")
-        self.document_feature.setChecked(get_document_search_enabled())
-        self.document_feature.setToolTip("开启后会在低优先级后台补建 Word/PDF 内容索引。")
-        self.document_feature.toggled.connect(
-            lambda on: self._toggle_feature("document_search", on)
-        )
-        lay.addWidget(self.document_feature)
-
-        # 「索引所有文件」的开关已经撤掉（2026-08-28）：全盘文件名盘点现在是常开能力，
-        # 用不用由搜索框右边的范围选择器当场决定，不必先来设置里找一个开关、再等一轮重扫。
-        self.grouping_feature = QCheckBox("相似稿 / 重复稿智能归组")
-        self.grouping_feature.setChecked(get_smart_grouping_enabled())
-        self.grouping_feature.setToolTip(
-            "开启后计算完整文件哈希和 MinHash；大型资料库首次补建会更久。"
-        )
-        self.grouping_feature.toggled.connect(
-            lambda on: self._toggle_feature("smart_grouping", on)
-        )
-        lay.addWidget(self.grouping_feature)
-
-        version_title = QLabel("版本管理设置")
-        version_title.setStyleSheet("font-weight:700;font-size:13px;margin-top:4px;")
-        lay.addWidget(version_title)
-
-        self.stat = QLabel("正在读取守护状态…")
-        lay.addWidget(self.stat)
+    # ---------- 常规：开机自启 / 唤起热键 / 界面字体 ----------
+    def _build_general_page(self) -> QWidget:
+        outer, lay = self._page("常规", "启动方式、全局热键和界面字体。")
+        card = self._card(lay)
 
         self.auto = QCheckBox("开机自动启动")
         self.auto.setToolTip("建议开启，这样关机后重新登录也能继续守护保存事件。")
         self.auto.setChecked(get_autostart())
         self.auto.toggled.connect(self._toggle_auto)
-        lay.addWidget(self.auto)
-
-        retention_row = QHBoxLayout()
-        retention_row.addWidget(QLabel("每份 PPT 最多保留版本："))
-        self.retention = QComboBox()
-        for label, value in (
-            ("50 版", 50),
-            ("100 版（推荐）", 100),
-            ("200 版", 200),
-            ("不限", 0),
-        ):
-            self.retention.addItem(label, value)
-        current_limit = get_version_keep_per_doc()
-        index = self.retention.findData(current_limit)
-        if index < 0:
-            self.retention.addItem(f"{current_limit} 版", current_limit)
-            index = self.retention.count() - 1
-        self.retention.setCurrentIndex(index)
-        self.retention.currentIndexChanged.connect(self._apply_retention)
-        retention_row.addWidget(self.retention, 1)
-        lay.addLayout(retention_row)
-
-        vault_dir_row = QHBoxLayout()
-        vault_dir_row.addWidget(QLabel("版本库存储位置："))
-        self.vault_dir_edit = QLineEdit(get_version_vault_dir())
-        self.vault_dir_edit.setPlaceholderText(f"默认：{data_dir() / 'vault'}")
-        vault_dir_row.addWidget(self.vault_dir_edit, 1)
-        vault_browse = QPushButton("浏览…")
-        vault_browse.clicked.connect(self._browse_vault_dir)
-        vault_dir_row.addWidget(vault_browse)
-        vault_reset = QPushButton("还原默认")
-        vault_reset.clicked.connect(lambda: self.vault_dir_edit.setText(""))
-        vault_dir_row.addWidget(vault_reset)
-        vault_apply = QPushButton("应用")
-        vault_apply.clicked.connect(self._apply_vault_dir)
-        vault_dir_row.addWidget(vault_apply)
-        lay.addLayout(vault_dir_row)
-        self._vault_dir_result = QLabel("")
-        self._vault_dir_result.setWordWrap(True)
-        self._vault_dir_result.setStyleSheet("font-size:11.5px;")
-        lay.addWidget(self._vault_dir_result)
-        vault_max_row = QHBoxLayout()
-        vault_max_row.addWidget(QLabel("版本库容量上限："))
-        self.vault_max = QComboBox()
-        for label, value in (
-            ("2 GB", 2048),
-            ("5 GB（推荐）", 5120),
-            ("10 GB", 10240),
-            ("20 GB", 20480),
-            ("不限", 0),
-        ):
-            self.vault_max.addItem(label, value)
-        current_max = get_vault_max_mb()
-        index = self.vault_max.findData(current_max)
-        if index < 0:
-            self.vault_max.addItem(f"{current_max} MB", current_max)
-            index = self.vault_max.count() - 1
-        self.vault_max.setCurrentIndex(index)
-        self.vault_max.setToolTip(
-            "立即检查容量并清理可回收旧版；受保护的恢复点仍超限时暂停新增留版。"
-        )
-        self.vault_max.currentIndexChanged.connect(self._apply_vault_max)
-        vault_max_row.addWidget(self.vault_max, 1)
-        lay.addLayout(vault_max_row)
-        self._vault_size_label = QLabel("当前版本库占用：打开对话框时测量…")
-        self._vault_size_label.setStyleSheet("font-size:11.5px;")
-        lay.addWidget(self._vault_size_label)
-        self._ghost_btn = QPushButton("清理失效版本（源文件已删除的留底）…")
-        self._ghost_btn.clicked.connect(self._reap_ghost_docs)
-        lay.addWidget(self._ghost_btn)
+        self._row(card, self.auto, "登录 Windows 后在后台启动，版本守护和全局热键随时可用。")
 
         # 全局唤起热键（#2 可改：解决状态栏「热键被占用」无修复路径）
-        hk_title = QLabel("全局唤起热键")
-        hk_title.setStyleSheet("font-weight:700;font-size:13px;margin-top:8px;")
-        lay.addWidget(hk_title)
-        hk_desc = QLabel("在下框中按下新组合键（需含 Ctrl / Alt，再加一个字母或数字），点「应用」即时生效。")
-        hk_desc.setWordWrap(True)
-        lay.addWidget(hk_desc)
         hk_row = QHBoxLayout()
+        hk_row.setSpacing(8)
         self._hotkey_edit = HotkeyEdit(get_hotkey())
-        hk_row.addWidget(self._hotkey_edit, 1)
+        self._hotkey_edit.setFixedWidth(180)
+        hk_row.addWidget(self._hotkey_edit)
         hk_apply = QPushButton("应用")
         hk_apply.clicked.connect(self._apply_hotkey)
         hk_row.addWidget(hk_apply)
-        lay.addLayout(hk_row)
-        self._hotkey_result = QLabel("")
-        self._hotkey_result.setWordWrap(True)
-        self._hotkey_result.setStyleSheet("font-size:11.5px;")
-        lay.addWidget(self._hotkey_result)
+        self._hotkey_result = self._note()
+        self._row(card, "全局唤起热键",
+                  "点输入框后按下新组合键（需含 Ctrl / Alt，再加一个字母或数字），点「应用」即时生效。",
+                  hk_row, below=self._hotkey_result)
 
         # 界面字体（字族 + 字号档位）：点「应用」即时全 App 生效并写 ui.json
-        font_title = QLabel("界面字体")
-        font_title.setStyleSheet("font-weight:700;font-size:13px;margin-top:8px;")
-        lay.addWidget(font_title)
         font_row = QHBoxLayout()
+        font_row.setSpacing(8)
         font_row.addWidget(QLabel("字族："))
         self._font_family = QFontComboBox()
+        # 字体下拉默认按最长的字体名定宽，会把整张卡片撑出窗口
+        self._font_family.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self._font_family.setMinimumContentsLength(14)
         self._font_family.insertItem(0, "默认（内置字体）", "")
         # QFontComboBox 的模型不回显 insertItem 的文本，DisplayRole 要补写一次
         self._font_family.setItemData(0, "默认（内置字体）", Qt.DisplayRole)
@@ -402,7 +464,9 @@ class SettingsDialog(QDialog):
         # 已存字族在本机不存在（被卸载）时回落到默认项
         self._font_family.setCurrentIndex(idx if idx > 0 else 0)
         font_row.addWidget(self._font_family, 1)
-        font_row.addWidget(QLabel("字号："))
+        size_row = QHBoxLayout()
+        size_row.setSpacing(8)
+        size_row.addWidget(QLabel("字号："))
         # 三个预设一键即得；预设不合口味时选「自定义」，右边的倍率框接管。
         # 档位值只在 config.FONT_SCALES 定义一次，这里只负责起中文名。
         self._font_scale = QComboBox()
@@ -426,26 +490,138 @@ class SettingsDialog(QDialog):
             idx if idx >= 0 else self._font_scale.count() - 1)
         self._font_scale.currentIndexChanged.connect(self._sync_font_scale_custom)
         self._sync_font_scale_custom()
-        font_row.addWidget(self._font_scale)
-        font_row.addWidget(self._font_scale_custom)
+        size_row.addWidget(self._font_scale)
+        size_row.addWidget(self._font_scale_custom)
+        size_row.addStretch(1)
         font_apply = QPushButton("应用")
         font_apply.clicked.connect(self._apply_font)
-        font_row.addWidget(font_apply)
-        lay.addLayout(font_row)
-        self._font_result = QLabel("部分卡片的固定字号样式不受影响。")
-        self._font_result.setWordWrap(True)
-        self._font_result.setStyleSheet("font-size:11.5px;")
-        lay.addWidget(self._font_result)
+        size_row.addWidget(font_apply)
+        self._font_result = self._note("部分卡片的固定字号样式不受影响。")
+        self._row(card, "界面字体", "字族与字号对整个程序生效，点「应用」立即看到效果。",
+                  below=[font_row, size_row, self._font_result])
+        lay.addStretch(1)
+        return outer
 
-        # 索引范围（自定义根：本地目录 + 网络 UNC，增量于固定盘；保存后重启生效）
-        roots_title = QLabel("索引范围")
-        roots_title.setStyleSheet("font-weight:700;font-size:13px;margin-top:8px;")
-        lay.addWidget(roots_title)
+    # ---------- 功能：三项高阶功能开关 ----------
+    def _build_features_page(self) -> QWidget:
+        outer, lay = self._page(
+            "功能",
+            "基础模式始终开启：全盘 PPT 检索 + PPT 统计。下面三项默认关闭，"
+            "只在你确实需要时才占用额外 CPU、磁盘和后台线程。")
+        card = self._card(lay)
+        self.version_feature = QCheckBox("PPT 版本管理（自动留历史版本）")
+        self.version_feature.setChecked(get_version_management_enabled())
+        self.version_feature.setToolTip("开启后才启动全盘保存监听、离线补拍和版本库维护。")
+        self.version_feature.toggled.connect(
+            lambda on: self._toggle_feature("version_management", on)
+        )
+        self._row(card, self.version_feature, "改存即自动留一版，随时回到旧版本；会启动全盘保存监听与版本库维护。")
+
+        self.document_feature = QCheckBox("Word / PDF 内容搜索")
+        self.document_feature.setChecked(get_document_search_enabled())
+        self.document_feature.setToolTip("开启后会在低优先级后台补建 Word/PDF 内容索引。")
+        self.document_feature.toggled.connect(
+            lambda on: self._toggle_feature("document_search", on)
+        )
+        self._row(card, self.document_feature, "在低优先级后台补建 Word / PDF 的内容索引，搜索时一并命中。")
+
+        # 「索引所有文件」的开关已经撤掉（2026-08-28）：全盘文件名盘点现在是常开能力，
+        # 用不用由搜索框右边的范围选择器当场决定，不必先来设置里找一个开关、再等一轮重扫。
+        self.grouping_feature = QCheckBox("相似稿 / 重复稿智能归组")
+        self.grouping_feature.setChecked(get_smart_grouping_enabled())
+        self.grouping_feature.setToolTip(
+            "开启后计算完整文件哈希和 MinHash；大型资料库首次补建会更久。"
+        )
+        self.grouping_feature.toggled.connect(
+            lambda on: self._toggle_feature("smart_grouping", on)
+        )
+        self._row(card, self.grouping_feature, "计算文件哈希与相似度，把同一份稿的多个副本归成一组；大资料库首次补建会更久。")
+
+        lay.addStretch(1)
+        return outer
+
+    # ---------- 版本库：保留数 / 容量 / 位置 / 清理 ----------
+    def _build_vault_page(self) -> QWidget:
+        outer, lay = self._page("版本库", "PPT 历史版本存放在哪里、留多少。需要先在「功能」里开启版本管理。")
+        self.stat = self._note("正在读取守护状态…", "setPageDesc")
+        lay.addWidget(self.stat)
+        card = self._card(lay)
+        self.retention = QComboBox()
+        for label, value in (
+            ("50 版", 50),
+            ("100 版（推荐）", 100),
+            ("200 版", 200),
+            ("不限", 0),
+        ):
+            self.retention.addItem(label, value)
+        current_limit = get_version_keep_per_doc()
+        index = self.retention.findData(current_limit)
+        if index < 0:
+            self.retention.addItem(f"{current_limit} 版", current_limit)
+            index = self.retention.count() - 1
+        self.retention.setCurrentIndex(index)
+        self.retention.currentIndexChanged.connect(self._apply_retention)
+        self.retention.setMinimumWidth(170)
+        self._row(card, "每份 PPT 最多保留", "超出后自动清理最旧的版本，受保护的恢复点除外。", self.retention)
+
+        self.vault_max = QComboBox()
+        for label, value in (
+            ("2 GB", 2048),
+            ("5 GB（推荐）", 5120),
+            ("10 GB", 10240),
+            ("20 GB", 20480),
+            ("不限", 0),
+        ):
+            self.vault_max.addItem(label, value)
+        current_max = get_vault_max_mb()
+        index = self.vault_max.findData(current_max)
+        if index < 0:
+            self.vault_max.addItem(f"{current_max} MB", current_max)
+            index = self.vault_max.count() - 1
+        self.vault_max.setCurrentIndex(index)
+        self.vault_max.setToolTip(
+            "立即检查容量并清理可回收旧版；受保护的恢复点仍超限时暂停新增留版。"
+        )
+        self.vault_max.currentIndexChanged.connect(self._apply_vault_max)
+        self.vault_max.setMinimumWidth(170)
+        self._vault_size_label = self._note("当前版本库占用：打开对话框时测量…", "setRowDesc")
+        self._row(card, "版本库容量上限", self._vault_size_label, self.vault_max)
+
+        vault_dir_row = QHBoxLayout()
+        vault_dir_row.setSpacing(8)
+        self.vault_dir_edit = QLineEdit(get_version_vault_dir())
+        self.vault_dir_edit.setPlaceholderText(f"默认：{data_dir() / 'vault'}")
+        vault_dir_row.addWidget(self.vault_dir_edit, 1)
+        vault_browse = QPushButton("浏览…")
+        vault_browse.clicked.connect(self._browse_vault_dir)
+        vault_dir_row.addWidget(vault_browse)
+        vault_reset = QPushButton("还原默认")
+        vault_reset.clicked.connect(lambda: self.vault_dir_edit.setText(""))
+        vault_dir_row.addWidget(vault_reset)
+        vault_apply = QPushButton("应用")
+        vault_apply.clicked.connect(self._apply_vault_dir)
+        vault_dir_row.addWidget(vault_apply)
+        self._vault_dir_result = self._note()
+        self._row(card, "存储位置", "可以放到空间更大的磁盘；修改时可选择把已有版本一起迁移过去。",
+                  below=[vault_dir_row, self._vault_dir_result])
+
+        self._ghost_btn = QPushButton("清理…")
+        self._ghost_btn.setToolTip("清理失效版本（源文件已删除的留底）")
+        self._ghost_btn.clicked.connect(self._reap_ghost_docs)
+        self._row(card, "清理失效版本", "源文件已经删除、只剩版本留底的记录，确认后可一并清掉，释放空间。",
+                  self._ghost_btn)
+        lay.addStretch(1)
+        return outer
+
+    # ---------- 索引范围 ----------
+    def _build_roots_page(self) -> QWidget:
+        outer, lay = self._page("索引范围")
         roots_desc = QLabel(
             "默认索引所有本地固定磁盘；下面添加的目录会与固定盘一起被索引（不是替换）。"
             "网络路径（如 \\\\server\\share\\dir）当前不可达也可保存，可达时自动纳入；"
             "网络路径上的内容变化最坏约一周后才随完整扫描被感知，重启应用可加速。"
         )
+        roots_desc.setObjectName("setPageDesc")
         roots_desc.setWordWrap(True)
         lay.addWidget(roots_desc)
         # 环境变量旧语义是「限定索引范围」；一旦保存自定义根，它降级为追加项且
@@ -454,17 +630,21 @@ class SettingsDialog(QDialog):
             "检测到 PPTX_FINDER_ROOTS 环境变量限定；保存自定义根后本地固定盘将一并纳入索引。"
         )
         env_roots_note.setWordWrap(True)
-        env_roots_note.setStyleSheet("color:#9a6a00;font-size:11.5px;")
+        env_roots_note.setObjectName("setWarn")
         env_roots_note.setVisible(bool(os.environ.get("PPTX_FINDER_ROOTS", "").strip()))
         lay.addWidget(env_roots_note)
         self.index_roots_list = QListWidget()
-        self.index_roots_list.setMaximumHeight(90)
+        self.index_roots_list.setMinimumHeight(140)
         for root in get_index_roots():
             self._append_index_root_item(root)
         # 已保存的根：关窗时与列表比对，判断是否有没点「保存」的改动
         self._index_roots_saved = tuple(self._index_root_items())
         self._close_after_roots_save = False
-        lay.addWidget(self.index_roots_list)
+        card = self._card(lay)
+        list_box = QVBoxLayout()
+        list_box.setContentsMargins(0, 12, 0, 12)
+        list_box.setSpacing(8)
+        list_box.addWidget(self.index_roots_list)
         net_row = QHBoxLayout()
         self.index_root_edit = QLineEdit()
         self.index_root_edit.setPlaceholderText("网络路径，如 \\\\server\\share\\dir")
@@ -473,7 +653,7 @@ class SettingsDialog(QDialog):
         self._index_root_net_add = QPushButton("添加网络路径")
         self._index_root_net_add.clicked.connect(self._add_index_root_network)
         net_row.addWidget(self._index_root_net_add)
-        lay.addLayout(net_row)
+        list_box.addLayout(net_row)
         roots_btn_row = QHBoxLayout()
         self._index_root_local_add = QPushButton("添加本地目录…")
         self._index_root_local_add.clicked.connect(self._add_index_root_local)
@@ -485,19 +665,12 @@ class SettingsDialog(QDialog):
         self._index_roots_save = QPushButton("保存")
         self._index_roots_save.clicked.connect(self._apply_index_roots)
         roots_btn_row.addWidget(self._index_roots_save)
-        lay.addLayout(roots_btn_row)
-        self._index_roots_result = QLabel("")
-        self._index_roots_result.setWordWrap(True)
-        self._index_roots_result.setStyleSheet("font-size:11.5px;")
-        lay.addWidget(self._index_roots_result)
-
+        list_box.addLayout(roots_btn_row)
+        self._index_roots_result = self._note()
+        list_box.addWidget(self._index_roots_result)
+        card.addLayout(list_box)
         lay.addStretch(1)
-        # 区块已累计超过 600px 设计高度：滚动承载，避免窗口被内容最小高度撑高
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QScrollArea.NoFrame)
-        scroll.setWidget(page)
-        return scroll
+        return outer
 
     def _browse_vault_dir(self) -> None:
         start = self.vault_dir_edit.text().strip() or str(data_dir() / "vault")
@@ -938,32 +1111,24 @@ class SettingsDialog(QDialog):
         from .. import components
         from .component_center import component_center
 
-        page = QWidget()
-        lay = QVBoxLayout(page)
-        lay.setContentsMargins(12, 12, 12, 12)
-        lay.setSpacing(12)
-        title = QLabel("可选组件")
-        title.setStyleSheet("font-weight:700;font-size:15px;")
-        lay.addWidget(title)
-        desc = QLabel("基础版不预装识别组件，用到时下载一次，之后在本机离线识别，图片不上传。"
-                      "下载和软件更新走同一套：GitHub 优先，连不上自动换备用服务器。")
-        desc.setWordWrap(True)
-        desc.setObjectName("emptyMeta")
-        lay.addWidget(desc)
+        page, lay = self._page(
+            "组件",
+            "基础版不预装识别组件，用到时下载一次，之后在本机离线识别，图片不上传。"
+            "下载和软件更新走同一套：GitHub 优先，连不上自动换备用服务器。")
 
         self._component_rows: dict[str, dict] = {}
         for comp in components.ALL:
             card = QFrame()
-            card.setObjectName("card")
+            card.setObjectName("setCard")
             row = QHBoxLayout(card)
             row.setContentsMargins(14, 12, 14, 12)
             row.setSpacing(12)
             text = QVBoxLayout()
             text.setSpacing(2)
             name = QLabel(comp.name)
-            name.setStyleSheet("font-weight:700;font-size:14px;")
+            name.setObjectName("setRowTitle")
             purpose = QLabel("用于" + comp.purpose)
-            purpose.setObjectName("emptyMeta")
+            purpose.setObjectName("setRowDesc")
             status = QLabel("")
             status.setObjectName(f"componentStatus_{comp.key}")
             status.setWordWrap(True)
@@ -985,7 +1150,7 @@ class SettingsDialog(QDialog):
                                               "note": ""}
         hint = QLabel("公司网络连不上 GitHub 和备用服务器时，可以改装「完整版」安装包，它已内置全部组件。")
         hint.setWordWrap(True)
-        hint.setObjectName("emptyMeta")
+        hint.setObjectName("setNote")
         lay.addWidget(hint)
         lay.addStretch(1)
         component_center().state_changed.connect(self._on_component_state)
@@ -1149,15 +1314,10 @@ class SettingsDialog(QDialog):
                 return
 
     def _build_health_tab(self) -> QWidget:
-        page = QWidget()
-        lay = QVBoxLayout(page)
-        lay.setContentsMargins(12, 12, 12, 12)
-        lay.setSpacing(10)
-
+        page, lay = self._page("健康诊断", "索引、版本库和运行环境的体检结果；反馈问题时点「复制」把全文发过来。",
+                               scroll=False)
         head = QHBoxLayout()
-        title = QLabel("健康诊断")
-        title.setStyleSheet("font-weight:700;font-size:15px;")
-        head.addWidget(title, 1)
+        head.setSpacing(8)
         self.rescan_btn = QPushButton("重新扫描索引")
         self.rescan_btn.setToolTip("后台重新扫描 PPT 索引；扫描期间仍可继续搜索已索引内容。")
         self.rescan_btn.setEnabled(callable(self._on_rescan))
@@ -1189,6 +1349,7 @@ class SettingsDialog(QDialog):
         copy = QPushButton("复制")
         copy.clicked.connect(self._copy_diagnostics)
         head.addWidget(copy)
+        head.addStretch(1)
         lay.addLayout(head)
 
         self.diagnostic_text = QPlainTextEdit()
@@ -1200,26 +1361,14 @@ class SettingsDialog(QDialog):
         return page
 
     def _build_powerpoint_tab(self) -> QWidget:
-        page = QWidget()
-        lay = QVBoxLayout(page)
-        lay.setContentsMargins(12, 12, 12, 12)
-        lay.setSpacing(12)
-
-        title = QLabel("PowerPoint 检测")
-        title.setStyleSheet("font-weight:700;font-size:15px;")
-        lay.addWidget(title)
-        desc = QLabel("检测预览和跳转所需的 PowerPoint COM 能力。检测在后台执行，不会关闭用户已有的演示文稿。")
-        desc.setWordWrap(True)
-        lay.addWidget(desc)
-
+        page, lay = self._page(
+            "PowerPoint", "检测预览和跳转所需的 PowerPoint COM 能力。检测在后台执行，不会关闭你已打开的演示文稿。")
+        card = self._card(lay)
         self.powerpoint_status = QLabel("尚未检测")
         self.powerpoint_status.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.powerpoint_status.setWordWrap(True)
-        lay.addWidget(self.powerpoint_status)
-
         self.powerpoint_btn = QPushButton("开始检测")
         self.powerpoint_btn.clicked.connect(self._check_powerpoint)
-        lay.addWidget(self.powerpoint_btn, 0, Qt.AlignLeft)
+        self._row(card, "PowerPoint 检测", self.powerpoint_status, self.powerpoint_btn)
         lay.addStretch(1)
         return page
 
