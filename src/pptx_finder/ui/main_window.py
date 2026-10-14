@@ -8,6 +8,7 @@ from __future__ import annotations
 import datetime
 import html
 import logging
+import math
 import os
 import re
 from collections import deque
@@ -41,7 +42,7 @@ from ..config import (
     get_index_all_files,
     get_search_exact_match, get_smart_grouping_enabled, get_theme,
     set_search_exact_match,
-    get_window_geometry, set_window_geometry,
+    GEOMETRY_VERSION, get_window_geometry, set_window_geometry,
     index_feature_signature,
     is_first_run, mark_welcomed,
     set_completed_index_feature_signature,
@@ -967,6 +968,7 @@ class MainWindow(QMainWindow):
         self._restore_window_geometry()
         self._title_h = 64  # 自绘顶栏高度（搜索行；空白处可按住拖动窗口）
         self.setWindowFlag(Qt.FramelessWindowHint, True)  # 无边框 → 自绘玻璃标题栏
+        window_drag.forbid_native_siblings()  # 原生子窗口会截走命中测试 → 拖不动
 
         self._theme = _load_theme()
         self._tok = theme.tok(self._theme)
@@ -5482,6 +5484,7 @@ class MainWindow(QMainWindow):
     # ---------- 窗口几何记忆 ----------
     DEFAULT_WIN_W = 1180
     DEFAULT_WIN_H = 760
+    DEFAULT_AREA_RATIO = 0.8
     _GEOM_SAVE_DELAY_MS = 800
 
     @staticmethod
@@ -5504,19 +5507,31 @@ class MainWindow(QMainWindow):
         screen = QGuiApplication.screenAt(pos) if pos is not None else None
         return screen or QGuiApplication.primaryScreen()
 
+    @classmethod
+    def _default_rect(cls, screen_rect: QRect, avail: QRect) -> QRect:
+        """首次打开的尺寸：和屏幕同一个长宽比，面积约占整屏的 80%，居中。
+
+        v2.0.2 前固定 1180x760（长宽比 1.55），在 16:9 屏上显得又矮又方；
+        两边各乘 √0.8 ≈ 0.894，比例就和屏幕一致、面积正好 80%。任务栏挡住的部分再夹一遍。
+        """
+        scale = math.sqrt(cls.DEFAULT_AREA_RATIO)
+        want = QRect(0, 0, round(screen_rect.width() * scale), round(screen_rect.height() * scale))
+        want.moveCenter(avail.center())
+        return cls._fit_rect_to_screen(want, avail)
+
     def _restore_window_geometry(self) -> None:
         saved = get_window_geometry()
+        if saved is not None and saved.get("v", 1) < GEOMETRY_VERSION:
+            # 老版本记下的尺寸来自旧默认值（比例不对），升级后按新默认重开一次；
+            # 之后用户自己拖出来的大小照常记住。最大化习惯保留。
+            self._restore_maximized_on_show = saved.get("maximized", False)
+            saved = None
         if saved is None:
             screen = self._target_screen(None)
             if screen is None:                      # 无头环境
                 self.resize(self.DEFAULT_WIN_W, self.DEFAULT_WIN_H)
                 return
-            avail = screen.availableGeometry()
-            want = QRect(0, 0,
-                         min(self.DEFAULT_WIN_W, avail.width()),
-                         min(self.DEFAULT_WIN_H, avail.height()))
-            want.moveCenter(avail.center())
-            self.setGeometry(self._fit_rect_to_screen(want, avail))
+            self.setGeometry(self._default_rect(screen.geometry(), screen.availableGeometry()))
             return
 
         pos = QPoint(saved["x"], saved["y"])

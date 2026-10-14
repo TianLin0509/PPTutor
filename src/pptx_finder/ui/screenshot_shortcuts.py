@@ -51,7 +51,9 @@ class ScreenshotShortcuts(QObject):
         self.app=app;self.owner=owner;self.closed=False
         self.preferences=preferences or CapturePreferences(data_dir()/'screenshot-preferences.json')
         self.specs=self.preferences.keys();self.registered=set();self.errors={}
-        self._window=QWidget(owner,Qt.Tool)
+        # 只用来接 WM_HOTKEY 的隐形窗口，必须不挂父窗口：挂在主窗口下取 winId()，Qt 会把主窗口
+        # 的中央区、状态栏一起变成原生子窗口，它们盖住整个主窗口、把命中测试截走 → 主窗口拖不动（v2.0.2 修）。
+        self._window=QWidget(None,Qt.Tool)
         hwnd=int(self._window.winId())
         self._hwnd=hwnd
         if register is None:
@@ -144,7 +146,7 @@ class ScreenshotShortcuts(QObject):
         self.closed=True;self._unbind()
         self.app.removeNativeEventFilter(self._filter)
         if self.dialog:self.dialog.close()
-        self._window.close()
+        self._window.close();self._window.deleteLater()
 
 
 def install_screenshot_shortcuts(app,owner):

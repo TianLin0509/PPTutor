@@ -711,6 +711,8 @@ def main() -> int:
     from .logging_setup import configure_logging
     configure_logging()
     log = logging.getLogger(__name__)
+    from .ui.window_drag import forbid_native_siblings
+    forbid_native_siblings()
     app = QApplication(sys.argv)
     _install_qt_chinese(app)
 

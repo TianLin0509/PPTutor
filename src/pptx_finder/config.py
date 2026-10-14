@@ -234,13 +234,22 @@ def get_window_geometry() -> dict | None:
         return None
     if w <= 0 or h <= 0:
         return None
-    return {"x": x, "y": y, "w": w, "h": h, "maximized": bool(v.get("maximized"))}
+    try:
+        ver = int(v.get("v", 1))
+    except (TypeError, ValueError):
+        ver = 1
+    return {"x": x, "y": y, "w": w, "h": h, "maximized": bool(v.get("maximized")), "v": ver}
+
+
+#: 窗口几何的记录格式版本。2 = v2.0.2 起「和屏幕同比例、约 80% 面积」的默认尺寸；
+#: 读到更老的记录时主窗口按新默认重开一次（见 main_window._restore_window_geometry）。
+GEOMETRY_VERSION = 2
 
 
 def set_window_geometry(x: int, y: int, w: int, h: int, maximized: bool = False) -> None:
     update_ui_settings(window_geometry={
         "x": int(x), "y": int(y), "w": int(w), "h": int(h),
-        "maximized": bool(maximized),
+        "maximized": bool(maximized), "v": GEOMETRY_VERSION,
     })
 
 

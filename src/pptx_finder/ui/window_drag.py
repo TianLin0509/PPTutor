@@ -21,7 +21,7 @@ from ctypes import wintypes
 
 from PySide6.QtCore import QPoint, Qt
 from PySide6.QtWidgets import (
-    QAbstractButton, QAbstractItemView, QAbstractSlider, QAbstractSpinBox,
+    QAbstractButton, QApplication, QAbstractItemView, QAbstractSlider, QAbstractSpinBox,
     QComboBox, QGraphicsView, QLabel, QLineEdit, QMenuBar, QPlainTextEdit,
     QSizeGrip, QSplitterHandle, QTabBar, QTextEdit, QWidget,
 )
@@ -45,6 +45,21 @@ _INTERACTIVE_TYPES = (
 )
 
 _MOUSE_HANDLERS = ("mousePressEvent", "mouseReleaseEvent", "mouseDoubleClickEvent")
+
+
+def forbid_native_siblings() -> None:
+    """一个子控件变成原生窗口时，不许 Qt 顺手把它的兄弟控件也变成原生窗口。
+
+    无边框主窗口的拖动靠 WM_NCHITTEST 回 HTCAPTION，而这个消息只发给鼠标下面那个
+    原生窗口。一旦中央区、状态栏被连带变成原生子窗口，它们就盖住整个主窗口、一律回
+    「普通内容区」——哪里都拖不动（v2.0.0/2.0.1 实际发生过，见 PITFALLS 2026-10-14）。
+    """
+    QApplication.setAttribute(Qt.AA_DontCreateNativeWidgetSiblings, True)
+
+
+def native_children(top: QWidget) -> list[QWidget]:
+    """top 里已经成了原生窗口的非顶层子控件（应当为空；自检与测试用）。"""
+    return [w for w in top.findChildren(QWidget) if not w.isWindow() and w.internalWinId()]
 
 
 def _defines_mouse_handler(w: QWidget) -> bool:

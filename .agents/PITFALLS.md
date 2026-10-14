@@ -136,3 +136,17 @@ CPU 也没有优化空间：托盘空闲 0.02%（20 核 30 秒采样），索引
 - **设置页标签按名称定位（`show_tab("健康诊断")`）**：新增「组件」页后，原来写死的 `setCurrentIndex(1)` 会跳错页。
 - 实测（2026-10-14 家里网络）：文字识别组件 82 MB，GitHub 12 秒、备用服务器 205 秒（约 0.4 MB/s）。备用服务器下 436 MB 的公式组件要十几分钟，界面上有进度和剩余时间，可后台继续。
 - v2.0.1 起发布页不再提供 `Setup-Ocr.exe`，但 `manifest-Ocr.json` 与 `PPT-Doctor-vX-Ocr.zip` 必须照常发布：已安装的文字识别版靠它们自动更新。增量块按「新版对比 v2.0.0 与 v1.6.12 两份清单」取并集，老用户也只下变化的文件。
+
+## 2026-10-14：v2.0.2 主窗口「哪里都拖不动」与默认尺寸
+
+- **拖不动的真根因不是命中判定，而是原生子窗口**：`ScreenshotShortcuts` 为收 WM_HOTKEY 建了 `QWidget(owner, Qt.Tool)` 并取 `winId()`，
+  Qt 把主窗口的中央区、状态栏、toast 全变成原生子窗口（WA_NativeWindow）。WM_NCHITTEST 只发给鼠标下面那个原生窗口，
+  子窗口一律回 HTCLIENT，主窗口的 `nativeEvent` 根本收不到 → v2.0.0/2.0.1 实机全窗拖不动。
+- **测试为什么没发现**：v2.0 的拖动测试和第一次排查都是 `SendMessage(主窗口, WM_NCHITTEST)`，直接问主窗口，绕开了遮挡。
+  现在的回归测试先 `ChildWindowFromPointEx` 找「这个点落在哪个原生窗口」，再问那个窗口（`tests/test_window_drag_v202.py`）。
+  实机排查：`EnumChildWindows(主窗口)` 应当没有可见子窗口。
+- **修法**：热键接收窗口不挂父窗口；`window_drag.forbid_native_siblings()`（AA_DontCreateNativeWidgetSiblings）在 app 启动和
+  MainWindow 构造时各设一次兜底——录制控制条的 `exclude_from_capture` 也会对带父窗口的 Tool 窗口取 winId。
+  以后任何地方要 `winId()`，用无父窗口的顶层窗口，或确认 `window_drag.native_children(win) == []`。
+- **默认尺寸**：和屏幕同长宽比、面积约 80%（两边各乘 √0.8），任务栏再夹一遍；记录带格式版本 `v=2`，
+  老版本存的尺寸升级后按新默认重开一次（最大化习惯保留），之后用户拖的大小照常记住。
