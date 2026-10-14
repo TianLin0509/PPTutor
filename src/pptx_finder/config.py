@@ -555,6 +555,15 @@ def set_vault_storage_confirmed() -> None:
     update_ui_settings(vault_storage_setup_version=1)
 
 
+def get_vault_storage_prompted() -> bool:
+    """问过一次「版本库放哪、占多大」就不再每次启动都问（点「暂不调整」也算问过）。"""
+    return bool(load_ui_settings().get('vault_storage_prompted'))
+
+
+def set_vault_storage_prompted() -> None:
+    update_ui_settings(vault_storage_prompted=True)
+
+
 def get_hotkey() -> str:
     """当前全局唤起热键：用户覆盖值优先，否则默认 GLOBAL_HOTKEY。"""
     v = load_ui_settings().get("hotkey")

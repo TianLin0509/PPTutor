@@ -107,7 +107,7 @@ class VaultStorageDialog(QDialog):
         row.addWidget(self.cancel);row.addWidget(self.apply)
         layout.addLayout(row)
         self.progress.connect(self.feedback.setText)
-        self.apply.setEnabled(False)
+        # 「当前占用」要扫一遍版本库，大库要几秒到几十秒：只用来显示，不挡住两个按钮
         self._status_task=BackgroundTask(self._read_status,'vault-storage-status')
         self._status_task.done.connect(self._status_ready)
         self._status_task.finished.connect(self._status_finished)
@@ -127,6 +127,12 @@ class VaultStorageDialog(QDialog):
             return {'ok':False,'error':str(exc)}
 
     def _status_ready(self,result):
+        try:
+            from shiboken6 import isValid
+            if not isValid(self.current):
+                return
+        except Exception:  # noqa: BLE001
+            pass
         if not isinstance(result,dict) or not result.get('ok'):
             self.current.setText('当前占用无法读取：'+str((result or {}).get('error','任务未完成')))
             return
@@ -136,14 +142,13 @@ class VaultStorageDialog(QDialog):
 
     def _status_finished(self):
         self._status_task=None
-        self.apply.setEnabled(True)
 
     def _browse(self):
         path=QFileDialog.getExistingDirectory(self,'选择版本库存储位置',self.path.text() or str(data_dir()))
         if path:self.path.setText(path)
 
     def _apply(self):
-        if self._task is not None or self._status_task is not None:return
+        if self._task is not None:return
         path, limit, migrate=self.path.text(),int(self.limit.currentData()),self.migrate.isChecked()
         for widget in (self.apply,self.cancel,self.path,self.limit,self.browse,self.migrate):widget.setEnabled(False)
         self.feedback.setText('正在检查并应用设置；通常数秒，迁移大量历史可能需要数分钟…')
@@ -186,7 +191,7 @@ class VaultStorageDialog(QDialog):
             self.accept()
 
     def reject(self):
-        if self._task is not None or self._status_task is not None:
+        if self._task is not None:
             self.feedback.setText('正在检查或应用设置，完成后可关闭。')
             return
         if getattr(self,'_accepted_with_overflow',False):self.accept()

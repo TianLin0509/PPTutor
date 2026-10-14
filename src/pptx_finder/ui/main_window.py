@@ -1246,7 +1246,9 @@ class MainWindow(QMainWindow):
                 self.update_chip, update_base_url(), self.force_quit, self)
             QTimer.singleShot(4000, self._updater.start_check)
             # 有没看过的新版本 → 侧栏「设置」挂红点；侧栏版本号可点开更新中心
-            self._updater.unread_changed.connect(self.set_settings_unread)
+            # 有新版本时红点亮在侧栏「更新」上（入口从设置挪到侧栏左下角）
+            self._updater.state_changed.connect(self._refresh_update_rail)
+            self._updater.unread_changed.connect(lambda *_a: self._refresh_update_rail())
             if getattr(self, "gt_ver", None) is not None:
                 self.gt_ver.setCursor(Qt.PointingHandCursor)
                 self.gt_ver.setToolTip("点击检查更新")
@@ -1763,6 +1765,17 @@ class MainWindow(QMainWindow):
         sep2.setFixedHeight(1)
         lay.addWidget(sep2)
         lay.addSpacing(6)
+        # 「更新」常驻侧栏左下角（v2.0.3 田哥要求：原来入口藏在设置里、找不到）：
+        # 平时显示「检查更新」，有新版本 / 下载中 / 待重启时文字跟着变，并亮红点。
+        self.rail_update_btn = self._mk_rail_btn("检查更新", "检查更新、查看下载进度")
+        self.rail_update_btn.setAccessibleName("软件更新")
+        self.rail_update_btn.clicked.connect(self._open_update_center)
+        lay.addWidget(self.rail_update_btn)
+        self._update_dot = QLabel(self.rail_update_btn)
+        self._update_dot.setObjectName("railDot")
+        self._update_dot.setFixedSize(8, 8)
+        self._update_dot.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self._update_dot.hide()
         self.theme_btn = self._mk_rail_btn("主题", "切换界面主题")
         self.theme_btn.setAccessibleName("主题")
         self.theme_btn.clicked.connect(self._show_theme_menu)
@@ -1797,6 +1810,7 @@ class MainWindow(QMainWindow):
             btn.style().polish(btn)
         if getattr(self, "_settings_dot", None) is not None and self._settings_dot.isVisible():
             self.set_settings_unread(True, getattr(self, "_settings_unread_version", ""))
+        self._refresh_update_rail()
 
     def _mk_rail_btn(self, label: str, tip: str) -> QPushButton:
         """侧栏条目：图标 + 文字横排，整行可点；选中态的底色与左侧强调条由 QSS #railBtn 承担。"""
@@ -1830,6 +1844,49 @@ class MainWindow(QMainWindow):
             dot.hide()
             btn.setToolTip("打开设置")
 
+    def _open_update_center(self) -> None:
+        """侧栏「更新」：打开更新窗口（没查过就当场查）。开发版不联网，给一句说明。"""
+        upd = getattr(self, "_updater", None)
+        if upd is None:
+            self._toast("开发版不联网检查更新；安装版会在这里显示新版本")
+            return
+        upd.open_dialog()
+
+    def _refresh_update_rail(self) -> None:
+        """侧栏「更新」的文字与红点跟着更新状态走。"""
+        btn = getattr(self, "rail_update_btn", None)
+        if btn is None:
+            return
+        upd = getattr(self, "_updater", None)
+        snap = upd.snapshot() if upd is not None else {"phase": "idle"}
+        phase, latest = snap.get("phase"), snap.get("latest") or ""
+        pct = ""
+        st = snap.get("status") or {}
+        if st.get("total"):
+            pct = f" {int(min(1.0, (st.get('received') or 0) / st['total']) * 100)}%"
+        label, tip, dot = {
+            "available": (f"新版本 v{latest}", f"有新版本 v{latest}，点击查看并更新", True),
+            "downloading": (f"下载中{pct}", "正在下载新版本，点击查看进度", False),
+            "ready": ("重启以更新", f"v{latest} 已下载好，点击「立即重启」完成更新", True),
+            "applying": ("正在更新…", "正在启动更新程序", False),
+            "error": ("更新失败", "更新没有完成，点击查看原因并重试", True),
+            "checking": ("正在检查…", "正在查询最新版本", False),
+        }.get(phase, ("检查更新", f"当前 v{__version__}，点击检查更新", False))
+        btn.setProperty("railLabel", label)
+        btn.setText("" if getattr(self, "_rail_compact", False) else "  " + label)
+        btn.setToolTip(tip)
+        mark = getattr(self, "_update_dot", None)
+        if mark is not None:
+            if dot:
+                if getattr(self, "_rail_compact", False):
+                    mark.move(btn.width() - 14, 6)
+                else:
+                    mark.move(btn.width() - 22, (btn.height() - mark.height()) // 2)
+                mark.show()
+                mark.raise_()
+            else:
+                mark.hide()
+
     def _refresh_rail_icons(self) -> None:
         """侧栏图标色跟随主题与选中态：选中用强调色，其余用次级灰。"""
         btns = getattr(self, "_rail_page_btns", None)
@@ -1844,7 +1901,8 @@ class MainWindow(QMainWindow):
                 btn.setIcon(_icons.icon(name, acc if btn.isChecked() else ink, 18))
         for attr, name in (("rail_screenshot_btn", "screenshot"), ("rail_imgtext_btn", "imgtext"),
                            ("rail_material_btn", "materials"), ("rail_report_btn", "report"),
-                           ("rail_settings_btn", "settings"), ("theme_btn", "theme")):
+                           ("rail_settings_btn", "settings"), ("rail_update_btn", "update"),
+                           ("theme_btn", "theme")):
             btn = getattr(self, attr, None)
             if btn is not None:
                 btn.setIcon(_icons.icon(name, ink, 18))
@@ -2289,13 +2347,17 @@ class MainWindow(QMainWindow):
         return ""
 
     def _prompt_version_storage(self) -> None:
-        from ..config import get_vault_storage_confirmed
+        from ..config import (get_vault_storage_confirmed, get_vault_storage_prompted,
+                              set_vault_storage_prompted)
         from .vault_storage_dialog import VaultStorageDialog, supports_storage
         manager = getattr(self, '_version_mgr', None)
-        if (getattr(self, '_version_storage_prompted', False)
+        if (getattr(self, '_version_storage_prompted', False) or get_vault_storage_prompted()
                 or get_vault_storage_confirmed() or not supports_storage(manager)):
             return
         self._version_storage_prompted = True
+        # v2.0.3：只问一次。原来点「暂不调整」不留记录，每次重启后第一次点「版本」都会再弹，
+        # 而且要等扫完整个版本库才放人——用户感受是「点版本经常先卡半天」。之后改位置去设置 → 版本库。
+        set_vault_storage_prompted()
         # Cancelling the setup must never hide the user's existing history.
         VaultStorageDialog(manager, self).exec()
 
@@ -2306,11 +2368,12 @@ class MainWindow(QMainWindow):
         mgr = getattr(self, "_version_mgr", None)
         if mgr is None:
             return False
-        self._prompt_version_storage()
         from .version_window import VersionWindow
         win = VersionWindow(mgr, self, embedded=True)
         self._version_page_lay.addWidget(win)
         self._version_page_win = win
+        # 先把版本页显示出来，再（只问一次地）询问版本库位置，别让弹窗挡在页面前面
+        QTimer.singleShot(0, self._prompt_version_storage)
         return True
 
     def _ensure_health_page(self):

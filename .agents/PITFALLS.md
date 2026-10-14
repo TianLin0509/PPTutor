@@ -150,3 +150,16 @@ CPU 也没有优化空间：托盘空闲 0.02%（20 核 30 秒采样），索引
   以后任何地方要 `winId()`，用无父窗口的顶层窗口，或确认 `window_drag.native_children(win) == []`。
 - **默认尺寸**：和屏幕同长宽比、面积约 80%（两边各乘 √0.8），任务栏再夹一遍；记录带格式版本 `v=2`，
   老版本存的尺寸升级后按新默认重开一次（最大化习惯保留），之后用户拖的大小照常记住。
+
+## 2026-10-14：v2.0.3 一键更新「点立即重启 → 程序关了，没更新也没重开」
+
+- **根因**：`updater.launch_helper` 用 `DETACHED_PROCESS` 启动 PowerShell。PowerShell 5.1 没有控制台时**一行不执行、以 0 退出**，
+  主程序照常退出 → 不替换、不重开。v0.9 起就这样；旧测试全是 `subprocess.run(apply.ps1, -MainPid 0)` 直接跑脚本，
+  `update.log` 里 360 次「swap done」全是测试留下的，从没走过「主程序拉起 helper 后退出」这条真实路径。
+- **修法**：`CREATE_NO_WINDOW`（隐藏控制台）+ 尝试 `CREATE_BREAKAWAY_FROM_JOB`；helper 第一行写 `started` 握手文件，
+  主程序等到握手（≤15 s）才退出，等不到就留在原地报错、可「再试一次」或去发布页下载安装包。
+- **验证必须走真路径**：`tests/test_update_helper_launch_v203.py` 让一个无控制台子进程调 `launch_helper` 后立刻退出，
+  helper 仍要完成替换；打包版用 UI Automation 在隐藏桌面点「下载更新」「立即重启」（脚本存档在发布产物 scripts/e2e_restart.py）。
+- **老版本（≤2.0.2）的一键更新永远修不好**：它们的 helper 根本起不来，只能手动装一次 2.0.3 安装包；之后的版本才能在程序里更新。
+- 同批：侧栏左下角常驻「更新」入口（有新版本时红点 + 文字）；设置窗口改左侧分类 + 卡片行，`_NavTabs` 保留 QTabWidget 接口；
+  版本库位置弹窗只问一次（`vault_storage_prompted`），扫描占用不再挡按钮，并在版本页显示之后才弹。

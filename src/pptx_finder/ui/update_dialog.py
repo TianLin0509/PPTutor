@@ -355,6 +355,8 @@ class UpdateDialog(QDialog):
             self._ctl.start_download()
         elif phase == "ready":
             self._ctl.apply()
+        elif phase == "error" and self._ctl.snapshot().get("apply_failed"):
+            self._ctl.retry_apply()
         elif phase == "error" and self._ctl._info is not None:
             self._ctl.start_download()
         else:
@@ -426,7 +428,7 @@ class UpdateDialog(QDialog):
                           "ok")
             rows = attempt_rows(s["attempts"], s["source_names"], False)
         elif phase == "applying":
-            self._set_msg("正在关闭并替换程序文件，完成后会自动重新打开…", "info")
+            self._set_msg("正在启动更新程序；确认它跑起来后，本程序会关闭并在约 5 秒后自动重新打开…", "info")
         elif phase == "error":
             self._set_msg(s["error"] or "更新失败", "bad")
             if s["attempts"]:
@@ -440,7 +442,7 @@ class UpdateDialog(QDialog):
         self.sources.set_rows(rows)
 
         primary = {"available": "下载更新", "ready": "立即重启", "none": "重新检查",
-                   "idle": "检查更新", "error": "重试"}.get(phase, "")
+                   "idle": "检查更新", "error": "再试一次" if s.get("apply_failed") else "重试"}.get(phase, "")
         self.btn_primary.setText(primary)
         self.btn_primary.setVisible(bool(primary))
         self.btn_cancel.setVisible(downloading)

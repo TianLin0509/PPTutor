@@ -171,6 +171,7 @@ class UpdateController(QObject):
         self._attempts: list = []
         self._ready_source = ""
         self._staging = _staging_dir()
+        self._apply_failed = False   # 下载成功、但「立即重启」那一步没跑起来
         self._check: _CheckThread | None = None
         self._dl: _DownloadThread | None = None
         self._download_token = 0
@@ -277,6 +278,7 @@ class UpdateController(QObject):
             "ready_source": self._ready_source,
             "error": _friendly_error(error),
             "release_page": RELEASE_PAGE,
+            "apply_failed": self._apply_failed and self._state == "error",
         }
 
     def pending_version(self) -> str:
@@ -452,7 +454,9 @@ class UpdateController(QObject):
     def _on_click(self) -> None:
         if not self._ui_alive():
             return
-        if self._state in ("available", "error"):
+        if self._state == "error" and self._apply_failed:
+            self.retry_apply()
+        elif self._state in ("available", "error"):
             self._start_download()
         elif self._state == "ready":
             self._apply()
@@ -486,10 +490,19 @@ class UpdateController(QObject):
         if self._state == "ready":
             self._apply()
 
+    def retry_apply(self) -> None:
+        """重启那一步失败（新版本已下载好）：不重新下载，直接再试一次替换。"""
+        if self._state == "error" and self._apply_failed and self._staging.exists():
+            self._state = "ready"
+            self._apply()
+        elif self._state == "error":
+            self._start_download()
+
     def _start_download(self) -> None:
         if not self._ui_alive():
             return
         self._state = "downloading"
+        self._apply_failed = False
         self._download_token += 1
         token = self._download_token
         self._download_error = ""
@@ -595,19 +608,30 @@ class UpdateController(QObject):
         if self._state == "applying":
             return
         self._state = "applying"
+        self._apply_failed = False
         self._chip.setEnabled(False)
-        self._chip.setText("正在重启更新…")
-        self._chip.setToolTip("正在启动更新 helper，请稍候。")
+        self._chip.setText("正在启动更新程序…")
+        self._chip.setToolTip("正在启动负责替换文件的更新程序，确认它跑起来后本程序才会关闭。")
         self._notify()
         try:
+            from PySide6.QtWidgets import QApplication
+            QApplication.processEvents()  # 握手要等 1–3 秒，先把「正在启动」画出来
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            # apply_update 会等 helper 写出握手文件才返回；没跑起来就抛异常，程序留在原地
             updater.apply_update(
                 self._staging, updater.install_dir(), self._info,
                 relaunch=updater.relaunch_name(
                     self._info, Path(sys.executable).name))
         except Exception as e:  # noqa: BLE001
-            self._on_failed(str(e))
+            log.warning("update helper failed to start: %s", e)
+            self._apply_failed = True
+            self._on_failed(f"{e}。程序没有关闭，新版本也已下载好：可以点「再试一次」，"
+                            "或点「打开发布页」下载安装包手动更新。")
             return
-        self._quit()  # 退出主程序，helper 接管替换 + 重启
+        log.info("update helper started, quitting for v%s", getattr(self._info, "version", "?"))
+        self._quit()  # helper 已确认在跑：退出主程序，由它替换文件并重新打开
 
 
 # ---------- 小工具 ----------
