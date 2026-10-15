@@ -137,8 +137,7 @@ class IndexWorker(QThread):
                 if self._index_all_files:
                     index_kwargs["index_all_files"] = True
                 if self._build_name_index:
-                    # 全盘文件名索引：扫描期间只在内存里攒，扫干净了才落盘。
-                    # 峰值约 200 MB（180 万文件真机实测），只在建库时出现。
+                    # 全盘文件名索引：扫描期间攒在临时文件里，扫干净了才拼成正式索引。
                     name_builder = namestore.NameStoreBuilder()
                     index_kwargs["name_sink"] = (
                         lambda p, size, mtime: name_builder.add(p, size, mtime))
@@ -171,7 +170,9 @@ class IndexWorker(QThread):
                 except Exception as e:  # noqa: BLE001 落盘失败不该拖垮整轮建库
                     log.warning("name index write failed: %s", e)
                     summary["name_index_error"] = f"{type(e).__name__}: {e}"
-            name_builder = None      # 200 MB 的攒料尽早还给系统
+            if name_builder is not None:
+                name_builder.close()  # 临时文件与目录表尽早还给系统
+            name_builder = None
             if int(summary.get("cancelled", 0) or 0):
                 # A user-requested stop must stay cheap. Grouping/FTS optimize/
                 # VACUUM can take minutes on a large database and would make

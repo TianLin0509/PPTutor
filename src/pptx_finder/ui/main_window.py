@@ -942,6 +942,11 @@ class MainWindow(QMainWindow):
     _INVENTORY_RECONCILE_INTERVAL_MS = 60_000
     _INVENTORY_DIRS_MAX = 2_000   # 脏目录集合上限；溢出即放弃增量，交给下次完整扫描
     _INVENTORY_DIRS_PER_ROUND = 60  # 每轮最多对账多少个目录（有界后台任务）
+    # 脏目录溢出后补一次全盘校准，但离上次完整扫描至少隔这么久。v2.0.3 及以前
+    # 溢出就立刻重扫：一轮全盘扫描要 8 分钟，这期间临时目录、浏览器缓存照样在变，
+    # 扫完又溢出，于是 50 秒后再扫一轮，真机日志里一整夜每 9 分钟一轮，
+    # 进程常驻 1.3 GB。没赶上校准的目录照样走增量对账，只是超出上限的那部分要等。
+    _OVERFLOW_RESCAN_MIN_SEC = 6 * 60 * 60
     _FULL_COVERAGE_DELAY_MS = 30_000
     _FULL_COVERAGE_RETRY_MS = 5_000
     _BG_LIGHT_SHUTDOWN_WAIT_MS = 250
@@ -1225,6 +1230,7 @@ class MainWindow(QMainWindow):
         # 有关，浏览器缓存那种一分钟几千次 churn 会被折叠成一个目录名。
         self._dirty_inventory_dirs: set[str] = set()
         self._inventory_dirs_overflowed = False
+        self._last_full_scan_wall = 0.0  # 上次完整扫描成功结束的时间（time.time）
         self._inventory_reconcile_inflight = False
         self._inventory_reconcile_timer = QTimer(self)
         self._inventory_reconcile_timer.setInterval(self._INVENTORY_RECONCILE_INTERVAL_MS)
@@ -2849,6 +2855,7 @@ class MainWindow(QMainWindow):
             and self._index_all_files_enabled
             and not self._inventory_reconcile_inflight
             and not (self._indexer is not None and self._indexer.isRunning())
+            and time.time() - self._last_full_scan_wall >= self._OVERFLOW_RESCAN_MIN_SEC
         ):
             self._inventory_dirs_overflowed = False
             self._schedule_full_coverage_scan(
@@ -6498,6 +6505,7 @@ class MainWindow(QMainWindow):
         from ..scanner import SCAN_POLICY_VERSION
 
         last_reconcile_at = max(last_completed_scan_at, last_known_reconcile_at)
+        self._last_full_scan_wall = max(self._last_full_scan_wall, last_completed_scan_at)
         self._startup_index_check_last_files = file_count
         self._startup_index_check_last_pages = page_count
         self._startup_index_check_last_pending = pending_count
@@ -6655,6 +6663,11 @@ class MainWindow(QMainWindow):
                 self._index_roots
             )
         roots = self.index_roots()
+        # 完整扫描会把此刻之前的所有变动一并收进来，攒着的脏目录与溢出标记就此作废；
+        # 扫描期间的新变动照常记，扫完再增量对账。
+        if hasattr(self, "_dirty_inventory_dirs"):
+            self._dirty_inventory_dirs.clear()
+            self._inventory_dirs_overflowed = False
         # 两个低优先级隔离 worker 是“速度/前台流畅”折中上限；显式传入更大值
         # 也不允许应用把八个解析进程同时压到用户的 PowerPoint 上。
         worker_count = max(1, min(2, int(workers))) if workers is not None else 2
@@ -6814,6 +6827,8 @@ class MainWindow(QMainWindow):
         self._index_status_cache = None
         error = str((summary or {}).get("error") or "")
         cancelled = bool(int((summary or {}).get("cancelled", 0) or 0))
+        if not error and not cancelled:
+            self._last_full_scan_wall = time.time()
         if error or cancelled:
             self.index_bar.hide()
             self.index_phase_label.hide()
