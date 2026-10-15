@@ -196,11 +196,15 @@ class _Spool:
     __slots__ = ("_fh", "_size")
 
     def __init__(self, directory: Path | None) -> None:
-        if directory is not None:
-            directory.mkdir(parents=True, exist_ok=True)
-        self._fh = tempfile.TemporaryFile(
-            prefix=".names-part-", dir=str(directory) if directory else None,
-            buffering=256 << 10)
+        try:
+            if directory is not None:
+                directory.mkdir(parents=True, exist_ok=True)
+            self._fh = tempfile.TemporaryFile(
+                prefix=".names-part-", dir=str(directory) if directory else None,
+                buffering=256 << 10)
+        except OSError:
+            # 数据目录写不了（权限、被占用）就退回系统临时目录
+            self._fh = tempfile.TemporaryFile(prefix=".names-part-", buffering=256 << 10)
         self._size = 0
 
     def __iadd__(self, data: bytes) -> "_Spool":

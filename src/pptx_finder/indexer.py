@@ -683,6 +683,7 @@ def update_index(
     seen = _ScanSeen(
         existing,
         mode="paths" if scan_iter is not None else ("dirs" if _roots_overlap(roots) else "none"),
+        nested_roots=_nested_roots(roots),
     )
     summary = {
         "indexed": 0,
@@ -1086,12 +1087,23 @@ def update_index(
     return summary
 
 
+def _root_key(root) -> str:
+    return os.path.normcase(os.path.abspath(str(root))).rstrip("\\/") + os.sep
+
+
 def _roots_overlap(roots) -> bool:
     """有没有一个根落在另一个根里面（或两个根相同）——只有这时同一路径才会被枚举两次。"""
-    keys = sorted(
-        os.path.normcase(os.path.abspath(str(r))).rstrip("\\/") + os.sep for r in roots
-    )
+    keys = sorted(_root_key(r) for r in roots)
     return any(b.startswith(a) for a, b in zip(keys, keys[1:]))
+
+
+def _nested_roots(roots) -> tuple[str, ...]:
+    """落在别的根里面（或与别的根相同）的那些根：只有它们下面的目录会被走到两次。"""
+    keys = [_root_key(r) for r in roots]
+    return tuple(sorted({
+        k for i, k in enumerate(keys)
+        if any(j != i and k.startswith(other) for j, other in enumerate(keys))
+    }))
 
 
 class _ScanSeen:
@@ -1109,14 +1121,17 @@ class _ScanSeen:
     """
 
     __slots__ = ("count", "_existing", "_existing_seen", "_all", "_dirs",
-                 "_cur_dir", "_cur_dup")
+                 "_nested", "_cur_dir", "_cur_dup")
 
-    def __init__(self, existing, *, mode: str) -> None:
+    def __init__(self, existing, *, mode: str, nested_roots: tuple[str, ...] = ()) -> None:
         self.count = 0
         self._existing = existing
         self._existing_seen: set[str] = set()
         self._all: set[str] | None = set() if mode == "paths" else None
         self._dirs: set[str] | None = set() if mode == "dirs" else None
+        # 只有嵌套根下面的目录会被走两次。自定义根落在 C:\ 里时，C:\ 其余几十万个
+        # 目录不必记；没给嵌套根就保守地全记。
+        self._nested = tuple(nested_roots)
         self._cur_dir: str | None = None
         self._cur_dup = False
 
@@ -1130,8 +1145,12 @@ class _ScanSeen:
             directory = os.path.normcase(os.path.dirname(path))
             if directory != self._cur_dir:
                 self._cur_dir = directory
-                self._cur_dup = directory in self._dirs
-                self._dirs.add(directory)
+                if self._nested and not (
+                        directory.rstrip("\\/") + os.sep).startswith(self._nested):
+                    self._cur_dup = False
+                else:
+                    self._cur_dup = directory in self._dirs
+                    self._dirs.add(directory)
             if self._cur_dup:
                 return False
         self.count += 1

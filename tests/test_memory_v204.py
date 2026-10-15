@@ -209,3 +209,52 @@ def test_bounded_dir_cache_keeps_paths_and_scoped_search_exact(tmp_path, monkeyp
                                                        exists=lambda _p: True))
         assert hits == sorted(p for p in expected if "\\proj5\\" in p)
         assert {r.path for r in search.search_names(store, "proj7", exists=lambda _p: True)} >= {"C:\\work\\proj7"}
+
+
+def test_nested_roots_only_track_the_nested_subtree():
+    """自定义根落在 C:\\ 里时，只记自定义根下面的目录，C:\\ 其余目录一个不记。"""
+    nested = indexer._nested_roots(["C:\\", "C:\\Work"])
+    assert nested == (os.path.normcase("C:\\Work\\"),)
+    assert indexer._nested_roots(["C:\\", "D:\\"]) == ()
+
+    seen = indexer._ScanSeen({}, mode="dirs", nested_roots=nested)
+    for i in range(50):
+        assert seen.add(f"C:\\Other\\d{i}\\a.txt")
+    assert seen._dirs == set()                      # C:\ 其余部分不记
+    assert seen.add("C:\\Work\\deck\\a.pptx")
+    assert seen.add("C:\\Work\\deck\\b.pptx")
+    assert seen.add("C:\\Other\\x\\c.txt")          # 走出嵌套子树
+    assert not seen.add("C:\\Work\\deck\\a.pptx")   # 第二个根再走到同一目录：整批重复
+    assert not seen.add("C:\\Work\\deck\\b.pptx")
+    assert len(seen) == 53
+
+
+def test_name_index_spool_failure_keeps_content_index(qtbot, tmp_path, monkeypatch):
+    """临时文件写不进去（磁盘满）只放弃这一轮文件名索引，内容索引照常完成。"""
+    from pptx_finder.ui.index_worker import IndexWorker
+
+    monkeypatch.setenv("PPTX_FINDER_DATA_DIR", str(tmp_path / "appdata"))
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    import fixtures_gen as fx
+
+    fx.make_pptx(docs / "keep.pptx", [{"body": "磁盘满也要能搜到"}])
+    (docs / "other.bin").write_bytes(b"x")
+
+    def boom(self, *args, **kwargs):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(namestore.NameStoreBuilder, "add", boom)
+    emitted: list[dict] = []
+    worker = IndexWorker(str(tmp_path / "i.db"), [str(docs)], workers=1,
+                         supported_exts=(".pptx",), build_name_index=True)
+    worker.finished_index.connect(emitted.append)
+    worker.run()                                     # 同步跑，不起线程
+
+    assert emitted and "error" not in emitted[0]
+    assert emitted[0]["indexed"] == 1
+    assert "OSError" in emitted[0]["name_index_error"]
+    conn = _conn(tmp_path, "i.db")
+    assert conn.execute("SELECT COUNT(*) FROM files WHERE status='ok'").fetchone()[0] == 1
+    conn.close()
+    assert namestore.current_data_path(namestore.MAIN) is None   # 半份索引不落盘
