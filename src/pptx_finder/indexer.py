@@ -680,7 +680,11 @@ def update_index(
     # 轻量投影：全量 Row（db.all_indexed）在百万行盘点库上实测约 700MB；
     # 只载入增量比对所需字段，峰值内存约减半
     existing = db.all_indexed_stats(conn)
-    seen: set[str] = set()
+    seen = _ScanSeen(
+        existing,
+        mode="paths" if scan_iter is not None else ("dirs" if _roots_overlap(roots) else "none"),
+        nested_roots=_nested_roots(roots),
+    )
     summary = {
         "indexed": 0,
         "errors": 0,
@@ -869,9 +873,8 @@ def update_index(
                 break
             yield_to_foreground()
             sp = str(p)
-            if sp in seen:
+            if not seen.add(sp):
                 continue  # 嵌套/重复根会重复枚举同一文件；本轮已处理过，跳过避免双倍写入
-            seen.add(sp)
             if len(seen) % SCAN_COMMIT_EVERY == 0:
                 conn.commit()  # 已登记的文件名落盘 → 立即可搜
                 if progress_cb:
@@ -1082,6 +1085,86 @@ def update_index(
         conn.commit()
     summary["scanned"] = len(seen)
     return summary
+
+
+def _root_key(root) -> str:
+    return os.path.normcase(os.path.abspath(str(root))).rstrip("\\/") + os.sep
+
+
+def _roots_overlap(roots) -> bool:
+    """有没有一个根落在另一个根里面（或两个根相同）——只有这时同一路径才会被枚举两次。"""
+    keys = sorted(_root_key(r) for r in roots)
+    return any(b.startswith(a) for a, b in zip(keys, keys[1:]))
+
+
+def _nested_roots(roots) -> tuple[str, ...]:
+    """落在别的根里面（或与别的根相同）的那些根：只有它们下面的目录会被走到两次。"""
+    keys = [_root_key(r) for r in roots]
+    return tuple(sorted({
+        k for i, k in enumerate(keys)
+        if any(j != i and k.startswith(other) for j, other in enumerate(keys))
+    }))
+
+
+class _ScanSeen:
+    """一轮扫描「见过哪些文件」，只记真正要用的那部分。
+
+    以前是一个装着**每一个**扫到路径的 set：开了全盘文件名索引后，真机 588 万个
+    路径光这一项就要 1 GB 上下，扫完释放也还不干净。实际只有两处用它：
+
+      · 去重：只有根互相嵌套时同一路径才会出现两次。根不重叠（mode="none"）时
+        os.walk 不会两次走到同一个目录，一个字节都不用记；根有嵌套（mode="dirs"，
+        自定义根总是落在某个盘符根里）时按**目录**去重——iter_ppt_files 把一个
+        目录的文件连续产出，第二次走到同一目录时整批都是重复的，目录数只有文件数的
+        十分之一左右；外部传进来的迭代器顺序没有保证（mode="paths"），按路径逐条记；
+      · 删除判定：只问「库里已有的那些路径这轮见没见到」，只记这部分就够了。
+    """
+
+    __slots__ = ("count", "_existing", "_existing_seen", "_all", "_dirs",
+                 "_nested", "_cur_dir", "_cur_dup")
+
+    def __init__(self, existing, *, mode: str, nested_roots: tuple[str, ...] = ()) -> None:
+        self.count = 0
+        self._existing = existing
+        self._existing_seen: set[str] = set()
+        self._all: set[str] | None = set() if mode == "paths" else None
+        self._dirs: set[str] | None = set() if mode == "dirs" else None
+        # 只有嵌套根下面的目录会被走两次。自定义根落在 C:\ 里时，C:\ 其余几十万个
+        # 目录不必记；没给嵌套根就保守地全记。
+        self._nested = tuple(nested_roots)
+        self._cur_dir: str | None = None
+        self._cur_dup = False
+
+    def add(self, path: str) -> bool:
+        """登记一条；本轮已经见过就返回 False。"""
+        if self._all is not None:
+            if path in self._all:
+                return False
+            self._all.add(path)
+        elif self._dirs is not None:
+            directory = os.path.normcase(os.path.dirname(path))
+            if directory != self._cur_dir:
+                self._cur_dir = directory
+                if self._nested and not (
+                        directory.rstrip("\\/") + os.sep).startswith(self._nested):
+                    self._cur_dup = False
+                else:
+                    self._cur_dup = directory in self._dirs
+                    self._dirs.add(directory)
+            if self._cur_dup:
+                return False
+        self.count += 1
+        if path in self._existing:
+            self._existing_seen.add(path)
+        return True
+
+    def __contains__(self, path: str) -> bool:
+        if self._all is not None:
+            return path in self._all
+        return path in self._existing_seen
+
+    def __len__(self) -> int:
+        return self.count
 
 
 def index_single(

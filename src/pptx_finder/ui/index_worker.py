@@ -107,6 +107,7 @@ class IndexWorker(QThread):
         last_emit_at = 0.0
         last_phase: str | None = None
         name_builder = None
+        name_failed: list[BaseException] = []
 
         def emit_progress(done: int, total: int, current: str) -> None:
             nonlocal last_emit_at, last_phase
@@ -137,12 +138,24 @@ class IndexWorker(QThread):
                 if self._index_all_files:
                     index_kwargs["index_all_files"] = True
                 if self._build_name_index:
-                    # 全盘文件名索引：扫描期间只在内存里攒，扫干净了才落盘。
-                    # 峰值约 200 MB（180 万文件真机实测），只在建库时出现。
-                    name_builder = namestore.NameStoreBuilder()
+                    # 全盘文件名索引：扫描期间攒在临时文件里，扫干净了才拼成正式索引。
+                    # 临时文件写不进去（磁盘满等）只放弃这一轮的文件名索引，
+                    # 内容索引照常扫完——两者原本就是两件事。
+                    name_builder = builder = namestore.NameStoreBuilder()
+
+                    def _feed(method, *args) -> None:
+                        if name_failed:
+                            return
+                        try:
+                            method(*args)
+                        except OSError as exc:
+                            name_failed.append(exc)
+                            log.warning("name index spool failed, skipped this round: %s", exc)
+
                     index_kwargs["name_sink"] = (
-                        lambda p, size, mtime: name_builder.add(p, size, mtime))
-                    index_kwargs["dir_sink"] = name_builder.add_dir
+                        lambda p, size, mtime: _feed(builder.add, p, size, mtime))
+                    index_kwargs["dir_sink"] = (
+                        lambda p, *rest: _feed(builder.add_dir, p, *rest))
                 if not self._compute_groups:
                     index_kwargs["compute_content_hash"] = False
                 if self._background_priority:
@@ -157,7 +170,10 @@ class IndexWorker(QThread):
             except Exception as e:  # noqa: BLE001 索引线程兜底，不让异常杀进程
                 self.finished_index.emit({"error": str(e)})
                 return
-            if name_builder is not None and not int(summary.get("cancelled", 0) or 0):
+            if name_failed:
+                summary["name_index_error"] = (
+                    f"{type(name_failed[0]).__name__}: {name_failed[0]}")
+            elif name_builder is not None and not int(summary.get("cancelled", 0) or 0):
                 # 只有扫干净了才落盘。半份索引会让「全部文件」少掉一半结果，
                 # 而且**不报错**——比干脆没有索引更难发现。
                 try:
@@ -171,7 +187,9 @@ class IndexWorker(QThread):
                 except Exception as e:  # noqa: BLE001 落盘失败不该拖垮整轮建库
                     log.warning("name index write failed: %s", e)
                     summary["name_index_error"] = f"{type(e).__name__}: {e}"
-            name_builder = None      # 200 MB 的攒料尽早还给系统
+            if name_builder is not None:
+                name_builder.close()  # 临时文件与目录表尽早还给系统
+            name_builder = None
             if int(summary.get("cancelled", 0) or 0):
                 # A user-requested stop must stay cheap. Grouping/FTS optimize/
                 # VACUUM can take minutes on a large database and would make

@@ -51,6 +51,7 @@ import bisect
 import logging
 import mmap
 import os
+import shutil
 import struct
 import tempfile
 import time
@@ -178,32 +179,96 @@ def _sanitize(name: str) -> str:
     return name.replace("\n", " ").replace("\r", " ") if ("\n" in name or "\r" in name) else name
 
 
+#: 建库时目录去重表最多记多少个目录。os.walk 自上而下走，一个目录的文件连续出现，
+#: 父目录也是刚走过的，所以只记最近用过的这些就几乎不会漏。偶尔漏掉的后果只是
+#: DIRS 段里同一个目录多存一份（路径匹配、限定文件夹搜索都按内容判断，结果不变）。
+#: 全量记 75 万个目录要 190 MB，而且是几十万个小对象，扫完释放也还不回操作系统。
+_DIR_CACHE_MAX = 50_000
+
+
+class _Spool:
+    """只追加的一段数据，攒在临时文件里而不是进程内存里。
+
+    支持 `+=` 和 len()，所以建库代码照旧写 `self._name += ...`。临时文件关闭即删除，
+    建库中途取消、builder 被丢弃时也不会留下垃圾。
+    """
+
+    __slots__ = ("_fh", "_size")
+
+    def __init__(self, directory: Path | None) -> None:
+        try:
+            if directory is not None:
+                directory.mkdir(parents=True, exist_ok=True)
+            self._fh = tempfile.TemporaryFile(
+                prefix=".names-part-", dir=str(directory) if directory else None,
+                buffering=256 << 10)
+        except OSError:
+            # 数据目录写不了（权限、被占用）就退回系统临时目录
+            self._fh = tempfile.TemporaryFile(prefix=".names-part-", buffering=256 << 10)
+        self._size = 0
+
+    def __iadd__(self, data: bytes) -> "_Spool":
+        self._fh.write(data)
+        self._size += len(data)
+        return self
+
+    def __len__(self) -> int:
+        return self._size
+
+    def copy_to(self, out) -> None:
+        self._fh.flush()
+        self._fh.seek(0)
+        shutil.copyfileobj(self._fh, out, 1 << 20)
+        self._fh.seek(0, os.SEEK_END)
+
+    def close(self) -> None:
+        self._fh.close()
+
+
 class NameStoreBuilder:
     """边扫盘边攒，最后一次性落盘。
 
-    内存峰值就是最终文件的大小（真机约 130 MB），全程只在结尾写一次盘。
+    名字、目录、记录这几段大块数据边扫边写进临时文件，进程里只留目录去重表和
+    几张偏移表。v2.0.3 以前全攒在内存里，落盘时还要再整体复制一遍：真机 588 万条、
+    538 MB 的索引，光这一项峰值就超过 1 GB。
     """
 
     def __init__(self) -> None:
+        try:
+            spool_dir: Path | None = data_dir()
+        except Exception:  # noqa: BLE001 数据目录不可用时退回系统临时目录
+            spool_dir = None
         self._dir_ids: dict[str, int] = {}
-        self._dirs = bytearray()
-        self._dirnorm = bytearray()
+        self._dirs = _Spool(spool_dir)
+        self._dirnorm = _Spool(spool_dir)
         self._diroff = array("I")
         self._dirnormoff = array("I")
-        self._norm = bytearray()
+        self._norm = _Spool(spool_dir)
         self._normoff = array("I")
-        self._name = bytearray()
-        self._recs = bytearray()
+        self._name = _Spool(spool_dir)
+        self._recs = _Spool(spool_dir)
         self._count = 0
 
     def __len__(self) -> int:
         return self._count
 
+    def close(self) -> None:
+        """立刻删掉临时文件、放掉目录表。不调也行，builder 被回收时会自己清掉。"""
+        for spool in (self._dirs, self._dirnorm, self._norm, self._name, self._recs):
+            spool.close()
+        self._dir_ids = {}
+
     def _dir_id(self, directory: str) -> int:
         dir_id = self._dir_ids.get(directory)
-        if dir_id is None:
-            dir_id = len(self._dir_ids)
+        if dir_id is not None:
+            # 挪到队尾 = 最近用过。父目录会在每个子目录登记时被反复用到，留得住。
+            del self._dir_ids[directory]
             self._dir_ids[directory] = dir_id
+        else:
+            dir_id = len(self._diroff)
+            self._dir_ids[directory] = dir_id
+            if len(self._dir_ids) > _DIR_CACHE_MAX:
+                del self._dir_ids[next(iter(self._dir_ids))]
             self._diroff.append(len(self._dirs))
             self._dirnormoff.append(len(self._dirnorm))
             clean = _sanitize(directory)
@@ -269,20 +334,24 @@ class NameStoreBuilder:
         dest = Path(dest)
         dest.parent.mkdir(parents=True, exist_ok=True)
         blocks = {
-            "norm": bytes(self._norm),
-            "name": bytes(self._name),
-            "dirs": bytes(self._dirs),
-            "dirnorm": bytes(self._dirnorm),
-            "diroff": self._diroff.tobytes(),
-            "dirnormoff": self._dirnormoff.tobytes(),
-            "normoff": self._normoff.tobytes(),
-            "recs": bytes(self._recs),
+            "norm": self._norm,
+            "name": self._name,
+            "dirs": self._dirs,
+            "dirnorm": self._dirnorm,
+            "diroff": self._diroff,
+            "dirnormoff": self._dirnormoff,
+            "normoff": self._normoff,
+            "recs": self._recs,
         }
+
+        def nbytes(block) -> int:
+            return len(block) * block.itemsize if isinstance(block, array) else len(block)
+
         offset = HEADER_SIZE
         spans: list[tuple[int, int]] = []
         for key in _SECTIONS:
-            spans.append((offset, len(blocks[key])))
-            offset += len(blocks[key])
+            spans.append((offset, nbytes(blocks[key])))
+            offset += nbytes(blocks[key])
 
         header = bytearray(HEADER_SIZE)
         packed = _HEADER_STRUCT.pack(
@@ -296,7 +365,11 @@ class NameStoreBuilder:
             with os.fdopen(fd, "wb") as out:
                 out.write(header)
                 for key in _SECTIONS:
-                    out.write(blocks[key])
+                    block = blocks[key]
+                    if isinstance(block, _Spool):
+                        block.copy_to(out)
+                    else:
+                        block.tofile(out)
                 out.flush()
                 os.fsync(out.fileno())
             os.replace(tmp, dest)
