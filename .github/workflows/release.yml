@@ -31,10 +31,13 @@ jobs:
           fetch-depth: 0
       - name: 取带注释的标签（发布说明在标签正文里）
         run: git fetch --force --tags origin
-      - uses: astral-sh/setup-uv@v6
+      # 用 python.org 官方版 3.12.10（与 v2.0.x 本机构建同一套解释器）：uv 自带的独立版 Python
+      # 打出来的 .pyd 与官方版不同，老用户首次升级会多下几 MB 增量块（2026-10-31 逐文件对照发现）
+      - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
-      - run: uv sync --locked
+          python-version: '3.12.10'
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --locked --python "$env:pythonLocation\python.exe"
       - name: 安装 Inno Setup
         run: |
           if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) { choco install innosetup -y --no-progress }
