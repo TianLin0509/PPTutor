@@ -5,7 +5,7 @@ name: Release
 on:
   push:
     tags: ['v*.*.*']
-    # 只构建和自检、不发布：用来验证流水线本身（推一个 ci-release-test/<名字> 分支即可）
+    # 演练：构建、自检、草稿上传核对后删除，不公开（推一个 ci-release-test/<名字> 分支即可）
     branches: ['ci-release-test/**']
   workflow_dispatch:
     inputs:
@@ -49,6 +49,9 @@ jobs:
       - run: uv run python tools/ci_release.py build --work "${{ runner.temp }}\pptd-release"
       - if: github.ref_type == 'tag' || inputs.tag
         run: uv run python tools/ci_release.py publish --work "${{ runner.temp }}\pptd-release"
+      - name: 演练发布（测试分支：草稿上传核对后删除，不公开）
+        if: github.ref_type != 'tag' && !inputs.tag
+        run: uv run python tools/ci_release.py publish --rehearsal --work "${{ runner.temp }}\pptd-release"
       - uses: actions/upload-artifact@v4
         if: always()
         with:

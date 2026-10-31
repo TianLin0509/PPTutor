@@ -264,22 +264,30 @@ def tag_notes(tag):
     return title.strip(), rest.strip()
 
 
-def cmd_publish(work: Path):
+def cmd_publish(work: Path, rehearsal=False):
+    """rehearsal=True：演练——建一个不公开的草稿 Release、传完全部文件逐个核对，然后删掉草稿。
+    除了「公开并设为最新」这最后一下，和真发布走的是同一段代码（验证流水线本身用）。"""
     out = work / "build-out"
     state = json.loads((out / "release-validation.json").read_text("utf-8"))
     assert state["passed"]
-    tag = "v" + state["version"]
     head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
-    tagged = subprocess.check_output(["git", "rev-list", "-n", "1", tag], cwd=ROOT, text=True).strip()
-    assert state["source_sha"] == head == tagged, (state["source_sha"], head, tagged)
-    title, notes = tag_notes(tag)
+    assert state["source_sha"] == head, (state["source_sha"], head)
+    if rehearsal:
+        tag = f"rehearsal-v{state['version']}-{head[:8]}"
+        title, notes = f"[演练，会自动删除] PPT Doctor {tag}", ""
+    else:
+        tag = "v" + state["version"]
+        tagged = subprocess.check_output(["git", "rev-list", "-n", "1", tag], cwd=ROOT, text=True).strip()
+        assert head == tagged, (head, tagged)
+        title, notes = tag_notes(tag)
     if not title.startswith("PPT Doctor"):
         title = f"PPT Doctor {tag} · {title}"
     notes_file = work / "release-notes.md"
     notes_file.write_text(notes or title, "utf-8")
     files = sorted(p for p in Path(state["release_directory"]).iterdir() if p.is_file() and p.stat().st_size)
     if gh("release", "view", tag, "--repo", REPO, "--json", "isDraft", check=False).returncode:
-        gh("release", "create", tag, "--repo", REPO, "--draft", "--verify-tag", "--title", title,
+        pin = ["--target", head] if rehearsal else ["--verify-tag"]
+        gh("release", "create", tag, "--repo", REPO, "--draft", *pin, "--title", title,
            "--notes-file", str(notes_file), "--latest=false")
     url = json.loads(gh("release", "view", tag, "--repo", REPO, "--json", "apiUrl").stdout)["apiUrl"]
     present = {a["name"]: a for a in api(url)["assets"]}
@@ -299,6 +307,11 @@ def cmd_publish(work: Path):
         assert a and a["size"] == p.stat().st_size, p.name
         if a.get("digest"):
             assert a["digest"] == "sha256:" + digest(p), p.name
+    if rehearsal:
+        assert api(url)["draft"], "演练的 Release 必须一直是草稿"
+        gh("release", "delete", tag, "--repo", REPO, "--yes", "--cleanup-tag")
+        say(f"演练通过：{len(files)} 个文件上传并逐个核对，草稿已删除")
+        return
     gh("release", "edit", tag, "--repo", REPO, "--title", title, "--notes-file", str(notes_file),
        "--draft=false", "--latest")
     assert api(f"repos/{REPO}/releases/latest")["tag_name"] == tag
@@ -309,9 +322,14 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("step", choices=("fetch", "build", "publish"))
     ap.add_argument("--work", required=True, type=Path)
+    ap.add_argument("--rehearsal", action="store_true", help="publish 只演练：草稿上传核对后删除")
     a = ap.parse_args(argv)
     a.work.mkdir(parents=True, exist_ok=True)
-    {"fetch": cmd_fetch, "build": cmd_build, "publish": cmd_publish}[a.step](a.work.resolve())
+    work = a.work.resolve()
+    if a.step == "publish":
+        cmd_publish(work, a.rehearsal)
+    else:
+        {"fetch": cmd_fetch, "build": cmd_build}[a.step](work)
     return 0
 
 
