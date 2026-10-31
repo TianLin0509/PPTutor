@@ -56,4 +56,6 @@ jobs:
           path: |
             ${{ runner.temp }}\pptd-release\build-out\*.log
             ${{ runner.temp }}\pptd-release\build-out\*.json
+            ${{ runner.temp }}\pptd-release\build-out\release\manifest*.json
+            ${{ runner.temp }}\pptd-release\build-out\release\SHA256SUMS.txt
           if-no-files-found: ignore
