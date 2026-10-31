@@ -99,8 +99,8 @@ uv run python -m pptx_finder
 - **不要"优化"整库建索引的速度**：低优先级、最多 2 worker、用户一交互就暂停，是设计如此。
 - **不要以"省磁盘"为由关掉 Everything 全文件索引**（+1.19 GB）。用户明确拍过板：
   藏在设置里的开关等于没有能力。
-- **不发布、不上传 ECS**：打包发布和 `.selftest/release.py`（要 `ECS_PWD`）一律等用户点头，
-  工作位不碰。
+- **不发布、不上传 ECS**：发版只能由维护者本人决定，走 `scripts/release.py`（见 `docs/MAINTAINERS.md`），
+  工作位不碰；ECS 密码谁都不需要。
 
 ## 七、怎么向维护者说话
 

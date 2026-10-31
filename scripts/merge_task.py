@@ -86,6 +86,23 @@ def acquire_merge_lock():
     return True
 
 
+RETRY_REMOTE_MOVED = 75
+
+
+def remote_moved_ahead(trunk):
+    """远端主干有本地没有的提交 = 推送被拒的原因是别人先推了（而不是断网）。"""
+    if run(["git", "fetch", "origin", trunk], check=False).returncode != 0:
+        return False
+    return run(["git", "merge-base", "--is-ancestor", f"origin/{trunk}", trunk], check=False).returncode != 0
+
+
+def release_merge_lock():
+    global _MERGE_LOCK_HANDLE
+    if _MERGE_LOCK_HANDLE is not None:
+        _MERGE_LOCK_HANDLE.close()
+        _MERGE_LOCK_HANDLE = None
+
+
 def load_config():
     if not CONFIG.exists():
         say(f"✗ 找不到项目配置：{CONFIG}")
@@ -367,7 +384,16 @@ def main():
     say("⑤ 推远端")
     if run(["git", "remote", "get-url", "origin"], check=False).returncode == 0:
         r = run(["git", "push", "origin", trunk], env=bypass, check=False)
-        say("   已推送" if r.returncode == 0 else f"   推送失败（本地已合，不影响）：{(r.stderr or '').strip()[:200]}")
+        if r.returncode == 0:
+            say("   已推送")
+        elif remote_moved_ahead(trunk):
+            # 多人直接维护主干（2026-10-31 起）：测试那一刻钟里别人可能已经推了新提交。
+            # 绝不强推覆盖别人；撤回本地这次合并，基于新主干从头再合、再测一遍。
+            say("   远端主干在测试期间被别人推进了 —— 撤回本地这次合并，基于新主干重来")
+            rollback()
+            return RETRY_REMOTE_MOVED
+        else:
+            say(f"   推送失败（本地已合，下次合并会一起推）：{(r.stderr or '').strip()[:200]}")
     else:
         say("   没配 origin，跳过")
 
@@ -387,9 +413,21 @@ def main():
     return 0
 
 
+def main_with_retry(attempts=3):
+    for i in range(attempts):
+        rc = main()
+        if rc != RETRY_REMOTE_MOVED:
+            return rc
+        release_merge_lock()
+        say()
+        say(f"── 第 {i + 2} 次：基于最新主干重新合并 ──")
+    say("✗ 连续几次都被别人抢先推送，先停下；稍后再跑一次即可。")
+    return 1
+
+
 if __name__ == "__main__":
     try:
-        sys.exit(main())
+        sys.exit(main_with_retry())
     except KeyboardInterrupt:
         say("\n中断")
         sys.exit(130)
