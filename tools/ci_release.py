@@ -309,7 +309,7 @@ def cmd_publish(work: Path, rehearsal=False):
             assert a["digest"] == "sha256:" + digest(p), p.name
     if rehearsal:
         assert api(url)["draft"], "演练的 Release 必须一直是草稿"
-        gh("release", "delete", tag, "--repo", REPO, "--yes", "--cleanup-tag")
+        gh("release", "delete", tag, "--repo", REPO, "--yes")   # 草稿没有真标签，不用清
         say(f"演练通过：{len(files)} 个文件上传并逐个核对，草稿已删除")
         return
     gh("release", "edit", tag, "--repo", REPO, "--title", title, "--notes-file", str(notes_file),
