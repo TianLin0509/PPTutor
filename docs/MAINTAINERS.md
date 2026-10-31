@@ -18,6 +18,9 @@
    uv sync
    ```
 
+4. 如果你给 pip / uv 配了国内镜像源：在主目录跑命令时加 `UV_FROZEN=1`（或 `uv run --frozen`），
+   否则 uv 会把 uv.lock 里的下载地址改写成镜像地址，合并脚本会因此拒绝合并（详见 `.agents/PITFALLS.md`）。
+
 ## 二、日常改动：一个任务一个 worktree
 
 ```bash

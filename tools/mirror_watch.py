@@ -11,7 +11,7 @@ r"""定时任务：发现 GitHub 上有新版本，就自动转传到阿里云�
     ③ GitHub 更新 → 调 mirror_release.py <版本> 转传并公网核对；同版本 → 什么都不做。
 失败不重试轰炸：同一版本连续失败 3 次后停手，等人看日志（状态文件里写着原因）。
 
-    uv run --with paramiko python tools/mirror_watch.py            # 计划任务每 15 分钟跑一次
+    uv run --frozen --with paramiko python tools/mirror_watch.py   # 计划任务每 15 分钟跑一次（--frozen：别让本机镜像源配置改写 uv.lock）
     uv run --with paramiko python tools/mirror_watch.py --status   # 看上次结果
 """
 from __future__ import annotations
@@ -121,7 +121,7 @@ def main():
     save_state(st)
     start = time.monotonic()
     with LOG.open("a", encoding="utf-8") as f:
-        r = subprocess.run(["uv", "run", "--with", "paramiko", "python", "tools/mirror_release.py", latest],
+        r = subprocess.run(["uv", "run", "--frozen", "--with", "paramiko", "python", "tools/mirror_release.py", latest],
                            cwd=ROOT, stdout=f, stderr=subprocess.STDOUT, creationflags=FLAGS,
                            env=dict(os.environ, PYTHONIOENCODING="utf-8"))
     minutes = (time.monotonic() - start) / 60
