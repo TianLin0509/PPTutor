@@ -6,7 +6,7 @@
 
   "$comment_test": "合并脚本亲自跑这些，不采信 Agent 的说法。退出码非 0 就不合。耗时见 timingNote——这个项目的闸门要一刻钟，所以 MERGER.md 明确要求直接跑真合、不要先 dry-run（两遍就是 29 分钟，必然超步骤预算）。",
   "test": [
-    "uv run pytest -q"
+    "uv run --frozen pytest -q"
   ],
 
   "$comment_version": "版本号由合并脚本在合并那一刻抬，分支不要碰。这个项目版本号在四个文件里：pyproject.toml / src/pptx_finder/__init__.py / assets/windows_version_info.txt（tests/test_package_spec.py 守一致性，不同步会在抬完之后立刻变红）/ uv.lock（记着本项目自己的版本，不同步的话 uv run 会顺手改写它，让工作区永远脏一块）。",
@@ -20,7 +20,7 @@
     "python scripts/bump_version.py"
   ],
 
-  "$comment_afterMerge": "合并成功后跑。这个项目的打包发布（pyinstaller + gh release）和 ECS 增量更新（要 ECS_PWD）必须用户点头才跑，所以不放在这里自动化。占位符：{branch} {sha}",
+  "$comment_afterMerge": "合并成功后跑。发版不放这里：维护者说发才发，走 scripts/release.py（推标签 → GitHub 流水线打包发布）。占位符：{branch} {sha}",
   "afterMerge": [],
 
   "contracts": {
@@ -40,7 +40,7 @@
     "版本库对象名永远是未压缩内容的 xxh64，.z 只是存放形态；存量零件不动；压完必须逐字节比对",
     "整库建索引慢是设计如此（低优先级、最多 2 worker、用户一交互就暂停），不要去优化",
     "Everything 全文件索引 +1.19 GB 是用户拍板要的，不许以省磁盘为由改回去",
-    "打包发布和 ECS 上传一律等用户点头，agent 不碰",
+    "发版只走 scripts/release.py，且要维护者本人（所有者或协作者）说发；阿里云由所有者电脑上的 tools/mirror_watch.py 自动转传，agent 不碰 ECS",
     "core.autocrlf=true，所以 .gitattributes 里 .githooks/* eol=lf 那行是钩子能活着的前提，别删"
   ],
 

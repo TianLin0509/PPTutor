@@ -1,0 +1,71 @@
+# 推版本标签 vX.Y.Z（用 scripts/release.py）→ 在干净的 Windows 机器上构建、自检、发到 GitHub Release。
+# 阿里云备用服务器不在这里传：服务器从 GitHub 下载极慢（2026-10-31 实测 13 KB/s），
+# 由项目所有者电脑上的同步任务（tools/mirror_watch.py）发现新版后转传，任何人都不需要服务器密码。
+name: Release
+on:
+  push:
+    tags: ['v*.*.*']
+    # 演练：构建、自检、草稿上传核对后删除，不公开（推一个 ci-release-test/<名字> 分支即可）
+    branches: ['ci-release-test/**']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 要重新发布的已有标签，如 v2.0.5（上次中途失败时用）
+        required: true
+concurrency:
+  group: release
+  cancel-in-progress: false
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 150
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+      - name: 取带注释的标签（发布说明在标签正文里）
+        run: git fetch --force --tags origin
+      # 用 python.org 官方的 Python 3.12.10（与本机历史构建同一套解释器）。
+      # 2026-10-31 逐文件对照：CI 构建与本机构建仍有 47 个文件不同（约 16 MB，来自构建机的系统 DLL，
+      # 如 ucrtbase / api-ms-win-*），只影响老用户从本机构建版升到第一个 CI 版时多下这一次增量。
+      - name: 安装 python.org 官方 Python 3.12.10（官方 NuGet 包，免安装）
+        run: |
+          Invoke-WebRequest https://www.nuget.org/api/v2/package/python/3.12.10 -OutFile py.zip
+          Expand-Archive py.zip "$env:RUNNER_TEMP\pynuget"
+          Move-Item "$env:RUNNER_TEMP\pynuget\tools" "$env:RUNNER_TEMP\py31210"
+          & "$env:RUNNER_TEMP\py31210\python.exe" -V
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --locked --python "$env:RUNNER_TEMP\py31210\python.exe"
+      - name: 安装 Inno Setup
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) { choco install innosetup -y --no-progress }
+      - name: 标签与代码里的版本号必须一致
+        if: github.ref_type == 'tag' || inputs.tag
+        shell: bash
+        run: |
+          want="${{ inputs.tag || github.ref_name }}"
+          have="v$(uv run python -c 'import sys; sys.path.insert(0,"src"); import pptx_finder; print(pptx_finder.__version__)')"
+          echo "tag=$want code=$have"; test "$want" = "$have"
+      - run: uv run python tools/ci_release.py fetch --work "${{ runner.temp }}\pptd-release"
+      - run: uv run python tools/ci_release.py build --work "${{ runner.temp }}\pptd-release"
+      - if: github.ref_type == 'tag' || inputs.tag
+        run: uv run python tools/ci_release.py publish --work "${{ runner.temp }}\pptd-release"
+      - name: 演练发布（测试分支：草稿上传核对后删除，不公开）
+        if: github.ref_type != 'tag' && !inputs.tag
+        run: uv run python tools/ci_release.py publish --rehearsal --work "${{ runner.temp }}\pptd-release"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: release-logs
+          path: |
+            ${{ runner.temp }}\pptd-release\build-out\*.log
+            ${{ runner.temp }}\pptd-release\build-out\*.json
+            ${{ runner.temp }}\pptd-release\build-out\release\manifest*.json
+            ${{ runner.temp }}\pptd-release\build-out\release\SHA256SUMS.txt
+          if-no-files-found: ignore
