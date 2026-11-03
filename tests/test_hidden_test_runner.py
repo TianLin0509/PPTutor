@@ -86,6 +86,55 @@ def test_child_rejects_user_desktop_before_importing_pytest():
         runner.enter_test_desktop('Default')
 
 
+def test_merge_relays_child_output_when_parent_stdout_is_redirected(tmp_path):
+    child = tmp_path / 'printing_child.py'
+    child.write_text("import sys\nprint('CHILD_STDOUT', flush=True)\n"
+                     "print('CHILD_STDERR', file=sys.stderr, flush=True)\n"
+                     "raise SystemExit(7)\n", 'utf-8')
+    driver = tmp_path / 'gate_driver.py'
+    driver.write_text(
+        "import runpy\n"
+        f"gate = runpy.run_path({str(ROOT / 'scripts/merge_task.py')!r})\n"
+        f"result = gate['run']({subprocess.list2cmdline([sys.executable, str(child)])!r}, "
+        "capture=False, check=False)\nraise SystemExit(result.returncode)\n", 'utf-8')
+    result = subprocess.run([sys.executable, str(driver)], cwd=ROOT,
+                            stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                            encoding='utf-8', errors='replace', timeout=30,
+                            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+    assert result.returncode == 7
+    assert 'CHILD_STDOUT' in result.stdout and 'CHILD_STDERR' in result.stdout
+
+
+@pytest.mark.skipif(os.name != 'nt', reason='Windows hidden-runner integration')
+def test_hidden_runner_preserves_failed_pytest_output_and_progress(tmp_path):
+    failing = tmp_path / 'test_failure_probe.py'
+    failing.write_text('def test_intentional_failure():\n    assert False, "OUTPUT_PROBE_中文"\n', 'utf-8')
+    report = tmp_path / 'hidden-report.json'
+    command = subprocess.list2cmdline([
+        sys.executable, str(ROOT / 'scripts/run_tests_hidden.py'), '--report', str(report),
+        '--', '-q', str(failing)])
+    driver = tmp_path / 'real_gate_driver.py'
+    driver.write_text(
+        "import runpy\n"
+        f"gate = runpy.run_path({str(ROOT / 'scripts/merge_task.py')!r})\n"
+        f"result = gate['run']({command!r}, capture=False, check=False)\n"
+        "raise SystemExit(result.returncode)\n", 'utf-8')
+    env = dict(os.environ)
+    env.pop('PYTHONIOENCODING', None)
+    result = subprocess.run(
+        [sys.executable, str(driver)], cwd=ROOT, stdin=subprocess.DEVNULL, env=env,
+        capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=45,
+        creationflags=subprocess.CREATE_NO_WINDOW)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert 'FAILED ' in result.stdout and '1 failed' in result.stdout and 'OUTPUT_PROBE_中文' in result.stdout
+    data = json.loads(report.read_text('utf-8'))
+    output = Path(data['outputLog']).read_text('utf-8')
+    assert 'FAILED ' in output and '1 failed' in output and 'OUTPUT_PROBE' in output
+    assert data['pytest']['failures'][0]['nodeid'].endswith('::test_intentional_failure')
+    assert data['pytest']['exitStatus'] == 1
+    assert data['visibleWindows'] == []
+
+
 def test_alternate_merge_script_cannot_change_repo_without_chdir(tmp_path, monkeypatch):
     merge = load_script('merge_task')
     monkeypatch.setattr(merge.sys, 'argv', ['merge_task.py', 'candidate', '--repo', str(tmp_path)])
@@ -205,5 +254,7 @@ def test_window_guard_detects_real_owned_window_without_touching_user_desktop(qt
             guard.check({os.getpid()})
         assert any(row['title'] == window.windowTitle() for row in error.value.windows)
         assert all(row['pid'] == os.getpid() for row in error.value.windows)
+        assert all(row['windowClass'] and Path(row['processImage']).name.lower() == 'python.exe'
+                   for row in error.value.windows)
     finally:
         guard.close()

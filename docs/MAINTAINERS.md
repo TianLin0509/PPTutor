@@ -52,8 +52,15 @@ python scripts/merge_task.py feat/<分支名>
 运行器在私有Win32桌面运行真实Qt，保留系统字体；外层每50ms检查本次测试进程树在Default
 及可访问输入桌面的可见窗口。发现泄漏则退出86并清理本次Job中的进程；测试本身失败仍
 保留pytest退出码。报告默认写入 `artifacts/hidden-tests-*.json`，可用 `--report`指定路径。
+同目录另存完整子进程输出 `*.pytest.log` 和逐项进度 `*.pytest.jsonl`，并把输出实时转回
+合入日志；`FAILED`行和pytest末尾统计会保留。JSON中的`outputLog`、`progressLog`指向
+这两份证据。若退出86，先看`visibleWindows`里的PID、窗口类和可执行文件，再看
+`pytest.lastNodeId`与阶段；进程被中止时会明确注明没有完整pytest汇总，不能将其说成
+某项断言失败。异常退出也保留已观测的进程ID。
 `--self-check-seconds 60`显示一个真正的Qt窗口在私有桌面等待一分钟，用于验证环境；
 隔离桌面无法替代真实屏幕采集验收，GIF等发布自检仍按原流程执行。
+更新器重启测试用无界面的GUI可执行夹具写回标记，保留真实helper和重启流程；不要用
+`.bat`冒充GUI程序，ShellExecute会在工作桌面为它创建控制台。
 
 第一次合入这个入口时，主检出的旧merge_task.py会缓存旧测试命令，不能直接运行它。
 先审查候选，再在主检出中调用候选的新脚本；`--repo`只是指定操作的主检出，仍保留

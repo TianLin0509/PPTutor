@@ -45,11 +45,24 @@ def run(cmd, cwd=None, env=None, check=True, capture=True):
     e = dict(os.environ)
     if env:
         e.update(env)
-    r = subprocess.run(
-        cmd, cwd=str(cwd or REPO), env=e, shell=isinstance(cmd, str),
-        capture_output=capture, text=True, encoding="utf-8", errors="replace",
-        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-    )
+    options = dict(cwd=str(cwd or REPO), env=e, shell=isinstance(cmd, str),
+                   text=True, encoding="utf-8", errors="replace",
+                   creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+    if capture:
+        r = subprocess.run(cmd, capture_output=True, **options)
+    else:
+        # CREATE_NO_WINDOW + cmd.exe can discard inherited redirected handles.
+        # Give the child explicit pipes and relay them into the merger's log.
+        with subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, **options) as process:
+            try:
+                for line in process.stdout:
+                    print(line, end="", flush=True)
+                r = subprocess.CompletedProcess(cmd, process.wait())
+            except BaseException:
+                process.kill()
+                process.wait()
+                raise
     if check and r.returncode != 0:
         out = (r.stdout or "") + (r.stderr or "") if capture else "(输出见上)"
         raise RuntimeError(f"命令失败（退出码 {r.returncode}）：{cmd}\n{out}")

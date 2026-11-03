@@ -5,6 +5,16 @@
 
 ## 环境
 
+- **2026-11-02：隐藏shell的继承输出可能全丢。** 实测`CREATE_NO_WINDOW`下，
+  `subprocess.run(..., shell=True, capture_output=False)`让子进程stdout/stderr都不进入
+  重定向的合入日志。闸门改为显式PIPE转发；隐藏运行器另存`*.pytest.log`原始输出及
+  `*.pytest.jsonl`逐项进度，退出86时保留最后节点、窗口类/进程路径及PID。原始输出文件
+  不要和外层重定向的`.log`同名，否则转发可能写回自身。需要检验失败摘要的真实整条调用链。
+- **2026-11-02：私有Qt桌面不能代替GUI重启夹具。** 全量在`test_helper_swap_real`结束
+  时，旧`relaunch.bat`经生产helper的`Start-Process`创建了工作桌面控制台，监测返回86；
+  不是已定位的pytest断言失败。4b23bd1与候选的安全探针都记录默认窗口方式启动bat；
+  探针强制实际启动隐藏，避免重演弹窗。三处重启夹具改成PowerShell/.NET编译的无界面
+  GUI exe，真实换文件、启动与标记断言保留，产品helper不改。短跑零窗口不等于全量零窗口。
 - **2026-11-02：CREATE_NO_WINDOW只藏控制台，不能藏pytest-qt创建的窗口。** 合入时直接
   `uv run --frozen pytest -q` 曾把pytest-qt-qapp显示到田哥桌面；当时立即停止并撤销合入。
   Windows测试统一用 `uv run --frozen python scripts/run_tests_hidden.py -- -q`：
