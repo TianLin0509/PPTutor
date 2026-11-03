@@ -121,15 +121,20 @@ def test_hidden_runner_preserves_failed_pytest_output_and_progress(tmp_path):
         "raise SystemExit(result.returncode)\n", 'utf-8')
     env = dict(os.environ)
     env.pop('PYTHONIOENCODING', None)
+    env.pop('PY_COLORS', None)
+    env.pop('NO_COLOR', None)
+    env['FORCE_COLOR'] = '3'  # Claude Code's inherited terminal environment.
     result = subprocess.run(
         [sys.executable, str(driver)], cwd=ROOT, stdin=subprocess.DEVNULL, env=env,
         capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=45,
         creationflags=subprocess.CREATE_NO_WINDOW)
     assert result.returncode == 1, result.stdout + result.stderr
     assert 'FAILED ' in result.stdout and '1 failed' in result.stdout and 'OUTPUT_PROBE_中文' in result.stdout
+    assert '\x1b[' not in result.stdout
     data = json.loads(report.read_text('utf-8'))
     output = Path(data['outputLog']).read_text('utf-8')
     assert 'FAILED ' in output and '1 failed' in output and 'OUTPUT_PROBE' in output
+    assert '\x1b[' not in output
     assert data['pytest']['failures'][0]['nodeid'].endswith('::test_intentional_failure')
     assert data['pytest']['exitStatus'] == 1
     assert data['visibleWindows'] == []

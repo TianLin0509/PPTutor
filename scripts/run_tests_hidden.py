@@ -338,7 +338,7 @@ def run_windows(pytest_args, report_path, probe_seconds=None):
                 inherited.append(handle)
             startup.hStdInput, startup.hStdOutput, startup.hStdError = inherited
             env = dict(os.environ, PPTDOCTOR_TEST_DESKTOP=name, QT_QPA_PLATFORM='windows',
-                       PYTHONIOENCODING='utf-8')
+                       PYTHONIOENCODING='utf-8', PY_COLORS='0')
             if probe_seconds is not None:
                 env['PPTDOCTOR_TEST_PROBE_SECONDS'] = str(probe_seconds)
             command = [sys.executable, '-u', str(Path(__file__).resolve()),
