@@ -161,8 +161,44 @@ def test_download_delta_hash_mismatch_raises(tmp_path):
 
 
 # ---------- PowerShell helper 真实换文件 ----------
+@pytest.fixture(scope="module")
+def relaunch_stub(tmp_path_factory):
+    """A windowless GUI executable, matching the real Doctor restart target.
+
+    A .bat target makes ShellExecute open a console on the interactive desktop.
+    Compile with the PowerShell/.NET runtime already required by these tests.
+    """
+    if os.name != "nt":
+        pytest.skip("Windows helper")
+    root = tmp_path_factory.mktemp("relaunch-gui-stub")
+    output = root / "relaunch.exe"
+    build = root / "build.ps1"
+    build.write_text(r'''
+param([string]$Output)
+$ErrorActionPreference = 'Stop'
+Add-Type -OutputAssembly $Output -OutputType WindowsApplication -TypeDefinition @'
+using System;
+using System.IO;
+public static class RelaunchProbe {
+    [STAThread]
+    public static void Main() {
+        File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory,
+                                      "..", "relaunched.flag"), "done");
+    }
+}
+'@
+''', encoding="utf-8")
+    result = subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden",
+         "-ExecutionPolicy", "Bypass", "-File", str(build), "-Output", str(output)],
+        capture_output=True, text=True, errors="replace", timeout=60,
+        creationflags=subprocess.CREATE_NO_WINDOW)
+    assert result.returncode == 0 and output.exists(), result.stdout + result.stderr
+    return output
+
+
 @pytest.mark.skipif(os.name != "nt", reason="helper 是 PowerShell，仅 Windows")
-def test_helper_swap_real(tmp_path):
+def test_helper_swap_real(tmp_path, relaunch_stub):
     # 模拟已安装目录
     dest = tmp_path / "dist"
     (dest / "sub").mkdir(parents=True)
@@ -175,9 +211,9 @@ def test_helper_swap_real(tmp_path):
     (staging / "app.txt").write_text("NEW", encoding="utf-8")
     (staging / "sub" / "new.txt").write_text("ADDED", encoding="utf-8")
     (staging / "manifest.json").write_text('{"version":"0.9.1"}', encoding="utf-8")
-    # relaunch 用一个写标记的 bat，验证「重启」确实发生
+    # 用无界面的GUI可执行文件写标记，验证真正启动而不制造测试控制台。
     marker = tmp_path / "relaunched.flag"
-    (dest / "relaunch.bat").write_text(f'@echo done> "{marker}"\r\n', encoding="ascii")
+    shutil.copyfile(relaunch_stub, dest / "relaunch.exe")
 
     info = updater.UpdateInfo(
         version="0.9.1", notes="",
@@ -188,14 +224,15 @@ def test_helper_swap_real(tmp_path):
         staging,
         dest,
         info,
-        relaunch="relaunch.bat",
+        relaunch="relaunch.exe",
         log_path=helper_log,
     )
     # MainPid=0 → 不等待，立即换。同步跑到 helper 退出。
     subprocess.run(
         ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
          "-File", h["ps1"], "-MainPid", "0", "-Plan", h["plan_path"]],
-        check=True, capture_output=True, timeout=60)
+        check=True, capture_output=True, timeout=60,
+        creationflags=subprocess.CREATE_NO_WINDOW)
     for _ in range(150):  # Windows 满载时 ShellExecute 可能排队，允许最多 15 秒
         if marker.exists():
             break
@@ -225,10 +262,11 @@ def _run_helper(h, timeout=90):
     subprocess.run(
         ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
          "-File", h["ps1"], "-MainPid", "0", "-Plan", h["plan_path"]],
-        check=True, capture_output=True, timeout=timeout)
+        check=True, capture_output=True, timeout=timeout,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
 
-def test_helper_preflight_aborts_without_touching_install(tmp_path):
+def test_helper_preflight_aborts_without_touching_install(tmp_path, relaunch_stub):
     """staging 缺文件时必须一个字节都不动安装目录，并重启仍然可用的旧版。
 
     半套替换会让安装目录里同时躺着两个构建的 exe 与 DLL，通常根本起不来，
@@ -239,7 +277,7 @@ def test_helper_preflight_aborts_without_touching_install(tmp_path):
     (dest / "app.txt").write_text("OLD", encoding="utf-8")
     (dest / "lib.txt").write_text("OLDLIB", encoding="utf-8")
     marker = tmp_path / "relaunched.flag"
-    (dest / "relaunch.bat").write_text(f'@echo done> "{marker}"\r\n', encoding="ascii")
+    shutil.copyfile(relaunch_stub, dest / "relaunch.exe")
 
     staging = tmp_path / "stg"
     staging.mkdir()
@@ -252,7 +290,7 @@ def test_helper_preflight_aborts_without_touching_install(tmp_path):
         version="0.9.2", notes="",
         changed=[("app.txt", "", 0), ("lib.txt", "", 0)], deleted=[], raw={})
     log = tmp_path / "u.log"
-    h = updater.write_helper(staging, dest, info, relaunch="relaunch.bat", log_path=log)
+    h = updater.write_helper(staging, dest, info, relaunch="relaunch.exe", log_path=log)
     _run_helper(h)
 
     text = log.read_text(encoding="utf-8")
@@ -263,14 +301,14 @@ def test_helper_preflight_aborts_without_touching_install(tmp_path):
     assert staging.exists()  # 保留 staging，下次可续用而不必重下整包
 
 
-def test_helper_rolls_back_when_a_file_cannot_be_replaced(tmp_path):
+def test_helper_rolls_back_when_a_file_cannot_be_replaced(tmp_path, relaunch_stub):
     """中途某个文件换不动时，已经换掉的必须回滚，绝不留混版安装。"""
     dest = tmp_path / "dist"
     dest.mkdir()
     (dest / "a.txt").write_text("OLD_A", encoding="utf-8")
     (dest / "b.txt").write_text("OLD_B", encoding="utf-8")
     marker = tmp_path / "relaunched.flag"
-    (dest / "relaunch.bat").write_text(f'@echo done> "{marker}"\r\n', encoding="ascii")
+    shutil.copyfile(relaunch_stub, dest / "relaunch.exe")
 
     staging = tmp_path / "stg"
     staging.mkdir()
@@ -282,7 +320,7 @@ def test_helper_rolls_back_when_a_file_cannot_be_replaced(tmp_path):
         version="0.9.3", notes="",
         changed=[("a.txt", "", 0), ("b.txt", "", 0)], deleted=[], raw={})
     log = tmp_path / "u.log"
-    h = updater.write_helper(staging, dest, info, relaunch="relaunch.bat", log_path=log)
+    h = updater.write_helper(staging, dest, info, relaunch="relaunch.exe", log_path=log)
 
     # 独占打开 b.txt：Windows 上 Copy-Item 覆盖会失败，触发 40 次重试后放弃
     handle = open(dest / "b.txt", "r+b")

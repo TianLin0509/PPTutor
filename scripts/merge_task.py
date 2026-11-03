@@ -45,10 +45,24 @@ def run(cmd, cwd=None, env=None, check=True, capture=True):
     e = dict(os.environ)
     if env:
         e.update(env)
-    r = subprocess.run(
-        cmd, cwd=str(cwd or REPO), env=e, shell=isinstance(cmd, str),
-        capture_output=capture, text=True, encoding="utf-8", errors="replace",
-    )
+    options = dict(cwd=str(cwd or REPO), env=e, shell=isinstance(cmd, str),
+                   text=True, encoding="utf-8", errors="replace",
+                   creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+    if capture:
+        r = subprocess.run(cmd, capture_output=True, **options)
+    else:
+        # CREATE_NO_WINDOW + cmd.exe can discard inherited redirected handles.
+        # Give the child explicit pipes and relay them into the merger's log.
+        with subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, **options) as process:
+            try:
+                for line in process.stdout:
+                    print(line, end="", flush=True)
+                r = subprocess.CompletedProcess(cmd, process.wait())
+            except BaseException:
+                process.kill()
+                process.wait()
+                raise
     if check and r.returncode != 0:
         out = (r.stdout or "") + (r.stderr or "") if capture else "(输出见上)"
         raise RuntimeError(f"命令失败（退出码 {r.returncode}）：{cmd}\n{out}")
@@ -187,16 +201,52 @@ def bump_version(commands, version_files, bypass):
         run(["git", "add", "--", *version_files], env=bypass, check=False)
 
 
+def run_test_gate(previous_tests, *, accept_test_change=False):
+    # Read the merged runner, but require the merger to accept command changes.
+    # Otherwise a candidate could silently replace or remove its own gate.
+    tests = load_config().get("test") or []
+    if tests != previous_tests:
+        say("④ 测试命令发生变化")
+        for label, commands in (("合并前", previous_tests), ("合并后", tests)):
+            say(f"   {label}测试命令（{len(commands)} 条）：")
+            if not commands:
+                say("     （未配置）")
+            for i, command in enumerate(commands, 1):
+                say(f"     [{i}/{len(commands)}] {command}")
+        if not accept_test_change:
+            raise RuntimeError("测试命令变化尚未接受；审查新旧命令后显式加 --accept-test-change 才能继续")
+        say("   已通过 --accept-test-change 显式接受，使用合并后的测试命令")
+    if not tests:
+        say("④ 项目没配测试命令，跳过（建议补上）")
+        return
+    say(f"④ 跑测试（{len(tests)} 条）")
+    for i, command in enumerate(tests, 1):
+        say(f"   [{i}/{len(tests)}] {command}")
+        if run(command, check=False, capture=False).returncode != 0:
+            raise RuntimeError(f"测试没过：{command}")
+    say("   全部通过")
+
+
 def main():
+    global REPO, CONFIG
     ap = argparse.ArgumentParser()
     ap.add_argument("branch", help="要合并的任务分支")
     ap.add_argument("--dry-run", action="store_true", help="只 rebase 和跑测试，不真合")
+    ap.add_argument("--repo", type=Path, help="首次升级合入脚本时指定主检出；仍须在该主检出运行")
+    ap.add_argument("--accept-test-change", action="store_true",
+                    help="审查后显式接受本次合并对测试命令的修改；默认发现变化即失败回滚")
     args = ap.parse_args()
+
+    if args.repo:
+        REPO = args.repo.resolve()
+        CONFIG = REPO / ".agents" / "project.json"
+        if Path.cwd().resolve() != REPO:
+            say("✗ --repo 必须等于当前工作目录，且仍须通过主工作目录检查")
+            return 2
 
     cfg = load_config()
     trunk = cfg.get("trunk") or "master"
     name = cfg.get("name") or REPO.name
-    tests = cfg.get("test") or []
     after = cfg.get("afterMerge") or []
     version_bump = [c for c in (cfg.get("versionBump") or []) if isinstance(c, str) and c.strip()]
     version_files = [p for p in (cfg.get("versionFiles") or []) if isinstance(p, str) and p.strip()]
@@ -325,6 +375,8 @@ def main():
             say(f"✓ 已是最新：{trunk} @ {original[:12]}")
             return 0
 
+        # Snapshot the actual pre-merge config after any remote fast-forward.
+        previous_tests = load_config().get("test") or []
         say(f"② 合并 {branch}（先不提交，测过了再落）")
         merged = run(["git", "merge", "--no-ff", "--no-commit", branch], env=bypass, check=False)
         if merged.returncode != 0:
@@ -341,16 +393,7 @@ def main():
             bump_version(version_bump, version_files, bypass)
 
         # ⑤ 亲自跑测试 —— 不采信任何 Agent 的说法
-        if not tests:
-            say("④ 项目没配测试命令，跳过（建议补上）")
-        else:
-            say(f"④ 跑测试（{len(tests)} 条）")
-            for i, t in enumerate(tests, 1):
-                say(f"   [{i}/{len(tests)}] {t}")
-                r = run(t, check=False, capture=False)
-                if r.returncode != 0:
-                    raise RuntimeError(f"测试没过：{t}")
-            say("   全部通过")
+        run_test_gate(previous_tests, accept_test_change=args.accept_test_change)
 
         if args.dry_run:
             say()

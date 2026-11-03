@@ -13,7 +13,9 @@ datas = [
     ('assets/blank_16x9.pptx', 'assets'),
 ]
 binaries = []
-hiddenimports = ["pptx_finder.imgtext_cli", "pptx_finder.imgtext", "pptx_finder.imgtext_ocr"]
+hiddenimports = ["pptx_finder.imgtext_cli", "pptx_finder.imgtext", "pptx_finder.imgtext_ocr",
+                 "pptx_finder.hub_cli", "pptx_finder.imgtext_assist",
+                 "pptx_finder.imgtext_assist_render", "pptx_finder.hub_library.report"]
 # OpenCC 繁简转换：必须打包它的 .ocd2/.json 词典 + opencc_clib .pyd，
 # 否则 frozen 下 OpenCC("t2s") 找不到词典 → 繁简归一化静默失效（搜「软件」漏掉「軟件」）。
 tmp_ret = collect_all('opencc')
@@ -139,3 +141,19 @@ coll = COLLECT(
     upx_exclude=[],
     name='PPT-Doctor',
 )
+
+# Passive marker prevents Hub launching an old GUI with an unknown --hub flag.
+# Bind to the exact binary so a stale/copied marker cannot bless an older exe.
+import hashlib
+import json
+from pathlib import Path
+from importlib.metadata import version
+hub_exe = Path(coll.name) / 'PPT-Doctor.exe'
+with hub_exe.open('rb') as hub_file:
+    hub_hash = hashlib.file_digest(hub_file, 'sha256').hexdigest()
+(hub_exe.parent / 'hub-api.json').write_text(json.dumps({
+    'apiVersion': 1, 'doctorVersion': version('pptx-finder'),
+    'executable': hub_exe.name, 'exeSha256': hub_hash,
+    'capabilities': ['status', 'search', 'read', 'catalog', 'report', 'index',
+                     'imgtext', 'imgtext-seed', 'imgtext-build', 'serve'],
+}, ensure_ascii=False, indent=2), encoding='utf-8')

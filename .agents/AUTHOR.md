@@ -23,7 +23,7 @@ uv sync                     # 在 worktree 里建它自己的 .venv
 - `uv sync` 大约 **2 分钟**（2026-09-08 实测 1 分 57 秒），别以为它卡住了。
   它是从 uv 全局缓存（`C:/Users/lintian/AppData/Local/uv/cache`）**硬链接**过来的
   （实测 .venv 里的 DLL 硬链接数=2），同一个盘符，几乎不占额外磁盘，也碰不到主目录。
-  装完先跑一个快文件确认能自测：`uv run pytest -q tests/test_parser.py`（约 2 秒）
+  装完先跑一个快文件确认能自测：`uv run --frozen python scripts/run_tests_hidden.py -- -q tests/test_parser.py`（约 2 秒）
 - 别去动主目录里别人的未提交改动
 
 ### ⚠ 绝对不要把主目录的 `.venv` 借给 worktree
@@ -53,10 +53,14 @@ C:\Users\lintian\pptx-finder\src
 ## 四、自己跑一遍（这是给自己看的，不叫审核）
 
 ```bash
-uv run pytest -q                      # 全量：1718 条 / 14 分 36 秒
-uv run pytest -q -m "not slow"        # 快档：1704 条 / 约 10 分 45 秒
-uv run pytest -q tests/test_xxx.py    # 迭代时就跑你改的那几个文件，单文件通常几秒到十几秒
+uv run --frozen python scripts/run_tests_hidden.py -- -q
+uv run --frozen python scripts/run_tests_hidden.py -- -q -m "not slow"
+uv run --frozen python scripts/run_tests_hidden.py -- -q tests/test_xxx.py
 ```
+
+**Windows上的实际入口（2026-11-02）：** pytest参数统一交给仓库隐藏桌面运行器。
+运行器保留真实字体、隔离Qt窗口，并监测本次测试进程是否在工作桌面泄漏可见窗口。
+不要再在工作桌面直接运行原始pytest；不使用offscreen替代真实字体测试。
 
 （`slow` 那 14 条是 100 万文件清点、10 万目录树这类压力测试，跑 3 分 50 秒；
 真正会起 PowerPoint COM 的只有 `test_render_real_page` 一条。）

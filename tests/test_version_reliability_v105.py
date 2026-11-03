@@ -182,7 +182,8 @@ def test_invalid_full_snapshot_never_replaces_destination(tmp_path):
     assert dest.read_bytes() == original
 
 
-def test_restore_target_survives_pre_restore_snapshot_quota(tmp_path):
+def test_restore_target_survives_pre_restore_snapshot_quota(tmp_path, monkeypatch):
+    monkeypatch.setattr("pptx_finder.actions.presentation_open_state", lambda path: False)
     source = tmp_path / "quota-restore.pptx"
     manager = VersionManager()
     manager.set_retention_limit(2)

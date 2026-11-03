@@ -66,7 +66,7 @@ def build_exe(python_exe: str, work: Path) -> Path:
         str(HERE / "sidecar.py"),
     ]
     print("[build]", " ".join(cmd))
-    subprocess.run(cmd, check=True)
+    subprocess.run(cmd, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     out = dist / NAME
     if not (out / f"{NAME}.exe").is_file():
         raise SystemExit(f"构建未产出 {NAME}.exe：{out}")
@@ -97,7 +97,7 @@ def make_manifest(root: Path, version: str) -> dict:
             continue
         rel = path.relative_to(root).as_posix()
         files[rel] = {"hash": sha256_file(path), "size": path.stat().st_size}
-    return {"version": version, "files": files}
+    return {"version": version, "files": files, "assistApiVersion": 1}
 
 
 def publish(source: Path, out_dir: Path, version: str) -> dict:

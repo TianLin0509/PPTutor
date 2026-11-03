@@ -5,6 +5,41 @@
 
 ## 环境
 
+- **2026-11-02：pywin32桌面句柄显式关闭后还需Detach。** `PyHDESK.CloseDesktop()`不清空
+  包装对象里的句柄，析构会再次关闭；号码被复用时，下一次监测可能随机报句柄无效。
+  仓库入口用`close_desktop`关闭并Detach；`GetThreadDesktop`借来的句柄只Detach不关闭。
+  回归用例检查关闭后所有权已释放、重复清理安全；不要靠吞掉ERROR_INVALID_HANDLE掩盖。
+- **2026-11-02：窗口PID快照不能替代现场Job归属。** 旧7c运行器只会报告本次Job快照里的
+  PID，因此26036当时命中了快照；旧日志没有进程名/命令行，无法事后排除PID复用或还原
+  完整身份。现在持有进程句柄调用`IsProcessInJob(handle, 本次Job)`复核，真归属才报泄漏；
+  非本Job候选另记`ignoredWindows`，不失败。两类记录均含进程路径/名称/命令行，读取不到
+  命令行则明确记错误，不能因此忽略已证实的泄漏。私有桌面里的真实正反窗口用例验证，
+  不故意向用户桌面弹窗。旧PID的重启bat归因是时序与安全A/B证据，不冒称恢复了进程身份。
+- **2026-11-02：隐藏shell的继承输出可能全丢。** 实测`CREATE_NO_WINDOW`下，
+  `subprocess.run(..., shell=True, capture_output=False)`让子进程stdout/stderr都不进入
+  重定向的合入日志。闸门改为显式PIPE转发；隐藏运行器另存`*.pytest.log`原始输出及
+  `*.pytest.jsonl`逐项进度，退出86时保留最后节点、窗口类/进程路径及PID。原始输出文件
+  不要和外层重定向的`.log`同名，否则转发可能写回自身。需要检验失败摘要的真实整条调用链。
+- **2026-11-02：私有Qt桌面不能代替GUI重启夹具。** 全量在`test_helper_swap_real`结束
+  时监测返回86；旧`relaunch.bat`经生产helper的`Start-Process`默认启动是主要嫌疑；
+  不是已定位的pytest断言失败。4b23bd1与候选的安全探针都记录默认窗口方式启动bat；
+  探针强制实际启动隐藏，避免重演弹窗。三处重启夹具改成PowerShell/.NET编译的无界面
+  GUI exe，真实换文件、启动与标记断言保留，产品helper不改。短跑零窗口不等于全量零窗口。
+- **2026-11-02：CREATE_NO_WINDOW只藏控制台，不能藏pytest-qt创建的窗口。** 合入时直接
+  `uv run --frozen pytest -q` 曾把pytest-qt-qapp显示到田哥桌面；当时立即停止并撤销合入。
+  Windows测试统一用 `uv run --frozen python scripts/run_tests_hidden.py -- -q`：
+  真实Win32私有桌面保留系统字体，最终Python解释器在导入Qt前重新绑定桌面，避免uv/venv
+  转发丢失lpDesktop。监督进程每50ms检查Default/可访问输入桌面的本次测试进程树，
+  检出可见窗口立即失败并清理自身Job；不改全局解释器、不使用offscreen/pythonw。
+  `--self-check-seconds 60`做一分钟真实Qt窗口探针，记录见artifacts/hidden-tests-*.json。
+- **合入脚本的配置必须合并后重读。** 旧脚本合并前缓存test字段，候选虽改了测试入口，
+  本轮仍执行旧命令。首次升级必须从已审查候选调用新版merge_task.py并显式`--repo`指向
+  当前主检出；主工作目录检查仍保留，不能直接运行旧脚本指望它在进程内更新自身代码。
+- **2026-11-02：合并后重读测试命令必须有显式接受。** d84d1f25只重读而不比较，
+  候选能把原本失败的测试换成简单成功命令，临时Git仓库红测已复现。现在在对齐远端后、
+  合并候选前保存test清单，合并后比较并打印新旧命令；有变化默认失败回滚，只有审查后
+  显式传`--accept-test-change`才继续。删除所有测试也要接受，不能把该开关设为默认。
+
 - **`QT_QPA_PLATFORM=offscreen` 不加载系统字体。** 调字号/行距/排版常量必须在真实平台上量：
   同一张图离屏算出 8.5~9.7pt、真实平台 11.6pt。（2026-08-27）
 - **worktree 必须有自己的 `.venv`。** `.venv/Lib/site-packages/pptx_finder.pth` 里写死

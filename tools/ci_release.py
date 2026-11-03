@@ -153,9 +153,9 @@ def cmd_build(work: Path):
             raise RuntimeError(f"{name} 失败：\n" + (out / (name + ".log")).read_text("utf-8", "replace")[-2500:])
         say(name + " 通过")
 
-    sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+    sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True, creationflags=FLAGS).strip()
     if subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=ROOT,
-                      capture_output=True, text=True).stdout.strip():
+                      capture_output=True, text=True, creationflags=FLAGS).stdout.strip():
         raise RuntimeError("工作区有未提交改动，发版必须对应一个确切提交")
     prevs = json.loads((work / "prev.json").read_text("utf-8"))
     olds = {e: [json.loads((work / "prev" / t / manifest_name(e)).read_text("utf-8")) for t in prevs]
@@ -169,6 +169,16 @@ def cmd_build(work: Path):
     run("core-build", ["uv", "run", "pyinstaller", "pptx-finder.spec", "--noconfirm",
                        "--distpath", out / "core", "--workpath", out / "pyi-work"])
     core = out / "core" / "PPT-Doctor"
+    # Build the optional OCR component from this exact checkout. Downloading the
+    # last released component would silently omit new Hub assist operations.
+    ocr_env = out / "ocr-build-env"
+    ocr_python = ocr_env / "Scripts" / "python.exe"
+    run("ocr-env", ["uv", "venv", ocr_env, "--python", sys.executable])
+    run("ocr-dependencies", ["uv", "pip", "install", "--python", ocr_python,
+                             "-r", ROOT / "tools/ocr_sidecar/requirements-build.txt"])
+    ocr_component = out / "ocr-component"
+    run("ocr-component", [sys.executable, ROOT / "tools/ocr_sidecar/build.py",
+                           "--python", ocr_python, "--out", ocr_component])
     builder = module("release_builder", ROOT / "tools" / "build_installer.py")
     iscc = builder.find_iscc()
     if not iscc:
@@ -182,7 +192,7 @@ def cmd_build(work: Path):
         dist = out / "editions" / edition / "PPT-Doctor"
         shutil.copytree(core, dist)
         if edition != "base":
-            builder.bundle_ocr(work / "components" / "ocr", dist)
+            builder.bundle_ocr(ocr_component, dist)
         if edition == "full":
             builder.bundle_ocr(work / "components" / "formula", dist, "formula", "pptdoctor-formula.exe")
         (dist / "_internal" / "edition.json").write_text(json.dumps({"edition": edition}), encoding="utf-8")
@@ -226,6 +236,11 @@ def cmd_build(work: Path):
         for key in ("PPTUTOR_OCR_CMD", "PPTUTOR_FORMULA_CMD", "QT_QPA_PLATFORM"):
             env.pop(key, None)
         exe = dist / "PPT-Doctor.exe"
+        hub_args = [sys.executable, ROOT / "scripts/verify_hub_frozen.py",
+                    exe, out / (edition + "-hub")]
+        if edition != "base":
+            hub_args.extend(["--assist-image", FIXTURES / "imgtext-clear_mixed.png"])
+        run(edition + "-hub", hub_args, env)
         run(edition + "-gif", [exe, "--gif-selftest", out / (edition + "-gif")], env)
         assert json.loads((out / (edition + "-gif") / "result.json").read_text("utf-8"))["passed"]
         run(edition + "-selftest", [exe, "--selftest", selftest_set, out / (edition + "-selftest.json")], env)
@@ -256,7 +271,7 @@ def cmd_build(work: Path):
 def tag_notes(tag):
     """发布说明 = 带注释 tag 的正文（scripts/release.py 写进去的）；第一行是标题。"""
     body = subprocess.run(["git", "tag", "-l", "--format=%(contents)", tag], cwd=ROOT,
-                          capture_output=True, text=True, encoding="utf-8").stdout.strip()
+                          capture_output=True, text=True, encoding="utf-8", creationflags=FLAGS).stdout.strip()
     body = re.sub(r"-----BEGIN PGP SIGNATURE-----.*", "", body, flags=re.S).strip()
     if not body:
         return f"PPT Doctor {tag}", ""
@@ -270,14 +285,14 @@ def cmd_publish(work: Path, rehearsal=False):
     out = work / "build-out"
     state = json.loads((out / "release-validation.json").read_text("utf-8"))
     assert state["passed"]
-    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True, creationflags=FLAGS).strip()
     assert state["source_sha"] == head, (state["source_sha"], head)
     if rehearsal:
         tag = f"rehearsal-v{state['version']}-{head[:8]}"
         title, notes = f"[演练，会自动删除] PPT Doctor {tag}", ""
     else:
         tag = "v" + state["version"]
-        tagged = subprocess.check_output(["git", "rev-list", "-n", "1", tag], cwd=ROOT, text=True).strip()
+        tagged = subprocess.check_output(["git", "rev-list", "-n", "1", tag], cwd=ROOT, text=True, creationflags=FLAGS).strip()
         assert head == tagged, (head, tagged)
         title, notes = tag_notes(tag)
     if not title.startswith("PPT Doctor"):

@@ -46,6 +46,39 @@ python scripts/merge_task.py feat/<分支名>
 - 别人在你测试期间推了新提交？脚本会自动撤回、基于新主干重合重测，最多 3 次，**绝不强推**。
 - 不要用 `git push --force`，也不要绕过脚本直接推 `master`。
 
+### Windows 测试入口与首次升级合入脚本
+
+测试统一用 `uv run --frozen python scripts/run_tests_hidden.py -- -q`，参数可缩到具体测试文件。
+运行器在私有Win32桌面运行真实Qt，保留系统字体；外层每50ms检查本次测试进程树在Default
+及可访问输入桌面的可见窗口。发现泄漏则退出86并清理本次Job中的进程；测试本身失败仍
+保留pytest退出码。报告默认写入 `artifacts/hidden-tests-*.json`，可用 `--report`指定路径。
+同目录另存完整子进程输出 `*.pytest.log` 和逐项进度 `*.pytest.jsonl`，并把输出实时转回
+合入日志；`FAILED`行和pytest末尾统计会保留。JSON中的`outputLog`、`progressLog`指向
+这两份证据。若退出86，先看`visibleWindows`里的PID、窗口类和可执行文件，再看
+`pytest.lastNodeId`与阶段；进程被中止时会明确注明没有完整pytest汇总，不能将其说成
+某项断言失败。异常退出也保留已观测的进程ID。
+`--self-check-seconds 60`显示一个真正的Qt窗口在私有桌面等待一分钟，用于验证环境；
+隔离桌面无法替代真实屏幕采集验收，GIF等发布自检仍按原流程执行。
+更新器重启测试用无界面的GUI可执行夹具写回标记，保留真实helper和重启流程；不要用
+`.bat`冒充GUI程序，ShellExecute会在工作桌面为它创建控制台。
+
+第一次合入这个入口时，主检出的旧merge_task.py会缓存旧测试命令，不能直接运行它。
+先审查候选，再在主检出中调用候选的新脚本；`--repo`只是指定操作的主检出，仍保留
+原来的主目录、锁、未提交改动检查和失败回滚：
+
+```powershell
+cd <主检出目录>
+uv run --frozen python <已审查候选worktree>/scripts/merge_task.py <候选分支> --repo . --accept-test-change
+```
+
+新版在对齐远端后、合并候选前保存测试命令，合并后重新读取project.json。两份命令不同
+时会先完整打印新旧清单，默认失败回滚，不执行测试；只有审查后显式传入
+`--accept-test-change`才使用新命令。新增、删除、调序和参数变化都属于变化；这个开关
+只接受本次命令修改，测试本身失败仍会回滚，不应放进默认合入命令。
+首次隐藏入口升级正好修改了测试命令，因此上述已审查候选的示例显式带该参数。
+首次合入完成后恢复使用
+普通 `python scripts/merge_task.py <分支>`；不用复制脚本到主检出，也不用提前覆盖配置。
+
 ## 四、发新版本
 
 在主目录、主干上（合并脚本推送成功之后）：

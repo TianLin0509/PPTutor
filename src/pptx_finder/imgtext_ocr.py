@@ -101,6 +101,48 @@ def installed_version() -> str:
         return ""
 
 
+def assist_available() -> bool:
+    """Capability metadata only; status must not start/extract the sidecar."""
+    if _dev_command():
+        return True  # A development override is verified on the actual request.
+    try:
+        root = bundled_component_dir() or active_component_dir()
+        manifest = json.loads((root / VERSION_FILE).read_text("utf-8"))
+        return manifest.get("assistApiVersion") == 1
+    except (OSError, ValueError):
+        return False
+
+
+def assist_cutout(image, output_dir, elements, *, auto_graphics=False):
+    from .hub_library.library import PptutorError
+    cmd = command()
+    if cmd is None:
+        raise OcrUnavailable("识别组件尚未安装")
+    if not assist_available():
+        raise PptutorError("OCR_COMPONENT_TOO_OLD", "增强转字需要更新识别组件")
+    with tempfile.TemporaryDirectory(prefix="pptdoctor-assist-") as temporary:
+        request, response = Path(temporary) / "request.json", Path(temporary) / "response.json"
+        request.write_text(json.dumps({"operation": "assist-cutout", "image": str(image),
+            "outputDir": str(output_dir), "elements": elements, "autoGraphics": auto_graphics}, ensure_ascii=False), encoding="utf-8")
+        try:
+            done = subprocess.run([*cmd, "--request", str(request), "--response", str(response)],
+                capture_output=True, timeout=RECOGNIZE_TIMEOUT_SEC,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), check=False)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise OcrUnavailable(f"增强转字组件无法运行：{exc}") from exc
+        if not response.is_file():
+            raise OcrUnavailable(f"增强转字组件没有返回结果（退出码 {done.returncode}）")
+        payload = json.loads(response.read_text("utf-8"))
+        if payload.get("assistApiVersion") != 1 and payload.get("ok"):
+            raise PptutorError("OCR_COMPONENT_TOO_OLD", "当前识别组件不支持增强转字，请升级")
+        if done.returncode != 0 or not payload.get("ok"):
+            raise OcrUnavailable(f"增强转字失败：{payload.get('error', '未知组件错误')}")
+        result = payload.get("result")
+        if not isinstance(result, dict) or not all(Path(result.get(k, "")).is_file() for k in ("base", "clean", "mask")):
+            raise OcrUnavailable("增强转字组件返回了不完整的产物")
+        return result
+
+
 def component_size_bytes() -> int:
     root = active_component_dir()
     if not root.is_dir():
@@ -386,6 +428,7 @@ def install(manifest: dict | None = None, *, progress=None, cancel=None,
                 raise OcrUnavailable(f"组件文件校验失败：{rel}")
         (unpacked / VERSION_FILE).write_text(
             json.dumps({"version": str(manifest.get("version") or ""),
+                        "assistApiVersion": manifest.get("assistApiVersion", 0),
                         "archive_hash": archive_hash},
                        ensure_ascii=False), encoding="utf-8")
         bundle.unlink(missing_ok=True)

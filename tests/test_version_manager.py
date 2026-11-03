@@ -182,7 +182,8 @@ def test_summary_stats_separates_protected_versions_and_rollback_docs(tmp_path):
     assert stats["single_version_docs"] == 1
 
 
-def test_restore_old_keeps_current(tmp_path):
+def test_restore_old_keeps_current(tmp_path, monkeypatch):
+    monkeypatch.setattr("pptx_finder.actions.presentation_open_state", lambda path: False)
     p = tmp_path / "a.pptx"
     fx.make_pptx(p, [{"body": "原始 OLDX"}])
     mgr = _mgr()

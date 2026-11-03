@@ -21,11 +21,29 @@ import os
 __version__ = "1.1.0"
 
 
+def available_cpus():
+    """Respect process affinity; excess ONNX spin threads can stall a 1-core job."""
+    if sys.platform == 'win32':
+        import ctypes
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel.GetCurrentProcess.restype = ctypes.c_void_p
+        kernel.GetProcessAffinityMask.argtypes = [ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_size_t)]
+        process, system = ctypes.c_size_t(), ctypes.c_size_t()
+        if not kernel.GetProcessAffinityMask(kernel.GetCurrentProcess(),
+                                             ctypes.byref(process), ctypes.byref(system)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return max(1, process.value.bit_count())
+    if hasattr(os, 'sched_getaffinity'):
+        return max(1, len(os.sched_getaffinity(0)))
+    return os.cpu_count() or 1
+
+
 def build_engine():
     from rapidocr_onnxruntime import RapidOCR
     # Large default thread pools cost more than they save on short screenshots.
     # These are execution settings; all three original OCR models stay enabled.
-    return RapidOCR(intra_op_num_threads=min(4, os.cpu_count() or 1), inter_op_num_threads=1)
+    return RapidOCR(intra_op_num_threads=min(4, available_cpus()), inter_op_num_threads=1)
 
 
 def serve():
@@ -88,10 +106,20 @@ def main(argv=None) -> int:
     try:
         with open(args.request, encoding="utf-8") as f:
             request = json.load(f)
-        images = [str(p) for p in (request.get("images") or [])]
-        engine = build_engine()
-        results = {path: recognize(engine, path) for path in images}
-        payload = {"ok": True, "version": __version__, "results": results}
+        operation = request.get("operation", "recognize")
+        if operation == "assist-cutout":
+            from assist import cutout
+            payload = {"ok": True, "version": __version__, "assistApiVersion": 1,
+                       "result": cutout(request)}
+        elif operation == "capabilities":
+            payload = {"ok": True, "version": __version__, "assistApiVersion": 1}
+        elif operation == "recognize":
+            images = [str(p) for p in (request.get("images") or [])]
+            engine = build_engine()
+            results = {path: recognize(engine, path) for path in images}
+            payload = {"ok": True, "version": __version__, "results": results}
+        else:
+            raise ValueError(f"未知侧车动作：{operation}")
         code = 0
     except Exception as exc:  # noqa: BLE001 侧车的唯一职责就是把失败原因带回去
         payload = {"ok": False, "error": f"{type(exc).__name__}: {exc}",
