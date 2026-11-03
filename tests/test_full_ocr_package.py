@@ -1,4 +1,5 @@
 """完整包必须离线可用，且拒绝带损坏运行库的安装源。"""
+import ast
 import importlib.util
 import hashlib
 import json
@@ -11,6 +12,27 @@ from types import SimpleNamespace
 import pytest
 
 from pptx_finder import imgtext_ocr
+
+
+def test_ocr_assist_release_version_and_download_tags_are_aligned():
+    """独立组件发布后，只能连GitHub的基础版也必须能取到同一代增强组件。"""
+    root = Path(__file__).resolve().parents[1]
+
+    def literal(path, name):
+        tree = ast.parse((root / path).read_text("utf-8"))
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and any(
+                isinstance(target, ast.Name) and target.id == name for target in node.targets
+            ):
+                return ast.literal_eval(node.value)
+        raise AssertionError(f"missing release metadata: {path}/{name}")
+
+    version = literal("tools/ocr_sidecar/sidecar.py", "__version__")
+    assert tuple(map(int, version.split("."))) >= (1, 2, 0), "增强组件不能复用已发布的旧1.1.0版本"
+    tag = f"ocr-v{version}"
+    assert imgtext_ocr.COMPONENT_FALLBACK_URL.rsplit("/", 1)[-1] == tag
+    for path in ("tools/ci_release.py", "tools/mirror_release.py"):
+        assert literal(path, "COMPONENT_TAGS")["ocr"] == tag
 
 
 @pytest.fixture

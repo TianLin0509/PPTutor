@@ -25,6 +25,8 @@ import time
 import urllib.request
 from pathlib import Path
 
+from mirror_release import MANIFESTS, validate_full
+
 ROOT = Path(__file__).resolve().parents[1]
 REPO = "TianLin0509/PPTutor"
 MIRROR_MANIFEST = "https://me.lt-stockpartner.tech/pptutor/manifest-Base.json"
@@ -55,6 +57,17 @@ def get_json(url, timeout=60):
 
 def vkey(v):
     return tuple(int(x) for x in v.split("."))
+
+
+def mirror_is_current(manifests: dict, latest: str) -> bool:
+    """三渠道都切换成功才算同步；上轮中断需继续，不能只看Base清单。"""
+    try:
+        versions = {manifests[name]["version"] for name in MANIFESTS}
+        full = validate_full(manifests["manifest.json"]["full"])
+        return (len(versions) == 1 and vkey(next(iter(versions))) >= vkey(latest)
+                and vkey(full["version"]) <= vkey(next(iter(versions))))
+    except (KeyError, TypeError, ValueError, SystemExit):
+        return False
 
 
 def load_state():
@@ -100,14 +113,16 @@ def main():
     st = load_state()
     try:
         latest = get_json(f"https://api.github.com/repos/{REPO}/releases/latest")["tag_name"].lstrip("v")
-        mirror = get_json(MIRROR_MANIFEST)["version"]
+        manifests = {name: get_json(MIRROR_MANIFEST.rsplit("/", 1)[0] + "/" + name)
+                     for name in MANIFESTS}
+        mirror = min((d["version"] for d in manifests.values()), key=vkey)
     except Exception as e:  # noqa: BLE001
         st.update(last_result=f"查询失败：{e}")
         save_state(st)
         log(f"查询失败：{e}")
         return 1
     st.update(github=latest, mirror=mirror)
-    if vkey(mirror) >= vkey(latest):
+    if mirror_is_current(manifests, latest):
         st.update(last_result="已同步", fails={})
         save_state(st)
         return 0
