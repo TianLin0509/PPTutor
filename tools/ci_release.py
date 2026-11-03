@@ -32,7 +32,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 REPO = os.environ.get("GITHUB_REPOSITORY", "TianLin0509/PPTutor")
-COMPONENT_TAGS = {"ocr": "ocr-v1.1.0", "formula": "formula-v1.0.0"}
+COMPONENT_TAGS = {"ocr": "ocr-v1.2.0", "formula": "formula-v1.0.0"}
 PREV_COUNT = 5
 FIXTURES = ROOT / "tools" / "release_fixtures"
 EDITIONS = ("base", "ocr", "full")

@@ -233,7 +233,7 @@ COMPONENT_MANIFEST = "component.json"
 #: v2.0 起对照 AI Hub：GitHub 在前、自建服务器作备用；两个源同一份清单、同一套两层
 #: sha256 校验，安全性一致。一个源被代理换成拦截网页、超时或 404，自动换下一个。
 COMPONENT_FALLBACK_URL = (
-    "https://github.com/TianLin0509/PPTutor/releases/download/ocr-v1.1.0")
+    "https://github.com/TianLin0509/PPTutor/releases/download/ocr-v1.2.0")
 
 
 def component_sources(kind: str = "ocr", github_base: str = COMPONENT_FALLBACK_URL
