@@ -46,8 +46,52 @@ def process_image(handle):
     return buffer.value
 
 
+def process_command_line(handle):
+    """Read Unicode command-line metadata through the same live process handle.
+
+    ProcessCommandLineInformation (60) is diagnostic only: an unavailable native
+    query is reported explicitly and never suppresses an owned-window failure.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    class UnicodeString(ctypes.Structure):
+        _fields_ = [('length', wintypes.USHORT), ('maximum_length', wintypes.USHORT),
+                    ('buffer', ctypes.c_void_p)]
+
+    query = ctypes.WinDLL('ntdll').NtQueryInformationProcess
+    query.argtypes = [wintypes.HANDLE, wintypes.ULONG, ctypes.c_void_p, wintypes.ULONG,
+                     ctypes.POINTER(wintypes.ULONG)]
+    query.restype = wintypes.LONG
+    needed = wintypes.ULONG()
+    status = query(int(handle), 60, None, 0, ctypes.byref(needed))
+    if not ctypes.sizeof(UnicodeString) <= needed.value <= 131072:
+        raise OSError(f'Command-line size query failed: NTSTATUS 0x{status & 0xffffffff:08x}')
+    buffer = ctypes.create_string_buffer(needed.value)
+    status = query(int(handle), 60, buffer, len(buffer), ctypes.byref(needed))
+    if status < 0:
+        raise OSError(f'Command-line query failed: NTSTATUS 0x{status & 0xffffffff:08x}')
+    value = UnicodeString.from_buffer(buffer)
+    if not value.length:
+        return ''
+    start = ctypes.addressof(buffer)
+    if (value.length % 2 or value.length > value.maximum_length or not value.buffer
+            or not start <= value.buffer <= start + len(buffer) - value.length):
+        raise OSError('Invalid command-line Unicode buffer')
+    return ctypes.string_at(value.buffer, value.length).decode('utf-16-le', errors='replace')
+
+
+def close_desktop(desktop):
+    # pywin32's CloseDesktop leaves its owning PyHDESK wrapper unchanged. Avoid
+    # a later destructor closing an unrelated handle that reuses this number.
+    try:
+        desktop.CloseDesktop()
+    finally:
+        desktop.Detach()
+
+
 class WindowGuard:
-    """Enumerate top-level windows, then inspect only PIDs owned by this job."""
+    """Filter by the job PID snapshot, then verify ownership on a live handle."""
     def __init__(self, desktop_names=('Default',)):
         import pywintypes
         import win32service
@@ -62,18 +106,34 @@ class WindowGuard:
             if win32service.GetUserObjectInformation(active, 2) not in names:
                 self.desktops.append(active)
             else:
-                active.CloseDesktop()
+                close_desktop(active)
         except pywintypes.error as error:
             if error.winerror != 5:
                 raise
             self.input_unavailable = True
         self.names = [win32service.GetUserObjectInformation(d, 2) for d in self.desktops]
         self.scans = 0
+        self.job = None
+        self.ignored_windows = []
+        self.ignored_windows_truncated = False
+
+    def _ignore(self, row):
+        if any((old['pid'], old['hwnd'], old['commandLine']) ==
+               (row['pid'], row['hwnd'], row['commandLine']) for old in self.ignored_windows):
+            return
+        if len(self.ignored_windows) < 64:
+            self.ignored_windows.append(row)
+        else:
+            self.ignored_windows_truncated = True
 
     def check(self, pids):
         import pywintypes
+        import win32api
         import win32gui
+        import win32job
         import win32process
+        if pids and self.job is None:
+            raise RuntimeError('窗口归属核验缺少本次Job句柄')
         found = []
         for name, desktop in zip(self.names, self.desktops):
             try:
@@ -86,19 +146,41 @@ class WindowGuard:
                 try:
                     _, pid = win32process.GetWindowThreadProcessId(hwnd)
                     if pid in pids and win32gui.IsWindowVisible(hwnd):
-                        row = dict(pid=pid, hwnd=int(hwnd), desktop=name,
-                                   title=win32gui.GetWindowText(hwnd),
-                                   windowClass=win32gui.GetClassName(hwnd))
-                        import win32api
                         try:
                             handle = win32api.OpenProcess(0x1000, False, pid)
+                        except pywintypes.error as error:
+                            if error.winerror == 87:  # The process exited after the PID snapshot.
+                                continue
+                            raise RuntimeError(f'无法打开窗口进程核验Job归属：pid={pid}, hwnd={hwnd}: {error}') from error
+                        try:
+                            try:
+                                member = bool(win32job.IsProcessInJob(handle, self.job))
+                            except pywintypes.error as error:
+                                raise RuntimeError(f'无法核验窗口Job归属：pid={pid}, hwnd={hwnd}: {error}') from error
+                            # HWNDs can be reused too. Do not attach metadata to a
+                            # window that has moved to another process meanwhile.
+                            if win32process.GetWindowThreadProcessId(hwnd)[1] != pid:
+                                continue
+                            row = dict(pid=pid, hwnd=int(hwnd), desktop=name,
+                                       title=win32gui.GetWindowText(hwnd),
+                                       windowClass=win32gui.GetClassName(hwnd), jobMember=member,
+                                       processImage=None, processName=None, commandLine=None)
                             try:
                                 row['processImage'] = process_image(handle)
-                            finally:
-                                handle.Close()
-                        except (pywintypes.error, OSError) as error:
-                            row['processImageError'] = str(error)
-                        found.append(row)
+                                row['processName'] = Path(row['processImage']).name
+                            except OSError as error:
+                                row['processImageError'] = str(error)
+                            try:
+                                row['commandLine'] = process_command_line(handle)
+                            except (OSError, AttributeError) as error:
+                                row['commandLineError'] = str(error)
+                        finally:
+                            handle.Close()
+                        if member:
+                            found.append(row)
+                        else:
+                            row['ignoredReason'] = 'outside_job'
+                            self._ignore(row)
                 except pywintypes.error as error:
                     if error.winerror != 1400:  # A window can disappear during enumeration.
                         raise
@@ -107,8 +189,9 @@ class WindowGuard:
             raise VisibleTestWindow(found)
 
     def close(self):
-        for desktop in self.desktops:
-            desktop.CloseDesktop()
+        desktops, self.desktops = self.desktops, []
+        for desktop in desktops:
+            close_desktop(desktop)
 
 
 def enter_test_desktop(name):
@@ -119,7 +202,11 @@ def enter_test_desktop(name):
     desktop = win32service.OpenDesktop(name, 0, False, 0x01ff)
     desktop.SetThreadDesktop()
     actual = win32service.GetThreadDesktop(win32api.GetCurrentThreadId())
-    if win32service.GetUserObjectInformation(actual, 2) != name:
+    try:
+        actual_name = win32service.GetUserObjectInformation(actual, 2)
+    finally:
+        actual.Detach()  # GetThreadDesktop returns a borrowed handle.
+    if actual_name != name:
         raise RuntimeError('测试桌面绑定失败；拒绝导入Qt')
     return desktop  # Keep its handle alive throughout pytest.
 
@@ -216,7 +303,8 @@ def run_windows(pytest_args, report_path, probe_seconds=None):
     name = DESKTOP_PREFIX + str(os.getpid()) + '-' + uuid.uuid4().hex
     started = time.monotonic()
     report = dict(desktop=name, pytestArgs=pytest_args, passed=False, scans=0,
-                  visibleWindows=[], qtPlatform='windows', pollIntervalMs=50)
+                  visibleWindows=[], ignoredWindows=[], qtPlatform='windows', pollIntervalMs=50,
+                  jobName=name + '-job', ownershipMethod='IsProcessInJob')
     report_path = report_path.resolve()
     # Keep separate from the usual outer redirect (<report stem>.log).
     output_path = report_path.with_suffix('.pytest.log')
@@ -233,7 +321,8 @@ def run_windows(pytest_args, report_path, probe_seconds=None):
         guard = WindowGuard()
         guard.check(set())  # Fail closed on enumeration errors before tests start.
         report.update(monitoredDesktops=guard.names, inputDesktopUnavailable=guard.input_unavailable)
-        job = win32job.CreateJobObject(None, name + '-job')
+        job = win32job.CreateJobObject(None, report['jobName'])
+        guard.job = job
         limits = win32job.QueryInformationJobObject(job, win32job.JobObjectExtendedLimitInformation)
         limits['BasicLimitInformation']['LimitFlags'] = win32job.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
         win32job.SetInformationJobObject(job, win32job.JobObjectExtendedLimitInformation, limits)
@@ -307,9 +396,11 @@ def run_windows(pytest_args, report_path, probe_seconds=None):
                 relay.close()
         if guard is not None:
             report['scans'] = guard.scans
+            report['ignoredWindows'] = guard.ignored_windows
+            report['ignoredWindowsTruncated'] = guard.ignored_windows_truncated
             guard.close()
         if desktop is not None:
-            desktop.CloseDesktop()
+            close_desktop(desktop)
         report.update(exitCode=exit_code, seconds=round(time.monotonic() - started, 3),
                       processIds=sorted(seen_pids), pytest=read_pytest_progress(progress_path))
         report_path.parent.mkdir(parents=True, exist_ok=True)

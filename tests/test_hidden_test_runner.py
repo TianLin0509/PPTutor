@@ -216,7 +216,10 @@ def test_real_qt_window_stays_on_private_desktop(qtbot):
     import win32con
     import win32service
     desktop = win32service.GetThreadDesktop(win32api.GetCurrentThreadId())
-    assert win32service.GetUserObjectInformation(desktop, win32con.UOI_NAME) == name
+    try:
+        assert win32service.GetUserObjectInformation(desktop, win32con.UOI_NAME) == name
+    finally:
+        desktop.Detach()  # Borrowed thread desktop, not owned by this test.
     assert QApplication.platformName() == 'windows'
     window = QWidget()
     qtbot.addWidget(window)
@@ -234,12 +237,18 @@ def test_real_qt_window_stays_on_private_desktop(qtbot):
 
 
 @pytest.mark.skipif(os.name != 'nt', reason='Windows desktop regression')
-def test_window_guard_detects_real_owned_window_without_touching_user_desktop(qtbot):
+@pytest.mark.parametrize('metadata_available', [True, False], ids=['metadata', 'metadata-unavailable'])
+def test_window_guard_detects_real_owned_window_without_touching_user_desktop(qtbot, monkeypatch, metadata_available):
     name = os.environ.get('PPTDOCTOR_TEST_DESKTOP')
     if not name:
         pytest.skip('Needs the private desktop test entry')
     from PySide6.QtWidgets import QWidget
+    import win32job
     runner = load_script('run_tests_hidden')
+    if not metadata_available:
+        def unavailable(handle):
+            raise OSError('command-line diagnostic unavailable')
+        monkeypatch.setattr(runner, 'process_command_line', unavailable)
     window = QWidget()
     qtbot.addWidget(window)
     window.setWindowTitle('hidden-gate-negative-test')
@@ -248,6 +257,8 @@ def test_window_guard_detects_real_owned_window_without_touching_user_desktop(qt
     # Treat this private test desktop as the monitored desktop to exercise the
     # real detection path. Never deliberately leak a window onto Default.
     guard = runner.WindowGuard((name,))
+    job = win32job.OpenJobObject(0x0004, False, name + '-job')
+    guard.job = job
     try:
         guard.check({0})  # Unrelated visible windows do not fail another run.
         with pytest.raises(runner.VisibleTestWindow) as error:
@@ -256,5 +267,74 @@ def test_window_guard_detects_real_owned_window_without_touching_user_desktop(qt
         assert all(row['pid'] == os.getpid() for row in error.value.windows)
         assert all(row['windowClass'] and Path(row['processImage']).name.lower() == 'python.exe'
                    for row in error.value.windows)
+        assert all(row['jobMember'] is True and row['processName'].lower() == 'python.exe'
+                   for row in error.value.windows)
+        if metadata_available:
+            assert all('run_tests_hidden.py' in row['commandLine'] for row in error.value.windows)
+        else:
+            assert all(row['commandLine'] is None and 'unavailable' in row['commandLineError']
+                       for row in error.value.windows)
+        print(json.dumps(dict(ownershipProbe='owned', windows=error.value.windows), ensure_ascii=False))
     finally:
         guard.close()
+        job.Close()
+
+
+@pytest.mark.skipif(os.name != 'nt', reason='Windows Job ownership regression')
+def test_window_guard_does_not_blame_a_visible_process_outside_its_job(qtbot):
+    name = os.environ.get('PPTDOCTOR_TEST_DESKTOP')
+    if not name:
+        pytest.skip('Needs the private desktop test entry')
+    from PySide6.QtWidgets import QWidget
+    import win32job
+    runner = load_script('run_tests_hidden')
+    window = QWidget()
+    qtbot.addWidget(window)
+    window.setWindowTitle('foreign-job-probe')
+    window.show()
+    qtbot.wait(50)
+    job = win32job.CreateJobObject(None, name + '-unrelated')  # Empty job cannot own pytest.
+    guard = runner.WindowGuard((name,))
+    guard.job = job
+    try:
+        # Simulate a stale PID snapshot while exercising the real OS ownership
+        # query; the visible window stays on the private test desktop.
+        guard.check({os.getpid()})
+        rows = [row for row in guard.ignored_windows if row['title'] == window.windowTitle()]
+        assert rows and rows[0]['jobMember'] is False
+        assert rows[0]['processName'].lower() == 'python.exe'
+        assert 'run_tests_hidden.py' in rows[0]['commandLine']
+        print(json.dumps(dict(ownershipProbe='outside_job', windows=rows), ensure_ascii=False))
+    finally:
+        guard.close()
+        job.Close()
+
+
+@pytest.mark.skipif(os.name != 'nt', reason='Windows process metadata regression')
+def test_process_command_line_preserves_unicode_for_a_real_child():
+    import win32api
+    runner = load_script('run_tests_hidden')
+    child = subprocess.Popen([sys._base_executable, '-c', 'import time; time.sleep(30)', '归属探针'],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
+    try:
+        handle = win32api.OpenProcess(0x1000, False, child.pid)
+        try:
+            assert '归属探针' in runner.process_command_line(handle)
+        finally:
+            handle.Close()
+    finally:
+        child.terminate()
+        child.wait(timeout=5)
+
+
+@pytest.mark.skipif(os.name != 'nt', reason='Windows desktop handle lifetime regression')
+def test_closed_guard_releases_handle_ownership_before_objects_are_collected():
+    runner = load_script('run_tests_hidden')
+    guard = runner.WindowGuard()
+    handles = list(guard.desktops)
+    guard.close()
+    # pywin32 CloseDesktop does not clear its owning wrapper. Its later
+    # destructor must not close an unrelated handle that reuses the number.
+    assert all(int(handle) == 0 for handle in handles)
+    guard.close()
