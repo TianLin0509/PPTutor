@@ -2497,6 +2497,9 @@ def test_detail_dot_refresh_is_debounced_during_fast_selection(qtbot, monkeypatc
     conn = _index(tmp_path)
     win = MainWindow(conn=conn, render_worker=StubRender(), version_mgr=vm, do_index=False)
     qtbot.addWidget(win)
+    # The detail panel independently reads versions after its own timer. Count
+    # only the dot check here, regardless of which timer the event loop runs first.
+    monkeypatch.setattr(win, "_update_detail", lambda: None)
 
     results = _fake_results(3)
     win._showing_recent = False
