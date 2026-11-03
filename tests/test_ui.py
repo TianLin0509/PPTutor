@@ -2987,6 +2987,10 @@ def test_opening_powerpoint_releases_preview_session_before_shell_open(
     qtbot, monkeypatch, tmp_path
 ):
     events: list[object] = []
+    # The fake render worker is released immediately. Actual unrelated COM
+    # processes are covered by dedicated handoff-busy tests below.
+    monkeypatch.setattr(main_window_mod.renderer_mod, "wait_for_external_open_ready",
+                        lambda **kwargs: True)
 
     class ReleasableRender(StubRender):
         def release_session(self, timeout_sec=0):

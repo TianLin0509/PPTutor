@@ -168,7 +168,10 @@ def test_copy_from_legacy_hash_version_uses_manifest_hash_fallback(tmp_path):
     assert [v["version_id"] for v in mgr.list_versions(str(child))] == [version_id]
 
 
-def test_restore_inherited_parent_version_targets_child_file(tmp_path):
+def test_restore_inherited_parent_version_targets_child_file(tmp_path, monkeypatch):
+    # This unit test owns no PowerPoint instance; another user's open deck must
+    # not turn the inherited-version assertion into a machine-state probe.
+    monkeypatch.setattr("pptx_finder.actions.presentation_open_state", lambda path: False)
     parent = tmp_path / "parent.pptx"
     child = tmp_path / "child-copy.pptx"
     fx.make_pptx(parent, [{"body": "parent v1 RESTOREME"}])

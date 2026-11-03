@@ -196,7 +196,8 @@ def test_restore_reports_missing_recovery_point(tmp_path):
     mgr.stop()
 
 
-def test_successful_restore_clears_error(tmp_path):
+def test_successful_restore_clears_error(tmp_path, monkeypatch):
+    monkeypatch.setattr("pptx_finder.actions.presentation_open_state", lambda path: False)
     deck = _deck(tmp_path)
     mgr = VersionManager(index_roots=[str(deck.parent)])
     vid = mgr.snapshot_now(str(deck), notify=False)
@@ -247,8 +248,9 @@ def test_restore_rechecks_powerpoint_immediately_before_atomic_replace(tmp_path,
     mgr.stop()
 
 
-def test_restore_recovers_when_current_file_is_already_corrupt(tmp_path):
+def test_restore_recovers_when_current_file_is_already_corrupt(tmp_path, monkeypatch):
     """恢复的首要场景就是当前稿已损坏，不能先强迫它通过健康留底。"""
+    monkeypatch.setattr("pptx_finder.actions.presentation_open_state", lambda path: False)
     deck = _deck(tmp_path, blob_kb=0)
     mgr = VersionManager(index_roots=[str(deck.parent)])
     version_id = mgr.snapshot_now(str(deck), notify=False)
