@@ -16,6 +16,12 @@ if __name__ == "__main__":
     if sys.stderr is None:
         sys.stderr = open(os.devnull, "w")  # noqa: SIM115
 
+    # Hub uses files, including errors: windowed builds have no console.
+    # Dispatch before importing the application, tray or single-instance code.
+    if "--hub" in sys.argv:
+        from pptx_finder.hub_cli import main as hub_main
+        raise SystemExit(hub_main(sys.argv[1:]))
+
     # 打包后端到端自检：`pptx-finder.exe --selftest <pptx_dir> <report.json>`
     # 在真实 frozen 环境建索引 + 搜，验证字级召回与 OpenCC 繁简可用（不弹 GUI）。
     if "--selftest" in sys.argv:
