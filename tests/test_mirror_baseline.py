@@ -85,6 +85,10 @@ def test_mirror_manifest_is_a_copy_and_other_editions_stay_byte_identical(tmp_pa
     ("path", "PPT-Doctor-v2.0.4.zip?x=1"),
     ("path", "PPT-Doctor-v2.0.4-Base.zip"),
     ("path", "x/%2e%2e/PPT-Doctor-v2.0.4.zip"),
+    ("path", "base.v2/PPT-Doctor-v2.0.4.zip"),
+    ("path", "old base/PPT-Doctor-v2.0.4.zip"),
+    ("path", "releases/base.v2/PPT-Doctor-v2.0.4.zip"),
+    ("path", "releases/old base/PPT-Doctor-v2.0.4.zip"),
     ("sha256", "bad"),
 ])
 def test_invalid_full_metadata_is_rejected(field, value):
@@ -97,6 +101,13 @@ def test_all_three_manifests_are_required(tmp_path):
     items = mirror.collect_from_dir("2.1.0", assets(tmp_path), False)
     with pytest.raises(SystemExit, match="清单"):
         mirror.check_consistency([i for i in items if i.remote != "manifest-Ocr.json"])
+
+
+@pytest.mark.parametrize("prefix", ["", "baseline/", "base-v2_1/", "RELEASES/v2_1/"])
+def test_full_path_accepts_hub_compatible_root_and_directories(prefix):
+    data = full()
+    data["path"] = prefix + data["path"]
+    assert mirror.validate_full(data) == data
 
 
 def test_base_archive_cannot_be_used_as_full_baseline(tmp_path):
@@ -274,16 +285,19 @@ def test_same_size_corrupt_block_is_replaced(tmp_path, monkeypatch):
     assert server.files["files/" + digest] == b"unchanged runtime"
 
 
-def test_refresh_verifies_new_full_before_switch_and_never_deletes_old_automatically(tmp_path, monkeypatch):
+@pytest.mark.parametrize("reason", ["runtime-change", "hub-compat"])
+def test_refresh_verifies_new_full_before_switch_and_never_deletes_old_automatically(tmp_path, monkeypatch, reason):
     old = assets(tmp_path, "2.0.4")
     src = assets(tmp_path)
     server = MemoryMirror(monkeypatch, old)
-    assert run_main(monkeypatch, tmp_path, src, "--refresh-full", "runtime-change") == 0
+    assert run_main(monkeypatch, tmp_path, src, "--refresh-full", reason) == 0
     full_name = "PPT-Doctor-v2.1.0.zip"
     assert json.loads(server.files["manifest.json"])["full"]["path"] == full_name
     assert server.events.index(("GET", full_name)) < server.events.index(("replace", "manifest.json"))
     assert "PPT-Doctor-v2.0.4.zip" in server.files
     assert not any(p.endswith(("-Base.zip", "-Ocr.zip")) for p in server.files)
+    audit = json.loads((tmp_path / "cache/v2.1.0/publish-report.json").read_text("utf-8"))
+    assert audit["refreshReason"] == reason and audit["full"]["version"] == "2.1.0"
 
 
 def test_partial_manifest_commit_can_be_resumed(tmp_path, monkeypatch):

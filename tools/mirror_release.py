@@ -198,6 +198,10 @@ def validate_full(data: dict) -> dict:
         raise SystemExit("[!] full 必须包含 version/path/sha256")
     version_key(data.get("version"))
     path = safe_path(data.get("path"))
+    # 与Hub下载器的相对ZIP规则一致；不能生成Doctor接受而Hub拒绝的full。
+    if not re.fullmatch(r"(?:[a-z0-9_-]+/)*[a-z0-9][a-z0-9._-]*\.zip", path,
+                        flags=re.IGNORECASE | re.ASCII):
+        raise SystemExit("[!] full 路径必须符合Hub相对ZIP规则，目录只允许字母数字下划线和短横线")
     if (PurePosixPath(path).name != f"PPT-Doctor-v{data['version']}.zip"
             or not isinstance(data.get("sha256"), str) or not _HEX64.fullmatch(data["sha256"])):
         raise SystemExit("[!] full 必须指向版本匹配的 Full ZIP，且含64位小写SHA256")
@@ -670,7 +674,7 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true", help="只列出将上传的清单，不连服务器")
     ap.add_argument("--verify-only", action="store_true", help="不上传，只核对公网上的文件")
     policy = ap.add_mutually_exclusive_group()
-    policy.add_argument("--refresh-full", choices=("runtime-change", "missing-baseline"),
+    policy.add_argument("--refresh-full", choices=("runtime-change", "missing-baseline", "hub-compat"),
                         help="显式批准更换基线的原因；仅上传本版Full ZIP")
     policy.add_argument("--baseline-zip", type=Path, help="迁移镜像已保留的旧Full ZIP，不重新上传")
     ap.add_argument("--prune-full", nargs="+", help="安装/升级验收后单独删除明确列出的旧ZIP")
