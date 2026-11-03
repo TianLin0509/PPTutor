@@ -5,6 +5,17 @@
 
 ## 环境
 
+- **2026-11-02：CREATE_NO_WINDOW只藏控制台，不能藏pytest-qt创建的窗口。** 合入时直接
+  `uv run --frozen pytest -q` 曾把pytest-qt-qapp显示到田哥桌面；当时立即停止并撤销合入。
+  Windows测试统一用 `uv run --frozen python scripts/run_tests_hidden.py -- -q`：
+  真实Win32私有桌面保留系统字体，最终Python解释器在导入Qt前重新绑定桌面，避免uv/venv
+  转发丢失lpDesktop。监督进程每50ms检查Default/可访问输入桌面的本次测试进程树，
+  检出可见窗口立即失败并清理自身Job；不改全局解释器、不使用offscreen/pythonw。
+  `--self-check-seconds 60`做一分钟真实Qt窗口探针，记录见artifacts/hidden-tests-*.json。
+- **合入脚本的配置必须合并后重读。** 旧脚本合并前缓存test字段，候选虽改了测试入口，
+  本轮仍执行旧命令。首次升级必须从已审查候选调用新版merge_task.py并显式`--repo`指向
+  当前主检出；主工作目录检查仍保留，不能直接运行旧脚本指望它在进程内更新自身代码。
+
 - **`QT_QPA_PLATFORM=offscreen` 不加载系统字体。** 调字号/行距/排版常量必须在真实平台上量：
   同一张图离屏算出 8.5~9.7pt、真实平台 11.6pt。（2026-08-27）
 - **worktree 必须有自己的 `.venv`。** `.venv/Lib/site-packages/pptx_finder.pth` 里写死

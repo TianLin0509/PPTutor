@@ -46,6 +46,27 @@ python scripts/merge_task.py feat/<分支名>
 - 别人在你测试期间推了新提交？脚本会自动撤回、基于新主干重合重测，最多 3 次，**绝不强推**。
 - 不要用 `git push --force`，也不要绕过脚本直接推 `master`。
 
+### Windows 测试入口与首次升级合入脚本
+
+测试统一用 `uv run --frozen python scripts/run_tests_hidden.py -- -q`，参数可缩到具体测试文件。
+运行器在私有Win32桌面运行真实Qt，保留系统字体；外层每50ms检查本次测试进程树在Default
+及可访问输入桌面的可见窗口。发现泄漏则退出86并清理本次Job中的进程；测试本身失败仍
+保留pytest退出码。报告默认写入 `artifacts/hidden-tests-*.json`，可用 `--report`指定路径。
+`--self-check-seconds 60`显示一个真正的Qt窗口在私有桌面等待一分钟，用于验证环境；
+隔离桌面无法替代真实屏幕采集验收，GIF等发布自检仍按原流程执行。
+
+第一次合入这个入口时，主检出的旧merge_task.py会缓存旧测试命令，不能直接运行它。
+先审查候选，再在主检出中调用候选的新脚本；`--repo`只是指定操作的主检出，仍保留
+原来的主目录、锁、未提交改动检查和失败回滚：
+
+```powershell
+cd <主检出目录>
+uv run --frozen python <已审查候选worktree>/scripts/merge_task.py <候选分支> --repo .
+```
+
+新版合并后重新读取project.json，再执行仓库内隐藏测试入口。首次合入完成后恢复使用
+普通 `python scripts/merge_task.py <分支>`；不用复制脚本到主检出，也不用提前覆盖配置。
+
 ## 四、发新版本
 
 在主目录、主干上（合并脚本推送成功之后）：

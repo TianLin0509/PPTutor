@@ -48,6 +48,7 @@ def run(cmd, cwd=None, env=None, check=True, capture=True):
     r = subprocess.run(
         cmd, cwd=str(cwd or REPO), env=e, shell=isinstance(cmd, str),
         capture_output=capture, text=True, encoding="utf-8", errors="replace",
+        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
     )
     if check and r.returncode != 0:
         out = (r.stdout or "") + (r.stderr or "") if capture else "(输出见上)"
@@ -187,16 +188,39 @@ def bump_version(commands, version_files, bypass):
         run(["git", "add", "--", *version_files], env=bypass, check=False)
 
 
+def run_test_gate():
+    # A candidate can change the test runner itself. Read the merged config,
+    # not the pre-merge command cached at process startup.
+    tests = load_config().get("test") or []
+    if not tests:
+        say("④ 项目没配测试命令，跳过（建议补上）")
+        return
+    say(f"④ 跑测试（{len(tests)} 条）")
+    for i, command in enumerate(tests, 1):
+        say(f"   [{i}/{len(tests)}] {command}")
+        if run(command, check=False, capture=False).returncode != 0:
+            raise RuntimeError(f"测试没过：{command}")
+    say("   全部通过")
+
+
 def main():
+    global REPO, CONFIG
     ap = argparse.ArgumentParser()
     ap.add_argument("branch", help="要合并的任务分支")
     ap.add_argument("--dry-run", action="store_true", help="只 rebase 和跑测试，不真合")
+    ap.add_argument("--repo", type=Path, help="首次升级合入脚本时指定主检出；仍须在该主检出运行")
     args = ap.parse_args()
+
+    if args.repo:
+        REPO = args.repo.resolve()
+        CONFIG = REPO / ".agents" / "project.json"
+        if Path.cwd().resolve() != REPO:
+            say("✗ --repo 必须等于当前工作目录，且仍须通过主工作目录检查")
+            return 2
 
     cfg = load_config()
     trunk = cfg.get("trunk") or "master"
     name = cfg.get("name") or REPO.name
-    tests = cfg.get("test") or []
     after = cfg.get("afterMerge") or []
     version_bump = [c for c in (cfg.get("versionBump") or []) if isinstance(c, str) and c.strip()]
     version_files = [p for p in (cfg.get("versionFiles") or []) if isinstance(p, str) and p.strip()]
@@ -341,16 +365,7 @@ def main():
             bump_version(version_bump, version_files, bypass)
 
         # ⑤ 亲自跑测试 —— 不采信任何 Agent 的说法
-        if not tests:
-            say("④ 项目没配测试命令，跳过（建议补上）")
-        else:
-            say(f"④ 跑测试（{len(tests)} 条）")
-            for i, t in enumerate(tests, 1):
-                say(f"   [{i}/{len(tests)}] {t}")
-                r = run(t, check=False, capture=False)
-                if r.returncode != 0:
-                    raise RuntimeError(f"测试没过：{t}")
-            say("   全部通过")
+        run_test_gate()
 
         if args.dry_run:
             say()
