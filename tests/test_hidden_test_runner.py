@@ -33,18 +33,50 @@ def test_merge_reads_test_commands_after_candidate_config_changes(tmp_path, monk
     calls = []
     monkeypatch.setattr(merge, 'run', lambda command, **kw: calls.append(command)
                         or type('Result', (), {'returncode': 0})())
-    merge.run_test_gate()
+    merge.run_test_gate(old['test'], accept_test_change=True)
     assert old['test'] == ['old-command'] and calls == ['new-hidden-command']
 
 
-def test_failed_test_gate_stops_instead_of_continuing(monkeypatch):
+@pytest.mark.parametrize(('previous', 'updated'), [
+    (['full-tests'], ['smoke-tests']),
+    ([], ['full-tests']),
+    (['full-tests'], []),
+    (['first', 'second'], ['second', 'first']),
+    (['pytest -q'], ['pytest -q -k smoke']),
+], ids=['replace', 'add', 'remove', 'reorder', 'arguments'])
+def test_changed_test_commands_require_explicit_acceptance(previous, updated, monkeypatch, capsys):
+    merge = load_script('merge_task')
+    monkeypatch.setattr(merge, 'load_config', lambda: {'test': updated})
+    monkeypatch.setattr(merge, 'run', lambda *a, **kw: pytest.fail('must not execute unaccepted commands'))
+    with pytest.raises(RuntimeError, match='--accept-test-change'):
+        merge.run_test_gate(previous)
+    output = capsys.readouterr().out
+    assert '合并前测试命令' in output and '合并后测试命令' in output
+    assert all(command in output for command in previous + updated)
+    if not previous or not updated:
+        assert '未配置' in output
+
+
+def test_unchanged_test_commands_do_not_need_acceptance(monkeypatch):
+    merge = load_script('merge_task')
+    monkeypatch.setattr(merge, 'load_config', lambda: {'test': ['first', 'second']})
+    calls = []
+    monkeypatch.setattr(merge, 'run', lambda command, **kw: calls.append(command)
+                        or type('Result', (), {'returncode': 0})())
+    merge.run_test_gate(['first', 'second'])
+    assert calls == ['first', 'second']
+
+
+@pytest.mark.parametrize('accept_change', [False, True], ids=['unchanged', 'accepted-change'])
+def test_failed_test_gate_stops_instead_of_continuing(monkeypatch, accept_change):
     merge = load_script('merge_task')
     monkeypatch.setattr(merge, 'load_config', lambda: {'test': ['first', 'second']})
     calls = []
     monkeypatch.setattr(merge, 'run', lambda command, **kw: calls.append(command)
                         or type('Result', (), {'returncode': 86})())
     with pytest.raises(RuntimeError, match='first'):
-        merge.run_test_gate()
+        merge.run_test_gate(['old-command'] if accept_change else ['first', 'second'],
+                            accept_test_change=accept_change)
     assert calls == ['first']
 
 
@@ -61,7 +93,8 @@ def test_alternate_merge_script_cannot_change_repo_without_chdir(tmp_path, monke
     assert merge.main() == 2
 
 
-def test_first_merge_bootstrap_uses_new_gate_and_keeps_rollback(tmp_path):
+@pytest.mark.parametrize('accept_change', [False, True], ids=['reject', 'accept'])
+def test_first_merge_bootstrap_uses_new_gate_and_keeps_rollback(tmp_path, accept_change):
     """Real throwaway repository: no origin, no production checkout or push."""
     def run(args):
         return subprocess.run(args, cwd=tmp_path, capture_output=True, text=True,
@@ -77,27 +110,39 @@ def test_first_merge_bootstrap_uses_new_gate_and_keeps_rollback(tmp_path):
     git('config', 'core.hooksPath', str(tmp_path / 'no-hooks'))
     (tmp_path / '.agents').mkdir()
     config = tmp_path / '.agents/project.json'
-    config.write_text(json.dumps({'trunk': 'master', 'test': [
-        subprocess.list2cmdline([sys.executable, '-c', 'raise SystemExit(17)'])]}), 'utf-8')
+    old_command = subprocess.list2cmdline([sys.executable, '-c', 'raise SystemExit(17)'])
+    config.write_text(json.dumps({'trunk': 'master', 'test': [old_command]}), 'utf-8')
     git('add', '.')
     git('commit', '-m', 'base with obsolete gate')
     original = git('rev-parse', 'HEAD')
     git('checkout', '-b', 'fix/new-gate')
-    config.write_text(json.dumps({'trunk': 'master', 'test': [
-        subprocess.list2cmdline([sys.executable, 'gate_probe.py'])]}), 'utf-8')
+    new_command = subprocess.list2cmdline([sys.executable, 'gate_probe.py'])
+    config.write_text(json.dumps({'trunk': 'master', 'test': [new_command]}), 'utf-8')
     (tmp_path / 'gate_probe.py').write_text(
         "from pathlib import Path; Path('new-gate-ran').write_text('ok')", 'utf-8')
     git('add', '.')
     git('commit', '-m', 'candidate gate')
     candidate = git('rev-parse', 'HEAD')
     git('checkout', 'master')
-    result = run([sys.executable, str(ROOT / 'scripts/merge_task.py'),
-                  'fix/new-gate', '--repo', str(tmp_path), '--dry-run'])
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert (tmp_path / 'new-gate-ran').read_text() == 'ok'
+    (tmp_path / 'unrelated.txt').write_text('keep unrelated work', 'utf-8')
+    command = [sys.executable, str(ROOT / 'scripts/merge_task.py'),
+               'fix/new-gate', '--repo', str(tmp_path), '--dry-run']
+    if accept_change:
+        command.append('--accept-test-change')
+    result = run(command)
+    assert result.returncode == (0 if accept_change else 1), result.stdout + result.stderr
+    assert old_command in result.stdout and new_command in result.stdout
+    assert (tmp_path / 'new-gate-ran').exists() is accept_change
+    if accept_change:
+        assert (tmp_path / 'new-gate-ran').read_text() == 'ok'
+    else:
+        assert '--accept-test-change' in result.stdout
     assert git('rev-parse', 'HEAD') == original
     assert git('rev-parse', 'fix/new-gate') == candidate
     assert not (tmp_path / '.git/MERGE_HEAD').exists()
+    assert json.loads(config.read_text('utf-8'))['test'] == [old_command]
+    assert not (tmp_path / 'gate_probe.py').exists()
+    assert (tmp_path / 'unrelated.txt').read_text('utf-8') == 'keep unrelated work'
 
 
 @pytest.mark.skipif(os.name != 'nt', reason='Windows desktop regression')

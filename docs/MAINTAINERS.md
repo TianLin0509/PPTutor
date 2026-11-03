@@ -61,10 +61,15 @@ python scripts/merge_task.py feat/<分支名>
 
 ```powershell
 cd <主检出目录>
-uv run --frozen python <已审查候选worktree>/scripts/merge_task.py <候选分支> --repo .
+uv run --frozen python <已审查候选worktree>/scripts/merge_task.py <候选分支> --repo . --accept-test-change
 ```
 
-新版合并后重新读取project.json，再执行仓库内隐藏测试入口。首次合入完成后恢复使用
+新版在对齐远端后、合并候选前保存测试命令，合并后重新读取project.json。两份命令不同
+时会先完整打印新旧清单，默认失败回滚，不执行测试；只有审查后显式传入
+`--accept-test-change`才使用新命令。新增、删除、调序和参数变化都属于变化；这个开关
+只接受本次命令修改，测试本身失败仍会回滚，不应放进默认合入命令。
+首次隐藏入口升级正好修改了测试命令，因此上述已审查候选的示例显式带该参数。
+首次合入完成后恢复使用
 普通 `python scripts/merge_task.py <分支>`；不用复制脚本到主检出，也不用提前覆盖配置。
 
 ## 四、发新版本
