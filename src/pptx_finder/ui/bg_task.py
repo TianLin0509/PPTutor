@@ -85,11 +85,18 @@ def diagnostic_lines() -> list[str]:
         ]
 
 
+#: 跑着的任务由这里持有到结束。任务的生命周期不能挂在窗口上：窗口销毁时线程还在跑，
+#: Qt 会以「QThread: Destroyed while thread is still running」直接终止整个进程
+#: （退出码 0xC0000409，关健康窗口、测试收尾都撞到过）。
+_running: set = set()
+
+
 class BackgroundTask(QThread):
     done = Signal(object)  # fn 的返回值（异常时为 None），经队列连接切回主线程
 
     def __init__(self, fn: Callable, label: str = "", parent=None) -> None:
-        super().__init__(parent)
+        # parent 参数保留兼容，但不再作为 Qt 父对象，原因见 _running
+        super().__init__(None)
         self._fn = fn
         self._label = label
         self._cancelled = threading.Event()
@@ -109,6 +116,7 @@ class BackgroundTask(QThread):
         if not self._retirement_connected:
             self.finished.connect(self._retire_after_signal_drain)
             self._retirement_connected = True
+        _running.add(self)
         super().start(priority)
 
     def _retire_after_signal_drain(self) -> None:
@@ -119,8 +127,11 @@ class BackgroundTask(QThread):
         # Detach first so closing a parent window during the grace cannot destroy
         # the task ahead of the timer and leave a callback aimed at an invalid
         # C++ wrapper.
-        self.setParent(None)
-        QTimer.singleShot(1000, self.deleteLater)
+        QTimer.singleShot(1000, self._release)
+
+    def _release(self) -> None:
+        _running.discard(self)
+        self.deleteLater()
 
     @property
     def label(self) -> str:
