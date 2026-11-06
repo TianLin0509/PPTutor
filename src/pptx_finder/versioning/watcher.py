@@ -10,7 +10,12 @@ from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
 from ..config import CONTENT_EXTS, PPTX_EXT, data_dir
-from ..path_policy import explicit_project_output_roots, is_project_output_path
+from ..path_policy import (
+    explicit_project_output_roots,
+    is_project_output_path,
+    system_temp_roots,
+)
+from ..usn_journal import volume_root
 
 DEBOUNCE_SEC = 1.5
 SAVE_RETRY_DELAYS_SEC = (0.75, 2.0, 5.0)
@@ -81,7 +86,13 @@ class _Handler(FileSystemEventHandler):
         self._explicit_project_output_roots = list(
             explicit_project_output_roots(roots)
         )
-        self._always_skip_roots = [_norm_path(str(data_dir()))]
+        # 真实的系统临时目录（%TEMP% 可能不在 AppData 下）。根明确选在它里面时尊重选择。
+        selected = [_norm_path(r) for r in (roots or [])]
+        temp_roots = [
+            t for t in system_temp_roots()
+            if not any(_under(root, t) for root in selected)
+        ]
+        self._always_skip_roots = [_norm_path(str(data_dir())), *temp_roots]
         self._timers: dict[str, _PendingCall] = {}
         self._retry_delays = SAVE_RETRY_DELAYS_SEC
         self._lock = threading.RLock()
@@ -106,6 +117,28 @@ class _Handler(FileSystemEventHandler):
         if not any(seg in low for seg in _SKIP_SEGS):
             return False
         return not any(_under(path, root) for root in self._explicit_skip_roots)
+
+    # ---- 事件来源（目录监听 / 流水账）共用的判定 ----
+    def skip_path(self, path: str) -> bool:
+        return self._skip_path(path)
+
+    def skip_directory(self, directory: str) -> bool:
+        """整个目录是否被排除。片段规则都带结尾分隔符，所以拼一个占位文件名再判。"""
+        return self._skip_path(os.path.join(directory, "_"))
+
+    def is_content_path(self, path: str) -> bool:
+        return (
+            os.path.splitext(path)[1].lower() in self._allowed_exts()
+            and not os.path.basename(path).startswith("~$")
+        )
+
+    def other_dir_changed(self, directory: str) -> None:
+        cb = self._on_other_dir_changed
+        if cb is not None:
+            try:
+                cb(directory)
+            except Exception:  # noqa: BLE001 盘点是尽力而为
+                pass
 
     def _trigger(self, path: str) -> None:
         if os.path.basename(path).startswith("~$"):
@@ -294,38 +327,82 @@ class _Handler(FileSystemEventHandler):
                 pass
 
 
+def _usn_enabled() -> bool:
+    return os.environ.get("PPTX_FINDER_WATCH_BACKEND", "").strip().lower() != "dirwatch"
+
+
 class VaultWatcher:
-    def __init__(
-        self,
-        roots: list[str],
-        on_saved,
-        on_moved=None,
-        on_content_saved=None,
-        on_removed=None,
-        allowed_exts=None,
-        on_other_dir_changed=None,
-    ):
+    """监听文件变化，事件来源按卷自动选：
+
+    - 整卷监听且卷上有 NTFS 流水账 → UsnFeed：不丢事件、离线变化下次补上、空闲几乎零开销。
+    - 其余情况（exFAT、U 盘、网络路径、只监听子目录、日志未开）→ watchdog 目录监听。
+    """
+
+    def __init__(self, roots, on_saved, on_moved=None, on_content_saved=None, on_removed=None,
+                 allowed_exts=None, on_other_dir_changed=None, *, known_rows=None, on_gap=None,
+                 state_path=None):
         self._obs = Observer()
-        handler = _Handler(
-            on_saved,
-            on_moved,
-            roots,
-            on_content_saved,
-            on_removed,
-            allowed_exts,
-            on_other_dir_changed,
-        )
+        handler = _Handler(on_saved, on_moved, roots, on_content_saved, on_removed,
+                           allowed_exts, on_other_dir_changed)
         self._handler = handler
-        for r in roots:
-            if os.path.isdir(r):
-                self._obs.schedule(handler, r, recursive=True)
+        self._feed = None
+        self._lock = threading.Lock()
+        self._scheduled = set()
+        existing = [r for r in roots if os.path.isdir(r)]
+        volumes = [r for r in existing if _norm_path(r) == _norm_path(volume_root(r) or r)]
+        taken = set()
+        if volumes and _usn_enabled() and os.name == "nt":
+            from .usn_feed import UsnFeed
+            feed = UsnFeed(handler, [volume_root(r) for r in volumes], known_rows=known_rows,
+                           on_gap=on_gap, on_unavailable=self._fall_back_to_dirwatch,
+                           state_path=state_path)
+            taken = {_norm_path(r) for r in feed.open()}
+            if taken:
+                self._feed = feed
+        for r in existing:
+            # 自定义子目录落在已被流水账接管的卷上：整卷都已覆盖，不再挂目录监听
+            if _norm_path(r) in taken or _norm_path(volume_root(r) or r) in taken:
+                continue
+            self._schedule_dirwatch(r)
 
-    def start(self) -> None:
+    def _schedule_dirwatch(self, root):
+        with self._lock:
+            key = _norm_path(root)
+            if key in self._scheduled:
+                return
+            self._scheduled.add(key)
+        self._obs.schedule(self._handler, root, recursive=True)
+
+    def _fall_back_to_dirwatch(self, root, reason):
+        log.warning("change journal lost on %s, falling back to directory watch: %s", root, reason)
+        try:
+            self._schedule_dirwatch(root)
+        except Exception:  # noqa: BLE001
+            log.warning("directory watch fallback failed on %s", root, exc_info=True)
+
+    def start(self):
         self._obs.start()
+        if self._feed is not None:
+            self._feed.start()
 
-    def stop(self) -> None:
+    def wake(self):
+        """用户正要搜索：马上追平变化，不等下一个轮询周期。"""
+        if self._feed is not None:
+            self._feed.wake()
+
+    def status(self):
+        rows = list(self._feed.status()) if self._feed is not None else []
+        known = {str(row.get("root")).lower() for row in rows}
+        for key in sorted(self._scheduled):
+            if key.lower() not in known:
+                rows.append({"root": key, "backend": "dirwatch"})
+        return rows
+
+    def stop(self):
         try:
             self._handler.stop()
+            if self._feed is not None:
+                self._feed.stop()
             self._obs.stop()
             self._obs.join(timeout=3)
         except Exception:  # noqa: BLE001

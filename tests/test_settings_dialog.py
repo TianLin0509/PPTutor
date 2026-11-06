@@ -1178,3 +1178,37 @@ def test_font_family_default_persists_empty(qtbot, mgr, monkeypatch, tmp_path):
 
     config.set_font_scale(2.5)  # 超出支持范围
     assert config.get_font_scale() == config.FONT_SCALE_MAX
+
+
+def test_screenshot_hotkeys_have_settings_entry(qtbot, tmp_path, monkeypatch):
+    """常规页能直接改截图快捷键；保存走同一个控制器，失败保留原因。"""
+    from PySide6.QtGui import QKeySequence
+    from PySide6.QtWidgets import QApplication
+
+    from pptx_finder.ui.settings_dialog import SettingsDialog
+
+    class Controller:
+        specs = {"capture": "Ctrl+Alt+A", "repeat": ""}
+        errors = {}
+        saved = None
+
+        def description(self):
+            return "desc"
+
+        def set_bindings(self, values):
+            Controller.saved = values
+            return False, "快捷键被占用"
+
+    monkeypatch.setattr(QApplication.instance(), "_screenshot_shortcuts", Controller(), raising=False)
+
+    class Mgr:
+        pass
+
+    dlg = SettingsDialog(Mgr())
+    qtbot.addWidget(dlg)
+    edit = dlg._shot_key_edits["capture"]
+    assert edit.keySequence().toString(QKeySequence.PortableText) == "Ctrl+Alt+A"
+    edit.setKeySequence(QKeySequence("Ctrl+Shift+S"))
+    dlg._apply_screenshot_keys()
+    assert Controller.saved["capture"] == "Ctrl+Shift+S"
+    assert "被占用" in dlg._shot_key_result.text()

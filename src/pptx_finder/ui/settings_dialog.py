@@ -13,6 +13,7 @@ from PySide6.QtCore import QSignalBlocker, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
+    QKeySequenceEdit,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -425,7 +426,8 @@ class SettingsDialog(QDialog):
 
     # ---------- 常规：开机自启 / 唤起热键 / 界面字体 ----------
     def _build_general_page(self) -> QWidget:
-        outer, lay = self._page("常规", "启动方式、全局热键和界面字体。")
+        outer, lay = self._page("常规", "启动方式、快捷键和界面外观。")
+        self._section(lay, "启动")
         card = self._card(lay)
 
         self.auto = QCheckBox("开机自动启动")
@@ -434,6 +436,8 @@ class SettingsDialog(QDialog):
         self.auto.toggled.connect(self._toggle_auto)
         self._row(card, self.auto, "登录 Windows 后在后台启动，版本守护和全局热键随时可用。")
 
+        self._section(lay, "快捷键")
+        card = self._card(lay)
         # 全局唤起热键（#2 可改：解决状态栏「热键被占用」无修复路径）
         hk_row = QHBoxLayout()
         hk_row.setSpacing(8)
@@ -448,6 +452,11 @@ class SettingsDialog(QDialog):
                   "点输入框后按下新组合键（需含 Ctrl / Alt，再加一个字母或数字），点「应用」即时生效。",
                   hk_row, below=self._hotkey_result)
 
+        self._build_screenshot_hotkey_row(card)
+
+        self._section(lay, "外观")
+        card = self._card(lay)
+        self._build_theme_row(card)
         # 界面字体（字族 + 字号档位）：点「应用」即时全 App 生效并写 ui.json
         font_row = QHBoxLayout()
         font_row.setSpacing(8)
@@ -501,6 +510,92 @@ class SettingsDialog(QDialog):
                   below=[font_row, size_row, self._font_result])
         lay.addStretch(1)
         return outer
+
+    @staticmethod
+    def _section(lay, title: str) -> None:
+        label = QLabel(title)
+        label.setObjectName("setSection")
+        lay.addWidget(label)
+
+    def _build_theme_row(self, card) -> None:
+        """主题直接在这里选：旧版本留下的主题也能一眼看到并切回 2.0 的静白。"""
+        from ..config import get_theme
+        from . import theme as _th
+
+        self._theme_combo = QComboBox()
+        for key, label in _th.THEMES:
+            suffix = "（推荐）" if key == "atelier" else ""
+            self._theme_combo.addItem(label + suffix, key)
+        index = self._theme_combo.findData(get_theme())
+        self._theme_combo.setCurrentIndex(max(0, index))
+        self._theme_combo.setMinimumWidth(170)
+        self._theme_combo.currentIndexChanged.connect(self._apply_theme_choice)
+        self._row(card, "界面主题", "「静白」是 2.0 的默认工作台外观，其余为早期版本保留的主题。",
+                  self._theme_combo)
+
+    def _apply_theme_choice(self, _index: int) -> None:
+        name = str(self._theme_combo.currentData() or "")
+        parent = self._diagnostic_parent
+        apply_theme = getattr(parent, "_apply_theme", None)
+        if callable(apply_theme):
+            apply_theme(name)
+        else:
+            from ..config import set_theme
+            set_theme(name)
+        try:
+            from . import theme as _th
+            self.setStyleSheet(_settings_qss(_th.tok(name)))
+        except Exception:  # noqa: BLE001 样式失败不影响功能
+            pass
+
+    def _screenshot_shortcuts(self):
+        return getattr(QApplication.instance(), "_screenshot_shortcuts", None)
+
+    def _build_screenshot_hotkey_row(self, card) -> None:
+        """截图快捷键：框选与重复区域两个动作，留空表示停用，冲突时保留旧值并说明原因。"""
+        controller = self._screenshot_shortcuts()
+        specs = dict(controller.specs) if controller is not None else {}
+        if not specs:
+            from ..screenshots.preferences import CapturePreferences
+            specs = CapturePreferences(data_dir() / "screenshot-preferences.json").keys()
+        # 分两行：同一行放两个输入框，窗口缩到最小宽度时会把卡片撑出横向滚动条
+        rows = []
+        self._shot_key_edits = {}
+        for key, label in (("capture", "框选截图"), ("repeat", "重复上次区域")):
+            row = QHBoxLayout()
+            row.setSpacing(8)
+            caption = QLabel(label + "：")
+            caption.setMinimumWidth(96)
+            row.addWidget(caption)
+            edit = QKeySequenceEdit(QKeySequence(specs.get(key, "")))
+            edit.setMaximumSequenceLength(1)
+            edit.setClearButtonEnabled(True)
+            edit.setFixedWidth(180)
+            self._shot_key_edits[key] = edit
+            row.addWidget(edit)
+            row.addStretch(1)
+            rows.append(row)
+        apply_btn = QPushButton("应用")
+        apply_btn.clicked.connect(self._apply_screenshot_keys)
+        rows[-1].addWidget(apply_btn)
+        self._shot_key_result = self._note(
+            controller.description() if controller is not None and controller.errors else "")
+        self._row(card, "截图快捷键", "全局生效；清空即停用该动作。被其他程序占用时会保留原来的组合。",
+                  below=[*rows, self._shot_key_result])
+
+    def _apply_screenshot_keys(self) -> None:
+        controller = self._screenshot_shortcuts()
+        values = {
+            key: edit.keySequence().toString(QKeySequence.PortableText)
+            for key, edit in self._shot_key_edits.items()
+        }
+        if controller is None:
+            from ..screenshots.preferences import CapturePreferences
+            CapturePreferences(data_dir() / "screenshot-preferences.json").update(keys=values)
+            self._shot_key_result.setText("已保存，重启后生效。")
+            return
+        ok, message = controller.set_bindings(values)
+        self._shot_key_result.setText(("✓ " if ok else "✗ ") + message)
 
     # ---------- 功能：三项高阶功能开关 ----------
     def _build_features_page(self) -> QWidget:
@@ -616,6 +711,8 @@ class SettingsDialog(QDialog):
     # ---------- 索引范围 ----------
     def _build_roots_page(self) -> QWidget:
         outer, lay = self._page("索引范围")
+        self._watch_status = self._note(self._watch_status_text(), "setPageDesc")
+        lay.addWidget(self._watch_status)
         roots_desc = QLabel(
             "默认索引所有本地固定磁盘；下面添加的目录会与固定盘一起被索引（不是替换）。"
             "网络路径（如 \\\\server\\share\\dir）当前不可达也可保存，可达时自动纳入；"
@@ -671,6 +768,22 @@ class SettingsDialog(QDialog):
         card.addLayout(list_box)
         lay.addStretch(1)
         return outer
+
+    def _watch_status_text(self) -> str:
+        """用人话说清新文件靠什么进索引，以及现在是否正常。"""
+        runtime = getattr(self._diagnostic_parent, "_feature_runtime", None)
+        status = getattr(runtime, "watcher_status", None)
+        rows = status() if callable(status) else []
+        if not rows:
+            return ""
+        usn = [str(r["root"]) for r in rows if r.get("backend") == "usn"]
+        plain = [str(r["root"]) for r in rows if r.get("backend") != "usn"]
+        parts = []
+        if usn:
+            parts.append("实时更新：" + "、".join(usn) + " 读取系统变更日志，新文件约 5 秒内进索引，程序关闭期间的变化下次启动补上")
+        if plain:
+            parts.append("、".join(plain) + " 使用目录监听，变化极多时可能延迟，靠定期校准补齐")
+        return "；".join(parts) + "。"
 
     def _browse_vault_dir(self) -> None:
         start = self.vault_dir_edit.text().strip() or str(data_dir() / "vault")

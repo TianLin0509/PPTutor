@@ -104,6 +104,10 @@ EXCLUDE_DIR_NAMES: set[str] = {
     # AI/开发自动化产物：PPT Doctor 自身压测与 agent artifacts 不应进入索引/版本库。
     ".selftest", ".arena", ".ai-team",
     "$winreagent", "recovery", "msocache", "intel", "perflogs",
+    # 工具与浏览器缓存：名字足够专有，不误伤业务文件夹；它们每分钟都在变
+    ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox", ".nox", ".ipynb_checkpoints",
+    "gpucache", "code cache", "dawncache", "dawngraphitecache", "dawnwebgpucache",
+    "grshadercache", "shadercache", "cachestorage", "cache_data",
 }
 
 # 支持的扩展名

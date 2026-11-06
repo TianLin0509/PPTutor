@@ -9,7 +9,11 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 
 from .config import EXCLUDE_DIR_NAMES, SUPPORTED_EXTS, data_dir
-from .path_policy import explicit_project_output_roots, is_project_output_path
+from .path_policy import (
+    explicit_project_output_roots,
+    is_project_output_path,
+    system_temp_roots,
+)
 
 DRIVE_REMOVABLE = 2
 DRIVE_FIXED = 3
@@ -19,7 +23,8 @@ DRIVE_FIXED = 3
 #: 网络盘（DRIVE_REMOTE=4）仍然不自动扫：一次全盘遍历可能要走很久的网络，
 #: 需要用户在设置里显式把 UNC 路径加成索引根。
 _INDEXED_DRIVE_TYPES = (DRIVE_FIXED, DRIVE_REMOVABLE)
-SCAN_POLICY_VERSION = "7"  # v7: NameStore size u32→u64，必须重建平铺索引
+# v7: NameStore size u32→u64；v8: 排除真实 %TEMP%、构建缓存，不再顺着目录联接重复扫
+SCAN_POLICY_VERSION = "8"
 
 
 def _norm_path(path: str | os.PathLike[str]) -> str:
@@ -98,7 +103,10 @@ def iter_ppt_files(
     explicit_output_roots = explicit_project_output_roots(roots)
     directories_seen = 0
     last_progress_at = 0.0
+    temp_roots = system_temp_roots()
     for root in roots:
+        # 根本身就选在临时目录里（测试、用户明确选择）时尊重这个选择
+        excluded_roots = hard_excluded_roots + [t for t in temp_roots if not _under(root, t)]
         for dirpath, dirnames, filenames in os.walk(
             root,
             topdown=True,
@@ -111,7 +119,7 @@ def iter_ppt_files(
             ):
                 scan_progress_cb(directories_seen, dirpath)
                 last_progress_at = now
-            if any(_under(dirpath, skip_root) for skip_root in hard_excluded_roots):
+            if any(_under(dirpath, skip_root) for skip_root in excluded_roots):
                 dirnames[:] = []
                 continue
             if _is_system_temp_subtree(dirpath, root):
@@ -130,8 +138,10 @@ def iter_ppt_files(
                     and not _is_system_temp_subtree(os.path.join(dirpath, d), root)
                     and not any(
                         _under(os.path.join(dirpath, d), skip_root)
-                        for skip_root in hard_excluded_roots
+                        for skip_root in excluded_roots
                     )
+                    # 目录联接指向的内容在目标位置已经扫过；顺着走会把整棵树记两遍
+                    and not os.path.isjunction(os.path.join(dirpath, d))
                 )
             ]
             if dir_cb is not None:

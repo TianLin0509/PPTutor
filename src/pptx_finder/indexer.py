@@ -431,6 +431,26 @@ def _indexed_rows_directly_under(conn: sqlite3.Connection, directory: str) -> di
     return out
 
 
+def known_rows_under(
+    conn: sqlite3.Connection, directory: str, *, recursive: bool = False,
+) -> list[tuple[str, int, float]]:
+    """索引里已知、位于该目录下的文件。流水账只说「这里删了东西」，删了谁靠它对账。"""
+    sep = chr(92)
+    prefix = directory if directory.endswith((sep, "/")) else directory + os.sep
+    out: list[tuple[str, int, float]] = []
+    for r in conn.execute(
+        "SELECT path, size, mtime FROM files WHERE path >= ? AND path < ?",
+        (prefix, prefix + chr(0xFFFF)),
+    ):
+        path = str(r["path"])
+        if not recursive:
+            rest = path[len(prefix):]
+            if sep in rest or "/" in rest:
+                continue
+        out.append((path, int(r["size"] or 0), float(r["mtime"] or 0.0)))
+    return out
+
+
 def reconcile_inventory_dir(
     conn: sqlite3.Connection,
     directory: str,
