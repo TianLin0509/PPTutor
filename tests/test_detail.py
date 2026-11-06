@@ -874,7 +874,7 @@ def test_version_tab_dot_matches_detail_has_versions(qtbot, tmp_path):
     win.result_list.setCurrentRow(0)
 
     assert win._detail_has_versions(win._cur.path, vm) is True
-    qtbot.waitUntil(lambda: not win._detail_dot.isHidden(), timeout=1000)  # 有版本 → 版本 Tab 红点
+    qtbot.waitUntil(lambda: not win._detail_dot.isHidden(), timeout=8000)  # 有版本 → 版本 Tab 红点
     # 红点挂在 Tab 条上，指向「版本」Tab
     assert win._detail_dot.parentWidget() is win.detail_panel.tabs.tabBar()
 

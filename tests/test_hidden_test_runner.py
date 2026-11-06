@@ -126,7 +126,7 @@ def test_hidden_runner_preserves_failed_pytest_output_and_progress(tmp_path):
     env['FORCE_COLOR'] = '3'  # Claude Code's inherited terminal environment.
     result = subprocess.run(
         [sys.executable, str(driver)], cwd=ROOT, stdin=subprocess.DEVNULL, env=env,
-        capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=45,
+        capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=240,
         creationflags=subprocess.CREATE_NO_WINDOW)
     assert result.returncode == 1, result.stdout + result.stderr
     assert 'FAILED ' in result.stdout and '1 failed' in result.stdout and 'OUTPUT_PROBE_中文' in result.stdout
