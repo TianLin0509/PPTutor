@@ -426,7 +426,8 @@ class SettingsDialog(QDialog):
 
     # ---------- 常规：开机自启 / 唤起热键 / 界面字体 ----------
     def _build_general_page(self) -> QWidget:
-        outer, lay = self._page("常规", "启动方式、全局热键和界面字体。")
+        outer, lay = self._page("常规", "启动方式、快捷键和界面外观。")
+        self._section(lay, "启动")
         card = self._card(lay)
 
         self.auto = QCheckBox("开机自动启动")
@@ -435,6 +436,8 @@ class SettingsDialog(QDialog):
         self.auto.toggled.connect(self._toggle_auto)
         self._row(card, self.auto, "登录 Windows 后在后台启动，版本守护和全局热键随时可用。")
 
+        self._section(lay, "快捷键")
+        card = self._card(lay)
         # 全局唤起热键（#2 可改：解决状态栏「热键被占用」无修复路径）
         hk_row = QHBoxLayout()
         hk_row.setSpacing(8)
@@ -451,6 +454,9 @@ class SettingsDialog(QDialog):
 
         self._build_screenshot_hotkey_row(card)
 
+        self._section(lay, "外观")
+        card = self._card(lay)
+        self._build_theme_row(card)
         # 界面字体（字族 + 字号档位）：点「应用」即时全 App 生效并写 ui.json
         font_row = QHBoxLayout()
         font_row.setSpacing(8)
@@ -504,6 +510,43 @@ class SettingsDialog(QDialog):
                   below=[font_row, size_row, self._font_result])
         lay.addStretch(1)
         return outer
+
+    @staticmethod
+    def _section(lay, title: str) -> None:
+        label = QLabel(title)
+        label.setObjectName("setSection")
+        lay.addWidget(label)
+
+    def _build_theme_row(self, card) -> None:
+        """主题直接在这里选：旧版本留下的主题也能一眼看到并切回 2.0 的静白。"""
+        from ..config import get_theme
+        from . import theme as _th
+
+        self._theme_combo = QComboBox()
+        for key, label in _th.THEMES:
+            suffix = "（推荐）" if key == "atelier" else ""
+            self._theme_combo.addItem(label + suffix, key)
+        index = self._theme_combo.findData(get_theme())
+        self._theme_combo.setCurrentIndex(max(0, index))
+        self._theme_combo.setMinimumWidth(170)
+        self._theme_combo.currentIndexChanged.connect(self._apply_theme_choice)
+        self._row(card, "界面主题", "「静白」是 2.0 的默认工作台外观，其余为早期版本保留的主题。",
+                  self._theme_combo)
+
+    def _apply_theme_choice(self, _index: int) -> None:
+        name = str(self._theme_combo.currentData() or "")
+        parent = self._diagnostic_parent
+        apply_theme = getattr(parent, "_apply_theme", None)
+        if callable(apply_theme):
+            apply_theme(name)
+        else:
+            from ..config import set_theme
+            set_theme(name)
+        try:
+            from . import theme as _th
+            self.setStyleSheet(_settings_qss(_th.tok(name)))
+        except Exception:  # noqa: BLE001 样式失败不影响功能
+            pass
 
     def _screenshot_shortcuts(self):
         return getattr(QApplication.instance(), "_screenshot_shortcuts", None)
