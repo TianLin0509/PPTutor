@@ -22,6 +22,7 @@ import logging
 import os
 import threading
 import time
+from collections import deque
 from collections.abc import Callable, Iterable
 
 from watchdog.events import (
@@ -44,6 +45,12 @@ DIR_CACHE_MAX = 20_000
 FILE_CACHE_MAX = 20_000
 #: 一个新挪进来的目录树最多展开多少项。超过就交给全量校准，别在后台线程里遍历半个盘。
 SUBTREE_WALK_LIMIT = 50_000
+#: 对账一次最多核对多少行：最坏情形是某个顶层目录下的全部已知文件
+MAX_RECONCILE_ROWS = 20_000
+#: 落盘的读取位置要比实际读到的晚这么久，必须长过防抖加最大重试（1.5 + 7.75 秒）。
+#: 否则「刚存完就退出/崩溃」：事件还排在防抖里被丢弃，位置却已写过它，这次变更永远补不回来。
+#: 晚一点的代价只是下次启动重放几条，处理本身是幂等的。
+STATE_LAG_SEC = 12.0
 _RENAME_OLD = usn.USN_REASON_RENAME_OLD_NAME
 _RENAME_NEW = usn.USN_REASON_RENAME_NEW_NAME
 _DELETE = usn.USN_REASON_FILE_DELETE
@@ -85,7 +92,7 @@ def save_state(path: str, state: dict) -> None:
 class _Volume:
     __slots__ = (
         "journal", "root", "journal_id", "cursor", "dirs", "files", "pending_moves",
-        "records", "losses", "caught_up_at",
+        "pending_dir_moves", "records", "losses", "caught_up_at", "safe_cursor", "history",
     )
 
     def __init__(self, journal: usn.VolumeJournal, root: str) -> None:
@@ -99,6 +106,10 @@ class _Volume:
         self.files: dict[int, str] = {}
         # 只看到改名前半截（旧名）的文件：编号 → 旧父目录编号，等下一块的后半截
         self.pending_moves: dict[int, int] = {}
+        # 目录改名前半截：编号 → (旧路径或 None, 旧父目录路径或 None)
+        self.pending_dir_moves: dict[int, tuple[str | None, str | None]] = {}
+        self.safe_cursor = 0
+        self.history: deque[tuple[float, int]] = deque()
         self.records = 0
         self.losses = 0
         self.caught_up_at = 0.0
@@ -159,6 +170,7 @@ class UsnFeed:
                 vol.cursor = int(saved["usn"])   # 接着上次读的位置：离线期间的变化一条不漏
             else:
                 self._note_gap(vol, "offline changes overwrote the saved position")
+            vol.safe_cursor = vol.cursor
             self._volumes.append(vol)
             opened.append(root)
         return opened
@@ -176,6 +188,11 @@ class UsnFeed:
         if thread is not None:
             thread.join(timeout=3)
         self._persist(force=True)
+        if thread is not None and thread.is_alive():
+            # 线程还卡在一次对账里：现在关句柄，它下一次系统调用可能打到被复用的句柄上。
+            # 守护线程随进程退出，句柄也随之回收。
+            log.warning("usn feed thread still busy at shutdown; leaving handles to process exit")
+            return
         for vol in self._volumes:
             vol.journal.close()
 
@@ -232,6 +249,12 @@ class UsnFeed:
                 return
             self._process(vol, records)
             vol.cursor = next_usn
+            history = vol.history
+            now = time.monotonic()
+            if history and now - history[-1][0] < 1.0:
+                history[-1] = (history[-1][0], next_usn)
+            else:
+                history.append((now, next_usn))
             vol.records += len(records)
             self._state_dirty = True
             if self._stop.is_set():
@@ -256,8 +279,11 @@ class UsnFeed:
         info = vol.journal.query()
         vol.journal_id = info.journal_id
         vol.cursor = info.next_usn
+        vol.safe_cursor = info.next_usn
+        vol.history.clear()
         vol.dirs.clear()
         vol.pending_moves.clear()
+        vol.pending_dir_moves.clear()
         self._state_dirty = True
         self._note_gap(vol, reason)
 
@@ -278,12 +304,16 @@ class UsnFeed:
             return
         if not force and now - self._state_saved_at < SAVE_STATE_SEC:
             return
-        state = load_state(self._state_path) if force else {}
+        state = load_state(self._state_path)   # 保留这次没打开的卷（如拔掉的 U 盘）的位置
+        settled = True
         for vol in self._volumes:
-            state[vol.root] = {"id": vol.journal_id, "usn": vol.cursor}
+            while vol.history and now - vol.history[0][0] >= STATE_LAG_SEC:
+                vol.safe_cursor = vol.history.popleft()[1]
+            settled = settled and vol.safe_cursor == vol.cursor
+            state[vol.root] = {"id": vol.journal_id, "usn": vol.safe_cursor}
         save_state(self._state_path, state)
         self._state_saved_at = now
-        self._state_dirty = False
+        self._state_dirty = not settled
 
     # ---------------------------------------------------------------- 翻译
     def _dir_path(self, vol: _Volume, dir_id: int) -> str | None:
@@ -438,7 +468,7 @@ class UsnFeed:
     def _process_dir_events(self, vol: _Volume, events: list[usn.Record]) -> None:
         handler = self._handler
         cache = vol.dirs
-        renamed_old: dict[int, str | None] = {}
+        check_parents: set[str] = set()
         for rec in events:
             fid = rec[FID]
             reason = rec[REASON]
@@ -446,15 +476,21 @@ class UsnFeed:
             if parent_path:
                 handler.other_dir_changed(parent_path)
             if reason & _RENAME_OLD:
-                renamed_old[fid] = cache.get(fid)
+                vol.pending_dir_moves[fid] = (cache.get(fid), parent_path)
+                if len(vol.pending_dir_moves) > 1000:
+                    vol.pending_dir_moves.clear()
                 continue
             if reason & _DELETE:
                 old = cache.pop(fid, None)
                 if old:
                     self._dir_removed(old)
+                elif parent_path:
+                    # 这个目录没被缓存过（子文件都没动过），不知道它叫什么。
+                    # 递归删除时子目录事件都查不到路径，最外层的父目录一定还在，在那里对账。
+                    check_parents.add(parent_path)
                 continue
             if reason & _RENAME_NEW:
-                old = renamed_old.pop(fid, cache.get(fid))
+                old, old_parent = vol.pending_dir_moves.pop(fid, (cache.get(fid), None))
                 # 目录改名：它和所有子目录缓存的路径都失效了，整张表清掉最简单也最稳
                 cache.clear()
                 vol.files.clear()
@@ -464,23 +500,43 @@ class UsnFeed:
                 elif old and not new:
                     self._dir_removed(old)
                 elif new:
+                    # 旧路径未知，或缓存里已经是新路径（同一块里文件事件先查过）
+                    if old_parent:
+                        self._dir_moved_from_parent(old_parent, new)
                     self._expand_subtree(new)
-        for old in renamed_old.values():
-            # 只见前半截：下一块才有后半截；缓存里的旧路径此时已经不准，先失效
-            if old:
-                cache.clear()
-                break
+                elif old_parent:
+                    check_parents.add(old_parent)     # 挪进了排除目录（如回收站）
+        if vol.pending_dir_moves:
+            # 只见前半截：下一块才有后半截；旧路径已记下，缓存此时已经不准
+            cache.clear()
+        for directory in check_parents:
+            self._dir_removed(directory)
+
+    def _rows_under(self, directory: str) -> list[tuple[str, int, float]]:
+        if self._known_rows is None:
+            return []
+        try:
+            return list(self._known_rows(directory, True))[:MAX_RECONCILE_ROWS]
+        except Exception:  # noqa: BLE001 对账失败不影响其余事件
+            log.debug("known rows lookup failed: %s", directory, exc_info=True)
+            return []
 
     def _dir_removed(self, directory: str) -> None:
-        if self._known_rows is None:
-            return
-        try:
-            rows = list(self._known_rows(directory, True))
-        except Exception:  # noqa: BLE001
-            log.debug("known rows lookup failed: %s", directory, exc_info=True)
-            return
-        for path, _size, _mtime in rows:
+        for path, _size, _mtime in self._rows_under(directory):
             if not os.path.exists(path):
+                self._handler.on_deleted(FileDeletedEvent(path))
+
+    def _dir_moved_from_parent(self, old_parent: str, new: str) -> None:
+        """只知道旧的父目录：已消失的行按「旧父目录\\某目录\\其余」对到新目录下。"""
+        prefix = len(old_parent.rstrip("\\/")) + 1
+        for path, _size, _mtime in self._rows_under(old_parent):
+            if os.path.exists(path):
+                continue
+            _first, sep, rest = path[prefix:].replace("/", os.sep).partition(os.sep)
+            dest = os.path.join(new, rest) if sep and rest else ""
+            if dest and os.path.exists(dest):
+                self._handler.on_moved(FileMovedEvent(path, dest))
+            else:
                 self._handler.on_deleted(FileDeletedEvent(path))
 
     def _dir_moved(self, old: str, new: str) -> None:

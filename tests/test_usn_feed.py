@@ -84,7 +84,8 @@ def test_changes_while_stopped_are_replayed_from_saved_position(work, tmp_path):
     finally:
         handler.stop()
         feed.stop()
-    assert int(load_state(str(state))[root]["usn"]) > info.next_usn
+    # 落盘位置滞后于已读位置，防抖中的事件不会因退出而永远丢失
+    assert int(load_state(str(state))[root]["usn"]) == info.next_usn
 
 
 def test_delete_found_by_reconciling_known_rows(work, tmp_path):
@@ -151,3 +152,85 @@ def test_root_inside_temp_is_respected(monkeypatch, tmp_path):
     root = str(tmp_path / "picked")
     handler = _Handler(lambda p: None, None, [root], None, None, (".pptx",), None)
     assert not handler.skip_path(os.path.join(root, "a.pptx"))
+
+
+def _rows(*paths):
+    infos = [(str(p), p.stat().st_size, p.stat().st_mtime) for p in paths]
+
+    def known(directory, recursive):
+        prefix = directory.rstrip(os.sep) + os.sep
+        return [r for r in infos if r[0].startswith(prefix)
+                and (recursive or os.sep not in r[0][len(prefix):])]
+    return known
+
+
+def test_shift_delete_of_cold_folder_reports_every_known_file(work, tmp_path):
+    """从没动过的文件夹被整个删除：子文件和目录路径都已查不到，也要在父目录对上账。"""
+    folder = work / "冷门" / "子目录"
+    folder.mkdir(parents=True)
+    target = folder / "旧稿.pptx"
+    target.write_bytes(b"a")
+    root = usn.volume_root(str(work))
+    feed, events, handler = _feed(root, tmp_path / "state.json", _rows(target))
+    time.sleep(0.3)
+    feed.start()
+    try:
+        time.sleep(0.5)
+        shutil.rmtree(work / "冷门")
+        assert _wait(lambda: str(target) in events["removed"])
+    finally:
+        handler.stop()
+        feed.stop()
+
+
+def test_rename_of_cold_folder_keeps_version_identity(work, tmp_path):
+    folder = work / "旧目录"
+    folder.mkdir()
+    target = folder / "汇报.pptx"
+    target.write_bytes(b"a")
+    root = usn.volume_root(str(work))
+    feed, events, handler = _feed(root, tmp_path / "state.json", _rows(target))
+    feed.start()
+    try:
+        time.sleep(0.5)
+        folder.rename(work / "新目录")
+        expected = str(work / "新目录" / "汇报.pptx")
+        assert _wait(lambda: (str(target), expected) in [
+            (a, b) for a, b in events["moved"]])
+    finally:
+        handler.stop()
+        feed.stop()
+
+
+def test_saved_pptx_is_searchable_through_real_window_pipeline(qtbot, work, tmp_path):
+    """真实链路：流水账 → 共享监听 → 桥接信号 → 主窗口 → 写入索引库。"""
+    from pptx_finder import app as app_mod, db
+    from pptx_finder.config import resource_path
+    from pptx_finder.ui.main_window import MainWindow
+    from pptx_finder.ui.version_bridge import VersionBridge
+
+    from test_live_index import StubRender
+
+    conn = db.connect(tmp_path / "index.db")
+    db.init_db(conn)
+    root = usn.volume_root(str(work))
+    win = MainWindow(conn=conn, render_worker=StubRender(), do_index=False, roots=[root])
+    qtbot.addWidget(win)
+    bridge = VersionBridge()
+    bridge.content_changed.connect(win.on_content_changed)
+    bridge.journal_gap.connect(win.on_journal_gap)
+
+    class Manager:
+        pass
+
+    runtime = app_mod._FeatureRuntime(win, Manager(), bridge)
+    runtime.start()
+    try:
+        status = runtime.watcher_status()
+        if not any(row.get("backend") == "usn" for row in status):
+            pytest.skip("no usable journal")
+        target = work / "刚保存的汇报.pptx"
+        shutil.copyfile(resource_path("assets/blank_16x9.pptx"), target)
+        qtbot.waitUntil(lambda: db.get_file_by_path(conn, str(target)) is not None, timeout=20000)
+    finally:
+        runtime.stop()

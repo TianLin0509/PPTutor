@@ -2923,8 +2923,8 @@ class MainWindow(QMainWindow):
     def _reconcile_inventory_dirs_sync(dirs) -> dict:
         """把变化的目录重新列一遍，并入「增量层」索引。
 
-        这就是 Everything 在拿不到 NTFS 变更日志时走的那条路（目录变更通知 →
-        重列该目录）。日志那条路要管理员权限，本程序不提权，所以照搬它的备用机制。
+        变化来自 NTFS 流水账或目录监听（见 versioning/usn_feed.py），这里只负责把
+        变化的目录重列一遍。
 
         实现上不去改那份 mmap 的全量索引——它是只读、整份重建的。而是维护第二份
         同格式的小索引，搜索时两份一起扫、按路径去重。删除不用管：结果在显示前会
