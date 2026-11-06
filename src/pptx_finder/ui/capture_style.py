@@ -33,6 +33,30 @@ QFrame[role="divider"] { background: #edf0f4; border: none; }
 QToolTip { color: #344054; background: #fff; border: 1px solid #e1e6ee; padding: 7px; }
 '''
 
+#: 截图文字 / 公式这类结果窗口：只在 STYLE 上补编辑区和底色，不再各写一套颜色。
+RESULT_STYLE = STYLE + '''
+QDialog { background: #ffffff; color: #1d2939; }
+QPlainTextEdit, QLineEdit { background: #f6f8fb; color: #1d2939; border: 1px solid #e4e7ec;
+    border-radius: 10px; padding: 8px 10px; selection-background-color: #bfd4ff; font-size: 13px; }
+QPlainTextEdit:focus, QLineEdit:focus { border-color: #2563eb; }
+QKeySequenceEdit { background: #f6f8fb; color: #1d2939; }
+QPushButton { border-color: #e4e7ec; }
+'''
+
+
+def result_margins(layout):
+    """结果窗口统一页边距：控件不贴窗口边。"""
+    layout.setContentsMargins(20, 18, 20, 18)
+    layout.setSpacing(12)
+
+
+def primary(button):
+    """主按钮统一走 role，不再逐个写颜色（曾同时存在两种蓝）。"""
+    button.setProperty('role', 'primary')
+    button.setCursor(Qt.PointingHandCursor)
+    return button
+
+
 # Common 24 px coordinate grid, rounded 1.7 px strokes. Render locally at the
 # monitor's actual scale; vectors remain sharp on high-DPI Windows displays.
 PATHS = {

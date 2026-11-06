@@ -129,13 +129,14 @@ class ScreenshotShortcuts(QObject):
             opener('常规');return
         if self.dialog is None:
             self.dialog=QDialog(self.owner);self.dialog.setWindowTitle('截图快捷键')
-            self.dialog.setStyleSheet('QDialog { background: #fff; } QLabel { color: #243249; } QKeySequenceEdit { background: #f7f9fc; color: #243249; border: 1px solid #dfe5ed; padding: 6px; } QPushButton { background: #edf3fc; color: #2867bd; border: 1px solid #dfe5ed; padding: 8px; }')
-            form=QFormLayout(self.dialog)
+            from .capture_style import RESULT_STYLE,primary,result_margins
+            self.dialog.setStyleSheet(RESULT_STYLE)
+            form=QFormLayout(self.dialog);result_margins(form)
             self.editors={key:QKeySequenceEdit(QKeySequence(self.specs[key])) for key in IDS}
             for editor in self.editors.values():editor.setMaximumSequenceLength(1)
             form.addRow('框选截图',self.editors['capture']);form.addRow('重复上次区域',self.editors['repeat'])
             self.label=QLabel(self.description());self.label.setWordWrap(True);form.addRow(self.label)
-            button=QPushButton('保存快捷键');form.addRow(button)
+            button=primary(QPushButton('保存快捷键'));form.addRow(button)
             def save():
                 values={key:editor.keySequence().toString(QKeySequence.PortableText) for key,editor in self.editors.items()}
                 ok,message=self.set_bindings(values)

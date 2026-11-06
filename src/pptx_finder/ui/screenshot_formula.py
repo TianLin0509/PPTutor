@@ -2,6 +2,7 @@
 from PySide6.QtCore import Signal,Qt,QSignalBlocker
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import QDialog,QVBoxLayout,QHBoxLayout,QLabel,QPlainTextEdit,QPushButton
+from .capture_style import RESULT_STYLE,primary,result_margins
 from .. import __version__
 
 
@@ -15,15 +16,15 @@ class ScreenshotFormula(QDialog):
         super().__init__(parent)
         self.setWindowTitle(f'识别公式 · PPT Doctor {__version__}');self.setModal(False)
         self.setAttribute(Qt.WA_StyledBackground,True)
-        self.setStyleSheet('QDialog { background: #fff; color: #243249; } QLabel { color: #243249; } QPlainTextEdit { background: #f7f9fc; color: #243249; border: 1px solid #dfe5ed; border-radius: 5px; padding: 6px; } QPushButton { color: #2867bd; background: #edf3fc; padding: 8px 12px; border: 1px solid #dfe5ed; border-radius: 5px; } QPushButton:disabled { color: #87909e; background: #f3f5f8; }')
-        layout=QVBoxLayout(self);layout.setContentsMargins(22,18,22,18);layout.setSpacing(10)
+        self.setStyleSheet(RESULT_STYLE)
+        layout=QVBoxLayout(self);result_margins(layout);layout.setContentsMargins(22,18,22,18);layout.setSpacing(10)
         self.status=QLabel('请框选单个清晰公式。识别在本机完成；请对照原图核对。');self.status.setWordWrap(True);layout.addWidget(self.status)
         pictures=QHBoxLayout()
         self.source=QLabel('原图');self.preview=QLabel('识别预览')
         for title,label in [('截图原图',self.source),('公式预览',self.preview)]:
             column=QVBoxLayout();caption=QLabel(title);caption.setFixedHeight(24);column.addWidget(caption)
             label.setAlignment(Qt.AlignCenter);label.setMinimumSize(160,130);label.setMaximumHeight(180)
-            label.setStyleSheet('background: #f7f9fc; color: #626b78; border: 1px solid #dfe5ed; border-radius: 6px;')
+            label.setStyleSheet('background: #f6f8fb; color: #667085; border: 1px solid #e4e7ec; border-radius: 10px;')
             column.addWidget(label);pictures.addLayout(column,1)
         layout.addLayout(pictures)
         layout.addWidget(QLabel('LaTeX · 可修改后更新预览'))
@@ -32,7 +33,7 @@ class ScreenshotFormula(QDialog):
         self.word=QPlainTextEdit();self.word.setReadOnly(True);self.word.setMaximumHeight(75);layout.addWidget(self.word)
         guide=QLabel('Word：Alt+= 插入公式框 → 选择 UnicodeMath → Ctrl+V → 转换为“专业”格式。');guide.setWordWrap(True);layout.addWidget(guide)
         row=QHBoxLayout()
-        self.latex_btn=QPushButton('复制 LaTeX');self.latex_btn.setStyleSheet('background: #2867bd; color: #fff;')
+        self.latex_btn=primary(QPushButton('复制 LaTeX'))
         self.word_btn=QPushButton('复制 Word 公式');self.refresh_btn=QPushButton('更新预览');self.retry_btn=QPushButton('重新识别')
         self.install_btn=QPushButton('下载公式识别组件')
         self.latex_btn.clicked.connect(lambda:self.copy_requested.emit('latex'));self.word_btn.clicked.connect(lambda:self.copy_requested.emit('word'))

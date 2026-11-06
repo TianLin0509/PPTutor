@@ -15,7 +15,7 @@ class ScreenshotNotice(QWidget):
         self.setAttribute(Qt.WA_ShowWithoutActivating,True)
         self.setAttribute(Qt.WA_StyledBackground,True)
         self.setObjectName('screenshotNotice')
-        self.setStyleSheet('#screenshotNotice { background: #fff; border: 1px solid #dfe5ed; border-radius: 6px; } QLabel { color: #243249; background: transparent; } QPushButton { color: #2867bd; background: #edf3fc; border: 0; padding: 6px; }')
+        self.setStyleSheet('#screenshotNotice { background: #fff; border: 1px solid #e4e7ec; border-radius: 10px; } QLabel { color: #344054; background: transparent; } QPushButton { color: #2563eb; background: #edf3fc; border: 0; padding: 6px; }')
         row = QHBoxLayout(self)
         row.setContentsMargins(16,12,12,12)
         self.label = QLabel()
