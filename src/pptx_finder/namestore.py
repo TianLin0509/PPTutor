@@ -129,6 +129,22 @@ def open_store(kind: str = MAIN):
         return None
 
 
+def peek_header(kind: str = MAIN) -> tuple[int, int] | None:
+    """只读文件头：(条目数, 建库时间)。定时任务只想看规模时不必打开整个索引。"""
+    path = current_data_path(kind)
+    if path is None:
+        return None
+    try:
+        with open(path, "rb") as fh:
+            fields = _HEADER_STRUCT.unpack(fh.read(_HEADER_STRUCT.size))
+    except (OSError, struct.error):
+        return None
+    magic, version, count, built_at = fields[:4]
+    if magic != MAGIC or version != FORMAT_VERSION:
+        return None
+    return int(count), int(built_at)
+
+
 def discard(kind: str) -> None:
     """作废某一套索引：先撤指针，再尽力删数据文件。
 
@@ -298,8 +314,17 @@ class NameStoreBuilder:
                      min(int(size), SIZE_CAP) if size and size > 0 else 0,
                      mtime, 0)
 
+    def add_folded(self, path: str, size: int, mtime: float, is_dir: bool, norm: str) -> None:
+        """从另一份索引搬条目：归一化结果已经算好，不必再算一遍。"""
+        directory, base = os.path.split(path.rstrip("\\/") or path)
+        if not base:
+            return
+        self._append(self._dir_id(directory), base,
+                     0 if is_dir else (min(int(size), SIZE_CAP) if size and size > 0 else 0),
+                     mtime, FLAG_DIR if is_dir else 0, norm=norm)
+
     def _append(self, dir_id: int, base: str, size: int,
-                mtime: float, flags: int) -> None:
+                mtime: float, flags: int, norm: str | None = None) -> None:
         base = _sanitize(base)
         name_off = len(self._name)
         # 原始名字原样存（surrogatepass 扛得住孤立代理项），这样 entry() 交回去的
@@ -311,7 +336,8 @@ class NameStoreBuilder:
         # 它拿到孤立代理项会直接抛 UnicodeEncodeError，真机上足以让整轮扫盘半途炸掉。
         # fold = normalize + 去掉变音符号。索引与查询必须调同一个函数，否则
         # 打 resume 找不到 résumé——两边口径不一致就等于搜不到。
-        self._norm += namequery.fold(base).encode("utf-8", "surrogatepass") + b"\n"
+        folded = namequery.fold(base) if norm is None else norm
+        self._norm += folded.encode("utf-8", "surrogatepass") + b"\n"
         self._recs += _RECORD_STRUCT.pack(
             dir_id, name_off, int(size),
             max(0, min(int(mtime), 0xFFFFFFFF)), int(flags),
@@ -514,19 +540,33 @@ class NameStore:
             raise NameStoreError("文件名索引的记录数与段长不符")
         if self._span["normoff"][1] != self.count * 4:
             raise NameStoreError("文件名索引的偏移表与记录数不符")
-        # 二分反查用：把 normoff 段读成一个真正的数组（1.75M × 4B = 7 MB）
-        off, length = self._span["normoff"]
-        self._norm_offsets = array("I")
-        self._norm_offsets.frombytes(mm[off: off + length])
-        off, length = self._span["diroff"]
-        self._dir_offsets = array("I")
-        self._dir_offsets.frombytes(mm[off: off + length])
-        off, length = self._span["dirnormoff"]
-        self._dirnorm_offsets = array("I")
-        self._dirnorm_offsets.frombytes(mm[off: off + length])
+        # 偏移表直接映射，不复制进进程内存：1100 万条时三张表合计 54 MB，
+        # 复制的话每开一次索引就多占这么多私有内存；映射的页面系统随时可以换出去。
+        self._views = []
+        self._norm_offsets = self._u32_view("normoff")
+        self._dir_offsets = self._u32_view("diroff")
+        self._dirnorm_offsets = self._u32_view("dirnormoff")
+
+    def _u32_view(self, key: str):
+        off, length = self._span[key]
+        assert self._mm is not None
+        base = memoryview(self._mm)[off: off + length]
+        view = base.cast("I")
+        self._views.extend((view, base))
+        return view
 
     def close(self) -> None:
         self._path_keys_cache = None
+        # 映射的视图要先放掉，否则 mmap 关不掉、Windows 上旧索引文件删不掉
+        for view in getattr(self, "_views", ()):
+            try:
+                view.release()
+            except (BufferError, ValueError):
+                pass
+        self._views = []
+        self._norm_offsets = array("I")
+        self._dir_offsets = array("I")
+        self._dirnorm_offsets = array("I")
         if self._mm is not None:
             try:
                 self._mm.close()

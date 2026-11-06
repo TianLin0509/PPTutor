@@ -2847,8 +2847,14 @@ class MainWindow(QMainWindow):
 
     def on_journal_gap(self, root: str, reason: str) -> None:
         """变更流水账断档（离线太久被覆盖等）：补一次低开销对账，太久没全扫才全扫。"""
+        if self._closing:
+            return
+        if self._startup_index_check_decision == "checking":
+            # 启动检查还没读到「上次全扫时间」：现在判断会误以为从没扫过而多扫一轮；
+            # 也不能动 token，那会让正在进行的启动检查结果作废。等它读完再判。
+            QTimer.singleShot(5000, lambda: self.on_journal_gap(root, reason))
+            return
         _log.info("change journal gap on %s: %s", root, reason)
-        self._startup_index_token += 1
         self._schedule_known_index_reconcile(self._startup_index_token)
         if time.time() - self._last_full_scan_wall >= self._OVERFLOW_RESCAN_MIN_SEC:
             self._schedule_full_coverage_scan(self._index_roots, "journal_gap")
@@ -2882,6 +2888,7 @@ class MainWindow(QMainWindow):
             not self._index_all_files_enabled
             or self._inventory_reconcile_inflight
             or not self._dirty_inventory_dirs
+            or time.monotonic() < getattr(self, "_inventory_next_due", 0.0)
         ):
             return
         if self._indexer is not None and self._indexer.isRunning():
@@ -2931,16 +2938,17 @@ class MainWindow(QMainWindow):
                 os.path.normcase(os.path.abspath(str(directory))) for directory in dirs
             }
             baseline: dict[str, tuple] = {}
-            main_store = namestore.open_store(namestore.MAIN)
             snapshot_at = 0
-            if main_store is not None:
-                try:
-                    if main_store.count <= MainWindow._OVERLAY_BASELINE_MAX_RECORDS:
+            header = namestore.peek_header(namestore.MAIN)
+            if header is not None and header[0] > MainWindow._OVERLAY_BASELINE_MAX_RECORDS:
+                snapshot_at = header[1]
+            elif header is not None:
+                main_store = namestore.open_store(namestore.MAIN)
+                if main_store is not None:
+                    try:
                         baseline = main_store.entries_for_directories(dirs)
-                    else:
-                        snapshot_at = int(main_store.built_at)
-                finally:
-                    main_store.close()
+                    finally:
+                        main_store.close()
             # 先把上一版增量层原样搬过来，否则这一轮只保留本批目录的内容，
             # 上一批刚发现的新文件会当场消失
             previous = namestore.open_store(namestore.OVERLAY)
@@ -2956,8 +2964,8 @@ class MainWindow(QMainWindow):
                         if key in seen:
                             continue      # 已删除的条目在结果显示前的 stat 里自然消失，不必每轮全部 stat
                         seen.add(key)
-                        (builder.add_dir(path, mtime) if is_dir
-                         else builder.add(path, size, mtime))
+                        # 归一化结果直接搬，不再过一遍繁简转换：这是整份重写最贵的一步
+                        builder.add_folded(path, size, mtime, is_dir, previous.norm_name(i))
                 finally:
                     previous.close()
             for directory in dirs:
@@ -3002,6 +3010,7 @@ class MainWindow(QMainWindow):
                     except OSError:
                         continue
             builder.write(kind=namestore.OVERLAY)
+            totals["entries"] = len(builder)
         except Exception as exc:  # noqa: BLE001 增量层是尽力而为，坏了也不能影响主索引
             # 用 warning 而不是 debug：这里一旦坏掉，表现是「新文件永远搜不到」，
             # 没有任何报错——只能靠日志发现。totals 也记一笔，方便体检面板看到。
@@ -3014,6 +3023,11 @@ class MainWindow(QMainWindow):
             return
         if bool(payload.get("overflowed")):
             self._inventory_dirs_overflowed = True
+        # 增量层越大，整份重写越贵：大到一定规模就放慢节奏，20 万条时约 100 秒一轮
+        entries = int(payload.get("entries", 0) or 0)
+        self._inventory_next_due = (
+            time.monotonic() + entries / 2000.0 if entries > 20_000 else 0.0
+        )
         if int(payload.get("added", 0)) or int(payload.get("dirs", 0)):
             self._index_status_cache = None
             self._refresh_status()
