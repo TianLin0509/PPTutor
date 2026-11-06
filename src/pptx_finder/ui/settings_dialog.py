@@ -558,25 +558,30 @@ class SettingsDialog(QDialog):
         if not specs:
             from ..screenshots.preferences import CapturePreferences
             specs = CapturePreferences(data_dir() / "screenshot-preferences.json").keys()
-        row = QHBoxLayout()
-        row.setSpacing(8)
+        # 分两行：同一行放两个输入框，窗口缩到最小宽度时会把卡片撑出横向滚动条
+        rows = []
         self._shot_key_edits = {}
         for key, label in (("capture", "框选截图"), ("repeat", "重复上次区域")):
-            row.addWidget(QLabel(label + "："))
+            row = QHBoxLayout()
+            row.setSpacing(8)
+            caption = QLabel(label + "：")
+            caption.setMinimumWidth(96)
+            row.addWidget(caption)
             edit = QKeySequenceEdit(QKeySequence(specs.get(key, "")))
             edit.setMaximumSequenceLength(1)
             edit.setClearButtonEnabled(True)
-            edit.setFixedWidth(150)
+            edit.setFixedWidth(180)
             self._shot_key_edits[key] = edit
             row.addWidget(edit)
-        row.addStretch(1)
+            row.addStretch(1)
+            rows.append(row)
         apply_btn = QPushButton("应用")
         apply_btn.clicked.connect(self._apply_screenshot_keys)
-        row.addWidget(apply_btn)
+        rows[-1].addWidget(apply_btn)
         self._shot_key_result = self._note(
             controller.description() if controller is not None and controller.errors else "")
         self._row(card, "截图快捷键", "全局生效；清空即停用该动作。被其他程序占用时会保留原来的组合。",
-                  below=[row, self._shot_key_result])
+                  below=[*rows, self._shot_key_result])
 
     def _apply_screenshot_keys(self) -> None:
         controller = self._screenshot_shortcuts()

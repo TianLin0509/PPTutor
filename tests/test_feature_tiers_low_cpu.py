@@ -489,7 +489,7 @@ def test_feature_runtime_keeps_live_indexing_but_does_not_start_versions_by_defa
 
     class _Watcher:
         def __init__(self, roots, on_saved, on_moved, on_content_saved, on_removed,
-                     allowed_exts=None, on_other_dir_changed=None):
+                     allowed_exts=None, on_other_dir_changed=None, **_kwargs):
             self.on_saved = on_saved
             self.allowed_exts = allowed_exts
             self.started = False
