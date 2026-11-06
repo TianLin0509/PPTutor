@@ -8,6 +8,7 @@ that case the same opt-in is honoured by every consumer of this policy.
 from __future__ import annotations
 
 import os
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -38,6 +39,25 @@ def _under(path: str | os.PathLike[str], root: str | os.PathLike[str]) -> bool:
         return os.path.commonpath([_norm(path), _norm(root)]) == _norm(root)
     except ValueError:
         return False
+
+
+def system_temp_roots() -> tuple[str, ...]:
+    """这台机器真实的临时目录（已归一化）。%TEMP% 可以被改到 AppData 之外。
+
+    盘符根或用户主目录这种异常配置不算，否则一个写错的环境变量会排除整个盘。
+    """
+    candidates = [os.environ.get("TEMP"), os.environ.get("TMP"), tempfile.gettempdir()]
+    home = _norm(os.path.expanduser("~"))
+    out: list[str] = []
+    for value in candidates:
+        if not value:
+            continue
+        normal = _norm(value)
+        if not os.path.splitdrive(normal)[1].strip("/" + chr(92)) or normal == home:
+            continue
+        if normal not in out:
+            out.append(normal)
+    return tuple(out)
 
 
 def _include_all_project_outputs() -> bool:

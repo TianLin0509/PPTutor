@@ -349,6 +349,8 @@ class _FeatureRuntime:
                 self._on_removed,
                 allowed_exts=self.allowed_exts,
                 on_other_dir_changed=self._on_other_dir_changed,
+                known_rows=self._known_rows,
+                on_gap=self._on_journal_gap,
             )
             watcher.start()
         except Exception as exc:  # noqa: BLE001 optional live freshness must not crash app
@@ -428,6 +430,32 @@ class _FeatureRuntime:
 
     def _on_content_saved(self, path: str) -> None:
         self._bridge.emit_content_changed(path)
+
+    def _known_rows(self, directory: str, recursive: bool):
+        """流水账线程专用的只读查询；连接按需建、线程内复用。"""
+        from . import db, indexer
+        from .config import db_path
+
+        conn = getattr(self, "_feed_conn", None)
+        if conn is None:
+            conn = self._feed_conn = db.connect(db_path())
+        return indexer.known_rows_under(conn, directory, recursive=recursive)
+
+    def _on_journal_gap(self, root: str, reason: str) -> None:
+        emit = getattr(self._bridge, "emit_journal_gap", None)
+        if callable(emit):
+            emit(root, reason)
+
+    def wake_change_feed(self) -> None:
+        with self._lifecycle_lock:
+            watcher = self._watcher
+        if watcher is not None and hasattr(watcher, "wake"):
+            watcher.wake()
+
+    def watcher_status(self) -> list[dict]:
+        with self._lifecycle_lock:
+            watcher = self._watcher
+        return watcher.status() if watcher is not None and hasattr(watcher, "status") else []
 
     def _on_other_dir_changed(self, directory: str) -> None:
         """非内容扩展名的文件变动：只上报目录，由主窗按目录批量对账盘点行。
@@ -769,6 +797,7 @@ def main() -> int:
     bridge.snapshotted.connect(win.on_version_snapshot)
     bridge.content_changed.connect(win.on_content_changed)
     bridge.inventory_dir_changed.connect(win.note_inventory_dir_dirty)
+    bridge.journal_gap.connect(win.on_journal_gap)
     bridge.runtime_error.connect(win._toast)
     feature_runtime = _FeatureRuntime(win, version_mgr, bridge)
     app._feature_runtime = feature_runtime

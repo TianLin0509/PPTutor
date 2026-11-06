@@ -124,6 +124,9 @@ class ScreenshotShortcuts(QObject):
 
     def show_settings(self):
         if self.closed:return
+        opener=getattr(self.owner,'open_settings_page',None)
+        if callable(opener):
+            opener('常规');return
         if self.dialog is None:
             self.dialog=QDialog(self.owner);self.dialog.setWindowTitle('截图快捷键')
             self.dialog.setStyleSheet('QDialog { background: #fff; } QLabel { color: #243249; } QKeySequenceEdit { background: #f7f9fc; color: #243249; border: 1px solid #dfe5ed; padding: 6px; } QPushButton { background: #edf3fc; color: #2867bd; border: 1px solid #dfe5ed; padding: 8px; }')

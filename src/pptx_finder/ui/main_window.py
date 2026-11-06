@@ -939,14 +939,14 @@ class MainWindow(QMainWindow):
     _FULL_COVERAGE_INTERVAL_SEC = 7 * 24 * 60 * 60
     # 盘点目录对账节拍：60 秒够「刚存的文件马上搜得到」，又足够稀疏，
     # 不会把 churn 目录变成持续的后台 IO。
-    _INVENTORY_RECONCILE_INTERVAL_MS = 60_000
-    _INVENTORY_DIRS_MAX = 2_000   # 脏目录集合上限；溢出即放弃增量，交给下次完整扫描
-    _INVENTORY_DIRS_PER_ROUND = 60  # 每轮最多对账多少个目录（有界后台任务）
+    _INVENTORY_RECONCILE_INTERVAL_MS = 15_000
+    _INVENTORY_DIRS_MAX = 20_000   # 脏目录集合上限；溢出即放弃增量，交给下次完整扫描
+    _INVENTORY_DIRS_PER_ROUND = 300  # 每轮最多对账多少个目录（有界后台任务）
     # 脏目录溢出后补一次全盘校准，但离上次完整扫描至少隔这么久。v2.0.3 及以前
     # 溢出就立刻重扫：一轮全盘扫描要 8 分钟，这期间临时目录、浏览器缓存照样在变，
     # 扫完又溢出，于是 50 秒后再扫一轮，真机日志里一整夜每 9 分钟一轮，
     # 进程常驻 1.3 GB。没赶上校准的目录照样走增量对账，只是超出上限的那部分要等。
-    _OVERFLOW_RESCAN_MIN_SEC = 6 * 60 * 60
+    _OVERFLOW_RESCAN_MIN_SEC = 24 * 60 * 60
     _FULL_COVERAGE_DELAY_MS = 30_000
     _FULL_COVERAGE_RETRY_MS = 5_000
     _BG_LIGHT_SHUTDOWN_WAIT_MS = 250
@@ -2023,10 +2023,18 @@ class MainWindow(QMainWindow):
 
     def focus_search(self) -> None:
         """显式唤起搜索框（Ctrl+L / 全局热键）：聚焦 + 全选，空文本时补弹历史下拉。
+        同时让变更流水账马上追平一轮：用户此刻最在乎刚存的文件能不能搜到。
         setFocus 产生的 FocusIn 不再自动弹历史（见 eventFilter），这里显式补一次。"""
+        self._wake_change_feed()
         self.search_box.setFocus()
         self.search_box.selectAll()
         self.show_history_popup()
+
+    def _wake_change_feed(self) -> None:
+        runtime = getattr(self, "_feature_runtime", None)
+        wake = getattr(runtime, "wake_change_feed", None)
+        if callable(wake):
+            wake()
 
     def set_hotkey_status(self, spec: str, ok: bool) -> None:
         """状态栏全局热键标签（#2）：成功显示热键；失败标黄「点此改」。app.py 注册后回调。"""
@@ -2837,6 +2845,14 @@ class MainWindow(QMainWindow):
                 self._show_recent(recent_force_refresh=True)
             self._refresh_status()
 
+    def on_journal_gap(self, root: str, reason: str) -> None:
+        """变更流水账断档（离线太久被覆盖等）：补一次低开销对账，太久没全扫才全扫。"""
+        _log.info("change journal gap on %s: %s", root, reason)
+        self._startup_index_token += 1
+        self._schedule_known_index_reconcile(self._startup_index_token)
+        if time.time() - self._last_full_scan_wall >= self._OVERFLOW_RESCAN_MIN_SEC:
+            self._schedule_full_coverage_scan(self._index_roots, "journal_gap")
+
     def note_inventory_dir_dirty(self, directory: str) -> None:
         """watcher 上报的「有非内容文件变动的目录」入队（主线程槽，必须 O(1)）。"""
         if not self._index_all_files_enabled or not directory:
@@ -2890,7 +2906,11 @@ class MainWindow(QMainWindow):
     #: 增量层的条目上限。超了就不再收新的，交给下一轮全盘扫描统一并入——
     #: 浏览器缓存这类目录一分钟能 churn 几千个文件，不封顶的话增量层会越滚越大，
     #: 而每轮对账都要把它整份重扫一遍。
-    _OVERLAY_MAX_ENTRIES = 50_000
+    _OVERLAY_MAX_ENTRIES = 200_000
+    #: 全量索引超过这么多条时，不再为取基线整表过一遍（1100 万条 3 个目录要 2.4 秒、持有 GIL）
+    _OVERLAY_BASELINE_MAX_RECORDS = 1_000_000
+    #: 目录子项不多时整目录进增量层（改名也能搜到）；大目录只收快照之后新增或改过的
+    _OVERLAY_FULL_DIR_MAX = 200
 
     @staticmethod
     def _reconcile_inventory_dirs_sync(dirs) -> dict:
@@ -2912,9 +2932,13 @@ class MainWindow(QMainWindow):
             }
             baseline: dict[str, tuple] = {}
             main_store = namestore.open_store(namestore.MAIN)
+            snapshot_at = 0
             if main_store is not None:
                 try:
-                    baseline = main_store.entries_for_directories(dirs)
+                    if main_store.count <= MainWindow._OVERLAY_BASELINE_MAX_RECORDS:
+                        baseline = main_store.entries_for_directories(dirs)
+                    else:
+                        snapshot_at = int(main_store.built_at)
                 finally:
                     main_store.close()
             # 先把上一版增量层原样搬过来，否则这一轮只保留本批目录的内容，
@@ -2929,8 +2953,8 @@ class MainWindow(QMainWindow):
                         # 跳过新值；那会让第二次修改永远保留第一次的大小/时间。
                         if os.path.normcase(os.path.dirname(path)) in dirty_keys:
                             continue
-                        if key in seen or not os.path.exists(path):
-                            continue      # 顺手把已经删掉的条目扔掉，别让增量层只涨不消
+                        if key in seen:
+                            continue      # 已删除的条目在结果显示前的 stat 里自然消失，不必每轮全部 stat
                         seen.add(key)
                         (builder.add_dir(path, mtime) if is_dir
                          else builder.add(path, size, mtime))
@@ -2952,6 +2976,12 @@ class MainWindow(QMainWindow):
                             continue
                         st = entry.stat()
                         is_dir = entry.is_dir(follow_symlinks=False)
+                        if (
+                            snapshot_at
+                            and len(entries) > MainWindow._OVERLAY_FULL_DIR_MAX
+                            and max(st.st_mtime, st.st_ctime) < snapshot_at - 120
+                        ):
+                            continue
                         base = baseline.get(key)
                         current = (
                             entry.path, entry.name, 0 if is_dir else int(st.st_size),
@@ -3774,6 +3804,29 @@ class MainWindow(QMainWindow):
             on_feature_change=self._feature_change_cb,
         )
         dlg.show_tab("健康诊断")
+        self._settings_dialogs.append(dlg)
+        dlg.destroyed.connect(lambda _=None, d=dlg: self._settings_dialogs.remove(d) if d in self._settings_dialogs else None)
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def open_settings_page(self, page: str) -> None:
+        """打开设置窗口并定位到指定分类（托盘、截图窗的「快捷键」入口走这里）。"""
+        for dlg in list(self._settings_dialogs):
+            try:
+                if dlg.isVisible():
+                    dlg.show_tab(page)
+                    dlg.raise_()
+                    dlg.activateWindow()
+                    return
+            except RuntimeError:
+                self._settings_dialogs.remove(dlg)
+        dlg = SettingsDialog(
+            self._version_backend, self,
+            on_rescan=self._request_full_rescan,
+            on_feature_change=self._feature_change_cb,
+        )
+        dlg.show_tab(page)
         self._settings_dialogs.append(dlg)
         dlg.destroyed.connect(lambda _=None, d=dlg: self._settings_dialogs.remove(d) if d in self._settings_dialogs else None)
         dlg.show()
@@ -6563,9 +6616,8 @@ class MainWindow(QMainWindow):
         否则会抢后台 IndexWorker 的 SQLite 写锁（最长等 8s）把 UI 顶成「未响应」。
         无 live 线程（do_index=False 的测试）：同步兜底，保持可测。
         """
-        if self._indexer is not None and self._indexer.isRunning():
-            self._live_deferred_paths.add(path)
-            return
+        # 全盘扫描一轮可能走一小时，新存的 PPT 不能等它结束。两者都在后台线程写库，
+        # WAL 下只是轮流拿写锁，碰不到界面线程。
         self._submit_live_index(path)
 
     def _submit_live_index(self, path: str) -> None:

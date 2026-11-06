@@ -843,12 +843,7 @@ def test_live_index_deferred_while_full_index_running(qtbot, tmp_path):
 
     win._index_file_live("C:/new.pptx")
 
-    assert submitted == []
-    assert win._live_deferred_paths == {"C:/new.pptx"}
-
-    running.running = False
-    win._flush_deferred_live_index()
-
+    # 全盘扫描一轮可能走一小时，新存的文件不等它结束（真机曾因此晚 4 小时才搜到）
     assert submitted == ["C:/new.pptx"]
     assert win._live_deferred_paths == set()
 

@@ -10,11 +10,15 @@ from PySide6.QtCore import QObject, Signal
 
 
 class VersionBridge(QObject):
+    journal_gap = Signal(str, str)  # (卷根, 原因)：变更流水账断档，要补一次对账
     snapshotted = Signal(str, str)  # (path, version_id)
     content_changed = Signal(str)   # Word/PDF 保存，仅触发搜索索引
     runtime_error = Signal(str)     # optional service failure, queued to GUI
     feature_state = Signal(str, bool)  # backend rollback, queued to GUI
     inventory_dir_changed = Signal(str)  # 「索引所有文件」：有非内容文件变动的目录
+
+    def emit_journal_gap(self, root: str, reason: str) -> None:
+        self.journal_gap.emit(str(root), str(reason))
 
     def emit_snapshot(self, path: str, version_id: str) -> None:
         """供 VersionManager.on_snapshot 回调（可能在 watcher 子线程被调用）。"""

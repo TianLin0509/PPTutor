@@ -41,3 +41,4 @@ tests/_generated/
 
 # logo 中间产物（base64 注入 mock 用，由 scripts/make_logo.py 生成）
 assets/logo_b64.txt
+.usn-test-work/
