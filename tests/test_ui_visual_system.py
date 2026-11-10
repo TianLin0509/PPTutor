@@ -41,6 +41,8 @@ def test_packaged_control_icons_exist_and_are_referenced():
         resource_path("assets", "ui-chevron-dark.svg"),
         resource_path("assets", "ui-chevron-light.svg"),
         resource_path("assets", "ui-check.svg"),
+        resource_path("assets", "ui-chevron-up-dark.svg"),
+        resource_path("assets", "ui-chevron-up-light.svg"),
     )
     for path in expected:
         assert path.is_file(), path
@@ -95,3 +97,17 @@ def test_qss_icons_render_from_path_with_spaces_and_chinese(qtbot, tmp_path, mon
 
     failures = [message for message in messages if "Cannot open file" in message]
     assert failures == []
+
+
+def test_status_bar_and_inputs_share_the_main_window_language():
+    """状态栏不画 Qt 默认的小件竖线；输入框、数字框与主搜索框同为白底描边。"""
+    for name, _label in theme.THEMES:
+        qss = theme.build_qss(name)
+        assert "QStatusBar#statusBar::item { border: none; }" in qss, name
+        assert "QAbstractSpinBox::up-arrow" in qss, name
+        assert "ui-chevron-up-" in qss, name
+    qss = theme.build_qss("atelier")
+    line_edit = qss.split("QLineEdit {", 1)[1].split("}", 1)[0]
+    assert "border: 1px solid" in line_edit
+    disabled = qss.split("QPushButton:disabled {", 1)[1].split("}", 1)[0]
+    assert "background: transparent" in disabled  # 禁用按钮不再是一块实心灰

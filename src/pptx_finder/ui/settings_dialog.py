@@ -9,7 +9,7 @@ import re
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QSignalBlocker, Qt, QTimer, Signal
+from PySide6.QtCore import QSignalBlocker, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
@@ -200,20 +200,40 @@ class _NavTabs(QWidget):
         self.nav.setObjectName("setNav")
         self.nav.setFixedWidth(172)
         self.nav.setFocusPolicy(Qt.NoFocus)
+        self.nav.setIconSize(QSize(18, 18))
+        self._icon_names: list[str] = []
+        self._icon_colors = ("#667085", "#2563EB")  # (常态, 选中)；由设置窗口按主题覆盖
         self.stack = QStackedWidget()
         self.stack.setObjectName("setStack")
         row.addWidget(self.nav)
         row.addWidget(self.stack, 1)
         self.nav.currentRowChanged.connect(self._on_row)
 
-    def addTab(self, page: QWidget, text: str) -> int:  # noqa: N802
+    def addTab(self, page: QWidget, text: str, icon: str = "") -> int:  # noqa: N802
         self.stack.addWidget(page)
         QListWidgetItem(text, self.nav)
+        self._icon_names.append(icon)
         if self.nav.currentRow() < 0:
             self.nav.setCurrentRow(0)
+        self._paint_icons()
         return self.stack.count() - 1
 
+    def set_icon_colors(self, normal: str, selected: str) -> None:
+        self._icon_colors = (normal, selected)
+        self._paint_icons()
+
+    def _paint_icons(self) -> None:
+        """和主窗侧栏一样：线条图标，选中项跟着变强调色。"""
+        from . import icons as _icons
+
+        current = self.nav.currentRow()
+        for row, name in enumerate(self._icon_names):
+            item = self.nav.item(row)
+            if name and item is not None:
+                item.setIcon(_icons.icon(name, self._icon_colors[row == current], 18))
+
     def _on_row(self, row: int) -> None:
+        self._paint_icons()
         if 0 <= row < self.stack.count():
             self.stack.setCurrentIndex(row)
             self.currentChanged.emit(row)
@@ -244,7 +264,7 @@ def _settings_qss(t: dict) -> str:
 QDialog#settingsWin {{ background: {t['win']}; }}
 QListWidget#setNav {{ background: {t['rail']}; border: none; border-right: 1px solid {t['bd2']};
     padding: 14px 10px; outline: none; font-size: 14px; }}
-QListWidget#setNav::item {{ height: 38px; padding-left: 12px; border-radius: 8px; color: {t['ink2']}; margin: 1px 0; }}
+QListWidget#setNav::item {{ height: 36px; padding: 0 0 0 10px; border-radius: 8px; color: {t['ink2']}; margin: 1px 0; }}
 QListWidget#setNav::item:hover {{ background: {t['hover']}; }}
 QListWidget#setNav::item:selected {{ background: {t['sel']}; color: {t['acc']}; font-weight: 700; }}
 QStackedWidget#setStack, QWidget#setPage {{ background: {t['win']}; }}
@@ -257,6 +277,7 @@ QFrame#setDivider {{ background: {t['bd2']}; border: none; }}
 QLabel#setRowTitle, QCheckBox#setRowTitle {{ font-size: 14px; font-weight: 600; color: {t['ink1']}; }}
 QLabel#setRowDesc, QLabel#setNote {{ font-size: 12.5px; color: {t['ink3']}; }}
 QLabel#setWarn {{ font-size: 12.5px; color: #9a6a00; }}
+QPlainTextEdit#setDiag {{ font-family: Consolas, "Microsoft YaHei UI"; font-size: 12px; color: {t['ink2']}; padding: 10px 12px; }}
 """
 
 
@@ -298,9 +319,10 @@ class SettingsDialog(QDialog):
         try:
             from ..config import get_theme
             from . import theme as _th
-            self.setStyleSheet(_settings_qss(_th.tok(get_theme())))
+            _tok = _th.tok(get_theme())
+            self.setStyleSheet(_settings_qss(_tok))
         except Exception:  # noqa: BLE001 样式失败不影响功能
-            pass
+            _tok = None
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -308,14 +330,18 @@ class SettingsDialog(QDialog):
 
         # v2.0.3：顶部页签 → 左侧分类；原「功能」一页塞了开关、版本库、热键、字体、索引范围，
         # 内容超宽出横向滚动条、分组也乱，拆成独立分类，每项一行（名称 + 说明在左，控件在右）。
+        # 每个分类一屏放完：外观从「常规」里拆出来，常规页不再需要滚动。
         self.tabs = _NavTabs()
-        self.tabs.addTab(self._build_general_page(), "常规")
-        self.tabs.addTab(self._build_features_page(), "功能")
-        self.tabs.addTab(self._build_vault_page(), "版本库")
-        self.tabs.addTab(self._build_roots_page(), "索引范围")
-        self.tabs.addTab(self._build_components_tab(), "组件")
-        self.tabs.addTab(self._build_health_tab(), "健康诊断")
-        self.tabs.addTab(self._build_powerpoint_tab(), "PowerPoint")
+        if _tok is not None:
+            self.tabs.set_icon_colors(_tok["ink3"], _tok["acc"])
+        self.tabs.addTab(self._build_general_page(), "常规", "settings")
+        self.tabs.addTab(self._build_appearance_page(), "外观", "theme")
+        self.tabs.addTab(self._build_features_page(), "功能", "dashboard")
+        self.tabs.addTab(self._build_vault_page(), "版本库", "version")
+        self.tabs.addTab(self._build_roots_page(), "索引范围", "folder")
+        self.tabs.addTab(self._build_components_tab(), "组件", "plus")
+        self.tabs.addTab(self._build_health_tab(), "健康诊断", "health")
+        self.tabs.addTab(self._build_powerpoint_tab(), "PowerPoint", "file")
         lay.addWidget(self.tabs, 1)
         self.tabs.currentChanged.connect(self._on_settings_tab_changed)
         self._sync_feature_controls()
@@ -426,7 +452,7 @@ class SettingsDialog(QDialog):
 
     # ---------- 常规：开机自启 / 唤起热键 / 界面字体 ----------
     def _build_general_page(self) -> QWidget:
-        outer, lay = self._page("常规", "启动方式、快捷键和界面外观。")
+        outer, lay = self._page("常规", "启动方式和快捷键。")
         self._section(lay, "启动")
         card = self._card(lay)
 
@@ -453,8 +479,11 @@ class SettingsDialog(QDialog):
                   hk_row, below=self._hotkey_result)
 
         self._build_screenshot_hotkey_row(card)
+        lay.addStretch(1)
+        return outer
 
-        self._section(lay, "外观")
+    def _build_appearance_page(self) -> QWidget:
+        outer, lay = self._page("外观", "界面主题和字体。")
         card = self._card(lay)
         self._build_theme_row(card)
         # 界面字体（字族 + 字号档位）：点「应用」即时全 App 生效并写 ui.json
@@ -1467,7 +1496,9 @@ class SettingsDialog(QDialog):
 
         self.diagnostic_text = QPlainTextEdit()
         self.diagnostic_text.setReadOnly(True)
-        self.diagnostic_text.setLineWrapMode(QPlainTextEdit.NoWrap)
+        self.diagnostic_text.setObjectName("setDiag")
+        # 长行自动折行：不出横向滚动条，复制出去的文本不受影响
+        self.diagnostic_text.setLineWrapMode(QPlainTextEdit.WidgetWidth)
         self.diagnostic_text.setPlainText("诊断加载中…")
         lay.addWidget(self.diagnostic_text, 1)
         self.schedule_diagnostics_refresh()

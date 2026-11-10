@@ -6,6 +6,8 @@ datas = [
     ('assets/app.ico', 'assets'),
     ('assets/ui-chevron-dark.svg', 'assets'),
     ('assets/ui-chevron-light.svg', 'assets'),
+    ('assets/ui-chevron-up-dark.svg', 'assets'),
+    ('assets/ui-chevron-up-light.svg', 'assets'),
     ('assets/ui-check.svg', 'assets'),
     ('assets/formula-katex.html', 'assets'),
     ('tools/formula_sidecar/licenses/KaTeX-MIT.txt', 'assets'),
