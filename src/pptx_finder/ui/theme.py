@@ -351,7 +351,7 @@ QPushButton#navBtn:disabled { color: $ink4; background: $panel; border-color: $b
 QLabel#pageLabel { color: $ink3; font-size: 12px; font-family: $mono_family; background: transparent; }
 
 /* 状态栏 */
-QStatusBar#statusBar { background: $rail; border-top: 1px solid $bd2; color: $ink3; min-height: 30px; }
+QStatusBar#statusBar { background: $rail; border-top: 1px solid $bd2; color: $ink3; }
 QStatusBar#statusBar::item { border: none; }
 QStatusBar#statusBar QLabel { color: $ink3; font-size: 12px; background: transparent; }
 QStatusBar#statusBar QLabel#lastIndexLabel { padding-left: 10px; }
