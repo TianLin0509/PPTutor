@@ -206,11 +206,11 @@ QPushButton {
 }
 QPushButton:hover { background: $hover; }
 QPushButton:pressed { background: $sel; }
-QPushButton:disabled { color: $ink4; background: $selblur; border-color: $bd2; }
+QPushButton:disabled { color: $ink4; background: transparent; border-color: $bd2; }
 QPushButton#primary { background: $acc; border: 1px solid $acc; color: $acctext; font-weight: 600; }
 QPushButton#primary:hover { background: $accd; border-color: $accd; }
 QPushButton#primary:pressed { background: $accd; border-color: $accd; }
-QPushButton#primary:disabled { background: $selblur; border-color: $bd2; color: $ink4; }
+QPushButton#primary:disabled { background: $selblur; border-color: transparent; color: $ink4; }
 QPushButton#ghost { background: transparent; border: none; color: $ink2; padding: 5px 8px; }
 QPushButton#ghost:hover { background: $hover; color: $ink1; }
 QPushButton#ghost:pressed, QPushButton#ghost:checked { background: $sel; color: $acc; }
@@ -245,7 +245,8 @@ QListWidget#resultList::item:selected { background: transparent; }
 /* 预览卡 */
 QWidget#previewPanel { background: $panel; border: none; border-radius: 0; }
 QWidget#previewHeadBar { background: transparent; }
-QLabel#previewImage { background: $canvas; border: 1px solid $bd2; border-radius: 8px; }
+QLabel#previewImage { background: $canvas; border: 1px solid $bd2; border-radius: 8px; color: $ink3; }
+QFrame#card { background: $panel; border: 1px solid $bd; border-radius: 10px; }
 QLabel#pathLabel { color: $ink1; font-size: 18px; font-weight: 700; background: transparent; }
 QLabel#metaLabel { color: $ink3; font-size: 12px; background: transparent; }
 QPushButton#headerBtn { background: $panel; border: 1px solid $bd; border-radius: 7px; padding: 5px 12px; color: $ink2; font-size: 12px; }
@@ -350,27 +351,28 @@ QPushButton#navBtn:disabled { color: $ink4; background: $panel; border-color: $b
 QLabel#pageLabel { color: $ink3; font-size: 12px; font-family: $mono_family; background: transparent; }
 
 /* 状态栏 */
-QStatusBar#statusBar { background: $panel; border-top: 1px solid $bd2; color: $ink3; }
+QStatusBar#statusBar { background: $rail; border-top: 1px solid $bd2; color: $ink3; }
+QStatusBar#statusBar::item { border: none; }
 QStatusBar#statusBar QLabel { color: $ink3; font-size: 12px; background: transparent; }
+QStatusBar#statusBar QLabel#lastIndexLabel { padding-left: 10px; }
 QLabel#kbd { color: $ink2; background: $field; border: 1px solid $bd2; border-bottom: 2px solid $bd2; border-radius: 5px; padding: 1px 7px; font-size: 10.5px; font-weight: 600; font-family: $mono_family; }
-QLabel#verShield { color: $grn; font-size: 11.5px; font-weight: 600; background: transparent; padding: 0 6px; }
-QLabel#hotkeyLabel { color: $ink3; background: $field; border: 1px solid $bd2; border-radius: 6px; padding: 2px 9px; font-size: 11px; font-family: $mono_family; }
-QLabel#hotkeyLabel:hover { color: $acc; border-color: $bd; }
+QStatusBar#statusBar QLabel#verShield { color: $ink3; font-size: 12px; font-weight: 400; background: transparent; padding: 0 10px; }
+QStatusBar#statusBar QLabel#hotkeyLabel { color: $ink3; background: transparent; border: none; border-radius: 6px; padding: 3px 12px 3px 8px; font-size: 12px; }
+QStatusBar#statusBar QLabel#hotkeyLabel:hover { color: $acc; background: $hover; }
 QLabel#navDot { color: #ff453a; font-size: 13px; font-weight: 700; background: transparent; }
 
 /* 索引状态：单色阶段胶囊 + 克制的自绘进度轨 */
-QLabel#indexPhase {
-  color: $acc; background: rgba($hl_r,$hl_g,$hl_b,0.12);
-  border: 1px solid rgba($hl_r,$hl_g,$hl_b,0.24); border-radius: 7px;
-  padding: 2px 7px; font-size: 10.5px; font-weight: 700;
+QStatusBar#statusBar QLabel#indexPhase {
+  color: $acc; background: rgba($hl_r,$hl_g,$hl_b,0.10);
+  border: none; border-radius: 9px;
+  padding: 2px 9px; margin-left: 10px; font-size: 11.5px; font-weight: 600;
 }
 QProgressBar#indexBar { background: transparent; border: none; min-height: 8px; max-height: 8px; }
-QLabel#indexCount { color: $ink2; font-size: 11.5px; font-weight: 600; padding: 0 3px; background: transparent; font-family: $mono_family; }
-QLabel#pctLabel {
-  color: $acc; background: rgba($hl_r,$hl_g,$hl_b,0.10);
-  border-radius: 6px; font-size: 11px; font-weight: 700; padding: 1px 5px; font-family: $mono_family;
+QStatusBar#statusBar QLabel#indexCount { color: $ink2; font-size: 12px; font-weight: 400; padding: 0 2px; background: transparent; }
+QStatusBar#statusBar QLabel#pctLabel {
+  color: $acc; background: transparent; font-size: 12px; font-weight: 600; padding: 0 2px;
 }
-QLabel#statusDot { color: $grn; font-size: 13px; padding: 0 2px 0 4px; background: transparent; }
+QStatusBar#statusBar QLabel#statusDot { color: $grn; font-size: 9px; padding: 0 0 0 12px; background: transparent; }
 QStatusBar#statusBar QLabel#lastIndexLabel { color: $ink4; font-size: 12px; background: transparent; }
 QStatusBar#statusBar QLabel#statusWarnLabel { color: #D97706; font-size: 12px; background: transparent; }
 QFrame#typeRail { background: transparent; }
@@ -427,20 +429,36 @@ QMenu::separator { height: 1px; background: $bd2; margin: 4px 6px; }
 
 /* 次级窗口通用控件 */
 QLineEdit {
-  background: $field; border: 1.5px solid transparent; border-radius: 7px;
+  background: $panel; border: 1px solid $bd; border-radius: 8px;
   padding: 5px 10px; color: $ink1; selection-background-color: $acc; selection-color: $acctext;
 }
-QLineEdit:hover { background: $hover; }
+QLineEdit:hover { border-color: rgba($hl_r,$hl_g,$hl_b,0.45); }
 QLineEdit:focus { border-color: $acc; background: $panel; }
-QLineEdit:disabled, QLineEdit:read-only { color: $ink3; background: $selblur; }
+QLineEdit:read-only { color: $ink2; }
+QLineEdit:disabled { color: $ink4; background: $field; border-color: $bd2; }
+
+/* 数字框：与下拉同形制，箭头用同一枚 chevron */
+QAbstractSpinBox {
+  background: $panel; border: 1px solid $bd; border-radius: 8px;
+  padding: 4px 24px 4px 10px; color: $ink1; selection-background-color: $acc; selection-color: $acctext;
+}
+QAbstractSpinBox:hover { border-color: rgba($hl_r,$hl_g,$hl_b,0.45); }
+QAbstractSpinBox:focus { border-color: $acc; }
+QAbstractSpinBox:disabled { color: $ink4; background: $field; border-color: $bd2; }
+QAbstractSpinBox::up-button, QAbstractSpinBox::down-button { border: none; background: transparent; width: 20px; subcontrol-origin: border; }
+QAbstractSpinBox::up-button { subcontrol-position: top right; margin: 2px 2px 0 0; border-top-right-radius: 6px; }
+QAbstractSpinBox::down-button { subcontrol-position: bottom right; margin: 0 2px 2px 0; border-bottom-right-radius: 6px; }
+QAbstractSpinBox::up-button:hover, QAbstractSpinBox::down-button:hover { background: $hover; }
+QAbstractSpinBox::up-arrow { image: url("$spin_up"); width: 9px; height: 6px; }
+QAbstractSpinBox::down-arrow { image: url("$combo_arrow"); width: 9px; height: 6px; }
 QPlainTextEdit, QTextEdit {
-  background: $field; color: $ink1; border: 1px solid $bd2; border-radius: 9px;
+  background: $panel; color: $ink1; border: 1px solid $bd; border-radius: 10px;
   padding: 8px; selection-background-color: $acc; selection-color: $acctext;
 }
 QPlainTextEdit:focus, QTextEdit:focus { border-color: $acc; }
-QPlainTextEdit:read-only, QTextEdit:read-only { background: $panel2; color: $ink2; }
+QPlainTextEdit:read-only, QTextEdit:read-only { background: $panel; color: $ink2; }
 QListWidget {
-  background: $field; border: 1px solid $bd2; border-radius: 10px;
+  background: $panel; border: 1px solid $bd; border-radius: 10px;
   outline: 0; padding: 4px;
 }
 QListWidget::item { color: $ink1; padding: 7px 9px; border-radius: 6px; }
@@ -514,6 +532,9 @@ def build_qss(theme: str, font_family: str = "", font_scale: float = 1.0) -> str
             "ui-chevron-dark.svg" if t.get("is_light", False) else "ui-chevron-light.svg"
         ),
         check_icon=_qss_asset("ui-check.svg"),
+        spin_up=_qss_asset(
+            "ui-chevron-up-dark.svg" if t.get("is_light", False) else "ui-chevron-up-light.svg"
+        ),
         font_family=_font_family_qss(font_family),
         mono_family=DEFAULT_MONO_FAMILY,
     )

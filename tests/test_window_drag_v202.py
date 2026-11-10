@@ -122,6 +122,11 @@ def test_old_saved_geometry_is_replaced_once_by_new_default(win, monkeypatch):
     win._restore_window_geometry()
     screen = win.screen()
     expect = MainWindow._default_rect(screen.geometry(), screen.availableGeometry())
+    # 屏幕很小时（如远程桌面连进来，逻辑分辨率 1097x617）默认尺寸会小于窗口最小尺寸，
+    # 实际大小由 Qt 的最小尺寸和屏幕可用区共同夹出，这条断言不适用
+    floor = win.minimumSizeHint().expandedTo(win.minimumSize())
+    if expect.width() < floor.width() or expect.height() < floor.height():
+        pytest.skip(f"屏幕 {screen.geometry().width()}x{screen.geometry().height()} 小于窗口最小尺寸")
     assert (win.width(), win.height()) == (expect.width(), expect.height())
 
     config.set_window_geometry(30, 40, 1000, 640)
