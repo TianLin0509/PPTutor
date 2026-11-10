@@ -490,7 +490,7 @@ def test_crash_mid_inventory_then_recover(tmp_path):
         [sys.executable, str(child), str(db_path), str(root)],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
     )
-    # 等到至少落了几批（commit 节奏 200/批）再杀
+    # 等到至少落了两批（commit 节奏 200/批）就杀：门槛定 2000 时忙机上偶发子进程先跑完（2026-11-10 合入闸门实测）
     deadline = time.time() + 120
     killed_rows = 0
     while time.time() < deadline:
@@ -500,14 +500,14 @@ def test_crash_mid_inventory_then_recover(tmp_path):
             conn = db.connect(db_path)
             n = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
             conn.close()
-            if n >= 2000:
+            if n >= 400:
                 killed_rows = n
                 proc.kill()
                 break
         except sqlite3.Error:
             time.sleep(0.1)
     out, _ = proc.communicate(timeout=30)
-    assert killed_rows >= 2000, f"child not killed mid-scan (rows={killed_rows}): {out[-500:]}"
+    assert killed_rows >= 400, f"child not killed mid-scan (rows={killed_rows}): {out[-500:]}"
     assert "DONE" not in out
     print(f"\n[crash injection] committed rows at kill: {killed_rows}")
 
