@@ -33,7 +33,8 @@ PHASES = ("idle", "checking", "downloading", "installing", "done", "cancelled", 
 
 def _blank_state() -> dict:
     return {"phase": "idle", "status": {}, "attempts": [], "checks": [], "error": "",
-            "version": "", "bytes": 0, "source_names": [], "ready_source": "", "local": False}
+            "version": "", "bytes": 0, "source_names": [], "ready_source": "", "local": False,
+            "import": None, "latest": ""}
 
 
 class ComponentCenter(QObject):
@@ -48,6 +49,7 @@ class ComponentCenter(QObject):
         self._threads: dict[str, threading.Thread] = {}
         self._callbacks: dict[str, list] = {c.key: [] for c in components.ALL}
         self._dialogs: dict[str, ComponentDialog] = {}
+        self._checked: set[str] = set()
         self._update.connect(self._apply)
 
     # ---------- 状态 ----------
@@ -85,6 +87,7 @@ class ComponentCenter(QObject):
         cancel = threading.Event()
         self._cancel[key] = cancel
         fresh = _blank_state()
+        fresh["latest"] = self._states[key].get("latest", "")
         fresh.update(phase="installing" if local else "checking", local=local,
                      source_names=["安装包内置"] if local else components.source_names(key))
         self._states[key] = fresh
@@ -118,6 +121,9 @@ class ComponentCenter(QObject):
         last_attempts: list = []    # 工作线程自己记一份：主线程那份要等排队的信号处理完才更新
 
         def on_status(st: dict) -> None:
+            if "import" in st:      # 素材包：下载解压完，正在逐页导入素材库
+                emit(key, {"phase": "installing", "import": list(st["import"])})
+                return
             if "attempts" in st:
                 last_attempts[:] = list(st["attempts"])
                 emit(key, {"attempts": list(st["attempts"])})
@@ -144,6 +150,33 @@ class ComponentCenter(QObject):
         ok = next((a.get("name", "") for a in last_attempts if a.get("status") == "ok"), "")
         emit(key, {"phase": "done", "version": version or "",
                    "ready_source": "安装包内置" if local else ok})
+
+    def check_latest(self, key: str, *, force: bool = False) -> None:
+        """后台问一次各源的清单版本，记到 state["latest"]（组件页据此显示「有更新」）。
+
+        每个组件每次运行只问一次（force 除外）；查不到不算错误，安静放弃。
+        """
+        components.info(key)
+        if self.busy(key) or (key in self._checked and not force):
+            return
+        self._checked.add(key)
+
+        def work():
+            try:
+                version = str(components.fetch_manifest(key).get("version") or "")
+            except Exception as exc:  # noqa: BLE001 只是顺带看看有没有更新
+                log.info("%s查询新版本失败：%s", components.info(key).name, exc)
+                return
+            self._update.emit(key, {"latest": version})
+
+        threading.Thread(target=work, name=f"component-check-{key}", daemon=True).start()
+
+    def upgradable(self, key: str) -> str:
+        """已装且清单版本更新时返回新版本号，否则空串。"""
+        latest = self._states[key].get("latest") or ""
+        if not latest or self.busy(key) or not components.is_installed(key):
+            return ""
+        return latest if components.is_newer(latest, components.installed_version(key)) else ""
 
     def cancel(self, key: str) -> None:
         event = self._cancel.get(key)
@@ -275,7 +308,7 @@ class ComponentDialog(QDialog):
         titles.setSpacing(0)
         self.title = QLabel(f"下载{self.info.name}")
         self.title.setObjectName("auTitle")
-        self.sub = QLabel(f"用于{self.info.purpose}，本机离线识别")
+        self.sub = QLabel(f"用于{self.info.purpose}，{self.info.note}")
         self.sub.setObjectName("auSub")
         self.sub.setWordWrap(True)   # 公式组件的用途较长，卡片定宽，不换行会被截掉
         titles.addWidget(self.title)
@@ -384,7 +417,7 @@ class ComponentDialog(QDialog):
     # ---------- 动作 ----------
     def _on_primary(self) -> None:
         phase = self._center.snapshot(self.key)["phase"]
-        if phase == "done":
+        if phase == "done" and not self._center.upgradable(self.key):
             self.close()
             return
         self._center.start(self.key)
@@ -404,7 +437,9 @@ class ComponentDialog(QDialog):
             return
         phase = s["phase"]
         installed = components.is_installed(self.key)
-        if phase == "idle" and installed:
+        if phase in ("idle", "done") and installed and self._center.upgradable(self.key):
+            phase = "upgradable"
+        elif phase == "idle" and installed:
             phase = "installed"
         self.phase_rendered = phase
         size = s["bytes"] or (s["status"] or {}).get("total") or 0
@@ -422,7 +457,15 @@ class ComponentDialog(QDialog):
             total = st.get("total") or size or 0
             received = st.get("received", 0)
             self.progress.setValue(int(min(1.0, received / total) * 1000) if total else 0)
-            if phase == "installing" and not s["local"]:
+            imported = s.get("import")
+            if phase == "installing" and imported:
+                done_n, total_n = imported
+                self.progress.setRange(0, max(1, total_n))
+                self.progress.setValue(done_n)
+                self.dl_head.setText(f"正在导入素材库 {done_n} / {total_n}" if total_n else "正在打开素材包…")
+                self.meta_left.setText("用 PowerPoint 在后台逐个拆分素材，不弹窗")
+                self.meta_right.setText("")
+            elif phase == "installing" and not s["local"]:
                 self.dl_head.setText("下载完成，正在校验并解压…")
                 self.progress.setRange(0, 0)   # 解压没有细进度，用来回滚动的忙碌条
                 self.meta_left.setText(fmt_bytes(total) if total else "")
@@ -440,6 +483,9 @@ class ComponentDialog(QDialog):
         src_title = ""
         if phase == "installed":
             self._set_msg(f"{self.info.name}已安装，可以直接使用。", "ok")
+        elif phase == "upgradable":
+            self._set_msg(f"{self.info.name}有新版本 v{s['latest']}。点「更新」整包替换；"
+                          "你自己收藏的素材不受影响。", "info")
         elif phase == "idle":
             self._set_msg("下载一次即可，之后完全离线。点「下载」开始。", "info")
         elif phase == "checking":
@@ -458,7 +504,8 @@ class ComponentDialog(QDialog):
         elif phase == "cancelled":
             self._set_msg("已取消下载，没有留下半套组件。随时可以重新下载。", "info")
         elif phase == "error":
-            self._set_msg((s["error"] or "下载失败") + "\n公司网络连不上时，可以改装「完整版」安装包（已内置全部组件）。", "bad")
+            tail = "\n公司网络连不上时，可以改装「完整版」安装包（已内置识别组件）。" if self.info.in_full else ""
+            self._set_msg((s["error"] or "下载失败") + tail, "bad")
             if s["attempts"]:
                 rows, src_title = attempt_rows(s["attempts"], s["source_names"], False), "各下载源的结果"
             elif s["checks"]:
@@ -467,11 +514,12 @@ class ComponentDialog(QDialog):
         self.src_head.setVisible(bool(src_title) and bool(rows))
         self.sources.set_rows(rows)
 
-        primary = {"idle": "下载", "cancelled": "重新下载", "error": "重试", "done": "完成"}.get(phase, "")
+        primary = {"idle": "下载", "cancelled": "重新下载", "error": "重试", "done": "完成",
+                   "upgradable": "更新"}.get(phase, "")
         self.btn_primary.setText(primary)
         self.btn_primary.setVisible(bool(primary))
         self.btn_cancel.setVisible(phase in ("checking", "downloading") or (phase == "installing" and s["local"]))
-        self.btn_manual.setVisible(phase == "error")
+        self.btn_manual.setVisible(phase == "error" and self.info.in_full)
         self.btn_close.setText("后台下载" if phase in ("checking", "downloading", "installing") else "关闭")
         self.btn_close.setVisible(phase != "done")
         self.card.layout().activate()

@@ -6,7 +6,7 @@ from PySide6.QtCore import QSize, Qt
 from PySide6.QtGui import QIcon, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
-    QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QMenu, QPushButton, QVBoxLayout, QWidget,
 )
 
@@ -30,6 +30,7 @@ class MaterialWindow(QWidget):
         self.library = library or MaterialLibrary()
         self._tasks = []
         self._busy = False
+        self._reload_pending = False
         self._items = []
         root = QVBoxLayout(self)
         root.setContentsMargins(20, 18, 20, 18)
@@ -39,6 +40,21 @@ class MaterialWindow(QWidget):
         hint = QLabel("在 PPT 中选中形状或图片并 Ctrl+C，然后收藏。取用时复制素材，回 PPT 粘贴。")
         hint.setWordWrap(True)
         root.addWidget(hint)
+        # 团队素材包没装时就地给下载入口（开箱即用，不让用户跑到设置页找）
+        self.pack_bar = QFrame()
+        self.pack_bar.setObjectName("teamPackBar")
+        self.pack_bar.setStyleSheet(
+            "QFrame#teamPackBar { border: 1px solid palette(mid); border-radius: 6px; }")
+        bar = QHBoxLayout(self.pack_bar)
+        bar.setContentsMargins(12, 8, 8, 8)
+        self.pack_label = QLabel("")
+        self.pack_label.setWordWrap(True)
+        self.pack_btn = QPushButton("下载团队素材包")
+        self.pack_btn.setObjectName("primary")
+        self.pack_btn.clicked.connect(self._pack_download)
+        bar.addWidget(self.pack_label, 1)
+        bar.addWidget(self.pack_btn, 0, Qt.AlignVCenter)
+        root.addWidget(self.pack_bar)
         capture = QHBoxLayout()
         self.name_edit = QLineEdit()
         self.name_edit.setPlaceholderText("素材名称（可留空，稍后整理）")
@@ -63,6 +79,8 @@ class MaterialWindow(QWidget):
         self.search.textChanged.connect(self._render)
         self.categories = QComboBox()
         self.categories.addItem("全部分类", "")
+        # 分类名带数量（如「箭头与流程（30）」），按内容放宽，不截断
+        self.categories.setSizeAdjustPolicy(QComboBox.AdjustToContents)
         self.categories.currentIndexChanged.connect(self._render)
         filters.addWidget(self.search, 1)
         filters.addWidget(self.categories)
@@ -118,7 +136,78 @@ class MaterialWindow(QWidget):
         self.open_export_btn.clicked.connect(self._open_export_folder)
         self.open_export_btn.hide()
         root.addWidget(self.open_export_btn, 0, Qt.AlignLeft)
+        self._center = None
+        try:
+            from .component_center import component_center
+            self._center = component_center()
+            self._center.state_changed.connect(self._on_pack_state)
+            self._center.installed.connect(self._on_pack_installed)
+        except Exception:  # noqa: BLE001 下载中心不可用时素材库照常能用
+            log.exception("component center unavailable")
+        self._refresh_pack_bar()
         self._run(self.library.list, self._loaded, "读取素材库")
+
+    # ---------- 团队素材包 ----------
+    def _refresh_pack_bar(self):
+        from .. import components
+        center = self._center
+        if center is None:
+            self.pack_bar.hide()
+            return
+        snap = center.snapshot("materials")
+        phase = snap["phase"]
+        if center.busy("materials"):
+            imported = snap.get("import")
+            if phase == "installing" and imported:
+                done_n, total_n = imported
+                text = f"团队素材包：正在导入素材库 {done_n} / {total_n}…" if total_n else "团队素材包：正在打开素材包…"
+            elif phase == "checking":
+                text = "团队素材包：正在连接下载源…"
+            else:
+                st = snap["status"] or {}
+                total = st.get("total") or snap["bytes"] or 0
+                pct = f" {int(st.get('received', 0) * 100 / total)}%" if total else ""
+                text = f"团队素材包：正在下载{pct}…"
+            self.pack_label.setText(text)
+            self.pack_btn.setText("查看进度")
+            self.pack_bar.show()
+            return
+        if components.is_installed("materials"):
+            self.pack_bar.hide()
+            return
+        info = components.MATERIALS
+        text = (f"团队素材包：团队常用的形状、箭头、图标，按分类筛选。约 {info.approx_mb} MB，"
+                "下载后自动导入，不影响你自己收藏的素材。")
+        if phase == "error":
+            text = "团队素材包下载失败：" + (snap["error"] or "未知原因")
+        self.pack_label.setText(text)
+        self.pack_btn.setText("重试" if phase == "error" else "下载团队素材包")
+        self.pack_bar.show()
+
+    def _pack_download(self):
+        if self._center is None:
+            return
+        if self._center.busy("materials"):
+            self._center.open_dialog("materials", self)
+        else:
+            self._center.request("materials", self)
+
+    def _on_pack_state(self, key):
+        if key == "materials":
+            try:
+                self._refresh_pack_bar()
+            except RuntimeError:   # 窗口已销毁
+                pass
+
+    def _on_pack_installed(self, key):
+        if key == "materials":
+            try:
+                if self._busy:
+                    self._reload_pending = True
+                else:
+                    self._refresh_after("团队素材包已导入，可用搜索框右边的分类下拉筛选。")
+            except RuntimeError:
+                pass
 
     def _selected(self):
         return [x.data(Qt.UserRole) for x in self.list_widget.selectedItems()]
@@ -157,8 +246,12 @@ class MaterialWindow(QWidget):
         self.categories.blockSignals(True)
         self.categories.clear()
         self.categories.addItem("全部分类", "")
-        for category in sorted({x.category for x in items if x.category}):
-            self.categories.addItem(category, category)
+        counts = {}
+        for x in items:
+            if x.category:
+                counts[x.category] = counts.get(x.category, 0) + 1
+        for category in sorted(counts):
+            self.categories.addItem(f"{category}（{counts[category]}）", category)
         self.categories.setCurrentIndex(max(0, self.categories.findData(previous)))
         self.categories.blockSignals(False)
         self._render()
@@ -187,6 +280,9 @@ class MaterialWindow(QWidget):
                 self.status.setText(f"{label}失败：{error}")
             else:
                 done(result["value"])
+            if self._reload_pending and not self._busy:
+                self._reload_pending = False
+                self._refresh_after("团队素材包已导入，可用搜索框右边的分类下拉筛选。")
 
         task = BackgroundTask(work, "materials", self)
         self._tasks.append(task)
