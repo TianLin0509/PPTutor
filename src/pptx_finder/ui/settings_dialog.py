@@ -1226,7 +1226,8 @@ class SettingsDialog(QDialog):
 
         page, lay = self._page(
             "组件",
-            "基础版不预装识别组件，用到时下载一次，之后在本机离线识别，图片不上传。"
+            "基础版不预装识别组件，用到时下载一次，之后在本机离线识别，图片不上传；"
+            "团队素材包下载后自动导入素材库。"
             "下载和软件更新走同一套：GitHub 优先，连不上自动换备用服务器。")
 
         self._component_rows: dict[str, dict] = {}
@@ -1261,7 +1262,7 @@ class SettingsDialog(QDialog):
             self._component_rows[comp.key] = {"status": status, "download": download,
                                               "remove": remove, "size": None, "busy": False,
                                               "note": ""}
-        hint = QLabel("公司网络连不上 GitHub 和备用服务器时，可以改装「完整版」安装包，它已内置全部组件。")
+        hint = QLabel("公司网络连不上 GitHub 和备用服务器时，可以改装「完整版」安装包，它已内置识别组件。")
         hint.setWordWrap(True)
         hint.setObjectName("setNote")
         lay.addWidget(hint)
@@ -1269,6 +1270,9 @@ class SettingsDialog(QDialog):
         component_center().state_changed.connect(self._on_component_state)
         self._components_measured = False
         self._refresh_components()
+        # 素材包内容会单独更新：已装的顺带问一次有没有新版（每次运行只问一次）
+        if components.is_installed("materials"):
+            component_center().check_latest("materials")
         return page
 
     def _on_component_state(self, key: str) -> None:
@@ -1293,6 +1297,7 @@ class SettingsDialog(QDialog):
             installed = components.is_installed(key)
             is_bundled = components.bundled(key)
             version = components.installed_version(key)
+            newer = center.upgradable(key)
             size = row["size"]
             if row["busy"]:
                 text = "正在卸载…"
@@ -1302,6 +1307,9 @@ class SettingsDialog(QDialog):
                 pct = f" {int(st.get('received', 0) * 100 / total)}%" if total else ""
                 text = {"checking": "正在查询下载源…", "installing": "正在校验并解压…"}.get(
                     phase, f"正在下载{pct}")
+                if phase == "installing" and snap.get("import"):
+                    done_n, total_n = snap["import"]
+                    text = f"正在导入素材库 {done_n} / {total_n}" if total_n else "正在打开素材包…"
                 row["download"].setText("查看进度")
             elif installed:
                 text = "已安装" + (f" v{version}" if version else "")
@@ -1309,7 +1317,9 @@ class SettingsDialog(QDialog):
                     text += f" · 占用 {_format_size_text(size)}"
                 if is_bundled:
                     text += " · 随安装包内置"
-                row["download"].setText("查看")
+                if newer:
+                    text += f" · 有更新 v{newer}"
+                row["download"].setText("更新" if newer else "查看")
             elif is_bundled:
                 text = "安装包已内置，第一次使用时自动解压（不联网）"
                 row["download"].setText("现在解压")
@@ -1321,7 +1331,7 @@ class SettingsDialog(QDialog):
             if row["note"] and not moving and not row["busy"]:
                 text += " · " + row["note"]
             row["status"].setText(text)
-            primary = not installed or moving
+            primary = not installed or moving or bool(newer)
             if row["download"].objectName() != ("primary" if primary else ""):
                 row["download"].setObjectName("primary" if primary else "")
                 row["download"].style().unpolish(row["download"])
@@ -1359,7 +1369,10 @@ class SettingsDialog(QDialog):
         from .component_center import component_center
         center = component_center()
         self._component_rows[key]["note"] = ""
-        if components.is_installed(key) or center.busy(key):
+        if center.upgradable(key):
+            center.start(key)
+            center.open_dialog(key, self)
+        elif components.is_installed(key) or center.busy(key):
             center.open_dialog(key, self)
         else:
             center.request(key, self)
@@ -1369,6 +1382,8 @@ class SettingsDialog(QDialog):
         comp = components.info(key)
         size = self._component_rows[key]["size"]
         tail = "（完整版会从安装包自动解压，不联网）。" if components.bundled(key) else "。"
+        if key == "materials":
+            tail = "。\n只移除团队素材包导入的素材，你自己收藏的素材不受影响。"
         box = QMessageBox(QMessageBox.Question, f"卸载{comp.name}",
                           f"删除本机的{comp.name}" + (f"，释放约 {_format_size_text(size)}" if size else "")
                           + f"？\n之后再用{comp.purpose}时需要重新下载" + tail,

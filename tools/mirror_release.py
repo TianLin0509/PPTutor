@@ -24,6 +24,7 @@ r"""把一个已发布版本同步到自建更新源（ECS 上的 Caddy 静态�
     PPT-Doctor-v<基线版本>.zip                                 仅一个Full基线
     ocr/component.json + ocr/component.zip                      文字识别组件
     formula/component.json + formula/component.zip              公式识别组件
+    materials/component.json + materials/component.zip          团队素材包（不进安装包）
 
 默认不上传本版ZIP；镜像manifest.json的full沿用已核验基线。原GitHub资产不改。
 先核验三个安装版需要的全部块（缺块从同构建ZIP补出），依赖公网验证后才原子切清单。
@@ -61,6 +62,9 @@ REMOTE = "C:/pptutor-updates"
 PUBLIC = "https://me.lt-stockpartner.tech/pptutor"
 REPO = "TianLin0509/PPTutor"
 COMPONENT_TAGS = {"ocr": "ocr-v1.2.0", "formula": "formula-v1.0.0"}
+#: 团队素材包：内容单独发版（materials-vX.Y.Z），客户端在 /pptutor/materials/ 取最新版；
+#: 标签还没发布时跳过，不影响其它组件的同步。新版本素材包发布后把这里改成新标签。
+OPTIONAL_COMPONENT_TAGS = {"materials": "materials-v1.0.0"}
 MANIFESTS = ("manifest.json", "manifest-Base.json", "manifest-Ocr.json")
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _VERSION = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
@@ -141,9 +145,16 @@ def collect_from_github(version: str, cache: Path, components: bool,
             _download(asset["browser_download_url"], dest, asset["size"])
         items.append(Item(dest, remote, asset["size"], _sha256(dest) if download else "", last))
     if components:
-        for kind, tag in COMPONENT_TAGS.items():
+        for kind, tag in {**COMPONENT_TAGS, **OPTIONAL_COMPONENT_TAGS}.items():
             print(f"[*] 读取组件 {tag}")
-            for asset in _github_assets(tag):
+            try:
+                assets = _github_assets(tag)
+            except urllib.error.HTTPError as exc:
+                if exc.code == 404 and kind in OPTIONAL_COMPONENT_TAGS:
+                    print(f"    {tag} 尚未发布，跳过")
+                    continue
+                raise
+            for asset in assets:
                 if asset["name"] not in ("component.json", "component.zip"):
                     continue
                 dest = cache / kind / asset["name"]
@@ -170,7 +181,7 @@ def collect_from_dir(version: str, src: Path, components: bool, *,
         elif refresh_full and p.name == f"PPT-Doctor-v{version}.zip":
             items.append(Item(p, p.name, p.stat().st_size, _sha256(p)))
     if components:
-        for kind in COMPONENT_TAGS:
+        for kind in {**COMPONENT_TAGS, **OPTIONAL_COMPONENT_TAGS}:
             for name in ("component.zip", "component.json"):
                 p = src / kind / name
                 if p.is_file():
@@ -670,7 +681,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="把已发布版本同步到自建更新源（备用服务器）")
     ap.add_argument("version", nargs="?", help="版本号，默认取源码里的 __version__")
     ap.add_argument("--from-dir", type=Path, help="用本地产物目录，不从 GitHub 下载")
-    ap.add_argument("--components", action="store_true", help="顺带同步 OCR / 公式组件")
+    ap.add_argument("--components", action="store_true", help="顺带同步 OCR / 公式组件 / 团队素材包")
     ap.add_argument("--dry-run", action="store_true", help="只列出将上传的清单，不连服务器")
     ap.add_argument("--verify-only", action="store_true", help="不上传，只核对公网上的文件")
     policy = ap.add_mutually_exclusive_group()

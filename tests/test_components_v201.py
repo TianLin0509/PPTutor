@@ -50,7 +50,7 @@ def test_stale_center_destroyed_later_does_not_drop_current(qtbot, qapp):
 
 
 def test_component_catalog_and_hint_sizes_match_published_archives():
-    assert [c.key for c in components.ALL] == ["ocr", "formula"]
+    assert [c.key for c in components.ALL] == ["ocr", "formula", "materials"]
     # 发布的组件压缩包：文字识别 85,544,805 字节、公式 457,567,111 字节（按 1024² 取整）
     assert components.OCR.approx_mb == round(85544805 / 1048576)
     assert components.FORMULA.approx_mb == round(457567111 / 1048576)

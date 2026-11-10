@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -57,7 +58,8 @@ def _metadata(slide, item: Material):
         MARKER + json.dumps(asdict(item), ensure_ascii=False))
 
 
-def _read_metadata(slide) -> Material:
+def _read_raw(slide) -> dict:
+    """备注首行标记之后的 JSON：{id, name, category}；name / category 已校验。"""
     shapes = slide.NotesPage.Shapes
     for i in range(1, int(shapes.Count) + 1):
         shape = shapes.Item(i)
@@ -69,8 +71,25 @@ def _read_metadata(slide) -> Material:
                 category = data.get("category", "")
                 if not isinstance(name, str) or not name.strip() or not isinstance(category, str):
                     raise ValueError("素材名称或分类格式不正确。")
-                return Material(uuid.uuid4().hex, name[:120], category[:80], time.time())
+                return data
     raise ValueError("不是 PPT Doctor 素材包：每页需有素材信息。普通 PPT 请选中对象后复制收藏。")
+
+
+def _read_metadata(slide) -> Material:
+    data = _read_raw(slide)
+    return Material(uuid.uuid4().hex, data["name"][:120], data.get("category", "")[:80], time.time())
+
+
+#: 组件导入的素材登记在素材库的 .packs/<包名>.json：版本号 + 这个包导入的全部素材标识。
+#: 升级 / 卸载只动登记里的素材，用户自己收藏或手动导入的素材一个都不碰。
+PACKS_DIR = ".packs"
+_PACK_KEY = re.compile(r"[a-z][a-z0-9-]{0,31}")
+_ITEM_ID = re.compile(r"[0-9a-f]{32}")
+
+
+def pack_item_id(pack: str, source_id: str) -> str:
+    """素材包里的 id → 素材库里的固定标识：同一个素材重复导入落在同一个目录，不会多出一份。"""
+    return hashlib.md5(f"pptdoctor-pack:{pack}:{source_id}".encode("utf-8")).hexdigest()
 
 
 def _save_deck(pres, path: Path):
@@ -227,3 +246,134 @@ class MaterialLibrary:
                     self.folder(item.id).rename(stage / item.id)
                 raise
         return items
+
+    # ---------- 组件素材包（团队素材包等）：按 id 去重、整包升级 ----------
+    def _pack_record_path(self, pack: str) -> Path:
+        if not _PACK_KEY.fullmatch(pack):
+            raise ValueError("素材包名不合法。")
+        return self.root / PACKS_DIR / f"{pack}.json"
+
+    def pack_record(self, pack: str) -> dict:
+        """{"version": "1.0.0", "ids": [...]}；没装过返回 {}。"""
+        try:
+            data = json.loads(self._pack_record_path(pack).read_text("utf-8"))
+        except FileNotFoundError:
+            return {}
+        if not isinstance(data, dict) or not isinstance(data.get("ids", []), list):
+            raise ValueError("素材包登记文件损坏。")
+        return data
+
+    def _pack_ids(self, record: dict) -> list[str]:
+        return [x for x in record.get("ids", []) if isinstance(x, str) and _ITEM_ID.fullmatch(x)]
+
+    def _write_pack_record(self, pack: str, record: dict):
+        path = self._pack_record_path(pack)
+        path.parent.mkdir(exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(record, ensure_ascii=False, indent=1), "utf-8")
+        os.replace(tmp, path)
+
+    @staticmethod
+    def _discard(folder: Path):
+        # 组件素材随时可重新下载：替换 / 卸载时直接删，不进 .trash 越攒越多
+        trash = folder.with_name(f".discard-{uuid.uuid4().hex}")
+        folder.rename(trash)
+        shutil.rmtree(trash, ignore_errors=True)
+
+    def sync_pack(self, pack: str, source: Path, version: str, *,
+                  progress=None, cancel=None) -> dict:
+        """把组件素材包导入素材库：同一 id 原地替换，新包里没有的旧素材移除。
+
+        全部页面先在暂存目录拆好、生成预览，一页失败整包不落地；取消只在落地前生效。
+        返回 {"total", "added", "updated", "removed"}。
+        """
+        record = self.pack_record(pack)
+        old_ids = self._pack_ids(record)
+        for leftover in self.root.glob(".discard-*"):   # 上次被打断留下的残留
+            shutil.rmtree(leftover, ignore_errors=True)
+        with tempfile.TemporaryDirectory(prefix=".sync-", dir=self.root) as tmp:
+            stage = Path(tmp)
+            snapshot = stage / "source.pptx"
+            shutil.copyfile(source, snapshot)
+            validate_pptx(snapshot)
+            items: list[Material] = []
+            with ppt_transfer.temporary_presentations() as session:
+                source_pres = session.open(snapshot)
+                count = int(source_pres.Slides.Count)
+                if not 1 <= count <= MAX_PACK_ITEMS:
+                    raise ValueError("素材包需要包含 1–500 页。")
+                raws = [_read_raw(source_pres.Slides.Item(i)) for i in range(1, count + 1)]
+                seen = set()
+                base = time.time()
+                for i, raw in enumerate(raws, 1):
+                    source_id = raw.get("id")
+                    if not isinstance(source_id, str) or not source_id.strip():
+                        raise ValueError(f"第 {i} 页素材缺少 id。")
+                    if source_id in seen:
+                        raise ValueError(f"第 {i} 页素材 id 重复：{source_id}")
+                    seen.add(source_id)
+                    # created 依次递减：素材库按时间倒序显示时保持素材包里的顺序
+                    items.append(Material(pack_item_id(pack, source_id), raw["name"][:120],
+                                          raw.get("category", "")[:80], base - i * 1e-3))
+                if progress:
+                    progress(0, count)
+                for i, item in enumerate(items, 1):
+                    if cancel is not None and cancel():
+                        raise InterruptedError("已取消导入")
+                    folder = stage / item.id
+                    folder.mkdir()
+                    pres = session.new()
+                    if int(pres.Slides.InsertFromFile(str(snapshot), 0, i, i)) != 1:
+                        raise ValueError(f"第 {i} 页导入失败。")
+                    slide = pres.Slides.Item(1)
+                    _metadata(slide, item)
+                    _preview(slide, folder / "preview.png")
+                    _save_deck(pres, folder / "material.pptx")
+                    self._write(folder, item)
+                    session.close(pres)
+                    if progress:
+                        progress(i, count)
+            if cancel is not None and cancel():
+                raise InterruptedError("已取消导入")
+            new_ids = [item.id for item in items]
+            # 先登记新旧并集：中途被打断时，卸载 / 下次升级仍能找全这个包的素材
+            self._write_pack_record(pack, {"version": record.get("version", ""),
+                                           "ids": list(dict.fromkeys(old_ids + new_ids))})
+            stats = {"total": len(items), "added": 0, "updated": 0, "removed": 0}
+            for item in items:
+                target = self.folder(item.id)
+                if target.exists():
+                    self._discard(target)
+                    stats["updated"] += 1
+                else:
+                    stats["added"] += 1
+                (stage / item.id).rename(target)
+            keep = set(new_ids)
+            for item_id in old_ids:
+                if item_id not in keep and self.folder(item_id).exists():
+                    self._discard(self.folder(item_id))
+                    stats["removed"] += 1
+            self._write_pack_record(pack, {"version": str(version), "ids": new_ids})
+        return stats
+
+    def remove_pack(self, pack: str) -> int:
+        """删掉某个组件素材包导入的全部素材（只按登记删），返回删除个数。"""
+        removed = 0
+        for item_id in self._pack_ids(self.pack_record(pack)):
+            folder = self.folder(item_id)
+            if folder.exists():
+                self._discard(folder)
+                removed += 1
+        self._pack_record_path(pack).unlink(missing_ok=True)
+        return removed
+
+    def pack_bytes(self, pack: str) -> int:
+        total = 0
+        for item_id in self._pack_ids(self.pack_record(pack)):
+            for path in (self.root / item_id).glob("*"):
+                try:
+                    total += path.stat().st_size
+                except OSError:
+                    pass
+        return total
+
