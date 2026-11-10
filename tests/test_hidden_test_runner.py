@@ -112,7 +112,8 @@ def test_hidden_runner_preserves_failed_pytest_output_and_progress(tmp_path):
     report = tmp_path / 'hidden-report.json'
     command = subprocess.list2cmdline([
         sys.executable, str(ROOT / 'scripts/run_tests_hidden.py'), '--report', str(report),
-        '--', '-q', str(failing)])
+        # confcutdir 挡住 pytest 逐级列 D:\Temp：别的任务的临时目录随时消失，会让收集偶发报错
+        '--', '-q', '--confcutdir', str(tmp_path), str(failing)])
     driver = tmp_path / 'real_gate_driver.py'
     driver.write_text(
         "import runpy\n"
