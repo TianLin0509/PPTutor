@@ -122,7 +122,10 @@ def test_old_saved_geometry_is_replaced_once_by_new_default(win, monkeypatch):
     win._restore_window_geometry()
     screen = win.screen()
     expect = MainWindow._default_rect(screen.geometry(), screen.availableGeometry())
-    assert (win.width(), win.height()) == (expect.width(), expect.height())
+    # 屏幕很小时（如远程桌面连进来，逻辑分辨率 1097x617）默认高度会低于窗口最小高度，Qt 按最小高度夹住
+    floor = win.minimumSizeHint()
+    assert (win.width(), win.height()) == (
+        max(expect.width(), floor.width()), max(expect.height(), floor.height()))
 
     config.set_window_geometry(30, 40, 1000, 640)
     win._restore_window_geometry()
