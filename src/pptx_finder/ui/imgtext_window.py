@@ -88,7 +88,9 @@ class ImgTextWindow(QWidget):
         # 截图工具出来的图只在剪贴板里，逼用户先存一次盘再拖进来是多余的一步。
         self._paste_sc = QShortcut(QKeySequence.StandardKey.Paste, self)
         self._paste_sc.activated.connect(self.paste_from_clipboard)
-        self._refresh_component_state()
+        from .component_center import component_center
+        component_center().state_changed.connect(self._on_center_state)
+        self._on_center_state("ocr")
         if source:
             self.set_source(source)
 
@@ -207,9 +209,6 @@ class ImgTextWindow(QWidget):
             return
         from .component_center import component_center
         center = component_center()
-        if not getattr(self, "_center_wired", False):
-            self._center_wired = True
-            center.state_changed.connect(self._on_center_state)
         center.request("ocr", self, on_ready=self._on_component_installed)
 
     def _on_center_state(self, key: str) -> None:
@@ -218,12 +217,16 @@ class ImgTextWindow(QWidget):
         from .component_center import component_center
         snap = component_center().snapshot("ocr")
         phase = snap["phase"]
+        self._refresh_component_state()
         if phase in ("checking", "downloading", "installing"):
             self._component_btn.setText("查看下载进度")
             self._component_label.setText("正在下载识别组件，可以关掉下载窗口，下载在后台继续。")
         elif phase == "error":
             self._component_btn.setText("重新下载识别组件")
             self._component_label.setText("识别组件下载失败：" + (snap["error"] or "原因未知"))
+        elif phase == "cancelled":
+            self._component_btn.setText("重新下载识别组件")
+            self._component_label.setText("识别组件下载已取消，可重新下载。")
         else:
             self._component_btn.setText(f"下载识别组件（约 {COMPONENT_HINT_MB} MB）")
             self._refresh_component_state()

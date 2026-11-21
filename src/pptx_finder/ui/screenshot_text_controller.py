@@ -18,6 +18,7 @@ class ScreenshotTextController(QObject):
         self.recognizer=recognizer
         self.source=QImage()
         self._active_serial=None
+        self._waiting_component=False
         self.dialog=ScreenshotText(owner)
         self.dialog.copy_requested.connect(self.copy)
         self.dialog.retry_requested.connect(lambda:self.start(self.source))
@@ -25,6 +26,26 @@ class ScreenshotTextController(QObject):
         self.dialog.rejected.connect(self.cancel)
         self.progress.connect(self._progress)
         owner._notice.text_requested.connect(self.show)
+        from .component_center import component_center
+        component_center().state_changed.connect(self._on_component_state)
+
+    def _on_component_state(self,key):
+        if key!='ocr' or not self._waiting_component or self.owner._closed:return
+        from .component_center import component_center
+        snap=component_center().snapshot('ocr')
+        phase=snap['phase']
+        if phase=='error':
+            self.dialog.status.setText('识别组件下载失败：'+(snap['error'] or '原因未知')+'；截图已保留，点击重试下载。')
+            self.dialog.install_btn.setText('重试下载识别组件')
+        elif phase=='cancelled':
+            self.dialog.status.setText('识别组件下载已取消；截图已保留，可以重新下载。')
+            self.dialog.install_btn.setText('重新下载识别组件')
+        elif phase in ('checking','downloading','installing'):
+            self.dialog.status.setText('正在准备本地识别组件，可查看下载进度；装好后自动识别。')
+            self.dialog.install_btn.setText('查看下载进度')
+        elif phase=='done':
+            self.dialog.install_btn.hide()
+            self.dialog.status.setText('识别组件已就绪；截图已保留，可点击重新识别。')
 
     def _progress(self,serial,text):
         if not self.owner._closed and serial==self.owner._serial and serial==self._active_serial:
@@ -39,14 +60,18 @@ class ScreenshotTextController(QObject):
     def start(self,image):
         owner=self.owner
         if owner._busy or image.isNull():return
+        self._waiting_component=False
         owner._closed=False
         self.source=image.copy()
         self.dialog.editor.clear()
         owner._preview_image=image.copy()
         owner._paths=[];owner._parts=[];owner._clear_cards();owner._update_preview()
         if self.recognizer is None and not imgtext_ocr.is_installed():
+            self._waiting_component=True
             self.dialog.install_btn.show()
+            self.dialog.install_btn.setText('下载本地识别组件')
             self.dialog.status.setText(f'需要本地识别组件（约 {components.OCR.approx_mb} MB）。点击下载，装好后自动识别；截图留在本机。')
+            self._on_component_state('ocr')
             self.show()
             return
         self.dialog.install_btn.hide()
@@ -118,8 +143,10 @@ class ScreenshotTextController(QObject):
             if self.owner._closed or self.owner._busy or not self.dialog.isVisible():return
             if self.source.isNull() or self.source!=source:return
             self.start(self.source)
-        component_center().request('ocr',self.dialog,on_ready=ready)
         self.dialog.status.setText('正在下载本地识别组件（可在下载窗口查看进度、取消）；装好后自动识别。')
+        self._waiting_component=True
+        component_center().request('ocr',self.dialog,on_ready=ready)
+        self._on_component_state('ocr')
 
     def _install_local(self):
         owner=self.owner
@@ -155,6 +182,7 @@ class ScreenshotTextController(QObject):
         self.dialog.close()
 
     def cancel(self):
+        self._waiting_component=False
         if self.owner._busy and self._active_serial==self.owner._serial:
             self.owner._cancel.set()
             self.owner._serial+=1
