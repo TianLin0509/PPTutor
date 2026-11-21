@@ -78,6 +78,7 @@ def test_index_roots_empty_list_explains_default(qtbot, tmp_path, monkeypatch):
     dlg = SettingsDialog(None)
     qtbot.addWidget(dlg)
     dlg.index_roots_list.clear()
+    dlg._sync_index_roots_empty()
     assert not dlg._index_roots_empty.isHidden()
     assert dlg.index_roots_list.isHidden()
     dlg._append_index_root_item(str(tmp_path))
@@ -115,3 +116,15 @@ def test_health_summary_reports_true_issue_total(qtbot, tmp_path, monkeypatch):
     dlg._render_diag_summary(lines)
     assert "发现 8 个需要关注的问题" in dlg.diag_summary.text()
     assert "只列出前 6 项" in dlg.diag_summary.text()
+
+
+def test_settings_destroy_with_index_roots_does_not_touch_deleted_widgets(qtbot, tmp_path, monkeypatch):
+    """析构时列表逐项删除不能回调到已删除的提示标签（2026-11-22 闸门 0xC0000005）。"""
+    import shiboken6
+
+    monkeypatch.setenv("PPTX_FINDER_DATA_DIR", str(tmp_path / "cfg"))
+    dlg = SettingsDialog(None)
+    for i in range(3):
+        dlg._append_index_root_item(str(tmp_path / f"d{i}"))
+    shiboken6.delete(dlg)
+    qtbot.wait(50)
