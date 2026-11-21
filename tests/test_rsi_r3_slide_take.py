@@ -2,6 +2,7 @@
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
+import os
 import sys
 import threading
 
@@ -272,6 +273,9 @@ def test_action_row_at_desktop_width(preview, qtbot):
 
 @pytest.mark.slow
 @pytest.mark.skipif(sys.platform != "win32", reason="需要 Microsoft PowerPoint COM")
+@pytest.mark.skipif(os.environ.get("PPTX_FINDER_REAL_PPT") != "1",
+                    reason="会改写系统剪贴板、驱动真实 PowerPoint；并行全量里与其他测试抢剪贴板。"
+                           "手动验收时设 PPTX_FINDER_REAL_PPT=1 运行")
 def test_real_powerpoint_copy_and_insert_second_slide_without_windows(tmp_path, monkeypatch):
     """Only activation/visible-target discovery is substituted; copy/clipboard/insert are real."""
     import win32clipboard

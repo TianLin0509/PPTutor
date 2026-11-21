@@ -181,9 +181,25 @@ def temporary_presentations(*, require_open=False):
             renderer._release_local_app_reference()
 
 
-def flush_clipboard():
+def flush_clipboard(attempts: int = 3):
+    """Force Office to render its clipboard formats before closing the deck.
+
+    Read-only, so a short retry is safe: clipboard managers / other apps can hold the
+    clipboard for a moment right after Copy (seen in the 2026-11-22 parallel gate).
+    """
+    import time
     import win32clipboard
-    # Force Office to render its clipboard formats before closing the deck.
+    for attempt in range(attempts):
+        try:
+            _flush_clipboard_once(win32clipboard)
+            return
+        except Exception:  # noqa: BLE001  pywintypes.error：被别的进程短暂占用
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.1)
+
+
+def _flush_clipboard_once(win32clipboard):
     # The Office process owns these OLE storage handles; never republish pointers.
     win32clipboard.OpenClipboard()
     try:
