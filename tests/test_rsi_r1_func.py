@@ -238,4 +238,6 @@ def test_name_layer_updates_do_not_starve_result_refresh(qtbot, tmp_path, monkey
     qtbot.wait(300)
     win._after_name_index_update()
     assert win._live_refresh.remainingTime() <= first_left - 200
+    win._live_refresh.stop()           # 别让刷新在库关闭后才触发
+    win._live_status_refresh.stop()
     conn.close()

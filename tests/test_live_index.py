@@ -1149,17 +1149,20 @@ def test_live_refresh_trailing_edge_runs_without_another_watcher_event(
     win = MainWindow(conn=_index(tmp_path), render_worker=StubRender(), thumb_worker=StubThumb(), do_index=False)
     qtbot.addWidget(win)
     win.search_box.setText("昇腾")
+    # setText 会排一次 280ms 后的真实搜索；闸门满载时它还没跑完，实时刷新会正确地「等搜索结束再补」，
+    # 本用例就超时了（2026-11-22 两次闸门复现）。这里只测节流尾沿，先撤掉这次输入搜索。
+    win._debounce.stop()
     searches = []
     monkeypatch.setattr(win, "_do_search", lambda: searches.append(1))
     win._BG_RESEARCH_MIN_INTERVAL_SEC = 0.05
     win._last_user_input_ts = 0.0
     win._last_bg_research_ts = time.monotonic()
     win._live_refresh_pending = True
+    assert win._search_pending_req is None
 
     win._do_live_refresh()
 
     assert searches == []
-    # 0.5s 在合入闸门满载时偶发超时（2026-11-22 单跑 5/5 过）：放宽到 3s，仍验证窗口结束后自动补跑
     qtbot.waitUntil(lambda: searches == [1], timeout=3000)
     assert win._live_refresh_pending is False
 

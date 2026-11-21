@@ -80,23 +80,35 @@ def list_presentations() -> list[PresentationTarget]:
         return [target for _, target in _targets(app)]
 
 
-def append_slide(source: str | Path, target: PresentationTarget) -> int:
+def _validate_page(page: int) -> None:
+    if isinstance(page, bool) or not isinstance(page, int) or page < 1:
+        raise TransferError("页码必须从 1 开始，请重新选择预览页。")
+
+
+def _insert_slide(pres, path: str, page: int = 1) -> int:
+    """Insert once into the explicitly selected deck; path is a caller-owned snapshot."""
+    _validate_page(page)
+    before = int(pres.Slides.Count)
+    try:
+        inserted = int(pres.Slides.InsertFromFile(path, before, page, page))
+        after = int(pres.Slides.Count)
+    except Exception as exc:
+        raise TransferError("插入未能确认完成，请先检查目标 PPT，避免重复插入。") from exc
+    if inserted != 1 or after != before + 1:
+        raise TransferError("插入结果与预期不符，请检查目标 PPT；没有自动重试。")
+    return before + 1
+
+
+def append_slide(source: str | Path, target: PresentationTarget, page: int = 1) -> int:
     """Re-resolve the exact visible window; never fall back to ActivePresentation."""
-    path = str(Path(source).resolve(strict=True))
-    with existing_app() as app:
+    _validate_page(page)
+    with _source_snapshot(source) as path, existing_app() as app:
         for pres, current in _targets(app):
             if (current.caption == target.caption and
                     os.path.normcase(current.full_name) == os.path.normcase(target.full_name)):
-                before = int(pres.Slides.Count)
                 # Group the explicit edit into the user's undo history when supported.
                 app.StartNewUndoEntry()
-                try:
-                    inserted = int(pres.Slides.InsertFromFile(path, before, 1, 1))
-                except Exception as exc:
-                    raise TransferError("插入未能确认完成，请先检查目标 PPT，避免重复插入。") from exc
-                if inserted != 1 or int(pres.Slides.Count) != before + 1:
-                    raise TransferError("插入结果与预期不符，请检查目标 PPT；没有自动重试。")
-                return before + 1
+                return _insert_slide(pres, path, page)
         raise TransferError("目标 PPT 已关闭或窗口已变化，请重新选择。")
 
 
@@ -169,9 +181,25 @@ def temporary_presentations(*, require_open=False):
             renderer._release_local_app_reference()
 
 
-def flush_clipboard():
+def flush_clipboard(attempts: int = 3):
+    """Force Office to render its clipboard formats before closing the deck.
+
+    Read-only, so a short retry is safe: clipboard managers / other apps can hold the
+    clipboard for a moment right after Copy (seen in the 2026-11-22 parallel gate).
+    """
+    import time
     import win32clipboard
-    # Force Office to render its clipboard formats before closing the deck.
+    for attempt in range(attempts):
+        try:
+            _flush_clipboard_once(win32clipboard)
+            return
+        except Exception:  # noqa: BLE001  pywintypes.error：被别的进程短暂占用
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.1)
+
+
+def _flush_clipboard_once(win32clipboard):
     # The Office process owns these OLE storage handles; never republish pointers.
     win32clipboard.OpenClipboard()
     try:
@@ -188,13 +216,24 @@ def flush_clipboard():
         win32clipboard.CloseClipboard()
 
 
-def copy_slide(source: str | Path):
+@contextmanager
+def _source_snapshot(source: str | Path):
+    source = Path(source).resolve(strict=True)
     with tempfile.TemporaryDirectory(prefix="ppt-copy-") as tmp:
-        snapshot = Path(tmp) / "slide.pptx"
+        # Preserve .ppt for legacy binary decks, too.
+        snapshot = Path(tmp) / ("slide" + source.suffix)
         shutil.copyfile(source, snapshot)
+        yield str(snapshot)
+
+
+def copy_slide(source: str | Path, page: int = 1):
+    _validate_page(page)
+    with _source_snapshot(source) as snapshot:
         with temporary_presentations(require_open=True) as session:
-            pres = session.open(snapshot)
-            pres.Slides.Item(1).Copy()
+            pres = session.open(Path(snapshot))
+            if page > int(pres.Slides.Count):
+                raise TransferError("源 PPT 页数已变化，请刷新预览后重新选择。")
+            pres.Slides.Item(page).Copy()
             flush_clipboard()
 
 

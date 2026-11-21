@@ -186,7 +186,7 @@ def test_primary_ui_text_stays_readable_chinese(qtbot, tmp_path):
     assert "只搜短语" in joined
     assert "筛选" in joined
     assert "打开文件" in joined
-    assert "复制到剪贴板" in joined
+    assert "复制文件" in joined
     assert "选中左侧结果" in joined
     assert "切换界面主题" in joined  # 主题按钮 tooltip 固定前缀（与当前持久化主题无关，避免顺序耦合）
     assert "最小化" in joined

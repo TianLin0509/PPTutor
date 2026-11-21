@@ -741,7 +741,9 @@ class SettingsDialog(QDialog):
         return outer
 
     # ---------- 索引范围 ----------
-    def _sync_index_roots_empty(self, *_args) -> None:
+    def _sync_index_roots_empty(self) -> None:
+        if getattr(self, "_index_roots_empty", None) is None:
+            return          # 构建页面时先灌列表、后建提示标签
         empty = self.index_roots_list.count() == 0
         self._index_roots_empty.setVisible(empty)
         self.index_roots_list.setVisible(not empty)
@@ -786,10 +788,8 @@ class SettingsDialog(QDialog):
         list_box.addWidget(self._index_roots_empty)
         self.index_roots_list.setMaximumHeight(220)
         list_box.addWidget(self.index_roots_list)
-        model = self.index_roots_list.model()
-        model.rowsInserted.connect(self._sync_index_roots_empty)
-        model.rowsRemoved.connect(self._sync_index_roots_empty)
-        model.modelReset.connect(self._sync_index_roots_empty)
+        # 不接 model 的增删信号：对话框析构时列表逐项删除也会发 rowsRemoved，回调里再碰已删除的
+        # 标签会直接崩进程（2026-11-22 合入闸门两次 0xC0000005）。改为在改列表的几处显式同步。
         self._sync_index_roots_empty()
         net_row = QHBoxLayout()
         self.index_root_edit = QLineEdit()
@@ -1034,6 +1034,7 @@ class SettingsDialog(QDialog):
             item.setForeground(QColor("#9a6a00"))
             item.setToolTip(warning)
         self.index_roots_list.addItem(item)
+        self._sync_index_roots_empty()
 
     def _index_root_items(self) -> list[str]:
         return [
@@ -1059,6 +1060,7 @@ class SettingsDialog(QDialog):
     def _remove_index_root(self) -> None:
         for item in self.index_roots_list.selectedItems():
             self.index_roots_list.takeItem(self.index_roots_list.row(item))
+        self._sync_index_roots_empty()
 
     def _set_index_root_editing_enabled(self, enabled: bool) -> None:
         """校验在途期间锁定根列表编辑：在途添加的根会被校验完成后的列表重建静默覆盖。"""
@@ -1101,6 +1103,7 @@ class SettingsDialog(QDialog):
         self._index_roots_saved = tuple(root for root, _ok, _reach, _msg in result)
         # 回写列表：不可达的根标警告样式，但允许保存（网络盘时通时断）
         self.index_roots_list.clear()
+        self._sync_index_roots_empty()
         warnings = 0
         for root, _ok, reachable, msg in result:
             if reachable:

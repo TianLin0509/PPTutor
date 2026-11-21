@@ -36,6 +36,7 @@ _INTERACTIVE_LABELS = {
     "ppt-slim-create",
     "ppt-slim-open",
     "copy-page-text",
+    "ppt-transfer",
     "autostart-toggle", "version-retention-update",
     "vault-storage-status", "vault-storage-configure", "vault-capacity-update",
 }
