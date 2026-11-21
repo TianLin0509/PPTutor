@@ -197,3 +197,79 @@ def test_new_any_file_searchable_through_real_journal_pipeline(qtbot, tmp_path, 
         runtime.stop()
         conn.close()
         shutil.rmtree(work.parent, ignore_errors=True)
+
+
+# ---------- 2026-11-21 Codex 审查补的四条 ----------
+
+def test_restart_keeps_unfolded_hot_entries(qtbot, tmp_path, monkeypatch):
+    """上次没来得及并入增量层的热层条目，重启后第一次重写不能把它们冲掉。"""
+    monkeypatch.setenv("PPTX_FINDER_DATA_DIR", str(tmp_path / "appdata"))
+    old = tmp_path / "重启前新建.txt"
+    old.write_text("x", encoding="utf-8")
+    hot = hot_names.HotNames()
+    hot.note(str(old))
+    hot_names.write_hot_layer(hot.snapshot())
+    win, conn = _window(qtbot, tmp_path, monkeypatch)
+    new = tmp_path / "重启后新建.txt"
+    new.write_text("x", encoding="utf-8")
+    win.note_names_changed([str(new)])
+    qtbot.waitUntil(lambda: new.name in _search("重启后新建"), timeout=5000)
+    assert old.name in _search("重启前新建")
+    conn.close()
+
+
+def test_fold_refreshes_metadata_already_in_overlay(tmp_path, monkeypatch):
+    from pptx_finder.ui.main_window import MainWindow
+
+    monkeypatch.setenv("PPTX_FINDER_DATA_DIR", str(tmp_path / "appdata"))
+    f = tmp_path / "会变大.bin"
+    f.write_bytes(b"x")
+    MainWindow._reconcile_inventory_dirs_sync((str(tmp_path),))
+    f.write_bytes(b"x" * 5000)
+    hot = hot_names.HotNames()
+    hot.note(str(f))
+    MainWindow._reconcile_inventory_dirs_sync((), hot.snapshot())
+    st = namestore.open_store(namestore.OVERLAY)
+    try:
+        sizes = [st.entry(i)[2] for i in range(st.count) if st.entry(i)[1] == f.name]
+    finally:
+        st.close()
+    assert sizes == [5000]
+
+
+def test_transient_stat_failure_keeps_hot_entry(tmp_path, monkeypatch):
+    from pptx_finder.ui.main_window import MainWindow
+
+    monkeypatch.setenv("PPTX_FINDER_DATA_DIR", str(tmp_path / "appdata"))
+    f = tmp_path / "被占用.pptx"
+    f.write_bytes(b"x")
+    hot = hot_names.HotNames()
+    hot.note(str(f))
+
+    def busy(_path):
+        raise hot_names.StatUnavailable("sharing violation")
+
+    monkeypatch.setattr(hot_names, "stat_entry", busy)
+    res = MainWindow._reconcile_inventory_dirs_sync((), hot.snapshot())
+    assert res["hot_folded"] == []
+    assert hot_names.write_hot_layer(hot.snapshot()) == 1   # 名字仍然可搜
+
+
+def test_hot_write_failure_retries_without_new_events(qtbot, tmp_path, monkeypatch):
+    win, conn = _window(qtbot, tmp_path, monkeypatch)
+    f = tmp_path / "写失败后重试.txt"
+    f.write_text("x", encoding="utf-8")
+    real = hot_names.write_hot_layer
+    calls = []
+
+    def flaky(snap):
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError("disk busy")
+        return real(snap)
+
+    monkeypatch.setattr(hot_names, "write_hot_layer", flaky)
+    win.note_names_changed([str(f)])
+    qtbot.waitUntil(lambda: _search("写失败后重试") == [f.name], timeout=8000)
+    assert len(calls) >= 2
+    conn.close()

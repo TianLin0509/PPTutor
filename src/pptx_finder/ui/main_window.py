@@ -1242,6 +1242,12 @@ class MainWindow(QMainWindow):
         self._hot_write_timer.setSingleShot(True)
         self._hot_write_timer.setInterval(self._HOT_WRITE_DEBOUNCE_MS)
         self._hot_write_timer.timeout.connect(self._write_hot_layer)
+        self._hot_write_failures = 0
+        if self._index_all_files_enabled:
+            try:
+                self._hot_names.restore_from_disk()
+            except Exception:  # noqa: BLE001 热层坏了就当空的，不影响启动
+                _log.warning("hot name layer restore failed", exc_info=True)
         self._last_full_scan_wall = 0.0  # 上次完整扫描成功结束的时间（time.time）
         self._inventory_reconcile_inflight = False
         self._inventory_reconcile_timer = QTimer(self)
@@ -2908,14 +2914,27 @@ class MainWindow(QMainWindow):
         snap = self._hot_names.snapshot()
         task = BackgroundTask(lambda snap=snap: hot_names.write_hot_layer(snap), "hot-names")
         self._bg_tasks.append(task)
+        task.done.connect(self._on_hot_written)
         task.finished.connect(lambda task=task: self._finish_hot_write(task))
         task.start()
+
+    def _on_hot_written(self, result) -> None:
+        # BackgroundTask 出异常时回 None：写失败要自己重试，否则没有新事件就再也不写
+        if result is None:
+            self._hot_write_failures += 1
+            self._hot_write_again = True
+        else:
+            self._hot_write_failures = 0
 
     def _finish_hot_write(self, task) -> None:
         self._hot_write_inflight = False
         if task in self._bg_tasks:
             self._bg_tasks.remove(task)
         if self._hot_write_again and not self._closing:
+            if self._hot_write_failures:
+                # 退避：2、4、8…最长 60 秒
+                self._hot_write_timer.setInterval(
+                    min(60_000, 1000 * 2 ** min(self._hot_write_failures, 6)))
             self._hot_write_timer.start()
 
     def _run_inventory_reconcile(self) -> None:
@@ -3000,6 +3019,7 @@ class MainWindow(QMainWindow):
                         main_store.close()
             # 先把上一版增量层原样搬过来，否则这一轮只保留本批目录的内容，
             # 上一批刚发现的新文件会当场消失
+            hot_keys = {key for key, _path, _seq in hot}
             previous = namestore.open_store(namestore.OVERLAY)
             if previous is not None:
                 try:
@@ -3010,6 +3030,8 @@ class MainWindow(QMainWindow):
                         # 跳过新值；那会让第二次修改永远保留第一次的大小/时间。
                         if os.path.normcase(os.path.dirname(path)) in dirty_keys:
                             continue
+                        if key in hot_keys:
+                            continue      # 热层记的是更新的状态，下面重新取值
                         if key in seen:
                             continue      # 已删除的条目在结果显示前的 stat 里自然消失，不必每轮全部 stat
                         seen.add(key)
@@ -3023,8 +3045,11 @@ class MainWindow(QMainWindow):
                     totals["overflowed"] = True
                     break
                 if key not in seen:
-                    entry = hot_names.stat_entry(path)
-                    if entry is not None:     # 已经没了的不收，热层也不必再留
+                    try:
+                        entry = hot_names.stat_entry(path)
+                    except hot_names.StatUnavailable:
+                        continue              # 暂时读不到：留在热层下轮再并
+                    if entry is not None:     # 确定没了的不收，热层也不必再留
                         p, size, mtime, is_dir = entry
                         seen.add(key)
                         if is_dir:
