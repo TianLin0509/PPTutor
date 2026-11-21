@@ -66,13 +66,31 @@ class HotNames:
     def clear(self) -> None:
         self._items.clear()
 
+    def restore_from_disk(self) -> int:
+        """启动时接上上次没来得及并入增量层的热层条目，否则第一次重写会把它们覆盖掉。"""
+        store = namestore.open_store(namestore.HOT)
+        if store is None:
+            return 0
+        try:
+            for i in range(store.count):
+                self.note(store.entry(i)[0])
+            return store.count
+        finally:
+            store.close()
+
+
+class StatUnavailable(OSError):
+    """文件还在但暂时读不到（共享冲突、权限）：调用方保留条目，下次再试。"""
+
 
 def stat_entry(path: str):
-    """返回 (path, size, mtime, is_dir)；文件已不在返回 None。"""
+    """返回 (path, size, mtime, is_dir)；确定已不存在返回 None；暂时读不到抛 StatUnavailable。"""
     try:
         st = os.stat(path)
-    except OSError:
+    except (FileNotFoundError, NotADirectoryError):
         return None
+    except OSError as exc:
+        raise StatUnavailable(str(exc)) from exc
     is_dir = os.path.isdir(path)
     return path, 0 if is_dir else int(st.st_size), st.st_mtime, is_dir
 
@@ -83,7 +101,10 @@ def write_hot_layer(snapshot) -> int:
     try:
         count = 0
         for _key, path, _seq in snapshot:
-            entry = stat_entry(path)
+            try:
+                entry = stat_entry(path)
+            except StatUnavailable:
+                entry = (path, 0, 0.0, False)   # 名字照样可搜，大小/时间等下次补
             if entry is None:
                 continue
             p, size, mtime, is_dir = entry
