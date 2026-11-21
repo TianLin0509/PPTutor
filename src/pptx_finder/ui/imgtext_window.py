@@ -103,7 +103,7 @@ class ImgTextWindow(QWidget):
         root.addWidget(title)
         note = QLabel("把 PPT 效果图拖进来，图里的文字会变成真正的文本框；"
                       "图形、配色、版式原样保留在背景里。全程离线。")
-        note.setObjectName("emptyMeta")
+        note.setObjectName("dashSub")   # 与素材库副标题同级；emptyMeta 太浅，几乎读不出来
         note.setWordWrap(True)
         root.addWidget(note)
 

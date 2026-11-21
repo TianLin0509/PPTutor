@@ -100,7 +100,7 @@ def test_qss_icons_render_from_path_with_spaces_and_chinese(qtbot, tmp_path, mon
 
 
 def test_status_bar_and_inputs_share_the_main_window_language():
-    """状态栏不画 Qt 默认的小件竖线；输入框、数字框与主搜索框同为白底描边。"""
+    """状态栏不画 Qt 默认的小件竖线；输入框、数字框与主搜索框同为灰槽底（2026-11-21 对齐 AI HUB-H）。"""
     for name, _label in theme.THEMES:
         qss = theme.build_qss(name)
         assert "QStatusBar#statusBar::item { border: none; }" in qss, name
@@ -108,6 +108,8 @@ def test_status_bar_and_inputs_share_the_main_window_language():
         assert "ui-chevron-up-" in qss, name
     qss = theme.build_qss("atelier")
     line_edit = qss.split("QLineEdit {", 1)[1].split("}", 1)[0]
-    assert "border: 1px solid" in line_edit
+    search_box = qss.split("QLineEdit#searchBox {", 1)[1].split("}", 1)[0]
+    field = theme.tok("atelier")["field"]
+    assert f"background: {field}" in line_edit and f"background: {field}" in search_box
     disabled = qss.split("QPushButton:disabled {", 1)[1].split("}", 1)[0]
     assert "background: transparent" in disabled  # 禁用按钮不再是一块实心灰

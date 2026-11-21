@@ -44,8 +44,6 @@ class MaterialWindow(QWidget):
         # 团队素材包没装时就地给下载入口（开箱即用，不让用户跑到设置页找）
         self.pack_bar = QFrame()
         self.pack_bar.setObjectName("teamPackBar")
-        self.pack_bar.setStyleSheet(
-            "QFrame#teamPackBar { border: 1px solid palette(mid); border-radius: 6px; }")
         bar = QHBoxLayout(self.pack_bar)
         bar.setContentsMargins(12, 8, 8, 8)
         self.pack_label = QLabel("")

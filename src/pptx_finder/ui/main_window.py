@@ -1533,6 +1533,10 @@ class MainWindow(QMainWindow):
         # 窄窗口时排序/匹配下拉可以收窄，结果计数可以省略号截断，不把整窗最小宽度顶高
         for w in (self.sort_combo, self.sort_secondary, self.match_mode_combo):
             w.setMinimumWidth(100)
+        # 「模糊匹配」四个字在 100px 里会被裁掉一截：按最长项实际字宽给足（含箭头留白）
+        fm = self.match_mode_combo.fontMetrics()
+        self.match_mode_combo.setMinimumWidth(
+            max(120, max(fm.horizontalAdvance(t) for t in ("模糊匹配", "精确匹配")) + 48))
         self.result_count.setMinimumWidth(40)
         self.result_count.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.list_head.hide()
@@ -3895,6 +3899,9 @@ class MainWindow(QMainWindow):
 
     def open_settings_page(self, page: str) -> None:
         """打开设置窗口并定位到指定分类（托盘、截图窗的「快捷键」入口走这里）。"""
+        # 此前漏了这行导入：没有已开的设置窗时，托盘「快捷键」直接 NameError、点了没反应
+        from .settings_dialog import SettingsDialog
+
         for dlg in list(self._settings_dialogs):
             try:
                 if dlg.isVisible():
