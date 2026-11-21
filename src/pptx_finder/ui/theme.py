@@ -142,7 +142,7 @@ QToolTip { background: $panel; color: $ink1; border: 1px solid $bd; border-radiu
 
 /* 合一工具栏（无边框窗口自绘标题栏：品牌 + 搜索 + 筛选 + 图标按钮 + 窗口控制） */
 QWidget#glassTitle { background: $panel; border-bottom: 1px solid $bd2; }
-QWidget#mainColumn { background: $panel; }
+QWidget#mainColumn { background: $panel; border-radius: 16px; }
 QLabel#gtDot { color: $acc; font-size: 12px; background: transparent; }
 QLabel#gtName { color: $ink1; font-size: 15px; font-weight: 700; background: transparent; }
 QLabel#gtVer { color: $ink4; font-size: 11px; font-family: $mono_family; background: transparent; }
@@ -155,7 +155,7 @@ QPushButton#winMin:hover, QPushButton#winMax:hover { background: $hover; color: 
 QPushButton#winClose:hover { background: #E81123; color: #FFFFFF; }
 
 /* 左侧导航栏：品牌 + 页面切换（搜索/概览/版本/健康）+ 工具（截图/转字/素材/报告/设置）+ 主题 */
-QWidget#navRail { background: $rail; border-right: 1px solid $bd2; }
+QWidget#navRail { background: $rail; border: none; border-radius: 20px; }
 QWidget#railBrand { background: transparent; }
 QLabel#railLogo { background: transparent; }
 QPushButton#railBtn {
@@ -328,6 +328,7 @@ QListView#historyPopup::item:selected { background: $sel; color: $ink1; }
 QWidget#emptyHint { background: transparent; }
 QLabel#emptyIcon { font-size: 38px; background: transparent; }
 QLabel#emptyTitle { color: $ink2; font-size: 15px; font-weight: 600; background: transparent; }
+QWidget#materialEmpty { background: $panel; border: 1px solid $bd2; border-radius: 16px; }
 QLabel#emptyTip { color: $ink3; font-size: 12px; background: transparent; }
 QLabel#emptyMeta { color: $ink4; font-size: 11.5px; background: transparent; }
 QPushButton#suggBtn { background: $field; border: 1px solid transparent; border-radius: 15px; padding: 7px 18px; color: $ink2; font-size: 12.5px; font-weight: 500; }
@@ -352,7 +353,7 @@ QPushButton#navBtn:disabled { color: $ink4; background: $field; border-color: tr
 QLabel#pageLabel { color: $ink3; font-size: 12px; font-family: $mono_family; background: transparent; }
 
 /* 状态栏 */
-QStatusBar#statusBar { background: $rail; border-top: 1px solid $bd2; color: $ink3; }
+QStatusBar#statusBar { background: transparent; border: none; color: $ink3; }
 QStatusBar#statusBar::item { border: none; }
 QStatusBar#statusBar QLabel { color: $ink3; font-size: 12px; background: transparent; }
 QStatusBar#statusBar QLabel#lastIndexLabel { padding-left: 10px; }
@@ -466,7 +467,7 @@ QListWidget::item { color: $ink1; padding: 7px 10px; border-radius: 10px; }
 QListWidget::item:hover { background: $hover; }
 QListWidget::item:selected { background: $sel; color: $acc; }
 QCheckBox { color: $ink1; spacing: 7px; background: transparent; }
-QCheckBox::indicator { width: 16px; height: 16px; border: 1.5px solid $bd; border-radius: 5px; background: $field; }
+QCheckBox::indicator { width: 16px; height: 16px; border: 1.5px solid $ink4; border-radius: 5px; background: $panel; }
 QCheckBox::indicator:hover { border-color: rgba($hl_r,$hl_g,$hl_b,0.58); }
 QCheckBox::indicator:checked { background: $acc; border-color: $acc; image: url("$check_icon"); }
 QCheckBox::indicator:disabled { background: $selblur; border-color: $bd2; }

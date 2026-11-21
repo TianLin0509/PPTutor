@@ -1437,12 +1437,15 @@ class MainWindow(QMainWindow):
         self._central = central
         # v2.0 白色工作台：左侧整高侧栏（品牌 + 导航 + 工具 + 主题），右侧是顶栏与页面
         outer = QHBoxLayout(central)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
+        # HUB-H 冷白工作室：灰画布上浮起白色导航岛与内容面板，彼此留 10px 缝
+        outer.setContentsMargins(10, 10, 10, 6)
+        outer.setSpacing(10)
         right_col = QWidget()
         right_col.setObjectName("mainColumn")
+        right_col.setAttribute(Qt.WA_StyledBackground, True)
         root = QVBoxLayout(right_col)
-        root.setContentsMargins(0, 0, 0, 0)
+        # 内缩 5px：子控件是方角的同色底，贴边会把面板 16px 圆角盖成直角
+        root.setContentsMargins(5, 5, 5, 5)
         root.setSpacing(0)
 
         root.addWidget(self._build_glass_title())  # 无边框窗口的自绘顶栏（搜索 + 窗口按钮）
@@ -1706,6 +1709,7 @@ class MainWindow(QMainWindow):
         """整高侧栏：品牌在顶，四个页面（搜索/概览/版本/健康），工具（截图/转字/素材/报告/设置），主题在底。"""
         rail = QWidget()
         rail.setObjectName("navRail")
+        rail.setAttribute(Qt.WA_StyledBackground, True)
         rail.setFixedWidth(self._RAIL_W)
         lay = QVBoxLayout(rail)
         lay.setContentsMargins(12, 16, 12, 12)
@@ -2072,6 +2076,7 @@ class MainWindow(QMainWindow):
     def _build_preview(self) -> QWidget:
         panel = QWidget()
         panel.setObjectName("previewPanel")
+        self._preview_panel = panel
         lay = QVBoxLayout(panel)
         lay.setContentsMargins(12, 10, 12, 12)
         lay.setSpacing(8)
@@ -3589,6 +3594,8 @@ class MainWindow(QMainWindow):
         self._empty_index_status.setObjectName("emptyMeta")
         self._empty_index_status.setAlignment(Qt.AlignCenter)
         self._empty_index_status.setWordWrap(True)
+        # 可换行的标签在居中布局里会被挤到最窄，「12 页」被拆成两行：给够一行的宽度
+        self._empty_index_status.setMinimumWidth(460)
         v.addWidget(self._empty_index_status)
         self._sugg_btns: dict[str, QPushButton] = {}
         for key, text in (
@@ -3747,6 +3754,7 @@ class MainWindow(QMainWindow):
         self._sugg_btns["query"].hide()
         self._clear_facet_btn.hide()
         self.empty_hint.show()
+        self._set_preview_visible(False)
         self._set_empty_query_suggestion_async(query)
 
     def _show_start_hint(self) -> None:
@@ -3765,6 +3773,13 @@ class MainWindow(QMainWindow):
             btn.hide()
         self._clear_facet_btn.hide()
         self.empty_hint.show()
+        self._set_preview_visible(False)
+
+    def _set_preview_visible(self, visible: bool) -> None:
+        """没有结果时右侧整块预览（空框 + 一排灰按钮）没有意义：收起，让空状态占满。"""
+        panel = getattr(self, "_preview_panel", None)
+        if panel is not None and panel.isHidden() == visible:
+            panel.setVisible(visible)
 
     def _hide_empty_hint(self, *, invalidate_status: bool = True) -> None:
         if getattr(self, "empty_hint", None) is not None:
@@ -3777,6 +3792,7 @@ class MainWindow(QMainWindow):
                 self._empty_query_suggestion = ""
             self.empty_hint.hide()
             self.result_list.show()
+            self._set_preview_visible(True)
 
     def _apply_suggestion(self, key: str) -> None:
         q = self.search_box.text()
