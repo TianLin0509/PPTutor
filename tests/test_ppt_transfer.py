@@ -86,7 +86,7 @@ def test_whole_slide_copy_requires_a_live_user_deck_and_uses_a_snapshot(monkeypa
             assert path != source
             assert path.read_bytes() == source.read_bytes()
             opened.append(path)
-            return SimpleNamespace(Slides=SimpleNamespace(Item=lambda _: SimpleNamespace(Copy=lambda: None)))
+            return SimpleNamespace(Slides=SimpleNamespace(Count=1, Item=lambda _: SimpleNamespace(Copy=lambda: None)))
         yield SimpleNamespace(open=open_snapshot)
     monkeypatch.setattr(transfer, "temporary_presentations", context)
     monkeypatch.setattr(transfer, "flush_clipboard", lambda: None)

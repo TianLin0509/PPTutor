@@ -17,9 +17,9 @@ import sys
 import time
 
 from PySide6.QtCore import QEvent, QMimeData, QObject, QPoint, QPropertyAnimation, QRect, QSize, Qt, QStringListModel, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QCursor, QDrag, QFontMetrics, QGuiApplication, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap, QShortcut
+from PySide6.QtGui import QAction, QColor, QCursor, QDrag, QFontMetrics, QGuiApplication, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap, QShortcut
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QCompleter, QDialog, QFrame, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+    QApplication, QComboBox, QCompleter, QDialog, QFrame, QGraphicsOpacityEffect, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMainWindow, QMenu, QProgressBar, QPushButton, QScrollArea,
     QSizePolicy, QSplitter, QStackedWidget, QToolButton, QVBoxLayout, QWidget,
 )
@@ -31,7 +31,7 @@ try:
 except Exception:  # noqa: BLE001
     _WIN = False
 
-from .. import actions, db, history, hot_names, indexer as indexer_mod, namestore, renderer as renderer_mod, search as search_mod, updater, __version__
+from .. import actions, db, history, hot_names, indexer as indexer_mod, namestore, ppt_transfer, renderer as renderer_mod, search as search_mod, updater, __version__
 from ..config import (
     DOCX_EXT, PDF_EXT, PPTX_EXT, PPT_EXTS, SUPPORTED_EXTS, db_path as cfg_db_path,
     enabled_index_exts as cfg_enabled_index_exts, ext_path,
@@ -2195,14 +2195,26 @@ class MainWindow(QMainWindow):
         self.goto_btn.clicked.connect(self._act_goto)
         self.open_btn = QPushButton(" 打开文件")
         self.open_btn.clicked.connect(self._act_open)
-        self.folder_btn = QPushButton(" 打开文件夹")
-        self.folder_btn.clicked.connect(self._act_folder)
-        self.clip_btn = QPushButton(" 复制到剪贴板")
-        self.clip_btn.setToolTip("复制文件到剪贴板，可直接粘贴到邮件 / 聊天 / 资源管理器")
-        self.clip_btn.clicked.connect(self._act_copy_clipboard)
-        for b in (self.goto_btn, self.open_btn, self.folder_btn, self.clip_btn):
+        self.copy_slide_btn = QPushButton("复制本页")
+        self.copy_slide_btn.setToolTip("复制当前预览页为 PowerPoint 幻灯片，保留原版式")
+        self.copy_slide_btn.clicked.connect(self._act_copy_slide)
+        self.insert_slide_btn = QPushButton("插入到 PPT…")
+        self.insert_slide_btn.setToolTip("将当前预览页插到已打开的 PPT 末尾，不自动保存")
+        self.insert_slide_btn.clicked.connect(self._act_insert_slide)
+        self.more_btn = QPushButton("更多")
+        more = QMenu(self.more_btn)
+        more.setToolTipsVisible(True)
+        self.folder_btn = QAction("打开文件夹", more)
+        self.folder_btn.triggered.connect(self._act_folder)
+        self.clip_btn = QAction("复制文件", more)
+        self.clip_btn.setToolTip("复制整个文件到剪贴板，可直接粘贴到邮件 / 聊天 / 资源管理器")
+        self.clip_btn.triggered.connect(self._act_copy_clipboard)
+        more.addAction(self.folder_btn)
+        more.addAction(self.clip_btn)
+        self.more_btn.setMenu(more)
+        for b in (self.goto_btn, self.open_btn, self.copy_slide_btn, self.insert_slide_btn, self.more_btn):
             b.setMinimumHeight(38)
-            # 窄窗口时允许按钮收窄（否则四个按钮的文字宽度会把整窗最小宽度顶到 1400+）
+            # 窄窗口时允许按钮收窄，避免操作行把整窗最小宽度顶到 1400+。
             b.setMinimumWidth(64)
             b.setIconSize(QSize(16, 16))
             b.setCursor(Qt.PointingHandCursor)
@@ -2480,11 +2492,15 @@ class MainWindow(QMainWindow):
 
     def _set_ops_enabled(self, on: bool) -> None:
         on = on and self._active_heavy_op is None and self._search_pending_req is None
-        for w in (self.open_btn, self.folder_btn, self.clip_btn,
+        for w in (self.open_btn, self.folder_btn, self.clip_btn, self.more_btn,
                   self.copy_path_btn, self.copy_text_btn,
                   self.prev_btn, self.next_btn):
             w.setEnabled(on)
         can_goto = on and self._cur is not None and (self._cur.ext or "").lower() in PPT_EXTS
+        is_ppt = self._cur is not None and not self._cur.is_dir and (self._cur.ext or "").lower() in PPT_EXTS
+        for button in (self.copy_slide_btn, self.insert_slide_btn):
+            button.setVisible(is_ppt)
+            button.setEnabled(on and is_ppt)
         self.goto_btn.setEnabled(can_goto)
         self.goto_btn.setToolTip(
             "用 PowerPoint 打开并跳到当前页"
@@ -2535,7 +2551,8 @@ class MainWindow(QMainWindow):
             btn = getattr(self, attr, None)
             if btn is not None:
                 btn.setIcon(_icons.icon(name, color, 16))
-                btn.setIconSize(QSize(16, 16))
+                if isinstance(btn, QPushButton):
+                    btn.setIconSize(QSize(16, 16))
 
     def _update_preview_header(self, r: FileResult | None) -> None:
         """预览顶栏：完整路径（可复制）+ 大小 · 页数 · 修改时间。"""
@@ -6254,6 +6271,77 @@ class MainWindow(QMainWindow):
             return
         self._open_at_page_bg(self._cur.path, self._view_page)
 
+    def _run_slide_transfer(self, fn, done, operation: str) -> None:
+        if self._block_if_search_pending() or self._block_if_file_op_active():
+            return
+        self._active_heavy_op = "ppt-transfer"
+        self._set_ops_enabled(False)
+        button = self.copy_slide_btn if operation == "复制本页" else self.insert_slide_btn
+        button.setText("复制中…" if operation == "复制本页" else "处理中…")
+        self._toast(f"正在{operation}…")
+
+        def work():
+            try:
+                return {"value": fn()}
+            except FileNotFoundError:
+                return {"error": "源文件已移动或删除，请刷新搜索结果后重试。"}
+            except PermissionError:
+                return {"error": "源文件被占用或无读取权限，请关闭占用程序或检查权限后重试。"}
+            except ppt_transfer.TransferError as exc:
+                return {"error": str(exc)}
+            except Exception as exc:
+                _log.exception("preview slide transfer failed")
+                return {"error": f"{exc}；请确认已安装 Microsoft PowerPoint 且目标 PPT 已打开。"
+                                 "若刚执行插入，请先检查目标 PPT，避免重复插入。"}
+
+        def finish(payload):
+            # Release before opening the chooser: its confirmed insertion is another task.
+            self._active_heavy_op = None
+            self.copy_slide_btn.setText("复制本页")
+            self.insert_slide_btn.setText("插入到 PPT…")
+            self._set_ops_enabled(self._cur is not None)
+            self._flush_deferred_preview_if_idle()
+            if not isinstance(payload, dict) or "error" in payload:
+                error = payload.get("error") if isinstance(payload, dict) else "任务未完成，请检查目标 PPT 后重试。"
+                self._toast(f"{operation}失败：{error}")
+                return
+            done(payload["value"])
+
+        self._run_bg(work, finish, "ppt-transfer")
+
+    def _act_copy_slide(self) -> None:
+        if self._cur and not self._cur.is_dir and (self._cur.ext or "").lower() in PPT_EXTS:
+            self._copy_preview_slide(self._cur.path, self._view_page)
+
+    def _copy_preview_slide(self, source: str, page: int) -> None:
+        self._run_slide_transfer(
+            lambda: ppt_transfer.copy_slide(source, page=page),
+            lambda _: self._toast(f"已复制第 {page} 页，到 PPT 左侧缩略图区 Ctrl+V 粘贴"),
+            "复制本页",
+        )
+
+    def _act_insert_slide(self) -> None:
+        if self._cur and not self._cur.is_dir and (self._cur.ext or "").lower() in PPT_EXTS:
+            self._insert_preview_slide(self._cur.path, self._view_page)
+
+    def _insert_preview_slide(self, source: str, page: int) -> None:
+        def choose(targets):
+            if not targets:
+                self._toast("没有可编辑的已打开 PPT，请先在 Microsoft PowerPoint 中打开目标文稿。")
+                return
+            labels = [f"{i + 1}. {t.name} · {t.slides} 页 · {t.full_name}" for i, t in enumerate(targets)]
+            label, ok = QInputDialog.getItem(
+                self, "选择已打开的 PPT", "在所选 PPT 末尾新增一页（不自动保存）：", labels, 0, False)
+            if ok:
+                target = targets[labels.index(label)]
+                self._run_slide_transfer(
+                    lambda: ppt_transfer.append_slide(source, target, page=page),
+                    lambda added: self._toast(f"已插入到《{target.name}》第 {added} 页"),
+                    "插入本页",
+                )
+
+        self._run_slide_transfer(ppt_transfer.list_presentations, choose, "读取已打开的 PPT")
+
     def _activate_result_item(self, item: QListWidgetItem | None) -> None:
         if item is not None and self.result_list.currentItem() is not item:
             self.result_list.setCurrentItem(item)
@@ -6291,6 +6379,11 @@ class MainWindow(QMainWindow):
         if idx is None or idx >= len(self._results):
             return
         r = self._results[idx]
+        is_ppt = not r.is_dir and (r.ext or "").lower() in PPT_EXTS
+        if is_ppt and self.result_list.currentItem() is not item:
+            # Right-clicking another deck first previews it; never transfer the old deck's page.
+            self.result_list.setCurrentItem(item)
+        page = self._view_page
         render_gen = self._render_gen
         menu = QMenu(self)
         menu.addAction("打开文件", lambda _checked=False, r=r, gen=render_gen:
@@ -6302,6 +6395,11 @@ class MainWindow(QMainWindow):
                                r.path, r.hits[0].page_no if r.hits else 1)))
         menu.addAction("打开所在文件夹", lambda _checked=False, r=r, gen=render_gen:
                        self._run_context_menu_action(gen, lambda: self._open_folder_path(r.path)))
+        if is_ppt:
+            menu.addAction("复制本页幻灯片", lambda _checked=False, r=r, page=page, gen=render_gen:
+                           self._run_context_menu_action(gen, lambda: self._copy_preview_slide(r.path, page)))
+            menu.addAction("插入到打开的 PPT…", lambda _checked=False, r=r, page=page, gen=render_gen:
+                           self._run_context_menu_action(gen, lambda: self._insert_preview_slide(r.path, page)))
         if str(r.path).lower().endswith(".pptx"):
             menu.addAction("PPT 瘦身体检", lambda _checked=False, r=r, gen=render_gen:
                            self._run_context_menu_action(gen, lambda: self._open_slim_window(r.path)))
