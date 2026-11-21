@@ -123,6 +123,8 @@ def _diagnostic_summary_lines(lines: list[str]) -> list[str]:
             and "last_error=-" not in line
         ):
             issues.append("版本快照近期有失败记录：" + line)
+        elif line.startswith("vault_fsck_manual:") and "ok=False" in line:
+            issues.append("版本库深度检查发现问题：" + line.split(":", 1)[1].strip())
         elif (
             line.startswith("vault_fsck:")
             and "versions=0" not in line
@@ -1773,19 +1775,34 @@ class SettingsDialog(QDialog):
         self.diagnostic_text.setVisible(on)
         self.diag_toggle.setText("收起完整诊断日志" if on else "展开完整诊断日志")
 
-    def _render_diag_summary(self, lines: list[str]) -> None:
+    def _render_diag_summary(self, lines: list[str], note: str = "") -> None:
+        """从完整诊断行重新提炼人话结论（深度检查等后追加的行也算进去）。"""
         label = getattr(self, "diag_summary", None)
         if not _qt_is_valid(label):
             return
-        issues = [ln.split(":", 1)[1].strip() for ln in lines if ln.startswith("diagnostic_issue:")]
-        if not issues:
+        raw = [ln for ln in lines if ln and not ln.startswith(("diagnostic_summary:", "diagnostic_issue:"))]
+        tail = f'<br><span style="color:#6E7781">{html.escape(note)}</span>' if note else ""
+        if any(ln.startswith("diagnostics: unavailable") for ln in raw):
+            label.setText('<span style="color:#D97706;font-weight:600">● 诊断没能完成</span>'
+                          '　点上方「刷新」再试一次；还不行就点「复制」把日志发给维护人。' + tail)
+            return
+        summary = _diagnostic_summary_lines(raw)
+        issues = [ln.split(":", 1)[1].strip() for ln in summary if ln.startswith("diagnostic_issue:")]
+        m = re.search(r"发现 (\d+) 个", summary[0]) if summary else None
+        total = int(m.group(1)) if m else len(issues)
+        if not total:
             label.setText('<span style="color:#3A9E42;font-weight:600">● 一切正常</span>'
-                          '　索引、版本库和运行环境都没发现问题。')
+                          '　索引、版本库和运行环境都没发现问题。' + tail)
             return
         items = "".join(f"<li>{html.escape(x)}</li>" for x in issues)
-        label.setText(f'<span style="color:#D97706;font-weight:600">● 发现 {len(issues)} 个需要关注的问题</span>'
+        more = f"（只列出前 {len(issues)} 项，其余见完整日志）" if total > len(issues) else ""
+        label.setText(f'<span style="color:#D97706;font-weight:600">● 发现 {total} 个需要关注的问题</span>{more}'
                       f'<ul style="margin:6px 0 0 -20px">{items}</ul>'
-                      '<span style="color:#6E7781">需要维护人帮忙时，点上方「复制」把完整诊断发过去。</span>')
+                      '<span style="color:#6E7781">需要维护人帮忙时，点上方「复制」把完整诊断发过去。</span>' + tail)
+
+    def _rerender_diag_summary(self, note: str = "") -> None:
+        if _qt_is_valid(getattr(self, "diagnostic_text", None)):
+            self._render_diag_summary(self.diagnostic_text.toPlainText().splitlines(), note)
 
     def _on_diagnostics_ready(self, token: int, result: object) -> None:
         if not self._ui_alive():
@@ -1857,6 +1874,7 @@ class SettingsDialog(QDialog):
         self.diagnostic_text.appendPlainText(
             "\nvault_fsck_manual: running deep object verification..."
         )
+        self._rerender_diag_summary("正在深度检查版本库，大库约需一分钟…")
 
         def audit_repository():
             # Attribute resolution initializes the lazy version backend. A
@@ -1880,6 +1898,7 @@ class SettingsDialog(QDialog):
             line = "vault_fsck_manual: unavailable"
             self._diag_extra_lines.append(line)
             self.diagnostic_text.appendPlainText("\n" + line)
+            self._rerender_diag_summary()
             return
         line = (
             "vault_fsck_manual: "
@@ -1892,6 +1911,7 @@ class SettingsDialog(QDialog):
         )
         self._diag_extra_lines.append(line)
         self.diagnostic_text.appendPlainText("\n" + line)
+        self._rerender_diag_summary()
 
     def _finish_vault_audit(self, task) -> None:
         self._forget_diag_task(task)
