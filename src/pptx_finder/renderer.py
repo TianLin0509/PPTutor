@@ -1255,6 +1255,7 @@ def _render_page_direct(
     use_snapshot: bool = False,
     existing_session_only: bool = False,
     allow_borrowed_session: bool = False,
+    retry: bool = False,
 ) -> Path | None:
     """导出 path 第 page_no 页（1-based）为高清 PNG，返回缓存路径；失败返回 None。
 
@@ -1263,7 +1264,12 @@ def _render_page_direct(
     hi_priority=True（预览）抢占共享 COM 锁，缩略图等低优先渲染让路（见 _priority）。
     """
     _state.last_error = ""
+    _state.last_error_category = "other"
     path = os.path.abspath(path)
+    if not os.path.exists(path):
+        _state.last_error = "source file does not exist"
+        _state.last_error_category = "missing_file"
+        return None
     if cache_key is None:
         cache_key = default_cache_key(path)
         if cache_key is None:
@@ -1279,6 +1285,8 @@ def _render_page_direct(
         return None
 
     fail_key = (path, int(page_no), cache_key, int(long_edge))
+    if retry:
+        _failed_until.pop(fail_key, None)
     if time.monotonic() < _failed_until.get(fail_key, 0.0):
         _state.last_error = "preview is temporarily throttled after a recent failure"
         return None
@@ -1295,6 +1303,7 @@ def _render_page_direct(
             # explicit clicked preview may use the audited borrowed path below.
             log.info("PowerPoint is active; background COM render declined safely")
             _state.last_error = "PowerPoint is active; background preview declined safely"
+            _state.last_error_category = "busy_timeout"
             return None
         try:
             if existing_session_only:
@@ -1344,9 +1353,12 @@ def _render_page_direct(
             # do not poison the page's 90-second retry cache.
             log.info("COM-only preview skipped: %s", e)
             _state.last_error = str(e)
+            _state.last_error_category = "busy_timeout"
             return None
         except Exception as e:  # noqa: BLE001
+            from .render_errors import classify_error
             _state.last_error = f"{type(e).__name__}: {e}"
+            _state.last_error_category = classify_error(e)
             if _is_powerpoint_busy_error(e):
                 # A rejected call says nothing about the document's health.
                 # Keep our exact snapshot for a later request/idle cleanup and
@@ -1355,7 +1367,8 @@ def _render_page_direct(
                 log.info("PowerPoint busy; preview can be retried path=%s page=%s: %s", path, page_no, e)
                 return None
             log.warning("render_page failed path=%s page=%s: %s", path, page_no, e)
-            _failed_until[fail_key] = time.monotonic() + _FAILED_TTL_SEC
+            if _state.last_error_category == "other":
+                _failed_until[fail_key] = time.monotonic() + _FAILED_TTL_SEC
             _close_pres()       # 关掉可能损坏的 pres
             _release_local_app_reference()  # 丢弃损坏的 COM apartment，下次重建
             return None
@@ -1373,8 +1386,11 @@ def render_page(
     existing_session_only: bool = False,
     allow_borrowed_session: bool = False,
     one_shot: bool = False,
+    retry: bool = False,
 ) -> Path | None:
     """Render a page, using a child process in packaged GUI builds."""
+    _state.last_error = ""
+    _state.last_error_category = "other"
     if not _ipc_enabled():
         direct_kwargs = {
             "cache_key": cache_key,
@@ -1386,6 +1402,8 @@ def render_page(
         }
         if existing_session_only:
             direct_kwargs["existing_session_only"] = True
+        if retry:
+            direct_kwargs["retry"] = True
         if one_shot:
             try:
                 return _render_page_direct(path, page_no, **direct_kwargs)
@@ -1394,6 +1412,10 @@ def render_page(
         return _render_page_direct(path, page_no, **direct_kwargs)
 
     path = os.path.abspath(path)
+    if not os.path.exists(path):
+        _state.last_error = "source file does not exist"
+        _state.last_error_category = "missing_file"
+        return None
     if cache_key is None:
         cache_key = default_cache_key(path)
         if cache_key is None:
@@ -1422,10 +1444,20 @@ def render_page(
         }
         if existing_session_only:
             client_kwargs["existing_session_only"] = True
+        if retry:
+            client_kwargs["retry"] = True
         if one_shot:
-            return render_client.render_page_once(path, page_no, **client_kwargs)
-        return render_client.render_page(path, page_no, **client_kwargs)
+            png = render_client.render_page_once(path, page_no, **client_kwargs)
+        else:
+            png = render_client.render_page(path, page_no, **client_kwargs)
+        if not png:
+            _state.last_error = render_client.last_error()
+            _state.last_error_category = render_client.last_error_category()
+        return png
     except Exception as e:  # noqa: BLE001
+        from .render_errors import classify_error
+        _state.last_error = str(e)
+        _state.last_error_category = classify_error(e)
         log.warning("renderer ipc failed path=%s page=%s: %s", path, page_no, e)
         return None
 
@@ -1503,3 +1535,8 @@ def diagnostic_lines() -> list[str]:
 
 def last_error() -> str:
     return str(getattr(_state, "last_error", "") or "")
+
+
+def last_error_category() -> str:
+    from .render_errors import normalize_category
+    return normalize_category(getattr(_state, "last_error_category", "other"))

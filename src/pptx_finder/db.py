@@ -8,6 +8,7 @@ import logging
 import os
 import sqlite3
 import sys
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
 
@@ -107,15 +108,66 @@ def sqlite_safe_text(text: str | None) -> str:
 
 def connect(db_path: str | Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path), check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA busy_timeout=8000")  # 遇锁等待而非立即失败（多连接/偶发并发）
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=8000")  # 遇锁等待而非立即失败（多连接/偶发并发）
+    except Exception:
+        conn.close()
+        raise
     # 这里刻意不设 journal_size_limit（版本库侧设了）：索引库的写入形态是建库时的
     # 批量灌入（盘点可达百万行），而回缩 WAL 要在 checkpoint 后额外截断文件，
     # A/B 实测让分档写入吞吐的末/首比从 0.84 掉到 0.72。索引库的 WAL 只在扫描期
     # 短暂变大、随后就被 checkpoint 收掉，为它牺牲建库速度不划算。
     return conn
+
+
+class CorruptSearchIndex(sqlite3.DatabaseError):
+    """Only search-index initialization may trigger the startup recovery UI."""
+
+    def __init__(self, path: str | Path, cause: sqlite3.DatabaseError):
+        super().__init__(str(cause))
+        self.path = Path(path)
+
+
+def open_search_index(path: str | Path) -> sqlite3.Connection:
+    conn = None
+    try:
+        conn = connect(path)
+        init_db(conn)
+        return conn
+    except sqlite3.DatabaseError as exc:
+        if conn is not None:
+            conn.close()
+        code = getattr(exc, "sqlite_errorcode", 0) & 0xFF
+        # SQLITE_BUSY/READONLY/CANTOPEN are not corruption. Never rename a
+        # healthy database just because it is locked or its directory is denied.
+        if code in (sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB):
+            raise CorruptSearchIndex(path, exc) from exc
+        raise
+
+
+def preserve_broken_index(path: str | Path) -> Path:
+    """Preserve the closed search DB and its journal files without overwriting."""
+    path = Path(path)
+    backup = path.with_name(path.name + ".broken-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f"))
+    moved = []
+    try:
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            source = Path(str(path) + suffix)
+            target = Path(str(backup) + suffix)
+            if suffix and not source.exists():
+                continue
+            if target.exists():
+                raise FileExistsError(str(target))
+            source.rename(target)
+            moved.append((source, target))
+    except OSError:
+        for source, target in reversed(moved):
+            target.rename(source)
+        raise
+    return backup
 
 
 def _readonly_uri(db_path: str | Path) -> str:
