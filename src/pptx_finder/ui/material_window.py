@@ -7,7 +7,7 @@ from PySide6.QtGui import QIcon, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
     QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMenu, QPushButton, QVBoxLayout, QWidget,
+    QMenu, QPushButton, QStackedWidget, QVBoxLayout, QWidget,
 )
 
 from ..materials import MaterialLibrary
@@ -106,7 +106,26 @@ class MaterialWindow(QWidget):
             sc.setContext(Qt.WidgetShortcut)
             sc.activated.connect(slot)
             self._shortcuts.append(sc)
-        root.addWidget(self.list_widget, 1)
+        # 空库时素材区中央直接告诉用户怎么开始（原来大白框里什么都没有，说明压在最底下一行）
+        self._empty_view = QWidget()
+        self._empty_view.setObjectName("materialEmpty")
+        self._empty_view.setAttribute(Qt.WA_StyledBackground, True)
+        ev = QVBoxLayout(self._empty_view)
+        ev.setAlignment(Qt.AlignCenter)
+        ev.setSpacing(8)
+        self._empty_title = QLabel("还没有素材")
+        self._empty_title.setObjectName("emptyTitle")
+        self._empty_title.setAlignment(Qt.AlignCenter)
+        self._empty_tip = QLabel("在 PPT 里选中一个箭头、图标或图片按 Ctrl+C，再点右上角「从剪贴板收藏」。\n"
+                                 "也可以先下载团队素材包，常用形状一次到位。")
+        self._empty_tip.setObjectName("emptyTip")
+        self._empty_tip.setAlignment(Qt.AlignCenter)
+        ev.addWidget(self._empty_title)
+        ev.addWidget(self._empty_tip)
+        self._list_stack = QStackedWidget()
+        self._list_stack.addWidget(self.list_widget)
+        self._list_stack.addWidget(self._empty_view)
+        root.addWidget(self._list_stack, 1)
         row = QHBoxLayout()
         self.copy_btn = QPushButton("复制素材")
         self.copy_btn.clicked.connect(self._copy)
@@ -236,6 +255,15 @@ class MaterialWindow(QWidget):
             row.setToolTip(f"{item.name}\n{item.category or '未分类'}\n双击复制素材")
             self.list_widget.addItem(row)
             row.setSelected(item.id in selected)
+        if self._items and not self.list_widget.count():
+            self._empty_title.setText("没有符合条件的素材")
+            self._empty_tip.setText("换个关键词，或把分类切回「全部分类」。")
+        elif not self._items:
+            self._empty_title.setText("还没有素材")
+            self._empty_tip.setText("在 PPT 里选中一个箭头、图标或图片按 Ctrl+C，再点右上角「从剪贴板收藏」。\n"
+                                    "也可以先下载团队素材包，常用形状一次到位。")
+        self._list_stack.setCurrentWidget(
+            self.list_widget if self.list_widget.count() else self._empty_view)
         self._sync()
 
     def _loaded(self, items):
@@ -253,8 +281,8 @@ class MaterialWindow(QWidget):
         self.categories.setCurrentIndex(max(0, self.categories.findData(previous)))
         self.categories.blockSignals(False)
         self._render()
-        self.status.setText(f"共 {len(items)} 个素材 · Ctrl / Shift 可多选后导出" if items else
-                            "还没有素材。从 PPT 复制一个喜欢的箭头、图标或图片，开始收藏。")
+        # 空库的引导已经放在素材区中央，底部状态行不再重复一遍
+        self.status.setText(f"共 {len(items)} 个素材 · Ctrl / Shift 可多选后导出" if items else "")
 
     def _run(self, fn, done, label):
         if self._busy:

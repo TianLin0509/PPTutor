@@ -1084,6 +1084,7 @@ class MainWindow(QMainWindow):
         self._index_last_total = 0
         self._index_last_current = ""
         self._index_last_summary: dict | None = None
+        self._name_index_error = ""
         self._index_progress_last_ui_at = 0.0
         self._index_progress_last_phase: str | None = None
         self._index_rate_ema = 0.0
@@ -1437,12 +1438,15 @@ class MainWindow(QMainWindow):
         self._central = central
         # v2.0 白色工作台：左侧整高侧栏（品牌 + 导航 + 工具 + 主题），右侧是顶栏与页面
         outer = QHBoxLayout(central)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
+        # HUB-H 冷白工作室：灰画布上浮起白色导航岛与内容面板，彼此留 10px 缝
+        outer.setContentsMargins(10, 10, 10, 6)
+        outer.setSpacing(10)
         right_col = QWidget()
         right_col.setObjectName("mainColumn")
+        right_col.setAttribute(Qt.WA_StyledBackground, True)
         root = QVBoxLayout(right_col)
-        root.setContentsMargins(0, 0, 0, 0)
+        # 内缩 5px：子控件是方角的同色底，贴边会把面板 16px 圆角盖成直角
+        root.setContentsMargins(5, 5, 5, 5)
         root.setSpacing(0)
 
         root.addWidget(self._build_glass_title())  # 无边框窗口的自绘顶栏（搜索 + 窗口按钮）
@@ -1668,6 +1672,11 @@ class MainWindow(QMainWindow):
         self.status.addWidget(self.status_dot)
         self.status_label = QLabel("准备中…")
         self.status.addWidget(self.status_label)
+        self.name_index_retry_btn = QPushButton("重试")
+        self.name_index_retry_btn.setToolTip("重新扫描磁盘，重试文件名盘点")
+        self.name_index_retry_btn.clicked.connect(lambda: self._request_full_rescan())
+        self.name_index_retry_btn.hide()
+        self.status.addWidget(self.name_index_retry_btn)
         # 无权限文件夹警示：仅上轮扫描有无权限目录时显示，点击弹出完整清单
         self.status_warn_label = QLabel("")
         self.status_warn_label.setObjectName("statusWarnLabel")
@@ -1706,6 +1715,7 @@ class MainWindow(QMainWindow):
         """整高侧栏：品牌在顶，四个页面（搜索/概览/版本/健康），工具（截图/转字/素材/报告/设置），主题在底。"""
         rail = QWidget()
         rail.setObjectName("navRail")
+        rail.setAttribute(Qt.WA_StyledBackground, True)
         rail.setFixedWidth(self._RAIL_W)
         lay = QVBoxLayout(rail)
         lay.setContentsMargins(12, 16, 12, 12)
@@ -2072,6 +2082,7 @@ class MainWindow(QMainWindow):
     def _build_preview(self) -> QWidget:
         panel = QWidget()
         panel.setObjectName("previewPanel")
+        self._preview_panel = panel
         lay = QVBoxLayout(panel)
         lay.setContentsMargins(12, 10, 12, 12)
         lay.setSpacing(8)
@@ -2929,6 +2940,8 @@ class MainWindow(QMainWindow):
             self._hot_write_again = True
         else:
             self._hot_write_failures = 0
+            if self._all_files_scope():
+                self._after_name_index_update()
 
     def _finish_hot_write(self, task) -> None:
         self._hot_write_inflight = False
@@ -3116,6 +3129,8 @@ class MainWindow(QMainWindow):
     def _on_inventory_reconciled(self, payload: object) -> None:
         if not isinstance(payload, dict):
             return
+        if self._all_files_scope():
+            self._after_name_index_update()
         if bool(payload.get("overflowed")):
             self._inventory_dirs_overflowed = True
         folded = payload.get("hot_folded") or ()
@@ -3401,6 +3416,9 @@ class MainWindow(QMainWindow):
                 f"搜索完成：命中 {len(results)} 个文件{relaxed_suffix}{suffix}")
         else:
             self.status_label.setText(f"搜索完成：没有命中{suffix}")
+        if self._name_index_error:
+            self.status_label.setText(
+                self.status_label.text() + f" · PPT 内容可搜 · 文件名盘点失败：{self._name_index_error}")
         self._apply_sort_render()
         if results:
             self.list_head.show()
@@ -3589,6 +3607,8 @@ class MainWindow(QMainWindow):
         self._empty_index_status.setObjectName("emptyMeta")
         self._empty_index_status.setAlignment(Qt.AlignCenter)
         self._empty_index_status.setWordWrap(True)
+        # 可换行的标签在居中布局里会被挤到最窄，「12 页」被拆成两行：给够一行的宽度
+        self._empty_index_status.setMinimumWidth(460)
         v.addWidget(self._empty_index_status)
         self._sugg_btns: dict[str, QPushButton] = {}
         for key, text in (
@@ -3638,6 +3658,8 @@ class MainWindow(QMainWindow):
         return self._index_status_text_from_stats(s, self._mode_key())
 
     def _index_status_text_from_stats(self, stats: dict, mode_key: str) -> str:
+        if self._name_index_error:
+            return f"PPT 内容可搜 · 文件名盘点失败：{self._name_index_error}"
         try:
             files = int(stats.get("file_count", 0))
             pages = int(stats.get("page_count", 0))
@@ -3740,6 +3762,9 @@ class MainWindow(QMainWindow):
         self._set_empty_icon("search")
         self._empty_tip.setText("换个说法试试")
         self._empty_query_label.setText(f"\u6ca1\u627e\u5230\u300c{query}\u300d")
+        if self._all_files_scope() and namestore.peek_header() is None:
+            self._empty_query_label.setText(f"正在盘点文件名：「{query}」暂未命中")
+            self._empty_tip.setText("全盘文件名盘点还没完成，结果可能不完整；完成后会自动刷新")
         self._set_empty_index_status_async()
         sugg = suggestion_keys(query, self._mode_key(), exact_match=self._exact_match())
         for key, btn in self._sugg_btns.items():
@@ -3747,6 +3772,7 @@ class MainWindow(QMainWindow):
         self._sugg_btns["query"].hide()
         self._clear_facet_btn.hide()
         self.empty_hint.show()
+        self._set_preview_visible(False)
         self._set_empty_query_suggestion_async(query)
 
     def _show_start_hint(self) -> None:
@@ -3765,6 +3791,13 @@ class MainWindow(QMainWindow):
             btn.hide()
         self._clear_facet_btn.hide()
         self.empty_hint.show()
+        self._set_preview_visible(False)
+
+    def _set_preview_visible(self, visible: bool) -> None:
+        """没有结果时右侧整块预览（空框 + 一排灰按钮）没有意义：收起，让空状态占满。"""
+        panel = getattr(self, "_preview_panel", None)
+        if panel is not None and panel.isHidden() == visible:
+            panel.setVisible(visible)
 
     def _hide_empty_hint(self, *, invalidate_status: bool = True) -> None:
         if getattr(self, "empty_hint", None) is not None:
@@ -3777,6 +3810,7 @@ class MainWindow(QMainWindow):
                 self._empty_query_suggestion = ""
             self.empty_hint.hide()
             self.result_list.show()
+            self._set_preview_visible(True)
 
     def _apply_suggestion(self, key: str) -> None:
         q = self.search_box.text()
@@ -5675,12 +5709,22 @@ class MainWindow(QMainWindow):
             self,
             on_start=self._dismiss_welcome,
             on_pick_theme=self._apply_theme,
+            on_settings=self._welcome_open_features,
             current_theme=self._theme)
         ov.move(0, 0)
         ov.resize(self.size())
         ov.show()
         ov.raise_()
         self._welcome = ov
+        if self._index_last_summary is not None:
+            ov.finish_index(self._index_last_summary)
+        elif self._index_last_current:
+            self._update_welcome_progress(self._index_last_done, self._index_last_total,
+                                          self._index_last_current)
+
+    def _welcome_open_features(self) -> None:
+        self._dismiss_welcome()
+        self.open_settings_page("功能")
 
     def _dismiss_welcome(self) -> None:
         mark_welcomed()
@@ -6769,6 +6813,14 @@ class MainWindow(QMainWindow):
         """后台 live 线程索引完一个文件（信号已切回主线程）→ 刷新状态 / 结果。"""
         self._after_live_index()
 
+    def _after_name_index_update(self) -> None:
+        """文件名层更新后刷新「全部文件」结果。开发机上热层每秒都在重写，若每次都把
+        2.5 秒去抖计时器往后推，刷新就永远轮不到；已经排上了就不再推迟。"""
+        if self._live_refresh.isActive():
+            self._live_refresh_pending = True
+            return
+        self._after_live_index()
+
     def _after_live_index(self) -> None:
         if self._closing:
             return
@@ -6949,8 +7001,7 @@ class MainWindow(QMainWindow):
         self.index_phase_label.show()
         self.index_count_label.show()
         self.index_bar.show()
-        if getattr(self, "_welcome", None) is not None and done > 0:
-            self._welcome.update_progress(done)
+        self._update_welcome_progress(done, total, cur)
         preserve_search_status = self._search_pending_req is not None
         if total < 0:
             self.index_bar.setRange(0, 0)
@@ -6985,12 +7036,36 @@ class MainWindow(QMainWindow):
                 self.status_label.setText(
                     f"正在建库{speed}{remaining} · 前台操作优先"
                 )
+        if self._name_index_error and not preserve_search_status:
+            self.status_label.setText(
+                self.status_label.text() + f" · 文件名盘点上次失败：{self._name_index_error}")
+
+    def _update_welcome_progress(self, done: int, total: int, cur: str) -> None:
+        if self._welcome is None:
+            return
+        if total < 0:
+            found = re.search(r"发现\s*([\d,]+)", str(cur or ""))
+            if found:
+                self._welcome.update_progress(int(found.group(1).replace(",", "")))
+        else:
+            self._welcome.update_progress(done, total)
+
+    def _remember_name_index_result(self, summary: dict | None) -> None:
+        if summary is not None:
+            if summary.get("name_index_error"):
+                self._name_index_error = str(summary["name_index_error"])
+            elif "name_index_entries" in summary:
+                self._name_index_error = ""
+        self.name_index_retry_btn.setVisible(bool(self._name_index_error))
 
     def _on_index_done(self, summary: dict) -> None:
         if self._closing:
             return
         self._index_search_ready = True
         self._index_last_summary = dict(summary or {})
+        self._remember_name_index_result(summary)
+        if self._welcome is not None:
+            self._welcome.finish_index(summary)
         self._index_status_cache = None
         error = str((summary or {}).get("error") or "")
         cancelled = bool(int((summary or {}).get("cancelled", 0) or 0))
@@ -7013,6 +7088,9 @@ class MainWindow(QMainWindow):
                 )
             else:
                 self.status_label.setText("建库已暂停，已完成的结果仍可搜索")
+            if self._name_index_error:
+                self.status_label.setText(
+                    self.status_label.text() + f" · 文件名盘点失败：{self._name_index_error}")
             return
         if not self._index_all_files_enabled and getattr(
             self, "_index_scan_had_inventory", False
@@ -7046,6 +7124,8 @@ class MainWindow(QMainWindow):
         if celebrate:
             self._index_celebrated = True
         self._refresh_status(summary, celebrate=celebrate)
+        if self.search_box.text().strip():
+            self._after_live_index()
         if not self.search_box.text().strip():
             self._show_recent(dashboard_force_refresh=True, recent_force_refresh=True)  # 索引完成后刷新最近（用户还没开始搜时，纳入新索引的文件）
     def _load_status_stats(self, conn_path: str | None) -> dict:
@@ -7161,6 +7241,7 @@ class MainWindow(QMainWindow):
                 self._toast(f"✓ 已整理好 {n} 个 PPT，搜搜看你写过的字吧")
 
     def _apply_status_stats(self, summary: dict | None, stats: dict) -> None:
+        self._remember_name_index_result(summary)
         self._index_status_cache = dict(stats)
         self._index_status_cache_at = time.monotonic()
         if self._search_pending_req is not None:
@@ -7196,6 +7277,8 @@ class MainWindow(QMainWindow):
         self.status_label.setText(
             f"\u7d22\u5f15\u5c31\u7eea\uff1a{stats.get('file_count', 0)} \u4e2a\u6587\u4ef6 \u00b7 {stats.get('page_count', 0)} \u9875{dist}"
        )
+        if self._name_index_error:
+            self.status_label.setText(f"PPT 内容可搜 · 文件名盘点失败：{self._name_index_error}")
         examples = (summary or {}).get(
             "scan_error_examples",
             stats.get("last_scan_error_examples", ""),

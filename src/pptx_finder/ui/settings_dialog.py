@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import html
 import logging
 import os
 import platform
@@ -122,6 +123,8 @@ def _diagnostic_summary_lines(lines: list[str]) -> list[str]:
             and "last_error=-" not in line
         ):
             issues.append("版本快照近期有失败记录：" + line)
+        elif line.startswith("vault_fsck_manual:") and "ok=False" in line:
+            issues.append("版本库深度检查发现问题：" + line.split(":", 1)[1].strip())
         elif (
             line.startswith("vault_fsck:")
             and "versions=0" not in line
@@ -738,6 +741,11 @@ class SettingsDialog(QDialog):
         return outer
 
     # ---------- 索引范围 ----------
+    def _sync_index_roots_empty(self, *_args) -> None:
+        empty = self.index_roots_list.count() == 0
+        self._index_roots_empty.setVisible(empty)
+        self.index_roots_list.setVisible(not empty)
+
     def _build_roots_page(self) -> QWidget:
         outer, lay = self._page("索引范围")
         self._watch_status = self._note(self._watch_status_text(), "setPageDesc")
@@ -770,7 +778,19 @@ class SettingsDialog(QDialog):
         list_box = QVBoxLayout()
         list_box.setContentsMargins(0, 12, 0, 12)
         list_box.setSpacing(8)
+        # 空列表不说明的话，像是「什么都没索引」：明确默认已覆盖全部本地固定盘
+        self._index_roots_empty = QLabel("还没有额外目录。默认已经在索引全部本地固定磁盘，"
+                                         "这里只需添加网络盘或其他额外位置。")
+        self._index_roots_empty.setObjectName("setPageDesc")
+        self._index_roots_empty.setWordWrap(True)
+        list_box.addWidget(self._index_roots_empty)
+        self.index_roots_list.setMaximumHeight(220)
         list_box.addWidget(self.index_roots_list)
+        model = self.index_roots_list.model()
+        model.rowsInserted.connect(self._sync_index_roots_empty)
+        model.rowsRemoved.connect(self._sync_index_roots_empty)
+        model.modelReset.connect(self._sync_index_roots_empty)
+        self._sync_index_roots_empty()
         net_row = QHBoxLayout()
         self.index_root_edit = QLineEdit()
         self.index_root_edit.setPlaceholderText("网络路径，如 \\\\server\\share\\dir")
@@ -1456,6 +1476,9 @@ class SettingsDialog(QDialog):
             row["note"] = f"卸载失败：{result}"
         elif isinstance(result, int) and result:
             row["note"] = f"已卸载，释放 {_format_size_text(result)}"
+        if isinstance(result, int):
+            from .component_center import component_center
+            component_center()._apply(key, {"phase": "idle", "error": "", "version": ""})
         self._refresh_components(measure=self._components_measured)
 
     def _on_settings_tab_changed(self, index: int) -> None:
@@ -1509,13 +1532,27 @@ class SettingsDialog(QDialog):
         head.addStretch(1)
         lay.addLayout(head)
 
+        # 先给人话结论：几个问题、各是什么；完整的英文诊断日志折叠起来，反馈时再展开或直接「复制」
+        self.diag_summary = QLabel("正在体检…")
+        self.diag_summary.setObjectName("diagSummary")
+        self.diag_summary.setWordWrap(True)
+        self.diag_summary.setTextFormat(Qt.RichText)
+        self.diag_summary.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        lay.addWidget(self.diag_summary)
+        self.diag_toggle = QPushButton("展开完整诊断日志")
+        self.diag_toggle.setObjectName("ghost")
+        self.diag_toggle.setCheckable(True)
+        self.diag_toggle.toggled.connect(self._toggle_diag_log)
+        lay.addWidget(self.diag_toggle, 0, Qt.AlignLeft)
         self.diagnostic_text = QPlainTextEdit()
         self.diagnostic_text.setReadOnly(True)
         self.diagnostic_text.setObjectName("setDiag")
         # 长行自动折行：不出横向滚动条，复制出去的文本不受影响
         self.diagnostic_text.setLineWrapMode(QPlainTextEdit.WidgetWidth)
         self.diagnostic_text.setPlainText("诊断加载中…")
+        self.diagnostic_text.hide()
         lay.addWidget(self.diagnostic_text, 1)
+        lay.addStretch(1)
         self.schedule_diagnostics_refresh()
         return page
 
@@ -1713,10 +1750,9 @@ class SettingsDialog(QDialog):
         except Exception as exc:  # noqa: BLE001
             lines.append(f"index: unavailable ({type(exc).__name__}: {exc})")
         lazy_state = getattr(self._mgr, "is_initialized", None)
-        version_cold = (
-            not get_version_management_enabled()
-            and callable(lazy_state)
-            and not lazy_state()
+        # 版本留存默认关闭：没开、库也没打开（或根本没有版本管理器）就是「未启用」，不算故障
+        version_cold = not get_version_management_enabled() and (
+            self._mgr is None or (callable(lazy_state) and not lazy_state())
         )
         if version_cold:
             guarded_docs = 0
@@ -1738,6 +1774,39 @@ class SettingsDialog(QDialog):
         lines = _diagnostic_summary_lines(lines) + lines
         return {"lines": lines, "guarded_docs": guarded_docs}
 
+    def _toggle_diag_log(self, on: bool) -> None:
+        self.diagnostic_text.setVisible(on)
+        self.diag_toggle.setText("收起完整诊断日志" if on else "展开完整诊断日志")
+
+    def _render_diag_summary(self, lines: list[str], note: str = "") -> None:
+        """从完整诊断行重新提炼人话结论（深度检查等后追加的行也算进去）。"""
+        label = getattr(self, "diag_summary", None)
+        if not _qt_is_valid(label):
+            return
+        raw = [ln for ln in lines if ln and not ln.startswith(("diagnostic_summary:", "diagnostic_issue:"))]
+        tail = f'<br><span style="color:#6E7781">{html.escape(note)}</span>' if note else ""
+        if any(ln.startswith("diagnostics: unavailable") for ln in raw):
+            label.setText('<span style="color:#D97706;font-weight:600">● 诊断没能完成</span>'
+                          '　点上方「刷新」再试一次；还不行就点「复制」把日志发给维护人。' + tail)
+            return
+        summary = _diagnostic_summary_lines(raw)
+        issues = [ln.split(":", 1)[1].strip() for ln in summary if ln.startswith("diagnostic_issue:")]
+        m = re.search(r"发现 (\d+) 个", summary[0]) if summary else None
+        total = int(m.group(1)) if m else len(issues)
+        if not total:
+            label.setText('<span style="color:#3A9E42;font-weight:600">● 一切正常</span>'
+                          '　索引、版本库和运行环境都没发现问题。' + tail)
+            return
+        items = "".join(f"<li>{html.escape(x)}</li>" for x in issues)
+        more = f"（只列出前 {len(issues)} 项，其余见完整日志）" if total > len(issues) else ""
+        label.setText(f'<span style="color:#D97706;font-weight:600">● 发现 {total} 个需要关注的问题</span>{more}'
+                      f'<ul style="margin:6px 0 0 -20px">{items}</ul>'
+                      '<span style="color:#6E7781">需要维护人帮忙时，点上方「复制」把完整诊断发过去。</span>' + tail)
+
+    def _rerender_diag_summary(self, note: str = "") -> None:
+        if _qt_is_valid(getattr(self, "diagnostic_text", None)):
+            self._render_diag_summary(self.diagnostic_text.toPlainText().splitlines(), note)
+
     def _on_diagnostics_ready(self, token: int, result: object) -> None:
         if not self._ui_alive():
             return
@@ -1753,6 +1822,7 @@ class SettingsDialog(QDialog):
             lines.extend(self._diag_extra_lines)
             self._diag_extra_lines.clear()
         self.diagnostic_text.setPlainText("\n".join(lines))
+        self._render_diag_summary(lines)
         if get_version_management_enabled():
             self.stat.setText(
                 self._version_stat_text(guarded_docs if isinstance(guarded_docs, int) else None)
@@ -1807,6 +1877,7 @@ class SettingsDialog(QDialog):
         self.diagnostic_text.appendPlainText(
             "\nvault_fsck_manual: running deep object verification..."
         )
+        self._rerender_diag_summary("正在深度检查版本库，大库约需一分钟…")
 
         def audit_repository():
             # Attribute resolution initializes the lazy version backend. A
@@ -1830,6 +1901,7 @@ class SettingsDialog(QDialog):
             line = "vault_fsck_manual: unavailable"
             self._diag_extra_lines.append(line)
             self.diagnostic_text.appendPlainText("\n" + line)
+            self._rerender_diag_summary()
             return
         line = (
             "vault_fsck_manual: "
@@ -1842,6 +1914,7 @@ class SettingsDialog(QDialog):
         )
         self._diag_extra_lines.append(line)
         self.diagnostic_text.appendPlainText("\n" + line)
+        self._rerender_diag_summary()
 
     def _finish_vault_audit(self, task) -> None:
         self._forget_diag_task(task)
