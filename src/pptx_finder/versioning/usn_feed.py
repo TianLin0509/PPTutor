@@ -399,6 +399,10 @@ class UsnFeed:
                 if parent_path:
                     other_dirs.add(parent_path)
                 continue
+            # Everything 式逐条记账：文件名层直接收下这一个路径，不等整目录重列
+            name_changed = getattr(handler, "name_changed", None)
+            if name_changed is not None:
+                name_changed(path)
             if handler.is_content_path(path):
                 previous = known_cache.get(fid)
                 if len(known_cache) >= FILE_CACHE_MAX:
@@ -480,6 +484,11 @@ class UsnFeed:
                 if len(vol.pending_dir_moves) > 1000:
                     vol.pending_dir_moves.clear()
                 continue
+            if reason & _CREATE and not reason & _DELETE:
+                created = self._dir_path(vol, fid)
+                name_changed = getattr(handler, "name_changed", None)
+                if created and name_changed is not None:
+                    name_changed(created)
             if reason & _DELETE:
                 old = cache.pop(fid, None)
                 if old:
@@ -495,6 +504,8 @@ class UsnFeed:
                 cache.clear()
                 vol.files.clear()
                 new = self._dir_path(vol, fid)
+                if new and getattr(handler, "name_changed", None) is not None:
+                    handler.name_changed(new)
                 if old and new and os.path.normcase(old) != os.path.normcase(new):
                     self._dir_moved(old, new)
                 elif old and not new:
@@ -557,6 +568,7 @@ class UsnFeed:
     def _expand_subtree(self, directory: str) -> None:
         """整棵目录挪进来时流水账只记一条，里面的文件要自己展开。"""
         handler = self._handler
+        name_changed = getattr(handler, "name_changed", None)
         seen = 0
         stack = [directory]
         while stack and not self._stop.is_set():
@@ -570,6 +582,8 @@ class UsnFeed:
                             self._note_subtree_overflow(directory)
                             return
                         try:
+                            if name_changed is not None and not entry.name.startswith("~$"):
+                                name_changed(entry.path)
                             if entry.is_dir(follow_symlinks=False):
                                 if not handler.skip_directory(entry.path):
                                     stack.append(entry.path)

@@ -31,7 +31,7 @@ try:
 except Exception:  # noqa: BLE001
     _WIN = False
 
-from .. import actions, db, history, indexer as indexer_mod, namestore, renderer as renderer_mod, search as search_mod, updater, __version__
+from .. import actions, db, history, hot_names, indexer as indexer_mod, namestore, renderer as renderer_mod, search as search_mod, updater, __version__
 from ..config import (
     DOCX_EXT, PDF_EXT, PPTX_EXT, PPT_EXTS, SUPPORTED_EXTS, db_path as cfg_db_path,
     enabled_index_exts as cfg_enabled_index_exts, ext_path,
@@ -942,6 +942,8 @@ class MainWindow(QMainWindow):
     _INVENTORY_RECONCILE_INTERVAL_MS = 15_000
     _INVENTORY_DIRS_MAX = 20_000   # 脏目录集合上限；溢出即放弃增量，交给下次完整扫描
     _INVENTORY_DIRS_PER_ROUND = 300  # 每轮最多对账多少个目录（有界后台任务）
+    _HOT_WRITE_DEBOUNCE_MS = 1000    # 热层落盘防抖：存盘风暴合成一次写
+    _HOT_FOLD_MIN_ENTRIES = 2000     # 没有脏目录时，热层攒到这么多也开一轮并入增量层
     # 脏目录溢出后补一次全盘校准，但离上次完整扫描至少隔这么久。v2.0.3 及以前
     # 溢出就立刻重扫：一轮全盘扫描要 8 分钟，这期间临时目录、浏览器缓存照样在变，
     # 扫完又溢出，于是 50 秒后再扫一轮，真机日志里一整夜每 9 分钟一轮，
@@ -1228,8 +1230,18 @@ class MainWindow(QMainWindow):
         # 「索引所有文件」的目录级实时对账：watcher 只上报「有非内容文件变动的目录」，
         # 这里合并去重 + 定时批量 scandir 对账。成本与事件数无关，只与目录内条目数
         # 有关，浏览器缓存那种一分钟几千次 churn 会被折叠成一个目录名。
-        self._dirty_inventory_dirs: set[str] = set()
+        # 用 dict 当有序集合：先来先对账。set.pop() 顺序随机，churn 目录多时
+        # 用户刚存文件的那个目录可能一直轮不到（2026-11-21 真机：5 分钟仍搜不到）
+        self._dirty_inventory_dirs: dict[str, None] = {}
         self._inventory_dirs_overflowed = False
+        # 文件名热层：流水账逐条报上来的路径，1 秒内单独落一份小索引（hot_names.py）
+        self._hot_names = hot_names.HotNames()
+        self._hot_write_inflight = False
+        self._hot_write_again = False
+        self._hot_write_timer = QTimer(self)
+        self._hot_write_timer.setSingleShot(True)
+        self._hot_write_timer.setInterval(self._HOT_WRITE_DEBOUNCE_MS)
+        self._hot_write_timer.timeout.connect(self._write_hot_layer)
         self._last_full_scan_wall = 0.0  # 上次完整扫描成功结束的时间（time.time）
         self._inventory_reconcile_inflight = False
         self._inventory_reconcile_timer = QTimer(self)
@@ -2835,6 +2847,8 @@ class MainWindow(QMainWindow):
                     timer.stop()
                     self._dirty_inventory_dirs.clear()
                     self._inventory_dirs_overflowed = False
+                    self._hot_names.clear()
+                    self._hot_write_timer.start()  # 空热层 → 撤掉索引文件
         if all_files_changed and not self._index_all_files_enabled:
             # 关闭后一次性清理非内容类型的 filename_only 盘点行（后台线程，单批 DELETE）
             self._purge_inventory_rows()
@@ -2868,7 +2882,41 @@ class MainWindow(QMainWindow):
             # 等下一次完整扫描统一收拢——继续无界堆积只会把内存和后台 IO 拖垮。
             self._inventory_dirs_overflowed = True
             return
-        self._dirty_inventory_dirs.add(directory)
+        self._dirty_inventory_dirs[directory] = None
+
+    def note_names_changed(self, paths) -> None:
+        """流水账/目录监听逐条报上来的新文件路径（主线程槽，每条 O(1)）。"""
+        if not self._index_all_files_enabled or self._closing:
+            return
+        for path in paths or ():
+            self._hot_names.note(str(path))
+        if not self._hot_write_timer.isActive():
+            # 热层越大一次写越久（每条要 stat）：几百条 1 秒，2 万条放宽到 4 秒，
+            # churn 再凶也不会让后台一直在重写
+            self._hot_write_timer.setInterval(
+                max(self._HOT_WRITE_DEBOUNCE_MS, len(self._hot_names) // 5))
+            self._hot_write_timer.start()
+
+    def _write_hot_layer(self) -> None:
+        if self._closing:
+            return
+        if self._hot_write_inflight:
+            self._hot_write_again = True
+            return
+        self._hot_write_inflight = True
+        self._hot_write_again = False
+        snap = self._hot_names.snapshot()
+        task = BackgroundTask(lambda snap=snap: hot_names.write_hot_layer(snap), "hot-names")
+        self._bg_tasks.append(task)
+        task.finished.connect(lambda task=task: self._finish_hot_write(task))
+        task.start()
+
+    def _finish_hot_write(self, task) -> None:
+        self._hot_write_inflight = False
+        if task in self._bg_tasks:
+            self._bg_tasks.remove(task)
+        if self._hot_write_again and not self._closing:
+            self._hot_write_timer.start()
 
     def _run_inventory_reconcile(self) -> None:
         """定时把一批脏目录交给后台线程对账（新增登记 + 消失删除）。"""
@@ -2887,21 +2935,22 @@ class MainWindow(QMainWindow):
         if (
             not self._index_all_files_enabled
             or self._inventory_reconcile_inflight
-            or not self._dirty_inventory_dirs
+            or not (self._dirty_inventory_dirs
+                    or len(self._hot_names) >= self._HOT_FOLD_MIN_ENTRIES)
             or time.monotonic() < getattr(self, "_inventory_next_due", 0.0)
         ):
             return
         if self._indexer is not None and self._indexer.isRunning():
             return  # 全盘扫描本身就在覆盖这些目录，不重复劳动
-        batch = [
-            self._dirty_inventory_dirs.pop()
-            for _ in range(min(self._INVENTORY_DIRS_PER_ROUND, len(self._dirty_inventory_dirs)))
-        ]
-        if not batch:
+        batch = list(self._dirty_inventory_dirs)[:self._INVENTORY_DIRS_PER_ROUND]
+        for directory in batch:
+            del self._dirty_inventory_dirs[directory]
+        hot = self._hot_names.snapshot()
+        if not batch and not hot:
             return
         self._inventory_reconcile_inflight = True
         task = BackgroundTask(
-            lambda dirs=tuple(batch): self._reconcile_inventory_dirs_sync(dirs),
+            lambda dirs=tuple(batch), hot=hot: self._reconcile_inventory_dirs_sync(dirs, hot),
             "inventory-dir-reconcile",
         )
         self._bg_tasks.append(task)
@@ -2920,7 +2969,7 @@ class MainWindow(QMainWindow):
     _OVERLAY_FULL_DIR_MAX = 200
 
     @staticmethod
-    def _reconcile_inventory_dirs_sync(dirs) -> dict:
+    def _reconcile_inventory_dirs_sync(dirs, hot=()) -> dict:
         """把变化的目录重新列一遍，并入「增量层」索引。
 
         变化来自 NTFS 流水账或目录监听（见 versioning/usn_feed.py），这里只负责把
@@ -2930,7 +2979,7 @@ class MainWindow(QMainWindow):
         同格式的小索引，搜索时两份一起扫、按路径去重。删除不用管：结果在显示前会
         逐条 stat，已经不存在的自然消失。
         """
-        totals = {"added": 0, "dirs": 0, "overflowed": False}
+        totals = {"added": 0, "dirs": 0, "overflowed": False, "hot_folded": []}
         try:
             builder = namestore.NameStoreBuilder()
             seen: set[str] = set()
@@ -2968,6 +3017,22 @@ class MainWindow(QMainWindow):
                         builder.add_folded(path, size, mtime, is_dir, previous.norm_name(i))
                 finally:
                     previous.close()
+            # 热层里逐条记下的路径先收：它们是用户最可能马上要搜的
+            for key, path, seq in hot:
+                if len(seen) >= MainWindow._OVERLAY_MAX_ENTRIES:
+                    totals["overflowed"] = True
+                    break
+                if key not in seen:
+                    entry = hot_names.stat_entry(path)
+                    if entry is not None:     # 已经没了的不收，热层也不必再留
+                        p, size, mtime, is_dir = entry
+                        seen.add(key)
+                        if is_dir:
+                            builder.add_dir(p, mtime)
+                        else:
+                            builder.add(p, size, mtime)
+                        totals["added"] += 1
+                totals["hot_folded"].append((key, seq))
             for directory in dirs:
                 try:
                     entries = list(os.scandir(directory))
@@ -3016,6 +3081,7 @@ class MainWindow(QMainWindow):
             # 没有任何报错——只能靠日志发现。totals 也记一笔，方便体检面板看到。
             _log.warning("overlay rebuild failed", exc_info=True)
             totals["error"] = f"{type(exc).__name__}: {exc}"
+            totals["hot_folded"] = []   # 没写成：热层一条都不能撤
         return totals
 
     def _on_inventory_reconciled(self, payload: object) -> None:
@@ -3023,6 +3089,9 @@ class MainWindow(QMainWindow):
             return
         if bool(payload.get("overflowed")):
             self._inventory_dirs_overflowed = True
+        folded = payload.get("hot_folded") or ()
+        if folded and self._hot_names.drop_folded(folded):
+            self._hot_write_timer.start()   # 已并入增量层：热层缩小后重写
         # 增量层越大，整份重写越贵：大到一定规模就放慢节奏，20 万条时约 100 秒一轮
         entries = int(payload.get("entries", 0) or 0)
         self._inventory_next_due = (

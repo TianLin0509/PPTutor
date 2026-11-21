@@ -312,6 +312,8 @@ class _FeatureRuntime:
         self.document_enabled = get_document_search_enabled()
         self.smart_grouping_enabled = get_smart_grouping_enabled()
         self._watcher = None
+        self._names_lock = threading.Lock()
+        self._names_pending: list[str] = []
         self._transition_q: queue.Queue = queue.Queue()
         self._transition_thread = threading.Thread(
             target=self._version_transition_loop,
@@ -349,6 +351,7 @@ class _FeatureRuntime:
                 self._on_removed,
                 allowed_exts=self.allowed_exts,
                 on_other_dir_changed=self._on_other_dir_changed,
+                on_name_changed=self._on_name_changed,
                 known_rows=self._known_rows,
                 on_gap=self._on_journal_gap,
             )
@@ -466,6 +469,23 @@ class _FeatureRuntime:
         emit = getattr(self._bridge, "emit_inventory_dir_changed", None)
         if callable(emit):
             emit(directory)
+
+    def _on_name_changed(self, path: str) -> None:
+        """流水账线程逐条报上来的路径：攒成一批再投递主线程，churn 时不刷爆信号队列。"""
+        with self._names_lock:
+            self._names_pending.append(path)
+            first = len(self._names_pending) == 1
+        if first:
+            timer = threading.Timer(0.3, self._flush_names)
+            timer.daemon = True
+            timer.start()
+
+    def _flush_names(self) -> None:
+        with self._names_lock:
+            batch, self._names_pending = self._names_pending, []
+        emit = getattr(self._bridge, "emit_names_changed", None)
+        if batch and callable(emit):
+            emit(batch)
 
     def _on_moved(self, old_path: str, new_path: str) -> None:
         if self.version_enabled:
@@ -797,6 +817,7 @@ def main() -> int:
     bridge.snapshotted.connect(win.on_version_snapshot)
     bridge.content_changed.connect(win.on_content_changed)
     bridge.inventory_dir_changed.connect(win.note_inventory_dir_dirty)
+    bridge.names_changed.connect(win.note_names_changed)
     bridge.journal_gap.connect(win.on_journal_gap)
     bridge.runtime_error.connect(win._toast)
     feature_runtime = _FeatureRuntime(win, version_mgr, bridge)

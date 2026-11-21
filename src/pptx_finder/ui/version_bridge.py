@@ -16,6 +16,7 @@ class VersionBridge(QObject):
     runtime_error = Signal(str)     # optional service failure, queued to GUI
     feature_state = Signal(str, bool)  # backend rollback, queued to GUI
     inventory_dir_changed = Signal(str)  # 「索引所有文件」：有非内容文件变动的目录
+    names_changed = Signal(object)  # 文件名热层：一批刚出现/改过的路径（list[str]）
 
     def emit_journal_gap(self, root: str, reason: str) -> None:
         self.journal_gap.emit(str(root), str(reason))
@@ -33,6 +34,9 @@ class VersionBridge(QObject):
 
     def emit_feature_state(self, key: str, enabled: bool) -> None:
         self.feature_state.emit(str(key), bool(enabled))
+
+    def emit_names_changed(self, paths) -> None:
+        self.names_changed.emit(list(paths))
 
     def emit_inventory_dir_changed(self, directory: str) -> None:
         """watcher 线程里的「非内容扩展名文件有变动」→ 主线程的目录级盘点对账队列。"""
