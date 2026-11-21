@@ -327,7 +327,7 @@ def test_new_file_is_findable_via_the_overlay(tmp_path):
     o.add(str(fresh), 1, BASE_T + 900)
     o.write(kind=namestore.OVERLAY)
 
-    stores = [namestore.open_store(k) for k in namestore.KINDS]
+    stores = [s for s in (namestore.open_store(k) for k in namestore.KINDS) if s is not None]
     try:
         got = {r.name for r in _search_mod.search_names(stores, ".txt")}
     finally:
@@ -347,7 +347,7 @@ def test_a_file_in_both_layers_appears_once(tmp_path):
     o.add(str(f), 999, BASE_T + 500)
     o.write(kind=namestore.OVERLAY)
 
-    stores = [namestore.open_store(k) for k in namestore.KINDS]
+    stores = [s for s in (namestore.open_store(k) for k in namestore.KINDS) if s is not None]
     try:
         got = _search_mod.search_names(stores, "edited")
     finally:
