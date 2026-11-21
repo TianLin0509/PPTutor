@@ -1476,6 +1476,9 @@ class SettingsDialog(QDialog):
             row["note"] = f"卸载失败：{result}"
         elif isinstance(result, int) and result:
             row["note"] = f"已卸载，释放 {_format_size_text(result)}"
+        if isinstance(result, int):
+            from .component_center import component_center
+            component_center()._apply(key, {"phase": "idle", "error": "", "version": ""})
         self._refresh_components(measure=self._components_measured)
 
     def _on_settings_tab_changed(self, index: int) -> None:

@@ -1,6 +1,6 @@
 """首次启动欢迎引导覆盖层：玩法教学 + 索引进度 + 风格选择。
 
-覆盖在主窗口 central 之上（随父 resize）；点「开始使用」或索引完成后由主窗关闭。
+覆盖在主窗口 central 之上（随父 resize）；完成后显示结果，点「开始使用」由主窗关闭。
 风格选择实时换肤（覆盖层自身也跟着换），降低「选了不知道长啥样」的顾虑。
 """
 from __future__ import annotations
@@ -38,14 +38,14 @@ def _welcome_logo(size: int = 60) -> QPixmap:
 
 _FEATURES = [
     ("🔍", "搜内容，直接定位到页", "记得幻灯片里写过的字，搜出来是哪个文件第几页，点开直接跳过去"),
-    ("🎬", "版本归组 · PPT 版 git", "同一份 PPT 的多个版本自动归到一起，改崩了能找回任意历史版本"),
+    ("🎬", "版本留存 · 智能归组", "版本留存可找回历史版本，智能归组把相似 PPT 归在一起；两项默认关闭，可在设置里开启"),
     ("📊", "趣味统计", "看看你的「PPT 肝度」「年度报告」「规模仓鼠」，打工人专属"),
     ("⌨️", "全局热键随叫随到", "任何时候按 Alt+F 唤起，关闭即收进托盘常驻"),
 ]
 
 
 class WelcomeOverlay(QWidget):
-    def __init__(self, parent=None, *, on_start, on_pick_theme, current_theme="cloud"):
+    def __init__(self, parent=None, *, on_start, on_pick_theme, current_theme="cloud", on_settings=None):
         super().__init__(parent)
         self._on_start_cb = on_start
         self._on_pick_cb = on_pick_theme
@@ -89,6 +89,11 @@ class WelcomeOverlay(QWidget):
             grid.addWidget(self._feat_card(ic, ft, fd), i // 2, i % 2)
         cl.addSpacing(26)
         cl.addLayout(grid)
+        self._settings_btn = QPushButton("去设置「功能」页开启 →")
+        self._settings_btn.setVisible(on_settings is not None)
+        if on_settings is not None:
+            self._settings_btn.clicked.connect(on_settings)
+        cl.addWidget(self._settings_btn, 0, Qt.AlignHCenter)
 
         self._progress_label = QLabel("正在首次扫描你的磁盘… 可边扫边搜")
         self._progress_label.setObjectName("wProgress")
@@ -161,9 +166,20 @@ class WelcomeOverlay(QWidget):
         self._apply_qss()
         self._on_pick_cb(name)
 
-    def update_progress(self, found: int) -> None:
-        self._progress_label.setText(
-            f"正在首次扫描你的磁盘… 已找到 {found} 个 PPTX · 可边扫边搜")
+    def update_progress(self, found: int, total: int | None = None) -> None:
+        count = f"已发现 {found} 个文件" if total is None else f"已处理 {found} / {total} 个文件"
+        self._progress_label.setText(f"正在首次扫描你的磁盘… {count} · 可边扫边搜")
+
+    def finish_index(self, summary: dict) -> None:
+        if summary.get("error"):
+            text = f"首次索引遇到问题：{summary['error']}；已有结果可搜，请重新扫描重试"
+        elif summary.get("cancelled"):
+            text = "首次索引已暂停，已完成的结果可搜；可重新扫描继续"
+        else:
+            text = "首次索引完成，可以开始搜索了"
+            if summary.get("name_index_error"):
+                text += f" · 文件名盘点失败：{summary['name_index_error']}；请在状态栏点击重试"
+        self._progress_label.setText(text)
 
     def resizeEvent(self, e):  # noqa: N802
         if self.parent() is not None:
