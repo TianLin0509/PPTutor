@@ -349,7 +349,7 @@ def test_main_window_dirty_dir_queue_and_reconcile(qtbot, tmp_path, monkeypatch)
     # watcher 侧只会丢一个目录名进来；churn 一千次也只应留下一个
     for _ in range(1000):
         win.note_inventory_dir_dirty(str(docs))
-    assert win._dirty_inventory_dirs == {str(docs)}
+    assert set(win._dirty_inventory_dirs) == {str(docs)}
 
     # 直接验同步对账语义：结果进的是平铺增量层，不再写 SQLite
     monkeypatch.setenv("PPTX_FINDER_DATA_DIR", str(tmp_path / "appdata"))
@@ -369,7 +369,7 @@ def test_main_window_dirty_dir_queue_and_reconcile(qtbot, tmp_path, monkeypatch)
     # 开关关掉后：不再入队，脏目录清空，定时器停
     win.apply_feature_flags(index_all_files_enabled=False)
     win.note_inventory_dir_dirty(str(docs))
-    assert win._dirty_inventory_dirs == set()
+    assert set(win._dirty_inventory_dirs) == set()
     assert not win._inventory_reconcile_timer.isActive()
     conn.close()
 

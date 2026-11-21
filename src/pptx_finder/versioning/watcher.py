@@ -72,6 +72,7 @@ class _Handler(FileSystemEventHandler):
         on_removed=None,
         allowed_exts=None,
         on_other_dir_changed=None,
+        on_name_changed=None,
     ):
         self._on_saved = on_saved
         self._on_moved = on_moved
@@ -79,6 +80,7 @@ class _Handler(FileSystemEventHandler):
         self._on_removed = on_removed
         self._allowed_exts_source = allowed_exts
         self._on_other_dir_changed = on_other_dir_changed
+        self._on_name_changed = on_name_changed
         self._explicit_skip_roots = [
             _norm_path(r) for r in (roots or [])
             if any(seg in _norm_path(r).lower() for seg in _SKIP_SEGS)
@@ -140,11 +142,21 @@ class _Handler(FileSystemEventHandler):
             except Exception:  # noqa: BLE001 盘点是尽力而为
                 pass
 
+    def name_changed(self, path: str) -> None:
+        """某个文件/目录刚出现或改过：文件名热层逐条收下（Everything 式，见 hot_names.py）。"""
+        cb = self._on_name_changed
+        if cb is not None:
+            try:
+                cb(path)
+            except Exception:  # noqa: BLE001 文件名层是尽力而为，绝不能拖垮 watcher
+                pass
+
     def _trigger(self, path: str) -> None:
         if os.path.basename(path).startswith("~$"):
             return
         if self._skip_path(path):
             return
+        self.name_changed(path)
         if os.path.splitext(path)[1].lower() not in self._allowed_exts():
             # 「索引所有文件」的盘点通道：只上报所在目录，不为每个文件事件排防抖
             # 定时器、更不逐个写库。浏览器缓存这类目录一分钟能churn几千个文件，
@@ -266,6 +278,8 @@ class _Handler(FileSystemEventHandler):
     def on_created(self, e):  # noqa: N802
         if not e.is_directory:
             self._trigger(e.src_path)
+        elif not self._skip_path(os.path.join(e.src_path, "_")):
+            self.name_changed(e.src_path)
 
     def on_moved(self, e):  # noqa: N802
         if not e.is_directory:
@@ -340,10 +354,10 @@ class VaultWatcher:
 
     def __init__(self, roots, on_saved, on_moved=None, on_content_saved=None, on_removed=None,
                  allowed_exts=None, on_other_dir_changed=None, *, known_rows=None, on_gap=None,
-                 state_path=None):
+                 state_path=None, on_name_changed=None):
         self._obs = Observer()
         handler = _Handler(on_saved, on_moved, roots, on_content_saved, on_removed,
-                           allowed_exts, on_other_dir_changed)
+                           allowed_exts, on_other_dir_changed, on_name_changed)
         self._handler = handler
         self._feed = None
         self._lock = threading.Lock()

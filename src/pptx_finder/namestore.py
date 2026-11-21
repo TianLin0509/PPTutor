@@ -89,9 +89,12 @@ DATA_SUFFIX = ".idx"
 #   main    —— 每轮全盘扫描整份重建，是绝大多数结果的来源
 #   overlay —— 目录监听发现变化后按目录重建的增量层，体积很小
 # Everything 在拿不到 NTFS 变更日志时走的也是目录监听这条路，我们照搬。
+#   hot     —— 流水账逐条报上来的「刚变过的文件」，几百条、秒级重写（见 hot_names.py）
 MAIN = "names"
 OVERLAY = "names-overlay"
-KINDS = (MAIN, OVERLAY)
+HOT = "names-hot"
+# 顺序即优先级：后面的层覆盖前面同路径的条目（记的是更新的状态）
+KINDS = (MAIN, OVERLAY, HOT)
 
 
 def pointer_path(kind: str = MAIN) -> Path:
