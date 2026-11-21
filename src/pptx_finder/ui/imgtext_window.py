@@ -154,7 +154,9 @@ class ImgTextWindow(QWidget):
         row.addWidget(self._convert_btn)
         row.addStretch(1)
         root.addLayout(row)
-        outputs = QHBoxLayout()
+        self._outputs = QWidget()
+        outputs = QHBoxLayout(self._outputs)
+        outputs.setContentsMargins(0, 0, 0, 0)
         self._copy_btn = QPushButton("复制整页到剪贴板")
         self._copy_btn.setToolTip("请先打开目标 Microsoft PowerPoint 文稿；复制后在左侧幻灯片缩略图区粘贴。")
         self._copy_btn.setEnabled(False)
@@ -179,7 +181,8 @@ class ImgTextWindow(QWidget):
         outputs.addWidget(self._open_folder_btn)
         outputs.addWidget(self._save_as_btn)
         outputs.addStretch()
-        root.addLayout(outputs)
+        root.addWidget(self._outputs)
+        self._outputs.hide()
 
     # ---------- 组件状态 ----------
     def _refresh_component_state(self) -> None:
@@ -196,6 +199,7 @@ class ImgTextWindow(QWidget):
         self._pick_btn.setEnabled(not self._busy)
         self._paste_btn.setEnabled(not self._busy)
         has_result = bool(self._result_path) and not self._busy
+        self._outputs.setVisible(bool(self._result_path))
         for btn in (self._copy_btn, self._insert_btn, self._open_result_btn,
                     self._open_folder_btn, self._save_as_btn):
             btn.setEnabled(has_result)
@@ -382,6 +386,7 @@ class ImgTextWindow(QWidget):
 
     def _on_converted(self, payload: object) -> None:
         self._busy = False
+        self._result_path = ""
         self._progress.hide()
         self._sync_buttons()
         if not isinstance(payload, dict) or "error" in payload:

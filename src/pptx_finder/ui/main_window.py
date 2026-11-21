@@ -994,8 +994,11 @@ class MainWindow(QMainWindow):
         ensure_completed_index_feature_signature(self._current_index_feature_signature())
         self._feature_change_cb = None
         self._db_path = str(cfg_db_path())
-        self._conn = conn or db.connect(self._db_path)
-        db.init_db(self._conn)
+        if conn is None:
+            self._conn = db.open_search_index(self._db_path)
+        else:
+            self._conn = conn
+            db.init_db(self._conn)
         self._index_roots = self._resolve_index_roots(roots)
         self._explicit_output_roots = explicit_project_output_roots(self._index_roots)
 
@@ -1118,7 +1121,10 @@ class MainWindow(QMainWindow):
         self._render_more_item: QListWidgetItem | None = None
 
         self._render = render_worker or RenderWorker(self)
-        self._render.rendered.connect(self._on_rendered)
+        if hasattr(self._render, "rendered_result"):
+            self._render.rendered_result.connect(self._on_rendered)
+        else:
+            self._render.rendered.connect(self._on_rendered)
         self._owns_render = render_worker is None
         if self._owns_render:
             self._render.start()
@@ -2142,6 +2148,20 @@ class MainWindow(QMainWindow):
         self.scroll.viewport().installEventFilter(self)
         self.image_label.installEventFilter(self)
         bl.addWidget(self.scroll, 1)
+
+        self.preview_error_actions = QWidget()
+        error_actions = QHBoxLayout(self.preview_error_actions)
+        error_actions.setContentsMargins(0, 0, 0, 0)
+        error_actions.addStretch()
+        self.preview_retry_btn = QPushButton("重试")
+        self.preview_retry_btn.clicked.connect(self._retry_preview)
+        error_actions.addWidget(self.preview_retry_btn)
+        self.preview_powerpoint_btn = QPushButton("检测 PowerPoint")
+        self.preview_powerpoint_btn.clicked.connect(lambda: self.open_settings_page("PowerPoint"))
+        error_actions.addWidget(self.preview_powerpoint_btn)
+        error_actions.addStretch()
+        bl.addWidget(self.preview_error_actions)
+        self.preview_error_actions.hide()
 
         # 命中页缩略图条
         self.thumb_row = QHBoxLayout()
@@ -5310,6 +5330,7 @@ class MainWindow(QMainWindow):
         self._spin_timer.timeout.connect(self._tick_spinner)
 
     def _tick_spinner(self) -> None:
+        self._hide_preview_error_actions()
         ch = "◐◓◑◒"[self._spin_idx % 4]
         self._spin_idx += 1
         accent = self._tok.get("acc", "#0A84FF")
@@ -5343,6 +5364,7 @@ class MainWindow(QMainWindow):
             self._stop_spinner()
 
     def _show_preview_pending(self) -> None:
+        self._hide_preview_error_actions()
         self._cur_pixmap = None
         self._last_preview_key = None  # 画面被占位文本替换，F2 去重 key 一并失效
         self._inflight_preview_key = None
@@ -5352,6 +5374,7 @@ class MainWindow(QMainWindow):
             f'<div style="color:{self._tok["ink3"]};font-size:13px;margin-top:12px">正在准备预览</div>')
 
     def _clear_preview_empty(self, message: str = "选中左侧结果查看预览") -> None:
+        self._hide_preview_error_actions()
         self._cur_pixmap = None
         self._last_preview_key = None  # F2
         self._inflight_preview_key = None
@@ -5359,17 +5382,37 @@ class MainWindow(QMainWindow):
         self.image_label.setText(
             f'<div style="color:{self._tok["ink3"]};font-size:13px">{message}</div>')
 
-    def _show_preview_unavailable(self) -> None:
+    def _hide_preview_error_actions(self) -> None:
+        if hasattr(self, "preview_error_actions"):
+            self.preview_error_actions.hide()
+
+    def _retry_preview(self) -> None:
+        self._last_preview_key = None
+        self._inflight_preview_key = None
+        if hasattr(self._render, "retry_next"):
+            self._render.retry_next()
+        self._request_preview()
+
+    def _show_preview_unavailable(self, category: str = "other") -> None:
+        messages = {
+            "missing_file": ("文件不存在或已被移动", "请确认文件位置，文件恢复后点击重试。"),
+            "powerpoint_unavailable": ("PowerPoint 暂时不可用", "请点击“检测 PowerPoint”，按提示检查安装或修复后重试。"),
+            "busy_timeout": ("PowerPoint 正忙或等待超时", "请先完成 PowerPoint 中的操作或处理弹窗，再点击重试。"),
+            "other": ("暂时无法生成原图预览", "请确认文件能在 PowerPoint 中打开，检查是否加密或损坏后再重试。无需关闭正在编辑的文稿。"),
+        }
+        title, hint = messages.get(category, messages["other"])
         self._last_preview_key = None  # 错误文本替换画面，上一页成功 key 一并失效（否则翻回上一页被去重卡住）
         self.image_label.setPixmap(QPixmap())
         self.image_label.setText(
-            f'<div style="font-size:15px;font-weight:600;color:{self._tok["ink2"]}">暂时无法生成原图预览</div>'
+            f'<div style="font-size:15px;font-weight:600;color:{self._tok["ink2"]}">{title}</div>'
             f'<div style="color:{self._tok["ink3"]};font-size:12px;margin-top:10px;line-height:1.7">'
-            '若 PowerPoint 正忙或有弹窗，完成当前操作后切换页码即可重试；<br>'
-            '无需关闭正在编辑的文稿。也可能是文件加密、损坏或页码已失效。</div>')
+            f'{hint}</div>')
         self._cur_pixmap = None
+        self.preview_powerpoint_btn.setVisible(category == "powerpoint_unavailable")
+        self.preview_error_actions.show()
 
     def _show_non_powerpoint_preview(self, ext: str) -> None:
+        self._hide_preview_error_actions()
         self._last_preview_key = None  # F2：非 PPT 文本占位替换画面，去重 key 失效
         self._inflight_preview_key = None
         self.image_label.setPixmap(QPixmap())
@@ -5592,7 +5635,7 @@ class MainWindow(QMainWindow):
         self._update_pixmap()
         self._toast("原尺寸放大 · 再双击还原" if self._zoom > 1.0 else "已适配窗口")
 
-    def _on_rendered(self, req_id: int, png: str) -> None:
+    def _on_rendered(self, req_id: int, png: str, category: str = "other") -> None:
         if self._closing:
             return
         if req_id != self._req_id:
@@ -5603,7 +5646,7 @@ class MainWindow(QMainWindow):
         self._stop_spinner()
         if not png or not os.path.exists(png):
             self._inflight_preview_key = None
-            self._show_preview_unavailable()
+            self._show_preview_unavailable(category)
             return
         pm = QPixmap(png)
         if pm.isNull():
@@ -5676,6 +5719,7 @@ class MainWindow(QMainWindow):
     def _update_pixmap(self) -> None:
         if self._cur_pixmap is None:
             return
+        self._hide_preview_error_actions()
         vp = self.scroll.viewport().size()
         fitted_size = QSize(self._cur_pixmap.width(), self._cur_pixmap.height())
         fitted_size.scale(

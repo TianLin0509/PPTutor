@@ -25,6 +25,7 @@ def test_app_for_render_starts_owned_microsoft_app_when_only_wps_is_in_rot(monke
 def test_renderer_service_returns_structured_empty_path_reason(monkeypatch):
     monkeypatch.setattr(renderer, "render_page", lambda *_a, **_k: None)
     monkeypatch.setattr(renderer, "last_error", lambda: "foreign WPS COM server")
+    monkeypatch.setattr(renderer, "last_error_category", lambda: "busy_timeout")
     response = render_service.handle_request({
         "id": 7, "op": "render", "path": "x.pptx", "page_no": 1,
     })
@@ -33,6 +34,7 @@ def test_renderer_service_returns_structured_empty_path_reason(monkeypatch):
         "ok": True,
         "path": "",
         "reason": "foreign WPS COM server",
+        "category": "busy_timeout",
     }
 
 

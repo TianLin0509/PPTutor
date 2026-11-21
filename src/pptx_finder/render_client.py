@@ -68,6 +68,7 @@ class RendererProcessClient:
         self._last_ms = 0.0
         self._samples: deque[float] = deque(maxlen=128)
         self._last_error = ""
+        self._failure_state = threading.local()
 
     def _command(self, port: int, token: str) -> list[str]:
         if getattr(sys, "frozen", False):
@@ -405,7 +406,11 @@ class RendererProcessClient:
         existing_session_only: bool = False,
         allow_borrowed_session: bool = False,
         one_shot: bool = False,
+        retry: bool = False,
     ) -> Path | None:
+        from .render_errors import classify_error, normalize_category
+        self._failure_state.reason = ""
+        self._failure_state.category = "other"
         try:
             resp = self.request({
                 "op": "render_once" if one_shot else "render",
@@ -418,15 +423,27 @@ class RendererProcessClient:
                 "use_snapshot": bool(use_snapshot),
                 "existing_session_only": bool(existing_session_only),
                 "allow_borrowed_session": bool(allow_borrowed_session),
+                "retry": bool(retry),
             })
-        except Exception:
+        except Exception as exc:
+            self._last_error = f"{type(exc).__name__}: {exc}"
+            self._failure_state.reason = self._last_error
+            self._failure_state.category = classify_error(exc)
             return None
         png = str(resp.get("path") or "")
         if not png:
-            self._last_error = str(resp.get("reason") or self._last_error or "render returned no image")
+            self._last_error = str(resp.get("reason") or resp.get("error") or "render returned no image")
+            self._failure_state.reason = self._last_error
+            self._failure_state.category = normalize_category(str(resp.get("category") or "other"))
         else:
             self._last_error = ""
         return Path(png) if png else None
+
+    def last_error(self) -> str:
+        return getattr(self._failure_state, "reason", "")
+
+    def last_error_category(self) -> str:
+        return getattr(self._failure_state, "category", "other")
 
     def close_current_presentation(self) -> None:
         with self._lock:
@@ -514,6 +531,7 @@ def render_page(
     existing_session_only: bool = False,
     allow_borrowed_session: bool = False,
     one_shot: bool = False,
+    retry: bool = False,
 ) -> Path | None:
     return _client.render_page(
         path,
@@ -526,6 +544,7 @@ def render_page(
         existing_session_only=existing_session_only,
         allow_borrowed_session=allow_borrowed_session,
         one_shot=one_shot,
+        retry=retry,
     )
 
 
@@ -539,6 +558,7 @@ def render_page_once(
     priority: int | None,
     use_snapshot: bool = False,
     allow_borrowed_session: bool = False,
+    retry: bool = False,
 ) -> Path | None:
     return render_page(
         path,
@@ -550,6 +570,7 @@ def render_page_once(
         use_snapshot=use_snapshot,
         allow_borrowed_session=allow_borrowed_session,
         one_shot=True,
+        retry=retry,
     )
 
 
@@ -575,3 +596,11 @@ def abort_inflight() -> bool:
 
 def diagnostic_lines() -> list[str]:
     return _client.diagnostic_lines()
+
+
+def last_error() -> str:
+    return _client.last_error()
+
+
+def last_error_category() -> str:
+    return _client.last_error_category()

@@ -14,10 +14,10 @@ import sys
 import threading
 import time
 
-from PySide6.QtCore import QAbstractNativeEventFilter, Qt
-from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPixmap
+from PySide6.QtCore import QAbstractNativeEventFilter, Qt, QUrl
+from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QIcon, QPainter, QPixmap
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
-from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
+from PySide6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QLabel, QMenu, QMessageBox, QSystemTrayIcon, QVBoxLayout
 try:
     from shiboken6 import isValid as _qt_is_valid
 except Exception:  # noqa: BLE001
@@ -754,6 +754,56 @@ def _install_qt_chinese(app) -> bool:
     return False
 
 
+def _open_log_directory() -> None:
+    from .config import data_dir
+    QDesktopServices.openUrl(QUrl.fromLocalFile(str(data_dir())))
+
+
+def _ask_index_recovery(path, detail: str) -> str:
+    dialog = QDialog()
+    dialog.setWindowTitle("搜索索引损坏，暂时无法启动")
+    layout = QVBoxLayout(dialog)
+    message = QLabel(
+        "搜索索引无法读取，可能在上次写入时损坏了。\n"
+        "可以保留故障索引，再从原文件重新建立搜索索引。\n"
+        "PPT 原文件、历史版本和用户设置都会保留。\n\n"
+        f"索引位置：{path}\n原因：{detail}")
+    message.setTextFormat(Qt.PlainText)
+    message.setWordWrap(True)
+    layout.addWidget(message)
+    buttons = QDialogButtonBox()
+    rebuild = buttons.addButton("保留故障索引并重新建立", QDialogButtonBox.AcceptRole)
+    logs = buttons.addButton("查看日志", QDialogButtonBox.ActionRole)
+    quit_button = buttons.addButton("退出", QDialogButtonBox.RejectRole)
+    quit_button.setDefault(True)
+    rebuild.clicked.connect(dialog.accept)
+    logs.clicked.connect(_open_log_directory)
+    quit_button.clicked.connect(dialog.reject)
+    layout.addWidget(buttons)
+    return "rebuild" if dialog.exec() == QDialog.Accepted else "exit"
+
+
+def _create_main_window():
+    from . import db
+    log = logging.getLogger(__name__)
+    while True:
+        try:
+            return MainWindow(do_index=True)
+        except db.CorruptSearchIndex as exc:
+            log.exception("search index is corrupt: %s", exc.path)
+            if _ask_index_recovery(exc.path, str(exc)) != "rebuild":
+                return None
+            try:
+                backup = db.preserve_broken_index(exc.path)
+                log.warning("preserved broken search index: %s", backup)
+            except OSError as error:
+                log.exception("cannot preserve broken search index")
+                QMessageBox.critical(None, "暂时无法重新建立索引",
+                                     f"故障索引未能完整保留，程序将退出。\n"
+                                     f"请查看日志，确认索引目录可以写入后再启动。\n{error}")
+                return None
+
+
 def main() -> int:
     multiprocessing.freeze_support()  # PyInstaller 下多进程必需
     from .logging_setup import configure_logging
@@ -799,7 +849,9 @@ def main() -> int:
     icon = _make_icon()
     app.setWindowIcon(icon)
 
-    win = MainWindow(do_index=True)
+    win = _create_main_window()
+    if win is None:
+        return 1
     win._to_tray_on_close = True
 
     # 基础模式只保留一个轻量文件监听器维持 PPT 索引新鲜；版本对账/维护仅在

@@ -22,6 +22,7 @@ log = logging.getLogger(__name__)
 
 class RenderWorker(QThread):
     rendered = Signal(int, str)  # request_id, png_path（失败为空串）
+    rendered_result = Signal(int, str, str)  # 兼容旧信号，同时带回失败类别。
     # 80ms absorbs rapid result-selection churn while still getting the next page
     # ready before a normal human page-turn. Concurrency remains one COM export.
     _PREFETCH_IDLE_GRACE_SEC = 0.08
@@ -37,6 +38,8 @@ class RenderWorker(QThread):
         super().__init__(parent)
         self._cv = threading.Condition()
         self._preview = None  # (req_id, path, page, key, long_edge, priority)，仅留最新
+        self._retry_next = False
+        self._preview_retry = False
         self._prefetch: collections.deque = collections.deque()  # (path, page, key, long_edge, priority)
         self._prefetch_pending_keys: set[tuple[str, int, str | None, int, int]] = set()
         self._prefetch_active_keys: set[tuple[str, int, str | None, int, int]] = set()
@@ -91,11 +94,18 @@ class RenderWorker(QThread):
         with self._cv:
             self._preview_requested += 1
             self._preview = (req_id, path, page_no, cache_key, int(long_edge), int(priority))
+            self._preview_retry = self._retry_next
+            self._retry_next = False
             self._warm = False  # 用户已在等真实预览；预热此时只会抢占等待路径
             self._prefetch_cleared += len(self._prefetch)
             self._prefetch.clear()  # 新预览 → 旧页的预取全作废
             self._prefetch_pending_keys.clear()
             self._cv.notify()
+
+    def retry_next(self) -> None:
+        """A deliberate retry bypasses only that page's recent-failure delay."""
+        with self._cv:
+            self._retry_next = True
 
     def prefetch(
         self,
@@ -199,6 +209,7 @@ class RenderWorker(QThread):
                             break
                         if self._preview is not None:
                             kind, data = "preview", self._preview
+                            retry = self._preview_retry
                             self._preview = None
                             break
                         if self._warm:
@@ -278,7 +289,9 @@ class RenderWorker(QThread):
                         self._session_last_activity = time.monotonic()
                 elif kind == "preview":
                     req_id, path, page_no, key, long_edge, priority = data
+                    category = "other"
                     try:
+                        extra = {"retry": True} if retry else {}
                         png = renderer.render_page(
                             path,
                             page_no,
@@ -288,8 +301,13 @@ class RenderWorker(QThread):
                             priority=priority,
                             use_snapshot=True,
                             allow_borrowed_session=True,
+                            **extra,
                         )
-                    except Exception:  # noqa: BLE001
+                        if not png:
+                            category = renderer.last_error_category()
+                    except Exception as exc:  # noqa: BLE001
+                        from ..render_errors import classify_error
+                        category = classify_error(exc)
                         png = None
                     with self._cv:
                         self._preview_completed += 1
@@ -298,6 +316,7 @@ class RenderWorker(QThread):
                         self._session_maybe_open = True
                         self._session_last_activity = time.monotonic()
                     self.rendered.emit(req_id, str(png) if png else "")
+                    self.rendered_result.emit(req_id, str(png) if png else "", "" if png else category)
                 else:  # prefetch：只复用已打开的安全快照，不发信号、被预览随时抢占
                     path, page_no, key, long_edge, priority = data
                     ok = False

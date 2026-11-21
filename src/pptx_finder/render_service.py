@@ -38,6 +38,8 @@ def handle_request(req: dict[str, Any]) -> dict[str, Any]:
             }
             if req.get("existing_session_only"):
                 render_kwargs["existing_session_only"] = True
+            if req.get("retry"):
+                render_kwargs["retry"] = True
             try:
                 png = renderer.render_page(
                     str(req.get("path") or ""),
@@ -47,12 +49,15 @@ def handle_request(req: dict[str, Any]) -> dict[str, Any]:
             finally:
                 if op == "render_once":
                     renderer.close_current_presentation()
-            return {
+            response = {
                 "id": req_id,
                 "ok": True,
                 "path": str(png) if png else "",
                 "reason": "" if png else renderer.last_error(),
             }
+            if not png:
+                response["category"] = renderer.last_error_category()
+            return response
         if op == "close_current":
             renderer.close_current_presentation()
             return {"id": req_id, "ok": True}
@@ -69,7 +74,9 @@ def handle_request(req: dict[str, Any]) -> dict[str, Any]:
             return {"id": req_id, "ok": True, "shutdown": True}
         return {"id": req_id, "ok": False, "error": f"unknown op: {op}"}
     except Exception as exc:  # noqa: BLE001 - child process must not tear down IPC on one bad file
-        return {"id": req_id, "ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        from .render_errors import classify_error
+        return {"id": req_id, "ok": False, "error": f"{type(exc).__name__}: {exc}",
+                "category": classify_error(exc)}
 
 
 def serve(sock: socket.socket, token: str) -> int:
