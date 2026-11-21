@@ -1159,7 +1159,8 @@ def test_live_refresh_trailing_edge_runs_without_another_watcher_event(
     win._do_live_refresh()
 
     assert searches == []
-    qtbot.waitUntil(lambda: searches == [1], timeout=500)
+    # 0.5s 在合入闸门满载时偶发超时（2026-11-22 单跑 5/5 过）：放宽到 3s，仍验证窗口结束后自动补跑
+    qtbot.waitUntil(lambda: searches == [1], timeout=3000)
     assert win._live_refresh_pending is False
 
 
