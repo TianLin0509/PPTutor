@@ -57,6 +57,11 @@ class FacetPanel(QWidget):
     def update_counts(self, counts: dict, keep: bool = False) -> None:
         if not keep:
             self._filters = {}
+        else:
+            available = {dim: {bucket for bucket, _ in buckets} for dim, buckets in counts.items()}
+            self._filters = {dim: buckets & available.get(dim, set())
+                             for dim, buckets in self._filters.items()
+                             if buckets & available.get(dim, set())}
         while self._cl.count() > 1:  # 保留末尾 stretch
             it = self._cl.takeAt(0)
             if it.widget():

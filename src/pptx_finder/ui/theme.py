@@ -68,11 +68,11 @@ def _mk_atelier(light: bool) -> dict:
             panel="#252529", panel2="#232327", field="#2E2E33", rail="#202024",
             hover="rgba(255,255,255,0.06)", sel="rgba(10,132,255,0.20)", selblur="rgba(255,255,255,0.07)",
             bd="rgba(255,255,255,0.11)", bd2="rgba(255,255,255,0.065)",
-            ink1="#F5F5F7", ink2="#D0D0D5", ink3="#98989F", ink4="#6A6A70",
+            ink1="#F5F5F7", ink2="#D0D0D5", ink3="#98989F", ink4="#A0A0AA",
             acc=acc, accd=accd, acctext="#FFFFFF", grn="#32D74B",
             scroll="rgba(255,255,255,0.24)", scrollh="rgba(255,255,255,0.44)",
             canvas="#161619", is_light=False,
-            hl_bg="rgba(255,214,10,0.30)", hl_fg="#FFD60A",
+            hl_bg="rgba(255,214,10,0.22)", hl_fg="#FFE047",
         )
     ar, ag, ab = _rgb(acc)
     d.update(hl_r=str(ar), hl_g=str(ag), hl_b=str(ab), hl_a="0.22", radius="12")
