@@ -1558,10 +1558,11 @@ class MainWindow(QMainWindow):
         # 窄窗口时排序/匹配下拉可以收窄，结果计数可以省略号截断，不把整窗最小宽度顶高
         for w in (self.sort_combo, self.sort_secondary, self.match_mode_combo):
             w.setMinimumWidth(92)
-            w.setFixedHeight(28)
-        self.sort_desc_btn.setFixedSize(28, 28)
-        self.case_sensitive_btn.setFixedHeight(28)
-        self.facet_add_chip.setFixedHeight(28)
+            w.setMinimumHeight(28)       # 只给下限：应用字号放大时允许长高，不裁字
+        self.sort_desc_btn.setFixedWidth(28)
+        self.sort_desc_btn.setMinimumHeight(28)
+        self.case_sensitive_btn.setMinimumHeight(28)
+        self.facet_add_chip.setMinimumHeight(28)
         # 「模糊匹配」四个字在 100px 里会被裁掉一截：按最长项实际字宽给足（含箭头留白）
         fm = self.match_mode_combo.fontMetrics()
         self.match_mode_combo.setMinimumWidth(
@@ -2226,7 +2227,7 @@ class MainWindow(QMainWindow):
         more.addAction(self.clip_btn)
         self.more_btn.setMenu(more)
         for b in (self.goto_btn, self.open_btn, self.copy_slide_btn, self.insert_slide_btn, self.more_btn):
-            b.setFixedHeight(34)
+            b.setMinimumHeight(34)       # 下限 34；大字号时随字体长高
             # 窄窗口时允许按钮收窄，避免操作行把整窗最小宽度顶到 1400+。
             b.setMinimumWidth(64)
             b.setIconSize(QSize(16, 16))
