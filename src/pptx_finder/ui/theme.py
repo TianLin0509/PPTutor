@@ -227,7 +227,7 @@ QPushButton#ghost:focus, QPushButton#iconBtn:focus { border: 1.5px solid $acc; }
 QPushButton#primary:focus { border: 2px solid $acctext; }
 
 /* 筛选 chip（Aa 大小写等）：胶囊，灰默认，选中淡强调 */
-QPushButton#chip { background: $field; border: 1px solid transparent; border-radius: 12px; padding: 4px 12px; color: $ink3; font-size: 12px; }
+QPushButton#chip { background: $field; border: 1px solid transparent; border-radius: 14px; padding: 0 12px; color: $ink2; font-size: 12px; }
 QPushButton#chip:hover { background: $hover; color: $ink2; }
 QPushButton#chip:checked { background: rgba($hl_r,$hl_g,$hl_b,0.14); border-color: $acc; color: $acc; }
 
@@ -235,7 +235,7 @@ QPushButton#chip:checked { background: rgba($hl_r,$hl_g,$hl_b,0.14); border-colo
 QWidget#facetBar { background: transparent; }
 QPushButton#facetActiveChip { background: rgba($hl_r,$hl_g,$hl_b,0.14); border: 1px solid $acc; border-radius: 12px; padding: 4px 12px; color: $acc; font-size: 12px; }
 QPushButton#facetActiveChip:hover { background: rgba($hl_r,$hl_g,$hl_b,0.22); }
-QPushButton#facetAdd { background: transparent; border: 1px dashed $bd; border-radius: 12px; padding: 4px 12px; color: $ink3; font-size: 12px; }
+QPushButton#facetAdd { background: $field; border: 1px solid transparent; border-radius: 14px; padding: 0 12px; color: $ink2; font-size: 12px; }
 QPushButton#facetAdd:hover { background: $hover; color: $ink2; }
 
 /* 结果列表（在 listPane 卡内，透明） */
@@ -315,7 +315,7 @@ QPushButton#verPreviewBtn:hover { background: $hover; color: $ink1; }
 QPushButton#outlineItem { background: transparent; border: none; text-align: left; padding: 4px 6px; color: $ink2; font-size: 11.5px; border-radius: 5px; }
 QPushButton#outlineItem:hover { background: $hover; color: $acc; }
 QLabel#listHead { color: $ink3; font-size: 11.5px; font-weight: 600; background: transparent; }
-QComboBox#sortCombo, QComboBox#sortSecondary { background: $field; border: 1px solid transparent; border-radius: 11px; padding: 3px 24px 3px 10px; color: $ink2; font-size: 11.5px; }
+QComboBox#sortCombo, QComboBox#sortSecondary { background: $field; border: 1px solid transparent; border-radius: 14px; padding: 0 22px 0 10px; color: $ink2; font-size: 12px; }
 QComboBox#sortCombo:hover, QComboBox#sortSecondary:hover { background: $bd; color: $ink1; }
 QComboBox#sortCombo QAbstractItemView { background: $win; border: 1px solid $bd; border-radius: 8px; selection-background-color: $sel; selection-color: $ink1; }
 
@@ -342,12 +342,12 @@ QToolButton#verExpand { background: transparent; border: 1px solid $bd2; border-
 QToolButton#verExpand:hover { background: $hover; border-color: $bd; color: $acc; }
 
 /* 命中页缩略图 / 页码分段：选中白底浮起（浅）或强调描边 */
-QToolButton#thumb { background: $field; border: 1px solid transparent; border-radius: 6px; padding: 0; color: $ink3; }
+QToolButton#thumb { background: $field; border: 1px solid transparent; border-radius: 14px; padding: 0; color: $ink2; font-size: 12px; }
 QToolButton#thumb:hover { background: $hover; color: $ink1; }
-QToolButton#thumb:checked { background: $panel; border: 1.5px solid $acc; color: $acc; font-weight: 600; }
+QToolButton#thumb:checked { background: $sel; border: 1px solid $acc; color: $acc; font-weight: 600; }
 
 /* 命中页导航：轻量文字按钮 */
-QPushButton#navBtn { background: $field; border: 1px solid transparent; border-radius: 14px; padding: 6px 14px; color: $ink2; font-size: 12.5px; }
+QPushButton#navBtn { background: $field; border: 1px solid transparent; border-radius: 14px; padding: 4px 14px; color: $ink2; font-size: 12px; }
 QPushButton#navBtn:hover { background: $bd; color: $ink1; }
 QPushButton#navBtn:disabled { color: $ink4; background: $field; border-color: transparent; }
 QLabel#pageLabel { color: $ink3; font-size: 12px; font-family: $mono_family; background: transparent; }

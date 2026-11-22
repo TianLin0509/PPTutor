@@ -516,7 +516,7 @@ _SORT_LABELS = {
 # 行高倒推：19px 行高 + 15 = 34（搜索框）、+ 11 = 30（两个下拉），所以 100% 及以下
 # 逐像素还是老样子，只有放大时才跟着长高。
 _SEARCH_BOX_METRICS = (34, 15)
-_SEARCH_CTRL_METRICS = (30, 11)
+_SEARCH_CTRL_METRICS = (34, 15)  # 与搜索框同高（HUB-H 一行控件齐平；原 30 比搜索框矮 4px）
 
 
 class _TypeBar(QWidget):
@@ -702,8 +702,8 @@ class ResultItem(QWidget):
             exact = QLabel("文件名全字" if match_kind.startswith("filename_") else "内容全字")
             exact.setObjectName("exactMatchBadge")
             exact.setStyleSheet(
-                f"font-size:10px;font-weight:600;color:{tok['ink3']};"
-                f"background:{tok['field']};border:none;border-radius:5px;padding:2px 7px;"
+                f"font-size:11px;font-weight:500;color:{tok['ink3']};"
+                "background:transparent;border:none;padding:0 2px;"
             )
             row.addWidget(exact, 0)
 
@@ -716,8 +716,9 @@ class ResultItem(QWidget):
                 pages += " \u2026"
             pg = QLabel(pages)
             pg.setStyleSheet(
-                f"font-size:11px;font-weight:600;color:{tok['ink3']};"
-                'font-family:"Consolas","Microsoft YaHei UI";background:transparent;padding:1px 2px;')
+                f"font-size:11.5px;font-weight:600;color:{tok['ink2']};"
+                'font-family:"Consolas","Microsoft YaHei UI";'
+                f"background:{tok['field']};border-radius:6px;padding:1px 8px;")
             pg.setToolTip("\u547d\u4e2d\u9875\u7801")
             row.addWidget(pg, 0)
         elif r.name_hit:
@@ -777,7 +778,7 @@ class ResultItem(QWidget):
         if r.hits and r.hits[0].snippet:
             sn = QLabel(_highlight(r.hits[0].snippet, hlcss))
             sn.setTextFormat(Qt.RichText)
-            sn.setStyleSheet(f"font-size:12px;color:{tok['ink2']};background:transparent;")
+            sn.setStyleSheet(f"font-size:12.5px;color:{tok['ink2']};background:transparent;")
             sn.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
             lay.addWidget(sn)
         elif r.status == "filename_only":
@@ -808,7 +809,7 @@ class ResultItem(QWidget):
             if len(dup_paths) > 1:
                 tm = f"{tm} · 同一文件 · {len(dup_paths)} 个位置"
             t = QLabel(tm)
-            t.setStyleSheet(f"font-size:11.5px;color:{tok['ink4']};background:transparent;")
+            t.setStyleSheet(f"font-size:12px;color:{tok['ink3']};background:transparent;")
             # 位置那段是省略过的，悬停给完整路径（多副本时列全部位置）
             t.setToolTip("\n".join(dup_paths) if len(dup_paths) > 1 else r.path)
             lay.addWidget(t)
@@ -893,12 +894,13 @@ class ResultItem(QWidget):
         t = self._tok
         if state == "sel":
             bg = t["sel"] if active else t["selblur"]
-            bar = t["acc"] if active else t["ink4"]
+            bar = f"rgba({t['hl_r']},{t['hl_g']},{t['hl_b']},0.28)" if active else t["bd"]
         elif state == "hover":
-            bg, bar = t["hover"], t["bd2"]
+            bg, bar = t["hover"], "transparent"
         else:
             bg, bar = "transparent", "transparent"
-        self.setStyleSheet(f"ResultItem{{background:{bg};border-radius:8px;border-left:3px solid {bar};}}")
+        # HUB-H 列表项：12px 圆角 + 细描边（原 3px 左粗线在 Qt 里会把圆角切出尖角）
+        self.setStyleSheet(f"ResultItem{{background:{bg};border-radius:12px;border:1px solid {bar};}}")
 
 
 class _PopupHideFilter(QObject):
@@ -1480,9 +1482,15 @@ class MainWindow(QMainWindow):
         ll.setSpacing(0)
         self.list_head = QWidget()
         self.list_head.setObjectName("listHeadBar")
-        hr = QHBoxLayout(self.list_head)
-        hr.setContentsMargins(12, 6, 8, 4)
+        head_rows = QVBoxLayout(self.list_head)
+        head_rows.setContentsMargins(12, 6, 10, 4)
+        head_rows.setSpacing(6)
+        hr = QHBoxLayout()
         hr.setSpacing(8)
+        hr2 = QHBoxLayout()
+        hr2.setSpacing(8)
+        head_rows.addLayout(hr)
+        head_rows.addLayout(hr2)
         # 左侧条件行：已选 facet 条件 chip（点 ✕ 移除）+ 虚线「+ 筛选」浮层入口，
         # 随 listHeadBar 一起显隐；零选中时只剩「+ 筛选」
         self.facet_bar = QWidget()
@@ -1497,7 +1505,8 @@ class MainWindow(QMainWindow):
         self.facet_add_chip.setToolTip("按时间 / 类型 / 页数 / 文件夹筛选")
         self.facet_add_chip.clicked.connect(self._toggle_facet)
         fb.addWidget(self.facet_add_chip)
-        hr.addWidget(self.facet_bar, 0)
+        hr2.addWidget(self.facet_bar, 0)
+        hr2.addStretch(1)
         self.result_count = QLabel("")
         self.result_count.setObjectName("listHead")
         hr.addWidget(self.result_count, 1)
@@ -1535,7 +1544,7 @@ class MainWindow(QMainWindow):
         if get_search_exact_match():
             self.match_mode_combo.setCurrentIndex(1)
         self.match_mode_combo.currentIndexChanged.connect(self._on_match_mode_changed)
-        hr.addWidget(self.match_mode_combo, 0)
+        hr2.addWidget(self.match_mode_combo, 0)
         self.case_sensitive_btn = QPushButton("Aa 大小写")
         self.case_sensitive_btn.setObjectName("chip")
         self.case_sensitive_btn.setCheckable(True)
@@ -1545,10 +1554,14 @@ class MainWindow(QMainWindow):
             "区分英文大小写；默认关闭。开启后 AI 不再匹配 ai"
         )
         self.case_sensitive_btn.toggled.connect(self._on_case_sensitive_changed)
-        hr.addWidget(self.case_sensitive_btn, 0)
+        hr2.addWidget(self.case_sensitive_btn, 0)
         # 窄窗口时排序/匹配下拉可以收窄，结果计数可以省略号截断，不把整窗最小宽度顶高
         for w in (self.sort_combo, self.sort_secondary, self.match_mode_combo):
-            w.setMinimumWidth(100)
+            w.setMinimumWidth(92)
+            w.setFixedHeight(28)
+        self.sort_desc_btn.setFixedSize(28, 28)
+        self.case_sensitive_btn.setFixedHeight(28)
+        self.facet_add_chip.setFixedHeight(28)
         # 「模糊匹配」四个字在 100px 里会被裁掉一截：按最长项实际字宽给足（含箭头留白）
         fm = self.match_mode_combo.fontMetrics()
         self.match_mode_combo.setMinimumWidth(
@@ -2213,7 +2226,7 @@ class MainWindow(QMainWindow):
         more.addAction(self.clip_btn)
         self.more_btn.setMenu(more)
         for b in (self.goto_btn, self.open_btn, self.copy_slide_btn, self.insert_slide_btn, self.more_btn):
-            b.setMinimumHeight(38)
+            b.setFixedHeight(34)
             # 窄窗口时允许按钮收窄，避免操作行把整窗最小宽度顶到 1400+。
             b.setMinimumWidth(64)
             b.setIconSize(QSize(16, 16))
@@ -3666,16 +3679,22 @@ class MainWindow(QMainWindow):
         self._clear_facet_btn.clicked.connect(lambda: self.facet_panel._clear_all())
         self._clear_facet_btn.hide()
         v.addWidget(self._clear_facet_btn, 0, Qt.AlignCenter)
+        # 次要出口横排成文字按钮，不与上面的「改搜文件名」等主建议抢视线
+        diag_row = QHBoxLayout()
+        diag_row.setSpacing(4)
+        diag_row.addStretch(1)
         self._diagnose_btn = QPushButton("查看健康诊断")
-        self._diagnose_btn.setObjectName("suggBtn")
+        self._diagnose_btn.setObjectName("ghost")
         self._diagnose_btn.setToolTip("查看索引库、扫描范围、数据目录和 PowerPoint 状态")
         self._diagnose_btn.clicked.connect(self._open_health_diagnostics)
-        v.addWidget(self._diagnose_btn, 0, Qt.AlignCenter)
+        diag_row.addWidget(self._diagnose_btn)
         self._health_center_btn = QPushButton("给整个库做次体检")
-        self._health_center_btn.setObjectName("suggBtn")
+        self._health_center_btn.setObjectName("ghost")
         self._health_center_btn.setToolTip("扫描重复 / 僵尸冷文件 / 终版诅咒 / 解析失败，并一键回收重复占用")
         self._health_center_btn.clicked.connect(self._open_health_center)
-        v.addWidget(self._health_center_btn, 0, Qt.AlignCenter)
+        diag_row.addWidget(self._health_center_btn)
+        diag_row.addStretch(1)
+        v.addLayout(diag_row)
         self.empty_hint.hide()
         parent_layout.addWidget(self.empty_hint, 1)
 
@@ -5306,7 +5325,7 @@ class MainWindow(QMainWindow):
             b.setCheckable(True)
             b.setChecked(i == self._hit_idx)
             b.setEnabled(self._active_heavy_op is None and self._search_pending_req is None)
-            b.setFixedSize(64, 34)
+            b.setFixedSize(60, 28)
             b.setProperty("hit_index", i)
             b.clicked.connect(lambda _=False, i=i: self._goto_hit(i))
             self.thumb_row.addWidget(b)
@@ -5318,7 +5337,7 @@ class MainWindow(QMainWindow):
             more.setText(f"+{remaining}")
             more.setToolTip(f"还有 {remaining} 个命中页，可用上/下命中页继续切换")
             more.setEnabled(False)
-            more.setFixedSize(52, 34)
+            more.setFixedSize(48, 28)
             self.thumb_row.addWidget(more)
 
     def _goto_hit(self, i: int) -> None:
