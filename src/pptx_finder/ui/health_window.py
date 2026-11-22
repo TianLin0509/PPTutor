@@ -312,11 +312,11 @@ class HealthWindow(QWidget):
         return lbl
 
     # ---------- 病灶条目链接 ----------
-    def _mk_link(self, name: str, path: str) -> QLabel:
+    def _mk_link(self, name: str, path: str, max_chars: int = 26) -> QLabel:
         """可点条目：acc 色链接、hover 下划线、tooltip 全路径；点击经主窗钩子跳转定位。"""
         disp = (name or os.path.basename(path)).strip() or path
-        if len(disp) > 26:
-            disp = disp[:25] + "…"
+        if len(disp) > max_chars:
+            disp = disp[:max_chars - 1] + "…"
         acc = self._tok.get("acc", "#0A84FF")
         esc = html.escape(disp)
         lbl = QLabel()
@@ -472,12 +472,17 @@ class HealthWindow(QWidget):
         row = QHBoxLayout(w)
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(6)
-        row.addWidget(self._line(f"{prefix}："))
+        # 两列网格里窄窗/大字号时：短标签不许折行成竖排，长文件名收短（全路径看悬停提示）
+        head = self._line(f"{prefix}：")
+        head.setWordWrap(False)
+        row.addWidget(head)
         if path:
-            row.addWidget(self._mk_link(name, path))
+            row.addWidget(self._mk_link(name, path, max_chars=16))
         else:
             row.addWidget(self._line(name))
-        row.addWidget(self._muted(f"·　{value}"))
+        tail = self._muted(f"·　{value}")
+        tail.setWordWrap(False)
+        row.addWidget(tail)
         row.addStretch(1)
         return w
 
@@ -485,7 +490,9 @@ class HealthWindow(QWidget):
         w, lay = self._card("解析失败")
         if r.parse_failed:
             names = {"encrypted": "加密", "too_large": "超大跳过", "error": "无法读取",
-                     "cloud_placeholder": "云盘未下载", "corrupt": "文件损坏"}
+                     "cloud_placeholder": "云盘未下载", "corrupt": "文件损坏", "timeout": "解析超时",
+                     "scanned": "扫描件无文字", "filename_only": "仅收录文件名", "pending": "等待解析",
+                     "unsupported": "格式不支持"}
             detail = "、".join(f"{names.get(k, k)} {v} 份" for k, v in r.parse_failed_by_status.items())
             lay.addWidget(self._line(f"{r.parse_failed} 份没能提取内容（{detail}）"))
             self._add_example_links(lay, r.parse_failed_examples)
