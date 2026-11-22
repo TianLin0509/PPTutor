@@ -52,7 +52,8 @@ def test_formula_uses_original_without_annotations(qtbot):
 
 def test_auto_latex_word_copy_edit_invalidates(qtbot,tmp_path):
     written=[];win=window(qtbot,tmp_path,written.append);win._formula_selected(image())
-    qtbot.waitUntil(lambda:not win._busy,timeout=5000)
+    # 首次识别要加载模型：闸门满载时单跑 32s 也出现过（2026-11-22），5s 会误报
+    qtbot.waitUntil(lambda:not win._busy,timeout=30000)
     dlg=win._formula.dialog
     assert written==[r'\frac{a}{b}'] and dlg.word.toPlainText()=='(a)/(b)'
     win._formula.copy('word');qtbot.waitUntil(lambda:not win._busy)
