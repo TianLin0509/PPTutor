@@ -507,7 +507,11 @@ class SettingsDialog(QDialog):
         idx = self._font_family.findText(saved_family) if saved_family else -1
         # 已存字族在本机不存在（被卸载）时回落到默认项
         self._font_family.setCurrentIndex(idx if idx > 0 else 0)
-        font_row.addWidget(self._font_family, 1)
+        # 定宽 260：撑满整卡时和下面 140px 的字号框长短悬殊（Antigravity 第 4 轮审查）
+        fm = self._font_family.fontMetrics()
+        self._font_family.setFixedWidth(max(260, fm.horizontalAdvance("默认（内置字体）") + 64))
+        font_row.addWidget(self._font_family)
+        font_row.addStretch(1)
         size_row = QHBoxLayout()
         size_row.setSpacing(8)
         size_row.addWidget(QLabel("字号："))
@@ -533,9 +537,10 @@ class SettingsDialog(QDialog):
         self._font_scale.setCurrentIndex(
             idx if idx >= 0 else self._font_scale.count() - 1)
         self._font_scale.currentIndexChanged.connect(self._sync_font_scale_custom)
-        self._sync_font_scale_custom()
         size_row.addWidget(self._font_scale)
         size_row.addWidget(self._font_scale_custom)
+        # 先进布局再同步显隐：没有父对象时 setVisible(True) 会闪出一个独立小窗
+        self._sync_font_scale_custom()
         size_row.addStretch(1)
         font_apply = QPushButton("应用")
         font_apply.clicked.connect(self._apply_font)
@@ -608,11 +613,13 @@ class SettingsDialog(QDialog):
             edit.setFixedWidth(180)
             self._shot_key_edits[key] = edit
             row.addWidget(edit)
-            row.addStretch(1)
             rows.append(row)
         apply_btn = QPushButton("应用")
         apply_btn.clicked.connect(self._apply_screenshot_keys)
+        # 「应用」紧跟在输入框后面，不再被中间的大空白推到最右下角
         rows[-1].addWidget(apply_btn)
+        for row in rows:
+            row.addStretch(1)
         self._shot_key_result = self._note(
             controller.description() if controller is not None and controller.errors else "")
         self._row(card, "截图快捷键", "全局生效；清空即停用该动作。被其他程序占用时会保留原来的组合。",
@@ -675,6 +682,12 @@ class SettingsDialog(QDialog):
         outer, lay = self._page("版本库", "PPT 历史版本存放在哪里、留多少。需要先在「功能」里开启版本管理。")
         self.stat = self._note("正在读取守护状态…", "setPageDesc")
         lay.addWidget(self.stat)
+        # 版本管理关着时就近给开启入口，不让用户自己去左栏找「功能」页
+        self._version_enable_link = QPushButton("去「功能」开启 →")
+        self._version_enable_link.setObjectName("ghost")
+        self._version_enable_link.clicked.connect(lambda: self.show_tab("功能"))
+        self._version_enable_link.hide()
+        lay.addWidget(self._version_enable_link, 0, Qt.AlignLeft)
         card = self._card(lay)
         self.retention = QComboBox()
         for label, value in (
@@ -1216,6 +1229,9 @@ class SettingsDialog(QDialog):
             self.vault_max.setEnabled(version_on and not getattr(self, '_vault_limit_inflight', False))
         if hasattr(self, "stat") and not version_on:
             self.stat.setText("版本管理已关闭；已有历史数据不会删除。")
+        link = getattr(self, "_version_enable_link", None)
+        if link is not None:
+            link.setVisible(not version_on)
 
     def apply_runtime_feature_state(self, key: str, enabled: bool) -> None:
         """Reflect a backend rollback without emitting another settings change."""
@@ -1263,6 +1279,8 @@ class SettingsDialog(QDialog):
         """只有选了「自定义」倍率框才可编辑；切回预设时同步显示该档位的数值。"""
         preset = self._font_scale.currentData()
         self._font_scale_custom.setEnabled(preset is None)
+        # 选了预设档时倍率框只是重复「100%」还显示成灰的：只在「自定义」时出现
+        self._font_scale_custom.setVisible(preset is None)
         if preset is not None:
             with QSignalBlocker(self._font_scale_custom):
                 self._font_scale_custom.setValue(float(preset))

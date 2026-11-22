@@ -111,7 +111,7 @@ def test_chronicle_tab_renders_year_cards_with_keywords_and_locate_buttons(qtbot
     qtbot.wait(1)
 
     texts = [label.text() for label in overlay._content.findChildren(QLabel)]
-    assert any("📅 2024 年" in text for text in texts)
+    assert any("2024 年" in text for text in texts)
     assert any("12</b> 页" in text for text in texts)  # 统计行是富文本 <b>12</b> 页
     assert any("nebula" in text for text in texts)
     locates = [b for b in overlay._content.findChildren(QPushButton) if b.text() == "定位"]
@@ -131,7 +131,7 @@ def test_chronicle_tab_notes_scope_when_report_is_not_all_history(qtbot, tmp_pat
     qtbot.wait(1)
 
     texts = [label.text() for label in overlay._content.findChildren(QLabel)]
-    assert any("📅 2024 年" in text for text in texts)  # 范围内的年份仍逐年展示
+    assert any("2024 年" in text for text in texts)  # 范围内的年份仍逐年展示
     assert any("全部" in text for text in texts)       # 顶部提示完整生涯在「全部」
 
 
@@ -148,7 +148,7 @@ def test_chronicle_tab_shows_dash_when_version_db_not_connected(qtbot, tmp_path)
     overlay._tab_bar.setCurrentIndex(6)
     qtbot.wait(1)
     texts = [label.text() for label in overlay._content.findChildren(QLabel)]
-    assert any("📅 2024 年" in text for text in texts)
+    assert any("2024 年" in text for text in texts)
     assert any("时光机留版：<b>—</b>" in text and "未连接" in text for text in texts)
     assert not any("时光机留版：<b>0</b> 次" in text for text in texts)
     overlay.close()

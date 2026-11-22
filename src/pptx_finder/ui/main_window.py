@@ -1693,7 +1693,7 @@ class MainWindow(QMainWindow):
         self.status_label = QLabel("准备中…")
         self.status.addWidget(self.status_label)
         self.name_index_retry_btn = QPushButton("重试")
-        self.name_index_retry_btn.setToolTip("重新扫描磁盘，重试文件名盘点")
+        self.name_index_retry_btn.setToolTip("重新查找文件并建立索引，查找期间仍可搜索已有结果")
         self.name_index_retry_btn.clicked.connect(lambda: self._request_full_rescan())
         self.name_index_retry_btn.hide()
         self.status.addWidget(self.name_index_retry_btn)
@@ -3480,7 +3480,7 @@ class MainWindow(QMainWindow):
             self.status_label.setText(f"搜索完成：没有命中{suffix}")
         if self._name_index_error:
             self.status_label.setText(
-                self.status_label.text() + f" · PPT 内容可搜 · 文件名盘点失败：{self._name_index_error}")
+                self.status_label.text() + f" · PPT 内容可搜 · 查找文件失败：{self._name_index_error}")
         self._apply_sort_render()
         if results:
             self.list_head.show()
@@ -3593,7 +3593,7 @@ class MainWindow(QMainWindow):
 
     def _show_recent(self, *, dashboard_force_refresh: bool = False,
                      recent_force_refresh: bool = False) -> None:
-        """空查询默认视图：仪表盘置顶 + 备好「最近文件」结果（切回搜索即用）。"""
+        """空查询保留当前页面；搜索页显示「最近修改」，其余页后台备好结果。"""
         self._clear_search_pending()
         self.query_hint.hide()
         self._clear_stale_result_context()
@@ -3604,11 +3604,11 @@ class MainWindow(QMainWindow):
         )
         self._showing_recent = True
         if dashboard_force_refresh or not already_on_recent_dashboard:
-            if self._current_page_key() in ("", "search", "dashboard"):
-                # 清空搜索词回落概览：仅当当前在搜索页/概览页时切页
+            if self._current_page_key() in ("", "dashboard"):
+                # 启动或停在概览时刷新概览，清空搜索词不把用户带离搜索页。
                 self._show_dashboard(force_refresh=dashboard_force_refresh)
             elif getattr(self, "dashboard", None) is not None:
-                # 停在版本/健康页：只后台刷新概览数据，不把用户切走
+                # 停在搜索/版本/健康页：只后台刷新概览数据，不把用户切走
                 self.dashboard.schedule_refresh(force=dashboard_force_refresh)
         recents = self._recent_files_cached(force=recent_force_refresh)
         if recents is not None:
@@ -3727,7 +3727,7 @@ class MainWindow(QMainWindow):
 
     def _index_status_text_from_stats(self, stats: dict, mode_key: str) -> str:
         if self._name_index_error:
-            return f"PPT 内容可搜 · 文件名盘点失败：{self._name_index_error}"
+            return f"PPT 内容可搜 · 查找文件失败：{self._name_index_error}"
         try:
             files = int(stats.get("file_count", 0))
             pages = int(stats.get("page_count", 0))
@@ -3831,8 +3831,8 @@ class MainWindow(QMainWindow):
         self._empty_tip.setText("换个说法试试")
         self._empty_query_label.setText(f"\u6ca1\u627e\u5230\u300c{query}\u300d")
         if self._all_files_scope() and namestore.peek_header() is None:
-            self._empty_query_label.setText(f"正在盘点文件名：「{query}」暂未命中")
-            self._empty_tip.setText("全盘文件名盘点还没完成，结果可能不完整；完成后会自动刷新")
+            self._empty_query_label.setText(f"正在查找文件：「{query}」暂未找到")
+            self._empty_tip.setText("查找文件还没完成，结果可能不完整；完成后会自动刷新，不影响你同时搜索")
         self._set_empty_index_status_async()
         sugg = suggestion_keys(query, self._mode_key(), exact_match=self._exact_match())
         for key, btn in self._sugg_btns.items():
@@ -7105,7 +7105,7 @@ class MainWindow(QMainWindow):
         # 记录本轮扫描是否带着「索引所有文件」启动：扫描中关开关时收尾要补 purge
         self._index_scan_had_inventory = self._index_all_files_enabled
         self.type_rail.hide()  # 避免建库写锁期间在 GUI 线程反复查 type_counts
-        self.index_phase_label.setText("升级" if self._index_rebuild_reason else "扫描")
+        self.index_phase_label.setText("升级" if self._index_rebuild_reason else "查找文件")
         self.index_phase_label.show()
         self.index_count_label.setText("准备中")
         self.index_count_label.show()
@@ -7115,13 +7115,13 @@ class MainWindow(QMainWindow):
         self.index_bar.show()
         self.status_dot.hide()
         if self._index_rebuild_reason:
-            self.status_label.setText("正在升级索引：需要重新整理一次，期间可边扫边搜")
+            self.status_label.setText("正在升级索引：需要重新整理一次，不影响你同时搜索")
         elif self._index_all_files_enabled:
             # 全盘文件名盘点量级提示：首轮会登记几十万级文件名，耗时明显更长
             self.status_label.setText(
-                f"开始索引：{', '.join(roots)} · 含全盘文件名盘点，首轮耗时较长")
+                f"正在查找文件：{', '.join(roots)} · 首次建立索引需要一些时间，不影响你同时搜索")
         else:
-            self.status_label.setText(f"开始索引：{', '.join(roots)}")
+            self.status_label.setText(f"正在查找文件：{', '.join(roots)} · 不影响你同时搜索")
         self._indexer.start()
         return True
 
@@ -7189,24 +7189,24 @@ class MainWindow(QMainWindow):
         preserve_search_status = self._search_pending_req is not None
         if total < 0:
             self.index_bar.setRange(0, 0)
-            self.index_phase_label.setText("升级" if self._index_rebuild_reason else "扫描")
+            self.index_phase_label.setText("升级" if self._index_rebuild_reason else "查找文件")
             found = re.search(r"发现\s*([\d,]+)", str(cur or ""))
             if found:
                 self.index_count_label.setText(f"发现 {found.group(1)}")
             elif done > 0:
                 self.index_count_label.setText(f"已整理 {done:,}")
             else:
-                self.index_count_label.setText("盘点中")
+                self.index_count_label.setText("查找中")
             self.pct_label.clear()
             self.pct_label.hide()
             self.status_label.setToolTip(str(cur or ""))
             if not preserve_search_status:
-                prefix = "升级索引中" if self._index_rebuild_reason else "扫描磁盘中"
-                self.status_label.setText(f"{prefix} · 可边扫边搜")
+                prefix = "升级索引中" if self._index_rebuild_reason else "正在查找文件"
+                self.status_label.setText(f"{prefix} · 不影响你同时搜索")
         else:
             self.index_bar.setRange(0, max(1, total))
             self.index_bar.setValue(done)
-            self.index_phase_label.setText("升级" if self._index_rebuild_reason else "建库")
+            self.index_phase_label.setText("升级" if self._index_rebuild_reason else "建立索引")
             self.index_count_label.setText(f"{done:,} / {total:,}")
             self.pct_label.setText(f"{int(done / max(1, total) * 100)}%")
             self.pct_label.show()
@@ -7218,11 +7218,11 @@ class MainWindow(QMainWindow):
                     if eta is not None and done < total else ""
                 )
                 self.status_label.setText(
-                    f"正在建库{speed}{remaining} · 前台操作优先"
+                    f"正在建立索引{speed}{remaining} · 不影响你同时搜索"
                 )
         if self._name_index_error and not preserve_search_status:
             self.status_label.setText(
-                self.status_label.text() + f" · 文件名盘点上次失败：{self._name_index_error}")
+                self.status_label.text() + f" · 上次查找文件失败：{self._name_index_error}")
 
     def _update_welcome_progress(self, done: int, total: int, cur: str) -> None:
         if self._welcome is None:
@@ -7268,13 +7268,13 @@ class MainWindow(QMainWindow):
             self.status_label.setToolTip("")
             if error:
                 self.status_label.setText(
-                    f"建库遇到问题，已有结果仍可搜索 · {error}"
+                    f"建立索引遇到问题，已有结果仍可搜索 · {error}"
                 )
             else:
-                self.status_label.setText("建库已暂停，已完成的结果仍可搜索")
+                self.status_label.setText("建立索引已暂停，已完成的结果仍可搜索")
             if self._name_index_error:
                 self.status_label.setText(
-                    self.status_label.text() + f" · 文件名盘点失败：{self._name_index_error}")
+                    self.status_label.text() + f" · 查找文件失败：{self._name_index_error}")
             return
         if not self._index_all_files_enabled and getattr(
             self, "_index_scan_had_inventory", False
@@ -7462,7 +7462,7 @@ class MainWindow(QMainWindow):
             f"\u7d22\u5f15\u5c31\u7eea\uff1a{stats.get('file_count', 0)} \u4e2a\u6587\u4ef6 \u00b7 {stats.get('page_count', 0)} \u9875{dist}"
        )
         if self._name_index_error:
-            self.status_label.setText(f"PPT 内容可搜 · 文件名盘点失败：{self._name_index_error}")
+            self.status_label.setText(f"PPT 内容可搜 · 查找文件失败：{self._name_index_error}")
         examples = (summary or {}).get(
             "scan_error_examples",
             stats.get("last_scan_error_examples", ""),

@@ -222,13 +222,15 @@ class RollNumber(QLabel):
         self._value = float(value)
         self._fmt = fmt
         self._suffix = suffix
+        # 从终值的 60% 滚到终值：首帧不再是「0 份胶片」，免得和下面正文「4 份胶片」打架
+        start = self._value * 0.6
         self._anim = QVariantAnimation(self)
-        self._anim.setStartValue(0.0)
+        self._anim.setStartValue(start)
         self._anim.setEndValue(self._value)
-        self._anim.setDuration(dur)
+        self._anim.setDuration(min(dur, 600))
         self._anim.setEasingCurve(QEasingCurve.OutCubic)
         self._anim.valueChanged.connect(lambda v: self._render(float(v)))
-        self._render(0.0)
+        self._render(start)
 
     def _text(self, v: float) -> str:
         if self._fmt == "gb":
@@ -368,7 +370,7 @@ class ReportOverlay(QWidget):
     def _build_header(self) -> None:
         tok = self._tok
         head = QHBoxLayout()
-        self._title = QLabel("🎞️ 我的胶片报告")
+        self._title = QLabel("我的胶片报告")
         self._title.setStyleSheet(
             f"font-size:17px;font-weight:700;color:{tok['ink1']};background:transparent;border:none;")
         head.addWidget(self._title, 1)
@@ -701,12 +703,12 @@ class ReportOverlay(QWidget):
         chronicle = getattr(report, "chronicle", ()) or ()
         if self.current_scope != _SCOPE_ALL:
             self._add_cards(self._section(
-                "📅 生涯履历",
+                "生涯履历",
                 [f"当前报告范围为「{self._scope_text()}」，只显示落在范围内的年份；"
                  "切回「全部」可查看完整生涯。"],
             ))
         if not chronicle:
-            self._add_cards(self._section("📅 生涯履历", ["暂无可按年份统计的胶片记录。"]))
+            self._add_cards(self._section("生涯履历", ["暂无可按年份统计的胶片记录。"]))
             return
         for stat in reversed(chronicle):  # 最新一年排最前
             self._add_cards(self._chronicle_year_card(stat))
@@ -747,7 +749,7 @@ class ReportOverlay(QWidget):
         row.addWidget(self._stat_box(n_chars, "累计码字"))
         row.addWidget(self._stat_box(disk, "磁盘占用"))
         v.addLayout(row)
-        head = QLabel(f"🎬 {scope} · 你和 {report.deck_count} 份胶片，一起肝了这一程")
+        head = QLabel(f"{scope} · 你和 {report.deck_count} 份胶片，一起肝了这一程")
         head.setWordWrap(True)
         head.setStyleSheet(f"color:{tok['ink3']};background:transparent;border:none;font-size:12px;")
         v.addWidget(head)
@@ -763,7 +765,7 @@ class ReportOverlay(QWidget):
         v = QVBoxLayout(f)
         v.setContentsMargins(17, 14, 17, 15)
         v.setSpacing(3)
-        cap = QLabel("🏅 你的称号")
+        cap = QLabel("你的称号")
         cap.setStyleSheet(
             f"color:{tok['ink3']};background:transparent;border:none;font-size:11.5px;font-weight:700;")
         v.addWidget(cap)
@@ -807,7 +809,7 @@ class ReportOverlay(QWidget):
         ]
         if n.latest_name:
             nlines.append(f"最晚一次 <b>{hour_label(n.latest_hour)}</b> 改了《{n.latest_name}》")
-        card = self._section("🔥 肝度", nlines)
+        card = self._section("肝度", nlines)
         lay = card.layout()
         lay.addWidget(self._roast_label(
             roast_night(n.night_ratio) + "　" + roast_weekend(n.weekend_count)))
@@ -819,7 +821,7 @@ class ReportOverlay(QWidget):
         foot = QHBoxLayout()
         if hmw.peak > 0 and hmw.peak_wd >= 0:
             call = QLabel(
-                f"🕚 <b style='color:{tok['accd']}'>{peak_label(hmw.peak_wd, hmw.peak_hour)}</b> 是你的魔鬼时段")
+                f"<b style='color:{tok['accd']}'>{peak_label(hmw.peak_wd, hmw.peak_hour)}</b> 是你的魔鬼时段")
             call.setTextFormat(Qt.RichText)
             call.setStyleSheet(f"color:{tok['roast']};background:transparent;border:none;font-size:11px;")
             foot.addWidget(call, 1)
@@ -843,7 +845,7 @@ class ReportOverlay(QWidget):
             dlines.append(f"僵尸胶片：《{d.zombie_name}》吃灰最久")
         else:
             days = 0
-        card = self._section("😅 改版名场面", dlines)
+        card = self._section("改版名场面", dlines)
         lay = card.layout()
         lay.addWidget(self._roast_label(roast_curse(d.final_curse_ratio)))
         zr = roast_zombie(days)
@@ -865,7 +867,7 @@ class ReportOverlay(QWidget):
             first = datetime.fromtimestamp(a.first_mtime).strftime("%Y-%m-%d")
             latest = datetime.fromtimestamp(a.latest_mtime).strftime("%Y-%m-%d")
             lines.append(f"当前库的修改时间跨度：<b>{first}</b> → <b>{latest}</b>")
-        card = self._section("📅 创作足迹", lines)
+        card = self._section("创作足迹", lines)
         card.setObjectName("activityCard")
         card.setToolTip("按当前文件的最后修改时间统计；不是逐次保存日志")
         return card
@@ -877,7 +879,7 @@ class ReportOverlay(QWidget):
             f"复用家族 <b>{dna.family_count}</b> 个，覆盖 <b>{dna.family_deck_count}</b> 份胶片（{dna.family_ratio:.0%}）",
             f"正文索引就绪 <b>{dna.content_ready_count}/{deck_count}</b>（{dna.content_ready_ratio:.0%}）",
         ]
-        card = self._section("🧬 胶片 DNA", lines)
+        card = self._section("胶片 DNA", lines)
         card.setObjectName("libraryDnaCard")
         card.setToolTip("复用家族来自已有近似内容分组；统计复用现有索引，不会重新打开 PPT")
         return card
@@ -888,7 +890,7 @@ class ReportOverlay(QWidget):
             slines.append(f"最长：《{sc.longest_name}》<b>{sc.longest_pages}</b> 页")
         slines.append(f"累计码字 {sc.total_chars:,} ≈ <b>{redmansion_equiv(sc.total_chars)}</b>")
         slines.append(f"磁盘占用 <b>{human_bytes(sc.total_bytes)}</b>")
-        return self._section("📊 规模仓鼠", slines)
+        return self._section("规模仓鼠", slines)
 
     @staticmethod
     def _h(value: object) -> str:
@@ -906,23 +908,27 @@ class ReportOverlay(QWidget):
         return "　".join(f"<b>{html.escape(str(item.label))}</b> × {item.count}" for item in picked)
 
     def _achievement_card(self, report) -> QFrame:
-        badges = "　".join(f"🏅 {self._h(item)}" for item in report.achievements)
+        # 富文本不支持圆角/内边距，背景只能画成贴字矩形：改为主题强调色加粗文字，深浅主题都清爽
+        acc = self._tok.get("acc", "#0A59F7")
+        badges = "　·　".join(
+            f'<span style="color:{acc};font-weight:600">{self._h(item)}</span>'
+            for item in report.achievements)
         lines = [self._h(report.one_liner), badges]
         memory = report.hall.today_memory
         if memory.name:
             lines.append(
-                f"📽️ 今日胶片回忆：《{self._h(memory.name)}》在 {memory.value} 年前的今天留下修改足迹"
+                f"今日胶片回忆：《{self._h(memory.name)}》在 {memory.value} 年前的今天留下修改足迹"
             )
-        return self._section("🏆 成就徽章与片库一句话", lines)
+        return self._section("成就徽章与片库一句话", lines)
 
     def _overview_version_card(self, versions) -> QFrame:
         if not versions.available:
             return self._section(
-                "🛡️ 时光机概览",
+                "时光机概览",
                 ["当前未连接版本元数据库；文件统计仍可正常使用。"],
             )
         return self._section(
-            "🛡️ 时光机概览",
+            "时光机概览",
             [
                 f"真实保存点 <b>{versions.version_count:,}</b> 个，覆盖 <b>{versions.protected_docs}</b> 份 PPT",
                 f"可回退（至少 2 个健康版本）<b>{versions.rollback_docs}</b> 份",
@@ -976,7 +982,7 @@ class ReportOverlay(QWidget):
     def _hall_of_fame_card(self, report) -> QFrame:
         h = report.hall
         return self._award_section(
-            "🏆 我的 PPT 之最",
+            "我的 PPT 之最",
             [
                 ("页数之最", h.most_pages, f"<b>{int(h.most_pages.value or 0)}</b> 页"),
                 ("体积之最", h.largest, f"<b>{human_bytes(float(h.largest.value or 0))}</b>"),
@@ -995,7 +1001,7 @@ class ReportOverlay(QWidget):
             f"最常见页数：<b>{h.common_page_count}</b> 页，共 {h.common_page_count_decks} 份",
             f"终版诅咒：{report.drama.final_curse_count} 份名字含 最终/final/vN",
         ]
-        return self._section("🎯 趣味纪录", lines)
+        return self._section("趣味纪录", lines)
 
     def _anniversary_card(self, hall) -> QFrame:
         lines = []
@@ -1007,7 +1013,7 @@ class ReportOverlay(QWidget):
             lines.append(f"周年纪念：《{self._h(item.name)}》 · {int(item.value)} 周年 · {self._h(item.detail)}")
         if not lines:
             lines.append("今天暂时没有同日往年的胶片回忆，明天再来会换一批彩蛋。")
-        return self._section("🎂 今日回忆与周年纪念", lines)
+        return self._section("今日回忆与周年纪念", lines)
 
     def _real_save_clock_card(self, versions) -> QFrame:
         lines = []
@@ -1015,7 +1021,7 @@ class ReportOverlay(QWidget):
             lines.append(f"按真实自动快照统计，共 <b>{versions.version_count}</b> 次保存留版；不是拿文件修改时间代替。")
         else:
             lines.append("版本元数据库暂不可用，因此不会拿文件修改时间冒充真实保存记录。")
-        card = self._section("⏱️ 真实保存时钟", lines)
+        card = self._section("真实保存时钟", lines)
         if versions.available:
             hmw = HeatmapWidget(
                 versions.save_heatmap,
@@ -1037,7 +1043,7 @@ class ReportOverlay(QWidget):
             f"最近月份：{months}",
             f"活跃 <b>{report.activity.active_days}</b> 天，最长连续开工 <b>{report.activity.longest_streak_days}</b> 天",
         ]
-        return self._section("🌳 创作年轮与旺季", lines)
+        return self._section("创作年轮与旺季", lines)
 
     def _chronicle_year_card(self, stat) -> QFrame:
         tok = self._tok
@@ -1052,7 +1058,7 @@ class ReportOverlay(QWidget):
             ),
             f"年度关键词：{self._count_items(stat.top_keywords, limit=5)}",
         ]
-        card = self._section(f"📅 {stat.year} 年", lines)
+        card = self._section(f"{stat.year} 年", lines)
         # 年度代表文件沿用名人堂「定位」按钮模式：一键打开所在文件夹
         for metric in stat.top_files:
             row = QHBoxLayout()
@@ -1084,7 +1090,7 @@ class ReportOverlay(QWidget):
 
     def _revision_night_card(self, versions) -> QFrame:
         if not versions.available:
-            return self._section("🌙 年度最大改稿夜与冲刺榜", ["需要版本快照后才能统计真实改稿夜。"])
+            return self._section("年度最大改稿夜与冲刺榜", ["需要版本快照后才能统计真实改稿夜。"])
         lines = [
             f"年度最大改稿夜：<b>{self._h(versions.peak_revision_night or '暂无')}</b>，留版 {versions.peak_revision_night_count} 次"
         ]
@@ -1094,18 +1100,18 @@ class ReportOverlay(QWidget):
             )
         if len(lines) == 1:
             lines.append("还没有形成两次以上的连续改稿冲刺。")
-        return self._section("🌙 年度最大改稿夜与冲刺榜", lines)
+        return self._section("年度最大改稿夜与冲刺榜", lines)
 
     def _real_most_edited_card(self, versions) -> QFrame:
         if not versions.available:
             return self._section(
-                "🕰️ 真正的「最能改奖」",
+                "真正的「最能改奖」",
                 ["版本库未连接；这里不再用相似文件分组冒充版本次数。"],
             )
         if not versions.most_edited_name:
-            return self._section("🕰️ 真正的「最能改奖」", ["暂无真实版本快照。"])
+            return self._section("真正的「最能改奖」", ["暂无真实版本快照。"])
         return self._section(
-            "🕰️ 真正的「最能改奖」",
+            "真正的「最能改奖」",
             [
                 f"《{self._h(versions.most_edited_name)}》留下 <b>{versions.most_edited_versions}</b> 个真实快照",
                 f"当前范围共有 <b>{versions.version_count}</b> 个健康版本点，覆盖 {versions.protected_docs} 份 PPT",
@@ -1114,7 +1120,7 @@ class ReportOverlay(QWidget):
 
     def _growth_story_card(self, versions) -> QFrame:
         if not versions.growth_points:
-            return self._section("📈 一份 PPT 的成长史", ["至少留下一个真实版本后，这里会出现页数与体积的成长轨迹。"])
+            return self._section("一份 PPT 的成长史", ["至少留下一个真实版本后，这里会出现页数与体积的成长轨迹。"])
         first, last = versions.growth_points[0], versions.growth_points[-1]
         lines = [
             f"主角：《{self._h(versions.most_edited_name)}》 · 展示最近 {len(versions.growth_points)} 个点",
@@ -1124,13 +1130,13 @@ class ReportOverlay(QWidget):
         lines.append("最近轨迹：" + "　".join(
             f"{datetime.fromtimestamp(p.ts).strftime('%m-%d')}·{p.page_count}页" for p in recent
         ))
-        return self._section("📈 一份 PPT 的成长史", lines)
+        return self._section("一份 PPT 的成长史", lines)
 
     def _version_safety_card(self, versions) -> QFrame:
         if not versions.available:
-            return self._section("🛟 被时光机救下的胶片", ["版本库未连接。"])
+            return self._section("被时光机救下的胶片", ["版本库未连接。"])
         return self._section(
-            "🛟 被时光机救下的胶片",
+            "被时光机救下的胶片",
             [
                 f"已删除但仍有健康恢复点：<b>{versions.recoverable_deleted_docs}</b> 份",
                 f"真正可回退（≥2 版）：<b>{versions.rollback_docs}</b> 份",
@@ -1155,7 +1161,7 @@ class ReportOverlay(QWidget):
             f"迁徙最远：《{self._h(versions.most_migrated_name or '暂无')}》待过 {versions.most_migrated_count} 个目录",
             f"页数反复横跳：《{self._h(versions.page_flip_flop_name or '暂无')}》方向切换 {versions.page_flip_flops} 次",
         ])
-        return self._section("🎢 改稿奇闻", lines)
+        return self._section("改稿奇闻", lines)
 
     def _sample_note(self, content) -> str:
         mode = "有界抽样" if content.sample_truncated else "全量索引"
@@ -1166,13 +1172,13 @@ class ReportOverlay(QWidget):
 
     def _catchphrase_card(self, content) -> QFrame:
         return self._section(
-            "💬 我的 PPT 口头禅",
+            "我的 PPT 口头禅",
             [self._count_items(content.catchphrases, limit=10), self._sample_note(content)],
         )
 
     def _topic_constellation_card(self, content) -> QFrame:
         return self._section(
-            "✨ 我的主题星座",
+            "我的主题星座",
             [
                 self._count_items(content.topics, limit=10),
                 "星座按“覆盖了多少份 PPT”排序，避免某一份超长文档霸榜。",
@@ -1185,11 +1191,11 @@ class ReportOverlay(QWidget):
             f"收尾仪式：<b>{self._h(content.ending_phrase or '暂无')}</b> · {content.ending_count} 次",
             f"最常重复的一句话：<b>{self._h(content.repeated_sentence or '暂无')}</b> · {content.repeated_sentence_count} 次",
         ]
-        return self._section("🎬 开场、收尾与复读机", lines)
+        return self._section("开场、收尾与复读机", lines)
 
     def _language_persona_card(self, content) -> QFrame:
         return self._section(
-            "🗣️ 内容语言人格",
+            "内容语言人格",
             [
                 f"你的内容人格：<b>{self._h(content.language_persona)}</b>",
                 f"英文字母占比 {content.english_ratio:.1%}　数字占比 {content.digit_ratio:.1%}　问号 {content.question_marks} 个",
@@ -1202,7 +1208,7 @@ class ReportOverlay(QWidget):
             f"<b>{self._h(item.period)}</b>　" + " / ".join(self._h(term) for term in item.terms)
             for item in content.keyword_trends
         ]
-        return self._section("🌊 关键词趋势河流", lines or ["暂无跨月份内容趋势。"])
+        return self._section("关键词趋势河流", lines or ["暂无跨月份内容趋势。"])
 
     def _library_map_card(self, report) -> QFrame:
         folders = report.library.top_folders
@@ -1218,7 +1224,7 @@ class ReportOverlay(QWidget):
             lines.append(
                 f"目录最深：《{self._h(report.hall.deepest_path.name)}》 · {int(report.hall.deepest_path.value)} 层"
             )
-        card = self._section("🗺️ 我的胶片版图", lines)
+        card = self._section("我的胶片版图", lines)
         if folders:
             card.setToolTip("\n".join(f"{item.label} × {item.count}" for item in folders[:8]))
         return card
@@ -1227,7 +1233,7 @@ class ReportOverlay(QWidget):
         bins = report.library.shape_bins
         distribution = "　".join(f"<b>{self._h(label)}</b> {count}" for label, count in bins.items())
         return self._section(
-            "📐 胶片身材分布",
+            "胶片身材分布",
             [
                 distribution or "暂无",
                 f"最常见页数：<b>{report.hall.common_page_count}</b> 页 · {report.hall.common_page_count_decks} 份",
@@ -1238,7 +1244,7 @@ class ReportOverlay(QWidget):
         examples = "、".join(self._h(name) for name in library.same_name_examples) or "暂无"
         generic = "、".join(self._h(name) for name in library.generic_name_examples) or "暂无"
         return self._section(
-            "🧬 文件名 DNA",
+            "文件名 DNA",
             [
                 "高频词：" + self._count_items(library.filename_terms, limit=10),
                 f"同名双胞胎：{library.same_name_twin_groups} 组 / {library.same_name_twin_files} 份 · {examples}",
@@ -1251,7 +1257,7 @@ class ReportOverlay(QWidget):
         minutes = report.library.meeting_minutes
         hours, remain = divmod(minutes, 60)
         return self._section(
-            "🎞️ 片库脑洞换算",
+            "片库脑洞换算",
             [
                 f"全部讲完预计 <b>{hours} 小时 {remain} 分</b>（按每页 2 分钟估算）",
                 f"全部打印约摞成 <b>{report.library.paper_height_mm:.1f} mm</b> 高（按每张 0.1 mm）",

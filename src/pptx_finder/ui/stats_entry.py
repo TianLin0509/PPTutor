@@ -133,6 +133,9 @@ def _open_report(mw) -> None:
             conn=mw._conn,
             version_db_path=version_db_path,
         )
+        toast = getattr(mw, "_toast_label", None)
+        if toast is not None:
+            toast.hide()          # 「正在生成胶片报告…」别从浮层底下透出来
         ov.setGeometry(mw.rect())
         ov.show()
         ov.raise_()

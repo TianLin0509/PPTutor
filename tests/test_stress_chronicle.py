@@ -335,9 +335,9 @@ def test_chronicle_tab_renders_30_year_cards_offscreen(qtbot, tmp_path):
     print(f"\n[stress] 30 年卡渲染: {dur:.2f}s")
 
     labels = [lab.text() for lab in overlay._content.findChildren(QLabel)]
-    year_titles = [t for t in labels if re.fullmatch(r"📅 \d{4} 年", t or "")]
+    year_titles = [t for t in labels if re.fullmatch(r"\d{4} 年", t or "")]
     assert len(year_titles) == 30
-    assert year_titles[0] == "📅 2026 年"  # 最新一年排最前
+    assert year_titles[0] == "2026 年"  # 最新一年排最前
     locates = [b for b in overlay._content.findChildren(QPushButton) if b.text() == "定位"]
     assert len(locates) == 90  # 30 年 × 3 份代表文件
     # 特殊字符：正文富文本必须转义，tooltip 原样保留真实路径

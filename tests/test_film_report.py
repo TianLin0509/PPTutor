@@ -102,7 +102,8 @@ def test_rollnumber_formats(qtbot):
 def test_rollnumber_starts_at_zero(qtbot):
     a = ro.RollNumber(3521, fmt="comma")
     qtbot.addWidget(a)
-    assert a.text() == "0"                                       # 未 start 前从 0 起
+    # 2026-11-22 起从终值 60% 起滚：首帧不再显示「0」与正文数字打架
+    assert a.text() == f"{int(round(3521 * 0.6)):,}"
 
 
 # ---------- 改版浮层构造 smoke ----------

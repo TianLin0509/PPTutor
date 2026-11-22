@@ -70,10 +70,10 @@ def test_search_input_switches_pages_by_arbitration_rules(qtbot, tmp_path):
     assert win._current_page_key() == "search"
     assert win._rail_page_btns["search"].isChecked()
 
-    # 在搜索页清空搜索词 → 回落概览页
+    # 在搜索页清空搜索词 → 留在搜索页显示最近修改
     win.search_box.setText("")
     win._do_search()
-    assert win._current_page_key() == "dashboard"
+    assert win._current_page_key() == "search"
 
     # 在版本页输入搜索词 → 也切到搜索页
     win._switch_page("version")
