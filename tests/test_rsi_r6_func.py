@@ -7,9 +7,9 @@ import threading
 import time
 
 import pytest
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QPixmap
-from PySide6.QtWidgets import QApplication, QLabel, QPushButton
+from PySide6.QtCore import QEvent, Qt
+from PySide6.QtGui import QKeyEvent, QPixmap
+from PySide6.QtWidgets import QApplication, QLabel, QLineEdit, QPlainTextEdit, QPushButton, QTextEdit
 
 from pptx_finder.models import FileResult, SearchHit
 from pptx_finder.ui import main_window, theme
@@ -47,6 +47,7 @@ def test_theme_keeps_page_zoom_and_navigation(preview, qtbot):
     assert not win.prev_btn.isEnabled() and not win.next_btn.isEnabled()
     qtbot.wait(200)  # 等现有列表淡入完成，再核对真实绘制。
     output = Path(__file__).resolve().parents[1] / "artifacts/rsi-r6-dark.png"
+    output.parent.mkdir(exist_ok=True)
     assert win.grab().save(str(output))
 
 
@@ -54,7 +55,8 @@ def test_pending_transfer_defers_close(preview, monkeypatch):
     win = preview
     win._bg_tasks.append(SimpleNamespace(_label="ppt-transfer"))
     calls = []
-    monkeypatch.setattr(win, "_shutdown", lambda: calls.append("shutdown"))
+    shutdown = win._shutdown
+    monkeypatch.setattr(win, "_shutdown", lambda: (calls.append("shutdown"), shutdown()))
     win._to_tray_on_close = False
     try:
         win.close()
@@ -388,9 +390,12 @@ def test_real_combo_popup_returns_keyboard_focus(preview, qtbot, control):
     combo = getattr(win, control)
     combo.showPopup()
     view = combo.view()
-    qtbot.wait(200)  # 与用户展开后再点击一致，避开 Qt 的弹出防误触时间。
+    qtbot.waitUntil(view.isVisible)
+    qtbot.wait(350)  # 给原生弹层防误触留出余量，避免卡在 200 ms 的边界上。
     target = combo.model().index((combo.currentIndex() + 1) % combo.count(), 0)
-    qtbot.mouseClick(view.viewport(), Qt.LeftButton, pos=view.visualRect(target).center())
+    pos = view.visualRect(target).center()
+    qtbot.mouseMove(view.viewport(), pos=pos)
+    qtbot.mouseClick(view.viewport(), Qt.LeftButton, pos=pos)
     def focus_restored():
         assert QApplication.focusWidget() is win.search_box, (
             f"focus={QApplication.focusWidget()!r}, index={combo.currentIndex()}, popup={view.isVisible()}")
@@ -411,3 +416,255 @@ def test_refresh_keeps_selected_history_version_expanded(preview):
     win._finish_search("命中", results)
     assert win._cur.path == results[1].path and 1 in win._expanded_groups
     assert (win._view_page, win._zoom) == (2, 2.0)
+    win._toggle_version_group(1)
+    assert win.result_list.count() == 2
+    assert win._cur.path == results[0].path
+    win._toggle_version_group(1)
+    assert win.result_list.count() == 4
+
+
+@pytest.mark.parametrize("reopen_early", [False, True])
+def test_collapsed_group_does_not_reappear_in_later_batches(preview, reopen_early):
+    win = preview
+    results = [replace(r, group_id=1, is_latest=i == 0) for i, r in enumerate(_results(30))]
+    _install_results(win, results)
+    win._toggle_version_group(1)
+    win._search_keep_selection = True
+    win._finish_search("命中", results)
+    win._toggle_version_group(1)
+    if reopen_early:
+        win._toggle_version_group(1)
+    while win._render_more_item is not None:
+        win._load_more_results()
+    if reopen_early:
+        assert win.result_list.count() == len(results)
+        win._toggle_version_group(1)
+    assert win.result_list.count() == 1
+    win._toggle_version_group(1)
+    assert win.result_list.count() == len(results)
+
+
+def test_transfer_quit_timeout_is_bounded_and_logged(preview, monkeypatch, caplog):
+    win = preview
+    task = SimpleNamespace(_label="ppt-transfer")
+    calls = []
+    shutdown = win._shutdown
+    monkeypatch.setattr(win, "_shutdown", lambda: (calls.append("shutdown"), shutdown()))
+    monkeypatch.setattr(QApplication, "quit", lambda: calls.append("quit"))
+    win._bg_tasks.append(task)
+    try:
+        started = time.monotonic()
+        win.force_quit()
+        assert started + 10 <= win._storage_quit_deadline <= time.monotonic() + 15
+        win._finish_storage_quit()
+        assert not calls
+        win._storage_quit_deadline = time.monotonic() - 1
+        win._finish_storage_quit()
+        assert calls == ["shutdown", "quit"]
+        assert win._bg_task_shutdown_wait_ms(task) == 0
+        assert "ppt-transfer" in caplog.text and "timed out" in caplog.text
+        win._finish_storage_quit()  # 已排队的轮询不能重复退出。
+        assert calls == ["shutdown", "quit"]
+    finally:
+        win._bg_tasks.remove(task)
+
+
+def test_transfer_timeout_never_bypasses_vault_transaction(preview, monkeypatch):
+    win = preview
+    calls = []
+    shutdown = win._shutdown
+    monkeypatch.setattr(win, "_shutdown", lambda: (calls.append("shutdown"), shutdown()))
+    win._bg_tasks.extend([SimpleNamespace(_label="ppt-transfer"),
+                          SimpleNamespace(_label="vault-storage-configure")])
+    win._to_tray_on_close = False
+    try:
+        win.close()
+        win._storage_quit_deadline = time.monotonic() - 1
+        win._finish_storage_quit()
+        assert not calls and win._storage_quit_pending
+    finally:
+        win._bg_tasks.clear()
+    win._finish_storage_quit()
+    assert calls == ["shutdown"]
+
+
+@pytest.mark.parametrize("state", ["pending", "closing"])
+def test_insert_chooser_does_not_open_during_quit(preview, monkeypatch, state):
+    win = preview
+    callbacks, dialogs = [], []
+    monkeypatch.setattr(win, "_run_slide_transfer", lambda fn, done, operation: callbacks.append(done))
+    monkeypatch.setattr(main_window.QInputDialog, "getItem", lambda *a: dialogs.append(a))
+    win._insert_preview_slide(win._cur.path, 2)
+    setattr(win, "_storage_quit_pending" if state == "pending" else "_closing", True)
+    try:
+        callbacks[0]([SimpleNamespace(name="target", slides=3, full_name="target.pptx")])
+        assert dialogs == [] and len(callbacks) == 1
+    finally:
+        win._closing = False
+        win._storage_quit_pending = False
+
+
+def test_inflight_target_enumeration_quits_without_chooser(preview, qtbot, monkeypatch):
+    win = preview
+    entered, release = threading.Event(), threading.Event()
+    dialogs, quits = [], []
+
+    def enumerate_targets():
+        entered.set()
+        assert release.wait(5)
+        return [SimpleNamespace(name="target", slides=3, full_name="target.pptx")]
+
+    monkeypatch.setattr(main_window.ppt_transfer, "list_presentations", enumerate_targets)
+    monkeypatch.setattr(main_window.QInputDialog, "getItem",
+                        lambda *args: (dialogs.append(args) or "", False))
+    monkeypatch.setattr(QApplication, "quit", lambda: quits.append(True))
+    win._insert_preview_slide(win._cur.path, 2)
+    try:
+        qtbot.waitUntil(entered.is_set)
+        win.force_quit()
+        assert win._storage_quit_pending and not quits
+    finally:
+        release.set()
+    qtbot.waitUntil(lambda: bool(quits))
+    assert not dialogs and win._closing
+
+
+@pytest.mark.parametrize("page", ["search", "versions"])
+@pytest.mark.parametrize("widget_type", [QLineEdit, QPlainTextEdit, QTextEdit])
+def test_escape_and_focus_restore_respect_other_inputs(preview, qtbot, page, widget_type):
+    win = preview
+    win._switch_page("search")
+    if page == "versions":
+        # 真实侧栏切换需要版本后端；只替换页码查询，仍使用主窗内真实输入框。
+        win._current_page_key = lambda: "versions"
+    field = widget_type(win)
+    field.setPlainText("保留") if hasattr(field, "setPlainText") else field.setText("保留")
+    field.show()
+    win.activateWindow()
+    field.setFocus()
+    qtbot.waitUntil(lambda: QApplication.focusWidget() is field)
+    qtbot.keyClick(field, Qt.Key_Escape)
+    assert win.search_box.text() == "命中" and win.isVisible()
+    win._restore_search_focus()
+    assert QApplication.focusWidget() is field
+
+
+def test_escape_on_other_page_does_not_clear_or_hide(preview, qtbot, monkeypatch):
+    win = preview
+    monkeypatch.setattr(win, "_current_page_key", lambda: "versions")
+    qtbot.keyClick(win.open_btn, Qt.Key_Escape)
+    assert win.search_box.text() == "命中" and win.isVisible()
+    win.search_box.clear()
+    qtbot.keyClick(win.open_btn, Qt.Key_Escape)
+    assert win.isVisible()
+
+
+def test_facet_apply_keeps_popup_focus(preview, qtbot):
+    win = preview
+    win.activateWindow()
+    win._toggle_facet()
+    win.facet_panel._clear_btn.setFocus()
+    win.facet_panel._toggle("page", "1-10", True)
+    assert not win.facet_panel.isHidden()
+    assert QApplication.focusWidget() is win.facet_panel._clear_btn
+
+
+@pytest.mark.parametrize("outcome", ["inflight", "locked"])
+def test_repeated_new_query_does_not_inherit_old_query_state(preview, outcome):
+    win = preview
+    win.facet_panel._toggle("page", "1-10", True)
+    win._zoom = 2.25
+    win._search_worker = PendingSearchWorker()
+    win.search_box.setText("新词")
+    win._do_search()
+    assert win._last_query_text == "命中"
+    if outcome == "locked":
+        win._on_search_done(win._search_seq, "新词", [], 1, "database is locked")
+    win._do_search()
+    assert not win._search_keep_selection
+    win._on_search_done(win._search_seq, "新词", _results(2), 1, None)
+    assert win._last_query_text == "新词"
+    assert win._facet_filters == {} and win._view_page == 1 and win._zoom == 1.0
+    win._clear_search_now()
+    assert win._last_query_text == ""
+
+
+@pytest.mark.parametrize("operation", ["search", "recent", "theme"])
+def test_facet_empty_clears_preview_and_survives_theme(preview, operation):
+    win = preview
+    results = _results(2)
+    _install_results(win, results)
+    win.facet_panel._toggle("type", "pptx", True)
+    win.facet_panel._toggle("page", "1-10", True)
+    changed = [replace(results[0], page_count=40), replace(results[1], ext=".pdf")]
+    pixmap = QPixmap(20, 20)
+    pixmap.fill(Qt.red)
+    win.image_label.setPixmap(pixmap)
+    if operation == "recent":
+        win._recent_keep_selection = True
+        win._apply_recent_results(changed)
+    else:
+        win._search_keep_selection = True
+        win._finish_search("命中", changed)
+        if operation == "theme":
+            win._apply_theme("atelier_dark", persist=False)
+    assert win._results_raw and not win._results and win._facet_filters
+    assert win._cur is None and win.image_label.pixmap().isNull()
+    assert "筛选后没有可预览结果" in win.image_label.text()
+    assert not win.empty_hint.isHidden() and win._empty_query_label.text() == "筛选后没有结果"
+    assert win.result_count.text() == "筛选出 0 / 2 个文件"
+
+
+@pytest.mark.parametrize("recent", [False, True])
+def test_facet_count_is_consistent_on_apply_refresh_and_clear(preview, recent):
+    win = preview
+    if recent:
+        win._clear_search_now()
+        win._recent_keep_selection = False
+        win._apply_recent_results(_results(2))
+    win.facet_panel._toggle("page", "1-10", True)
+    count = win.result_count.text()
+    assert count == f"筛选出 {len(win._results)} / {len(win._results_raw)} 个文件"
+    if recent:
+        win._recent_keep_selection = True
+        win._apply_recent_results(win._results_raw)
+    else:
+        win._search_keep_selection = True
+        win._finish_search("命中", win._results_raw)
+    assert win.result_count.text() == count
+    win.facet_panel._clear_all()
+    assert win.result_count.text().startswith("最近修改 · " if recent else "命中 ")
+
+
+def test_autostart_snapshot_and_failure_count_as_one_issue(settings):
+    settings._on_diagnostics_ready(settings._diag_refresh_token,
+                                   {"lines": ["autostart: preference=on actual=off"]})
+    settings._on_autostart_toggle_done(settings._autostart_toggle_token, True, False)
+    assert "发现 1 个" in settings.diag_summary.text()
+    assert "失败" in settings.diag_summary.text()
+
+
+@pytest.mark.parametrize("key,expected", [(Qt.Key_Return, 0), (Qt.Key_Down, 1)])
+def test_key_after_debounce_waits_for_async_result(preview, qtbot, monkeypatch, key, expected):
+    win = preview
+    opened = []
+    monkeypatch.setattr(win, "_act_goto", lambda: opened.append(win._cur.path))
+    win._search_worker = PendingSearchWorker()
+    win.search_box.setText("新词")
+    win._do_search()  # 280 ms 防抖已结束，但结果还未到达。
+    qtbot.keyClick(win.search_box, key)
+    new = _results(2)
+    win._on_search_done(win._search_seq, "新词", new, 1, None)
+    assert win._cur.path == new[expected].path
+    assert opened == ([new[0].path] if key == Qt.Key_Return else [])
+
+
+@pytest.mark.parametrize("key", [Qt.Key_Down, Qt.Key_Return])
+def test_history_popup_owns_search_keys(preview, monkeypatch, key):
+    win = preview
+    actions = []
+    monkeypatch.setattr(win._completer.popup(), "isVisible", lambda: True)
+    monkeypatch.setattr(win, "_act_search_key", lambda k: actions.append(k))
+    event = QKeyEvent(QEvent.KeyPress, key, Qt.NoModifier)
+    assert not win.eventFilter(win.search_box, event)
+    assert actions == []

@@ -141,7 +141,7 @@ def _diagnostic_summary_lines(lines: list[str]) -> list[str]:
         ):
             issues.append("版本库完整性检查未通过：" + line)
         elif (line.startswith("autostart:") and "preference=on actual=off" in line
-              and not latest_operations.get("autostart_toggle", "").endswith("applied")):
+              and "autostart_toggle" not in latest_operations):
             issues.append("开机自启目标无效，需要重新写入")
         elif "unavailable" in line:
             issues.append("诊断项不可用：" + line)
