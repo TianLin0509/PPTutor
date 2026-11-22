@@ -26,7 +26,8 @@ def test_settings_builds_with_basic_mode_defaults(qtbot, mgr, monkeypatch, tmp_p
     dlg = SettingsDialog(mgr)
     qtbot.addWidget(dlg)
     assert "PPT Doctor" in dlg.windowTitle()
-    qtbot.waitUntil(lambda: "data_dir:" in dlg.diagnostic_text.toPlainText(), timeout=1000)
+    # 诊断含 COM 读开机自启快捷方式，机器忙时超过 1s（2026-11-22）
+    qtbot.waitUntil(lambda: "data_dir:" in dlg.diagnostic_text.toPlainText(), timeout=5000)
     assert dlg.auto is not None          # 自启开关存在
     assert not dlg.version_feature.isChecked()
     assert not dlg.document_feature.isChecked()
@@ -463,6 +464,7 @@ def test_health_diagnostics_includes_search_worker_metrics(qtbot, mgr):
             ]
 
     parent = QWidget()
+    qtbot.addWidget(parent)   # 父窗口生命周期交给 qtbot（见下方 update_metrics 用例注释）
     parent._search_worker = FakeSearchWorker()
 
     dlg = SettingsDialog(mgr, parent)
@@ -480,6 +482,9 @@ def test_health_diagnostics_includes_update_metrics(qtbot, mgr):
             return ["update: state=idle check=failed error=TimeoutError: timed out"]
 
     parent = QWidget()
+    # 父窗口交给 qtbot 管：不然用例结束后它在随机时刻被 GC 连带删掉设置窗，
+    # 正赶上下一个用例处理该窗排队的回调就 0xC0000005（2026-11-22 二分定位）
+    qtbot.addWidget(parent)
     parent._updater = FakeUpdater()
 
     dlg = SettingsDialog(mgr, parent)
@@ -497,6 +502,7 @@ def test_health_diagnostics_includes_parent_ui_loop_metrics(qtbot, mgr):
             return ["ui_loop: samples=4 last_gap=10 ms max_gap=900 ms slow_gaps=1"]
 
     parent = FakeParent()
+    qtbot.addWidget(parent)   # 同上：父窗口生命周期交给 qtbot
 
     dlg = SettingsDialog(mgr, parent)
     qtbot.addWidget(dlg)
