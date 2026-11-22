@@ -701,7 +701,7 @@ def test_index_progress_uses_lock_free_aggregate_bar(qtbot, tmp_path):
     assert not win.index_bar.isHidden()
     assert win.index_bar.maximum() == 3
     assert win.index_bar.value() == 2
-    assert "前台操作优先" in win.status_label.text()
+    assert "不影响你同时搜索" in win.status_label.text()
 
 
 def test_live_indexer_async_off_main_thread(qtbot, tmp_path):

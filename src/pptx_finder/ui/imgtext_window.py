@@ -12,7 +12,7 @@ import uuid
 import logging
 from pathlib import Path
 
-from PySide6.QtCore import QStandardPaths, Qt, Signal
+from PySide6.QtCore import QEvent, QStandardPaths, Qt, Signal
 from PySide6.QtGui import QGuiApplication, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QFileDialog,
@@ -127,14 +127,16 @@ class ImgTextWindow(QWidget):
         self._progress.hide()
         root.addWidget(self._progress)
 
-        self._drop = QLabel("把图片拖到这里，或按 Ctrl+V 粘贴截图，或点「选择图片」")
+        self._drop = QLabel("把图片拖到这里、点击此处选择图片，或按 Ctrl+V 粘贴截图")
         self._drop.setObjectName("previewImage")
         self._drop.setAlignment(Qt.AlignCenter)
         self._drop.setMinimumHeight(280)
+        self._drop.setCursor(Qt.PointingHandCursor)
+        self._drop.installEventFilter(self)
         root.addWidget(self._drop, 1)
 
         self._status = QLabel("")
-        self._status.setObjectName("emptyMeta")
+        self._status.setObjectName("dashSub")
         self._status.setWordWrap(True)
         root.addWidget(self._status)
 
@@ -147,7 +149,7 @@ class ImgTextWindow(QWidget):
         self._paste_btn.setToolTip("Ctrl+V：直接粘贴剪贴板里的截图")
         self._paste_btn.clicked.connect(self.paste_from_clipboard)
         row.addWidget(self._paste_btn)
-        self._convert_btn = QPushButton("转换为可编辑 PPTX")
+        self._convert_btn = QPushButton("生成可编辑 PPT")
         self._convert_btn.setObjectName("primary")
         self._convert_btn.setEnabled(False)
         self._convert_btn.clicked.connect(self._convert)
@@ -190,12 +192,11 @@ class ImgTextWindow(QWidget):
         self._component_box.setVisible(not ready)
         if not ready:
             self._component_label.setText(
-                "还需要一次性下载识别组件（离线识别模型）。装好之后完全离线，不再联网。")
+                f"首次使用需下载文字识别组件（约 {COMPONENT_HINT_MB} MB），下载一次即可在本机离线识别。")
         self._sync_buttons()
 
     def _sync_buttons(self) -> None:
-        ready = imgtext_ocr.is_installed()
-        self._convert_btn.setEnabled(bool(self._source) and ready and not self._busy)
+        self._convert_btn.setEnabled(bool(self._source) and not self._busy)
         self._pick_btn.setEnabled(not self._busy)
         self._paste_btn.setEnabled(not self._busy)
         has_result = bool(self._result_path) and not self._busy
@@ -261,8 +262,19 @@ class ImgTextWindow(QWidget):
                 self._drop.width() or 640, self._drop.height() or 280,
                 Qt.KeepAspectRatio, Qt.SmoothTransformation))
         label = "剪贴板图片" if pasted else os.path.basename(path)
-        self._status.setText(f"{label} · {pixmap.width()}×{pixmap.height()}")
+        hint = ""
+        if not imgtext_ocr.is_installed():
+            hint = " · 尚未安装文字识别组件，点击「生成可编辑 PPT」即可下载；装好后再点一次生成。"
+        self._status.setText(f"{label} · {pixmap.width()}×{pixmap.height()}{hint}")
         self._sync_buttons()
+
+    def eventFilter(self, watched, event):  # noqa: N802
+        if watched is self._drop and event.type() == QEvent.MouseButtonRelease:
+            if event.button() == Qt.LeftButton:
+                if not self._busy:
+                    self._pick()
+                return True
+        return super().eventFilter(watched, event)
 
     def _pick(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -352,6 +364,10 @@ class ImgTextWindow(QWidget):
     # ---------- 转换 ----------
     def _convert(self) -> None:
         if self._busy or not self._source:
+            return
+        if not imgtext_ocr.is_installed():
+            self._status.setText("需要先下载文字识别组件；装好后再点「生成可编辑 PPT」，所选图片会保留。")
+            self._install_component()
             return
         results = config.cache_dir() / "imgtext-results"
         results.mkdir(parents=True, exist_ok=True)

@@ -49,7 +49,6 @@ class MaterialWindow(QWidget):
         self.pack_label = QLabel("")
         self.pack_label.setWordWrap(True)
         self.pack_btn = QPushButton("下载团队素材包")
-        self.pack_btn.setObjectName("primary")
         self.pack_btn.clicked.connect(self._pack_download)
         bar.addWidget(self.pack_label, 1)
         bar.addWidget(self.pack_btn, 0, Qt.AlignVCenter)
@@ -366,7 +365,7 @@ class MaterialWindow(QWidget):
         if ids and owner_actions.ask(self, "移出素材库", f"将选中的 {len(ids)} 个素材移出素材库？",
                                      "移出", "取消"):
             self._run(lambda: self.library.delete(ids),
-                      lambda _: self._refresh_after("已移出素材库；文件保留在素材库的 .trash 目录。"), "移出素材")
+                      lambda _: self._refresh_after("已移出素材库；文件仍保留在素材库的回收区。"), "移出素材")
 
     def _import(self):
         path, _ = QFileDialog.getOpenFileName(self, "导入 PPT Doctor 素材包", "", "PPTX 素材包 (*.pptx)")

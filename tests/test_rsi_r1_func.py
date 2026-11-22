@@ -56,7 +56,7 @@ def test_index_events_refresh_current_query(win, monkeypatch, event, all_files):
 def test_name_error_survives_status_refresh_until_success(win, monkeypatch):
     stats = {"file_count": 3, "page_count": 7}
     win._apply_status_stats({"name_index_error": "磁盘空间不足"}, stats)
-    assert "PPT 内容可搜 · 文件名盘点失败：磁盘空间不足" in win.status_label.text()
+    assert "PPT 内容可搜 · 查找文件失败：磁盘空间不足" in win.status_label.text()
     assert "索引就绪" not in win.status_label.text()
     assert not win.name_index_retry_btn.isHidden()
     calls = []
@@ -83,7 +83,7 @@ def test_all_files_pending_inventory_differs_from_no_matches(win, monkeypatch):
     monkeypatch.setattr(win, "_all_files_scope", lambda: True)
     monkeypatch.setattr(namestore, "peek_header", lambda: None)
     win._show_empty_hint("abc")
-    assert "全盘文件名盘点还没完成" in win._empty_tip.text()
+    assert "查找文件还没完成" in win._empty_tip.text()
     assert "完成后会自动刷新" in win._empty_tip.text()
     monkeypatch.setattr(namestore, "peek_header", lambda: (0, 1))
     win._show_empty_hint("abc")
@@ -112,7 +112,7 @@ def test_welcome_progress_and_terminal_states(win, qtbot):
     win._on_index_progress(0, -1, "发现 25 个文件")
     assert "已发现 25 个文件" in ov._progress_label.text()
     win._on_index_done({"name_index_error": "磁盘满"})
-    assert "首次索引完成" in ov._progress_label.text() and "磁盘满" in ov._progress_label.text()
+    assert "PPT 内容已可搜索" in ov._progress_label.text() and "磁盘空间不足" in ov._progress_label.text()
     qtbot.waitExposed(win)
     target = Path(__file__).resolve().parents[1] / "artifacts" / "rsi-welcome.png"
     assert ov.grab().save(str(target))
@@ -125,7 +125,7 @@ def test_welcome_progress_and_terminal_states(win, qtbot):
 def test_welcome_opened_after_index_completion(win):
     win._on_index_done({"name_index_entries": 0})
     win.maybe_show_welcome()
-    assert "首次索引完成" in win._welcome._progress_label.text()
+    assert "首次建立索引完成" in win._welcome._progress_label.text()
 
 
 def test_failed_hot_write_does_not_schedule_search(win, monkeypatch):
@@ -162,7 +162,7 @@ def test_imgtext_subscribes_before_own_download(qtbot, monkeypatch, center):
     qtbot.addWidget(settings)
     monkeypatch.setattr(settings, "_refresh_components", lambda **kw: None)
     settings._on_component_uninstalled("ocr", 123)
-    assert not widget._component_box.isHidden() and not widget._convert_btn.isEnabled()
+    assert not widget._component_box.isHidden() and widget._convert_btn.isEnabled()
     center._apply("ocr", {"phase": "error", "error": "网络超时"})
     assert "网络超时" in widget._component_label.text()
 
