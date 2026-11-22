@@ -281,17 +281,17 @@ def test_index_progress_three_states(qtbot, tmp_path):
     # 扫描态（total<0）：无百分比
     win._on_index_progress(0, -1, "已发现 100 个文件")
     assert win.pct_label.text() == ""
-    assert win.index_phase_label.text() == "扫描"
+    assert win.index_phase_label.text() == "查找文件"
     assert not win.index_phase_label.isHidden()
-    assert "扫描磁盘中" in win.status_label.text()
+    assert "正在查找文件" in win.status_label.text()
     assert "已发现 100 个文件" not in win.status_label.text()
     assert "已发现 100 个文件" in win.status_label.toolTip()
     # 索引态：百分比
     win._on_index_progress(50, 200, "x.pptx")
     assert win.pct_label.text() == "25%"
-    assert win.index_phase_label.text() == "建库"
+    assert win.index_phase_label.text() == "建立索引"
     assert win.index_count_label.text() == "50 / 200"
-    assert "正在建库" in win.status_label.text()
+    assert "正在建立索引" in win.status_label.text()
     # 就绪态
     win._on_index_done({"indexed": 1, "deleted": 0})
     qtbot.waitUntil(lambda: "索引就绪" in win.status_label.text(), timeout=2000)
@@ -311,7 +311,7 @@ def test_index_rebuild_progress_explains_upgrade(qtbot, tmp_path):
     win._on_index_progress(0, -1, "已发现 100 个文件")
 
     assert "升级索引中" in win.status_label.text()
-    assert "可边扫边搜" in win.status_label.text()
+    assert "不影响你同时搜索" in win.status_label.text()
 
 
 def test_index_progress_ui_updates_are_throttled(qtbot, monkeypatch, tmp_path):

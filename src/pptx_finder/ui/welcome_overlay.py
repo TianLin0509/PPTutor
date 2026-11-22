@@ -38,10 +38,24 @@ def _welcome_logo(size: int = 60) -> QPixmap:
 
 _FEATURES = [
     ("🔍", "搜内容，直接定位到页", "记得幻灯片里写过的字，搜出来是哪个文件第几页，点开直接跳过去"),
-    ("🎬", "版本留存 · 智能归组", "版本留存可找回历史版本，智能归组把相似 PPT 归在一起；两项默认关闭，可在设置里开启"),
-    ("📊", "趣味统计", "看看你的「PPT 肝度」「年度报告」「规模仓鼠」，打工人专属"),
-    ("⌨️", "全局热键随叫随到", "任何时候按 Alt+F 唤起，关闭即收进托盘常驻"),
+    ("📋", "复制本页 / 插入到 PPT", "找到需要的那页后，可以复制整页或插入到已打开的 PPT；请先打开目标文稿"),
+    ("✨", "图片转文字 · 素材库", "把截图转成文字可编辑的 PPT；常用箭头、框图也能收藏复用"),
+    ("🎬", "版本留存 · 智能归组", "版本留存可找回历史版本，智能归组把相似 PPT 归在一起；两项默认关闭，可在设置里开启。按 Alt+F 随时唤起搜索"),
 ]
+
+
+def _index_problem_message(error: object) -> str:
+    """首次引导只给可操作的原因，不透出异常类、系统路径和堆栈。"""
+    detail = str(error).lower()
+    if any(word in detail for word in ("errno 28", "winerror 112", "no space", "disk full", "磁盘满", "磁盘空间不足")):
+        reason = "磁盘空间不足，请清理一些空间"
+    elif any(word in detail for word in ("permission", "access is denied", "winerror 5]", "errno 13", "权限", "拒绝访问")):
+        reason = "没有访问权限，请确认相关文件夹允许读取"
+    elif any(word in detail for word in ("not found", "no such file", "winerror 3]", "找不到", "不存在")):
+        reason = "文件或磁盘暂时找不到，请确认磁盘已连接、文件未被移动"
+    else:
+        reason = "部分文件读取失败，请确认磁盘可访问"
+    return reason + "；点击「开始使用」后，可在「设置 → 健康诊断」点「重新扫描索引」重试"
 
 
 class WelcomeOverlay(QWidget):
@@ -95,26 +109,30 @@ class WelcomeOverlay(QWidget):
             self._settings_btn.clicked.connect(on_settings)
         cl.addWidget(self._settings_btn, 0, Qt.AlignHCenter)
 
-        self._progress_label = QLabel("正在首次扫描你的磁盘… 可边扫边搜")
+        self._progress_label = QLabel("正在查找文件… 不影响你同时搜索")
         self._progress_label.setObjectName("wProgress")
+        self._progress_label.setTextFormat(Qt.PlainText)
+        self._progress_label.setWordWrap(True)
         self._progress_label.setAlignment(Qt.AlignCenter)
         cl.addSpacing(22)
         cl.addWidget(self._progress_label)
 
-        st = QLabel("顺手挑个风格（之后随时能换）")
+        st = QLabel("顺手挑个外观（更多风格可随时在左下角「主题」切换）")
         st.setObjectName("wStyleHint")
         st.setAlignment(Qt.AlignCenter)
         cl.addSpacing(20)
         cl.addWidget(st)
-        # 12 主题分两行网格（6×2）：单行 HBox 在窄窗口会把 chip 挤到文字重叠
+        # 首次使用只主推静白/静黑；完整主题列表仍保留在主窗的主题入口。
         sw = QGridLayout()
         sw.setSpacing(8)
         sw.setContentsMargins(0, 0, 0, 0)
-        per_row = 6
+        per_row = 2
         for c in range(per_row):
             sw.setColumnStretch(c, 1)  # 等宽列，chip 均匀铺满不挤
         self._theme_btns: dict[str, QPushButton] = {}
-        for i, (name, label) in enumerate(theme.THEMES):
+        recommended = [(name, label) for name, label in theme.THEMES
+                       if name in ("atelier", "atelier_dark")]
+        for i, (name, label) in enumerate(recommended):
             b = QPushButton(label)
             b.setObjectName("wSwatch")
             b.setCheckable(True)
@@ -168,17 +186,18 @@ class WelcomeOverlay(QWidget):
 
     def update_progress(self, found: int, total: int | None = None) -> None:
         count = f"已发现 {found} 个文件" if total is None else f"已处理 {found} / {total} 个文件"
-        self._progress_label.setText(f"正在首次扫描你的磁盘… {count} · 可边扫边搜")
+        phase = "正在查找文件" if total is None else "正在建立索引"
+        self._progress_label.setText(f"{phase}… {count} · 不影响你同时搜索")
 
     def finish_index(self, summary: dict) -> None:
         if summary.get("error"):
-            text = f"首次索引遇到问题：{summary['error']}；已有结果可搜，请重新扫描重试"
+            text = "首次建立索引遇到问题，已完成的结果仍可搜索。" + _index_problem_message(summary["error"])
         elif summary.get("cancelled"):
-            text = "首次索引已暂停，已完成的结果可搜；可重新扫描继续"
+            text = "首次建立索引已暂停，已完成的结果可搜；点击「开始使用」后，可在「设置 → 健康诊断」点「重新扫描索引」继续"
         else:
-            text = "首次索引完成，可以开始搜索了"
+            text = "首次建立索引完成，可以开始搜索了"
             if summary.get("name_index_error"):
-                text += f" · 文件名盘点失败：{summary['name_index_error']}；请在状态栏点击重试"
+                text = "PPT 内容已可搜索，部分文件名暂时搜不到。" + _index_problem_message(summary["name_index_error"])
         self._progress_label.setText(text)
 
     def resizeEvent(self, e):  # noqa: N802
