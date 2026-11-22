@@ -273,10 +273,10 @@ QListWidget#setNav::item:hover {{ background: {t['hover']}; }}
 QListWidget#setNav::item:selected {{ background: {t['sel']}; color: {t['acc']}; font-weight: 700; }}
 QStackedWidget#setStack, QWidget#setPage {{ background: {t['win']}; }}
 QScrollArea#setScroll {{ background: transparent; border: none; }}
-QLabel#setPageTitle {{ font-size: 20px; font-weight: 700; color: {t['ink1']}; }}
+QLabel#setPageTitle {{ font-size: 22px; font-weight: 700; color: {t['ink1']}; }}
 QLabel#setPageDesc {{ font-size: 13px; color: {t['ink3']}; }}
 QLabel#setSection {{ font-size: 13px; font-weight: 700; color: {t['ink2']}; padding-top: 6px; }}
-QFrame#setCard {{ background: {t['panel']}; border: 1px solid {t['bd']}; border-radius: 10px; }}
+QFrame#setCard {{ background: {t['panel']}; border: 1px solid {t['bd2']}; border-radius: 16px; }}
 QFrame#setDivider {{ background: {t['bd2']}; border: none; }}
 QLabel#setRowTitle, QCheckBox#setRowTitle {{ font-size: 14px; font-weight: 600; color: {t['ink1']}; }}
 QLabel#setRowDesc, QLabel#setNote {{ font-size: 12.5px; color: {t['ink3']}; }}
@@ -1577,7 +1577,7 @@ class SettingsDialog(QDialog):
         self.diag_summary.setTextFormat(Qt.RichText)
         self.diag_summary.setTextInteractionFlags(Qt.TextSelectableByMouse)
         card.addWidget(self.diag_summary)
-        self.diag_toggle = QPushButton("▸ 展开完整诊断日志")
+        self.diag_toggle = QPushButton("展开完整诊断日志")
         self.diag_toggle.setObjectName("ghost")
         self.diag_toggle.setCheckable(True)
         self.diag_toggle.toggled.connect(self._toggle_diag_log)
@@ -1813,7 +1813,7 @@ class SettingsDialog(QDialog):
 
     def _toggle_diag_log(self, on: bool) -> None:
         self.diagnostic_text.setVisible(on)
-        self.diag_toggle.setText("▾ 收起完整诊断日志" if on else "▸ 展开完整诊断日志")
+        self.diag_toggle.setText("收起完整诊断日志" if on else "展开完整诊断日志")
 
     def _render_diag_summary(self, lines: list[str], note: str = "") -> None:
         """从完整诊断行重新提炼人话结论（深度检查等后追加的行也算进去）。"""

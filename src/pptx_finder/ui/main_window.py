@@ -2424,6 +2424,13 @@ class MainWindow(QMainWindow):
         for k, btn in getattr(self, "_rail_page_btns", {}).items():
             btn.setChecked(k == key)
         self._refresh_rail_icons()
+        # 搜索语法解释行只属于搜索页：切到概览/版本/健康页时收起，回来再按当前词重建
+        hint = getattr(self, "query_hint", None)
+        if hint is not None:
+            if key == "search":
+                self._update_query_hint(self.search_box.text().strip())
+            else:
+                hint.hide()
         if key == "health":
             win = self._health_page_win
             if win is not None:

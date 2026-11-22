@@ -187,10 +187,10 @@ def test_diagnostics_card_and_log_use_remaining_height(settings, qtbot):
     settings.show()
     assert settings.diag_summary.parentWidget().objectName() == "setCard"
     assert settings.vault_audit_btn.parentWidget() is settings.diag_summary.parentWidget()
-    assert settings.diag_toggle.text().startswith("▸")
+    assert settings.diag_toggle.text().startswith("展开")
     settings.diag_toggle.click()
     qtbot.wait(20)
-    assert settings.diag_toggle.text().startswith("▾")
+    assert settings.diag_toggle.text().startswith("收起")
     assert settings.diagnostic_text.height() > 300
     dest = Path(__file__).resolve().parents[1] / "artifacts" / "rsi-r4-health.png"
     dest.parent.mkdir(exist_ok=True)
