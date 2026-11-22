@@ -68,11 +68,11 @@ def _mk_atelier(light: bool) -> dict:
             panel="#252529", panel2="#232327", field="#2E2E33", rail="#202024",
             hover="rgba(255,255,255,0.06)", sel="rgba(10,132,255,0.20)", selblur="rgba(255,255,255,0.07)",
             bd="rgba(255,255,255,0.11)", bd2="rgba(255,255,255,0.065)",
-            ink1="#F5F5F7", ink2="#D0D0D5", ink3="#98989F", ink4="#6A6A70",
+            ink1="#F5F5F7", ink2="#D0D0D5", ink3="#98989F", ink4="#A0A0AA",
             acc=acc, accd=accd, acctext="#FFFFFF", grn="#32D74B",
             scroll="rgba(255,255,255,0.24)", scrollh="rgba(255,255,255,0.44)",
             canvas="#161619", is_light=False,
-            hl_bg="rgba(255,214,10,0.30)", hl_fg="#FFD60A",
+            hl_bg="rgba(255,214,10,0.22)", hl_fg="#FFE047",
         )
     ar, ag, ab = _rgb(acc)
     d.update(hl_r=str(ar), hl_g=str(ag), hl_b=str(ab), hl_a="0.22", radius="12")
@@ -247,7 +247,7 @@ QListWidget#resultList::item:selected { background: transparent; }
 QWidget#previewPanel { background: $panel; border: none; border-radius: 0; }
 QWidget#previewHeadBar { background: transparent; }
 QLabel#previewImage { background: $canvas; border: 1px solid $bd2; border-radius: 8px; color: $ink3; }
-QFrame#card { background: $panel; border: 1px solid $bd; border-radius: 10px; }
+QFrame#card { background: $panel; border: 1px solid $bd2; border-radius: 16px; }
 QLabel#pathLabel { color: $ink1; font-size: 18px; font-weight: 700; background: transparent; }
 QLabel#metaLabel { color: $ink3; font-size: 12px; background: transparent; }
 QPushButton#headerBtn { background: $field; border: 1px solid transparent; border-radius: 14px; padding: 5px 12px; color: $ink2; font-size: 12px; }
@@ -388,7 +388,7 @@ QLabel#dashSub { color: $ink3; font-size: 12.5px; background: transparent; }
 QLabel#kpiNum { color: $acc; font-size: 28px; font-weight: 700; font-family: $mono_family; background: transparent; }
 QLabel#kpiLab { color: $ink2; font-size: 12.5px; font-weight: 600; background: transparent; }
 QLabel#kpiSub { color: $ink4; font-size: 11px; background: transparent; }
-QLabel#dashCardT { color: $ink2; font-size: 13px; font-weight: 700; background: transparent; }
+QLabel#dashCardT { color: $ink1; font-size: 14px; font-weight: 700; background: transparent; }
 QLabel#legName { color: $ink2; font-size: 12px; background: transparent; }
 QLabel#legPc { color: $ink3; font-size: 12px; font-weight: 700; font-family: $mono_family; background: transparent; }
 QFrame#dashRec { background: $canvas; border: 1px solid transparent; border-radius: 12px; }

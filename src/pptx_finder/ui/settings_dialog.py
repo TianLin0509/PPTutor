@@ -96,8 +96,16 @@ def _diag_number(line: str, key: str) -> float:
 
 def _diagnostic_summary_lines(lines: list[str]) -> list[str]:
     issues: list[str] = []
-    for line in lines:
-        if line.startswith("ui_loop:"):
+    latest_operations = {line.split(":", 1)[0]: line for line in lines
+                         if line.startswith(("autostart_toggle:", "rescan:"))}
+    current_lines = [line for line in lines if not line.startswith(("autostart_toggle:", "rescan:"))]
+    current_lines.extend(latest_operations.values())
+    for line in current_lines:
+        if line.startswith(("autostart_toggle:", "rescan:")):
+            if "failed" in line:
+                issues.append("开机自启设置失败：请重新切换自启开关重试。" if line.startswith("autostart_toggle:")
+                              else "重新扫描失败：请点「重新扫描索引」重试；仍失败可复制完整诊断。")
+        elif line.startswith("ui_loop:"):
             max_gap = _diag_number(line, "max_gap")
             slow_gaps = _diag_number(line, "slow_gaps")
             if max_gap >= 500 or slow_gaps > 0:
@@ -132,7 +140,8 @@ def _diagnostic_summary_lines(lines: list[str]) -> list[str]:
             and "ok=True" not in line
         ):
             issues.append("版本库完整性检查未通过：" + line)
-        elif line.startswith("autostart:") and "preference=on actual=off" in line:
+        elif (line.startswith("autostart:") and "preference=on actual=off" in line
+              and "autostart_toggle" not in latest_operations):
             issues.append("开机自启目标无效，需要重新写入")
         elif "unavailable" in line:
             issues.append("诊断项不可用：" + line)
@@ -273,10 +282,10 @@ QListWidget#setNav::item:hover {{ background: {t['hover']}; }}
 QListWidget#setNav::item:selected {{ background: {t['sel']}; color: {t['acc']}; font-weight: 700; }}
 QStackedWidget#setStack, QWidget#setPage {{ background: {t['win']}; }}
 QScrollArea#setScroll {{ background: transparent; border: none; }}
-QLabel#setPageTitle {{ font-size: 20px; font-weight: 700; color: {t['ink1']}; }}
+QLabel#setPageTitle {{ font-size: 22px; font-weight: 700; color: {t['ink1']}; }}
 QLabel#setPageDesc {{ font-size: 13px; color: {t['ink3']}; }}
 QLabel#setSection {{ font-size: 13px; font-weight: 700; color: {t['ink2']}; padding-top: 6px; }}
-QFrame#setCard {{ background: {t['panel']}; border: 1px solid {t['bd']}; border-radius: 10px; }}
+QFrame#setCard {{ background: {t['panel']}; border: 1px solid {t['bd2']}; border-radius: 16px; }}
 QFrame#setDivider {{ background: {t['bd2']}; border: none; }}
 QLabel#setRowTitle, QCheckBox#setRowTitle {{ font-size: 14px; font-weight: 600; color: {t['ink1']}; }}
 QLabel#setRowDesc, QLabel#setNote {{ font-size: 12.5px; color: {t['ink3']}; }}
@@ -306,6 +315,7 @@ class SettingsDialog(QDialog):
         self._diag_refresh_token = 0
         self._diag_inflight_token: int | None = None
         self._diag_extra_lines: list[str] = []
+        self._diag_operation_lines: dict[str, str] = {}
         self._vault_audit_line = ""
         self._vault_audit_note = ""
         self._powerpoint_inflight = False
@@ -1577,7 +1587,7 @@ class SettingsDialog(QDialog):
         self.diag_summary.setTextFormat(Qt.RichText)
         self.diag_summary.setTextInteractionFlags(Qt.TextSelectableByMouse)
         card.addWidget(self.diag_summary)
-        self.diag_toggle = QPushButton("▸ 展开完整诊断日志")
+        self.diag_toggle = QPushButton("展开完整诊断日志")
         self.diag_toggle.setObjectName("ghost")
         self.diag_toggle.setCheckable(True)
         self.diag_toggle.toggled.connect(self._toggle_diag_log)
@@ -1636,7 +1646,13 @@ class SettingsDialog(QDialog):
         self.auto.setEnabled(True)
         state = "on" if on else "off"
         result = "applied" if ok else "failed; will retry at next startup"
-        self._diag_extra_lines.append(f"autostart_toggle: {state} {result}")
+        self._record_diag_operation("autostart_toggle", f"autostart_toggle: {state} {result}")
+
+    def _record_diag_operation(self, kind: str, line: str) -> None:
+        """立即显示操作结果；在途诊断快照不能把较新的结果覆盖掉。"""
+        self._diag_operation_lines[kind] = line
+        self.diagnostic_text.appendPlainText(line)
+        self._rerender_diag_summary()
 
     def _apply_retention(self, _index: int) -> None:
         limit = int(self.retention.currentData() or 0)
@@ -1680,6 +1696,8 @@ class SettingsDialog(QDialog):
         loading = "诊断加载中…"
         if self._diag_extra_lines:
             loading += "\n" + "\n".join(self._diag_extra_lines)
+        if self._diag_operation_lines:
+            loading += "\n" + "\n".join(self._diag_operation_lines.values())
         self.diagnostic_text.setPlainText(loading)
         if self._diag_inflight_token is not None:
             return
@@ -1813,7 +1831,7 @@ class SettingsDialog(QDialog):
 
     def _toggle_diag_log(self, on: bool) -> None:
         self.diagnostic_text.setVisible(on)
-        self.diag_toggle.setText("▾ 收起完整诊断日志" if on else "▸ 展开完整诊断日志")
+        self.diag_toggle.setText("收起完整诊断日志" if on else "展开完整诊断日志")
 
     def _render_diag_summary(self, lines: list[str], note: str = "") -> None:
         """从完整诊断行重新提炼人话结论（深度检查等后追加的行也算进去）。"""
@@ -1821,6 +1839,7 @@ class SettingsDialog(QDialog):
         if not _qt_is_valid(label):
             return
         raw = [ln for ln in lines if ln and not ln.startswith(("diagnostic_summary:", "diagnostic_issue:"))]
+        raw.extend(self._diag_operation_lines.values())
         if self._vault_audit_line:
             # 普通刷新可能带回检查开始前的后台快照；当前手工检查结果优先。
             raw = [ln for ln in raw if not ln.startswith(("vault_fsck:", "vault_fsck_manual:"))]
@@ -1868,6 +1887,7 @@ class SettingsDialog(QDialog):
         if self._diag_extra_lines:
             lines.extend(self._diag_extra_lines)
             self._diag_extra_lines.clear()
+        lines.extend(self._diag_operation_lines.values())
         lines = self._with_latest_vault_audit(lines)
         self.diagnostic_text.setPlainText("\n".join(lines))
         self._render_diag_summary(lines, self._vault_audit_note)
@@ -1907,14 +1927,12 @@ class SettingsDialog(QDialog):
             accepted = self._on_rescan()
         except Exception as exc:  # noqa: BLE001 诊断动作不能拖垮设置页
             line = f"rescan: failed ({type(exc).__name__}: {exc})"
-            if self._diag_inflight_token is not None:
-                self._diag_extra_lines.append(line)
-            self.diagnostic_text.appendPlainText(f"\n{line}")
+            self._record_diag_operation("rescan", line)
             return
         if accepted is False:
-            self._diag_extra_lines.append("rescan: already running")
+            self._record_diag_operation("rescan", "rescan: already running")
         else:
-            self._diag_extra_lines.append("rescan: requested in background")
+            self._record_diag_operation("rescan", "rescan: requested in background")
         self.schedule_diagnostics_refresh()
 
     def _check_vault_repository(self) -> None:

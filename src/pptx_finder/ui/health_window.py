@@ -13,6 +13,7 @@ from PySide6.QtCore import QEvent, Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QMessageBox,
@@ -202,11 +203,19 @@ class HealthWindow(QWidget):
         self._recycle_all_btn = None
         self._progress = None
         self._body.addWidget(self._dup_card(r))
-        self._body.addWidget(self._zombie_card(r))
-        self._body.addWidget(self._curse_card(r))
-        self._body.addWidget(self._bloat_card(r))
-        self._body.addWidget(self._parse_card(r))
-        self._body.addWidget(self._vault_card())
+        # 其余 5 张卡多是两三行短句：两列排，1440x900 一屏看全（Antigravity 第 5 轮审查）
+        grid_host = QWidget()
+        grid = QGridLayout(grid_host)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(12)
+        cards = (self._zombie_card(r), self._curse_card(r), self._bloat_card(r),
+                 self._parse_card(r), self._vault_card())
+        for i, card in enumerate(cards):
+            grid.addWidget(card, i // 2, i % 2)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+        self._body.addWidget(grid_host)
         self._body.addStretch(1)
         self._start_vault_probe()
 
@@ -303,11 +312,11 @@ class HealthWindow(QWidget):
         return lbl
 
     # ---------- 病灶条目链接 ----------
-    def _mk_link(self, name: str, path: str) -> QLabel:
+    def _mk_link(self, name: str, path: str, max_chars: int = 26) -> QLabel:
         """可点条目：acc 色链接、hover 下划线、tooltip 全路径；点击经主窗钩子跳转定位。"""
         disp = (name or os.path.basename(path)).strip() or path
-        if len(disp) > 26:
-            disp = disp[:25] + "…"
+        if len(disp) > max_chars:
+            disp = disp[:max_chars - 1] + "…"
         acc = self._tok.get("acc", "#0A84FF")
         esc = html.escape(disp)
         lbl = QLabel()
@@ -365,18 +374,18 @@ class HealthWindow(QWidget):
             row_g = QHBoxLayout()
             row_g.setSpacing(8)
             # 文件名做成可点链接（定位保留项）；复选框结构不变，_recycle_selected 遍历不受影响
-            row_g.addWidget(self._mk_link(os.path.basename(g.keep_path), g.keep_path))
             cb = QCheckBox(f"{g.copies} 份　·　可回收 {human_bytes(g.reclaimable)}")
             cb.setChecked(True)
             cb.setToolTip(
                 "保留：" + g.keep_path
                 + "\n送回收站其余 " + str(g.redundant) + " 份：\n" + "\n".join(g.paths[1:]))
-            row_g.addWidget(cb, 1)
+            row_g.addWidget(cb)
+            row_g.addWidget(self._mk_link(os.path.basename(g.keep_path), g.keep_path), 1)
             # 回收前要看得到：要送回收站的是哪几份（原来只藏在复选框的悬停提示里）
             toggle = QToolButton()
             toggle.setObjectName("dupToggle")
             toggle.setCheckable(True)
-            toggle.setText(f"▸ 查看要回收的 {g.redundant} 份")
+            toggle.setText(f"查看要回收的 {g.redundant} 份")
             toggle.setCursor(Qt.PointingHandCursor)
             row_g.addWidget(toggle)
             lay.addLayout(row_g)
@@ -401,7 +410,7 @@ class HealthWindow(QWidget):
             toggle.toggled.connect(
                 lambda on, w=copies, t=toggle, n=g.redundant: (
                     w.setVisible(on),
-                    t.setText(("▾ 收起" if on else f"▸ 查看要回收的 {n} 份"))))
+                    t.setText(("收起" if on else f"查看要回收的 {n} 份"))))
             lay.addWidget(copies)
             self._dup_checks.append((cb, g))
         if len(groups) > len(shown):
@@ -419,7 +428,6 @@ class HealthWindow(QWidget):
         self._recycle_btn.clicked.connect(self._recycle_selected)
         row.addWidget(self._recycle_btn)
         self._recycle_all_btn = QPushButton("全部回收")
-        self._recycle_all_btn.setObjectName("primary")
         self._recycle_all_btn.setToolTip("全部重复组各保留 1 份，其余送入系统回收站（含未展开列出的组）")
         self._recycle_all_btn.clicked.connect(self._recycle_all)
         row.addWidget(self._recycle_all_btn)
@@ -464,19 +472,28 @@ class HealthWindow(QWidget):
         row = QHBoxLayout(w)
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(6)
-        row.addWidget(self._line(f"{prefix}："))
+        # 两列网格里窄窗/大字号时：短标签不许折行成竖排，长文件名收短（全路径看悬停提示）
+        head = self._line(f"{prefix}：")
+        head.setWordWrap(False)
+        row.addWidget(head)
         if path:
-            row.addWidget(self._mk_link(name, path))
+            row.addWidget(self._mk_link(name, path, max_chars=16))
         else:
             row.addWidget(self._line(name))
-        row.addWidget(self._muted(f"·　{value}"))
+        tail = self._muted(f"·　{value}")
+        tail.setWordWrap(False)
+        row.addWidget(tail)
         row.addStretch(1)
         return w
 
     def _parse_card(self, r: health.HealthReport) -> QFrame:
         w, lay = self._card("解析失败")
         if r.parse_failed:
-            detail = "、".join(f"{k}×{v}" for k, v in r.parse_failed_by_status.items())
+            names = {"encrypted": "加密", "too_large": "超大跳过", "error": "无法读取",
+                     "cloud_placeholder": "云盘未下载", "corrupt": "文件损坏", "timeout": "解析超时",
+                     "scanned": "扫描件无文字", "filename_only": "仅收录文件名", "pending": "等待解析",
+                     "unsupported": "格式不支持"}
+            detail = "、".join(f"{names.get(k, k)} {v} 份" for k, v in r.parse_failed_by_status.items())
             lay.addWidget(self._line(f"{r.parse_failed} 份没能提取内容（{detail}）"))
             self._add_example_links(lay, r.parse_failed_examples)
             lay.addWidget(self._muted("多为加密 / 损坏 / 超大跳过；这些文件搜不到内文。"))
