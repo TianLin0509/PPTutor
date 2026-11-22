@@ -19,9 +19,9 @@ import time
 from PySide6.QtCore import QEvent, QMimeData, QObject, QPoint, QPropertyAnimation, QRect, QSize, Qt, QStringListModel, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QColor, QCursor, QDrag, QFontMetrics, QGuiApplication, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap, QShortcut
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QCompleter, QDialog, QFrame, QGraphicsOpacityEffect, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
+    QAbstractSpinBox, QApplication, QComboBox, QCompleter, QDialog, QFrame, QGraphicsOpacityEffect, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMainWindow, QMenu, QProgressBar, QPushButton, QScrollArea,
-    QSizePolicy, QSplitter, QStackedWidget, QToolButton, QVBoxLayout, QWidget,
+    QPlainTextEdit, QSizePolicy, QSplitter, QStackedWidget, QTextEdit, QToolButton, QVBoxLayout, QWidget,
 )
 
 try:
@@ -957,6 +957,7 @@ class MainWindow(QMainWindow):
     _BG_LIGHT_SHUTDOWN_TOTAL_WAIT_MS = 1000
     _SEARCH_SHUTDOWN_WAIT_MS = 500
     _BG_HEAVY_SHUTDOWN_WAIT_MS = 3000
+    _PPT_TRANSFER_QUIT_WAIT_SEC = 10.0
     _BG_HEAVY_LABELS = {
         "open", "restore", "export", "version-restore", "version-export", "version-recover",
         "version-restore-prepare",
@@ -1023,7 +1024,7 @@ class MainWindow(QMainWindow):
         self._cur_item_widget: ResultItem | None = None
         self._search_seq = 0
         self._search_pending_req: int | None = None
-        self._last_query_text = ""            # 上次 _do_search 入口的查询文本（识别后台重搜）
+        self._last_query_text = ""            # 最近已落地结果的查询文本（识别后台重搜）
         self._search_keep_selection = False   # 本次搜索是否「文本未变的后台重搜」（保留选中用）
         self._browse_restore_state = None
         self._pending_search_key = None  # (request id, key)：仅在对应新结果到达后执行
@@ -2079,8 +2080,15 @@ class MainWindow(QMainWindow):
             combo.activated.connect(lambda _index: QTimer.singleShot(0, self._restore_search_focus))
 
     def _restore_search_focus(self) -> None:
-        if not self._closing:
+        if (not self._closing and self.facet_panel.isHidden()
+                and self._current_page_key() in ("search", "dashboard")
+                and not self._other_input_has_focus()):
             self.search_box.setFocus(Qt.OtherFocusReason)
+
+    def _other_input_has_focus(self, widget=None) -> bool:
+        widget = widget if widget is not None else QApplication.focusWidget()
+        return widget is not self.search_box and isinstance(
+            widget, (QLineEdit, QPlainTextEdit, QTextEdit, QAbstractSpinBox))
 
     def _focus_search(self) -> None:
         self.focus_search()
@@ -2563,6 +2571,7 @@ class MainWindow(QMainWindow):
             w.setEnabled(enabled)
 
     def _clear_stale_result_context(self) -> None:
+        self._last_query_text = ""
         self._results_raw = []
         self._results = []
         self._cur = None
@@ -2690,6 +2699,7 @@ class MainWindow(QMainWindow):
         if self._results_raw:
             if not self._apply_sort_render(keep_selection=True):
                 self._select_first()
+            self._sync_facet_empty_and_count()
         self._apply_titlebar_theme()
         # 玻璃化顶屏同步刷新：central 极光 + 标题栏主题名 + 仪表盘图表
         if getattr(self, "_central", None) is not None:
@@ -3310,7 +3320,6 @@ class MainWindow(QMainWindow):
         # 区分「用户改词」与「后台重搜」（live 刷新等文本未变的重搜）：
         # 后者在结果重建后按 path 恢复选中，而不是拽回首行
         self._search_keep_selection = bool(query) and query == self._last_query_text
-        self._last_query_text = query
         self._search_seq += 1
         self._pending_search_key = None
         self._cancel_render_work_for_new_search()
@@ -3373,7 +3382,7 @@ class MainWindow(QMainWindow):
         self._update_query_hint(query)
         if query:
             self._do_search()
-        self.search_box.setFocus(Qt.OtherFocusReason)
+        self._restore_search_focus()
 
     def _on_case_sensitive_changed(self, _checked: bool) -> None:
         """大小写属于检索语义；切换后重跑当前词，而不是只重排旧结果。"""
@@ -3381,7 +3390,7 @@ class MainWindow(QMainWindow):
         self._update_query_hint(query)
         if query:
             self._do_search()
-        self.search_box.setFocus(Qt.OtherFocusReason)
+        self._restore_search_focus()
 
     def _show_search_pending(self, query: str) -> None:
         self._status_refresh_token += 1
@@ -3487,6 +3496,7 @@ class MainWindow(QMainWindow):
 
     def _finish_search(self, query: str, results: list[FileResult], elapsed_ms: float | None = None) -> None:
         self._clear_search_pending()
+        self._last_query_text = query
         self._results_raw = results
         self._refresh_facets(keep=self._search_keep_selection)
         suffix = f" \u00b7 {elapsed_ms:.0f} ms" if elapsed_ms is not None else ""
@@ -3507,10 +3517,7 @@ class MainWindow(QMainWindow):
             self.list_head.show()
             if not restored:
                 self._select_first(delayed_preview=True)
-            if self._facet_filters:
-                self.result_count.setText(f"筛选出 {len(self._results)} / {len(results)} 个文件")
-                if not self._results:
-                    self._show_facet_empty()
+            self._sync_facet_empty_and_count()
             self._animate_list_in()
             self._kick_history_search(query)
         else:
@@ -3599,10 +3606,7 @@ class MainWindow(QMainWindow):
             if not restored:
                 self._update_preview_header(None)
                 self._set_ops_enabled(False)
-            if self._facet_filters:
-                self.result_count.setText(f"筛选出 {len(self._results)} / {len(recents)} 个文件")
-                if not self._results:
-                    self._show_facet_empty()
+            self._sync_facet_empty_and_count()
         else:
             self._cur = None
             self.result_list.clear()
@@ -3637,6 +3641,7 @@ class MainWindow(QMainWindow):
         self._clear_search_pending()
         self.query_hint.hide()
         self._recent_keep_selection = self._showing_recent and not self._last_query_text
+        self._last_query_text = ""
         if not self._recent_keep_selection:
             self._clear_stale_result_context()
         already_on_recent_dashboard = (
@@ -4433,7 +4438,7 @@ class MainWindow(QMainWindow):
         self._on_sort_changed()
 
     def _on_sort_changed(self) -> None:
-        self.search_box.setFocus(Qt.OtherFocusReason)
+        self._restore_search_focus()
         if self._search_pending_req is not None:
             self._sort_refresh_pending = True
             return
@@ -4446,6 +4451,7 @@ class MainWindow(QMainWindow):
         if self._results_raw:
             self._cancel_auto_preview()
             restored = self._apply_sort_render(keep_selection=True)
+            self._sync_facet_empty_and_count()
             if self._results:
                 if not restored:
                     self._select_first(delayed_preview=True)
@@ -4601,6 +4607,13 @@ class MainWindow(QMainWindow):
                 self._add_section_header(entry[1])
             else:
                 _, idx, r, ginfo = entry
+                if ginfo and ginfo.get("member"):
+                    gid = ginfo["gid"]
+                    # 分批渲染期间折叠/重新展开后，不复活成员，也不重复插入。
+                    if (gid not in self._expanded_groups
+                            or any(item.data(Qt.UserRole) == idx
+                                   for item in self._group_member_items.get(gid, []))):
+                        continue
                 self._add_result_item(idx, r, hlcss, ginfo)
         return min(end, len(plan))
 
@@ -4629,6 +4642,8 @@ class MainWindow(QMainWindow):
         w.activated.connect(lambda item=item: self._activate_result_item(item))
         if ginfo and ginfo.get("count"):
             self._group_primary_item[ginfo["gid"]] = item  # 记录组主卡列表项，供就地展开定位
+        elif ginfo and ginfo.get("member"):
+            self._group_member_items.setdefault(ginfo["gid"], []).append(item)
 
     def _focus_result_item(self, item: QListWidgetItem) -> None:
         self.result_list.setCurrentItem(item)
@@ -4664,7 +4679,7 @@ class MainWindow(QMainWindow):
                 self._tok,
                 hlcss,
                 ginfo={"member": True, "gid": gid},
-                on_select=lambda item=item: self.result_list.setCurrentItem(item),
+                on_select=lambda item=item: self._focus_result_item(item),
             )
             item.setSizeHint(w.sizeHint())
             self.result_list.insertItem(base + 1 + k, item)
@@ -4873,12 +4888,11 @@ class MainWindow(QMainWindow):
         if self._search_pending_req is not None:
             return
         self._facet_filters = filters
-        self.search_box.setFocus(Qt.OtherFocusReason)
+        self._restore_search_focus()
         self._cancel_auto_preview()
         self._suppress_select_preview = True
         restored = self._apply_sort_render(keep_selection=True)
         if self._results:
-            self.result_count.setText(f"命中 {len(self._results)} 个文件")
             self.list_head.show()
             if not restored:
                 self._select_first(delayed_preview=True)
@@ -4887,9 +4901,23 @@ class MainWindow(QMainWindow):
                 QTimer.singleShot(0, lambda: setattr(self, "_suppress_select_preview", False))
         else:
             QTimer.singleShot(0, lambda: setattr(self, "_suppress_select_preview", False))
-            # 筛选后无结果：别留「命中 N 个」陈旧计数 + 给空状态提示（区别于「没搜到」）
-            self.result_count.setText("筛选后无结果")
+        self._sync_facet_empty_and_count()
+
+    def _sync_facet_empty_and_count(self) -> None:
+        if self._facet_filters:
+            self.result_count.setText(f"筛选出 {len(self._results)} / {len(self._results_raw)} 个文件")
+        elif self._showing_recent:
+            self.result_count.setText(f"最近修改 · {len(self._results_raw)} 个文件")
+        elif self._results_raw:
+            relaxed_count = sum(1 for result in self._results_raw if result.relaxed)
+            suffix = f" · 联想 {relaxed_count}" if relaxed_count else ""
+            # 搜索落地时的耗时文案保留；只在取消筛选等计数改变时重建。
+            prefix = f"命中 {len(self._results_raw)} 个文件{suffix}"
+            if not self.result_count.text().startswith(prefix):
+                self.result_count.setText(prefix)
+        if self._results_raw and not self._results:
             self._cur = None
+            self._cur_item_widget = None
             self._clear_detail_load_inflight()
             self.detail_panel.clear_selection()
             self._invalidate_preview_request()
@@ -6065,8 +6093,7 @@ class MainWindow(QMainWindow):
     def eventFilter(self, obj, ev):  # noqa: N802
         et = ev.type()
         if obj is getattr(self, "facet_panel", None) and et == QEvent.Hide:
-            if not self._closing:
-                self.search_box.setFocus(Qt.OtherFocusReason)
+            self._restore_search_focus()
         if (et == QEvent.KeyPress and ev.key() == Qt.Key_Escape
                 and isinstance(obj, QWidget)
                 and (obj.window() is self or obj.window() is getattr(self, "facet_panel", None))):
@@ -6074,6 +6101,9 @@ class MainWindow(QMainWindow):
                 self.facet_panel.hide()
             elif self._completer.popup().isVisible():
                 self._completer.popup().hide()
+            elif (self._current_page_key() not in ("search", "dashboard")
+                  or self._other_input_has_focus() or self._other_input_has_focus(obj)):
+                return super().eventFilter(obj, ev)
             elif self.search_box.text():
                 self._clear_search_now()
             elif self._to_tray_on_close:
@@ -6115,6 +6145,8 @@ class MainWindow(QMainWindow):
         if et == QEvent.KeyPress and obj in (self.search_box, getattr(self, "result_list", None)):
             k = ev.key()
             if k in (Qt.Key_Down, Qt.Key_Up, Qt.Key_Return, Qt.Key_Enter) and not ev.modifiers():
+                if obj is self.search_box and self._completer.popup().isVisible():
+                    return super().eventFilter(obj, ev)
                 if k == Qt.Key_Down and not self._completer.popup().isVisible():
                     self._switch_page("search")
                 if self._debounce.isActive():
@@ -6123,6 +6155,8 @@ class MainWindow(QMainWindow):
                         self._pending_search_key = (self._search_seq, k)
                         return True
                 if self._search_pending_req is not None:
+                    if not self._search_keep_selection:
+                        self._pending_search_key = (self._search_seq, k)
                     return True
                 if self._showing_recent and self._recent_load_inflight_token is not None and self._cur is None:
                     self._pending_search_key = (self._search_seq, k)
@@ -6429,7 +6463,8 @@ class MainWindow(QMainWindow):
         self._open_at_page_bg(self._cur.path, self._view_page)
 
     def _run_slide_transfer(self, fn, done, operation: str) -> None:
-        if self._block_if_search_pending() or self._block_if_file_op_active():
+        if (self._closing or getattr(self, "_storage_quit_pending", False)
+                or self._block_if_search_pending() or self._block_if_file_op_active()):
             return
         self._active_heavy_op = "ppt-transfer"
         self._set_ops_enabled(False)
@@ -6483,6 +6518,8 @@ class MainWindow(QMainWindow):
 
     def _insert_preview_slide(self, source: str, page: int) -> None:
         def choose(targets):
+            if self._closing or getattr(self, "_storage_quit_pending", False):
+                return
             if not targets:
                 self._toast("没有可编辑的已打开 PPT，请先在 Microsoft PowerPoint 中打开目标文稿。")
                 return
@@ -7639,13 +7676,26 @@ class MainWindow(QMainWindow):
 
     def _storage_transaction_pending(self) -> bool:
         # 等 done 回调交付传输结果、finished 清理后才放行，不能只看 isRunning。
-        return self._active_heavy_op == 'ppt-transfer' or any(getattr(task, '_label', '') in {
-            'vault-storage-configure', 'vault-capacity-update', 'ppt-transfer'
-        } for task in self._bg_tasks)
+        labels = {'vault-storage-configure', 'vault-capacity-update'}
+        if not getattr(self, '_transfer_quit_timed_out', False):
+            labels.add('ppt-transfer')
+            if self._active_heavy_op == 'ppt-transfer':
+                return True
+        return any(getattr(task, '_label', '') in labels for task in self._bg_tasks)
 
     def _finish_storage_quit(self) -> None:
+        if self._closing or not getattr(self, '_storage_quit_pending', False):
+            return
+        deadline = getattr(self, '_storage_quit_deadline', None)
+        if (deadline is not None and time.monotonic() >= deadline
+                and not getattr(self, '_transfer_quit_timed_out', False)):
+            self._transfer_quit_timed_out = True
+            _log.warning('ppt-transfer quit wait timed out after %.0f seconds; allowing shutdown',
+                         self._PPT_TRANSFER_QUIT_WAIT_SEC)
         if (self._storage_transaction_pending()
-                or (getattr(self, '_transfer_quit_wait_result', False) and self._toast_timer.isActive())):
+                or (getattr(self, '_transfer_quit_wait_result', False)
+                    and not getattr(self, '_transfer_quit_timed_out', False)
+                    and self._toast_timer.isActive())):
             # 传输结果沿用现有提示的显示时长，避免刚报告成功/失败就把窗口关掉。
             QTimer.singleShot(100, self._finish_storage_quit)
             return
@@ -7672,6 +7722,9 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(message)
             if not getattr(self, '_storage_quit_pending', False):
                 self._storage_quit_pending = True
+                self._storage_quit_deadline = (
+                    time.monotonic() + self._PPT_TRANSFER_QUIT_WAIT_SEC
+                    if self._transfer_quit_wait_result else None)
                 QTimer.singleShot(100, self._finish_storage_quit)
             return
         self._shutdown()
@@ -7755,6 +7808,9 @@ class MainWindow(QMainWindow):
                     _log.error("render worker did not stop after isolated renderer abort")
 
     def _bg_task_shutdown_wait_ms(self, task) -> int:
+        if (getattr(task, '_label', '') == 'ppt-transfer'
+                and getattr(self, '_transfer_quit_timed_out', False)):
+            return 0  # 已用完传输等待预算，不再叠加重任务等待。
         if self._is_heavy_bg_task(task):
             return self._BG_HEAVY_SHUTDOWN_WAIT_MS
         return self._BG_LIGHT_SHUTDOWN_WAIT_MS
