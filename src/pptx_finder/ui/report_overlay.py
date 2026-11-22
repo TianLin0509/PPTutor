@@ -908,8 +908,10 @@ class ReportOverlay(QWidget):
         return "　".join(f"<b>{html.escape(str(item.label))}</b> × {item.count}" for item in picked)
 
     def _achievement_card(self, report) -> QFrame:
-        badges = "　".join(
-            f'<span style="background:#E7EFFE;color:#0A59F7;border-radius:6px;padding:1px 8px">{self._h(item)}</span>'
+        # 富文本不支持圆角/内边距，背景只能画成贴字矩形：改为主题强调色加粗文字，深浅主题都清爽
+        acc = self._tok.get("acc", "#0A59F7")
+        badges = "　·　".join(
+            f'<span style="color:{acc};font-weight:600">{self._h(item)}</span>'
             for item in report.achievements)
         lines = [self._h(report.one_liner), badges]
         memory = report.hall.today_memory

@@ -508,7 +508,8 @@ class SettingsDialog(QDialog):
         # 已存字族在本机不存在（被卸载）时回落到默认项
         self._font_family.setCurrentIndex(idx if idx > 0 else 0)
         # 定宽 260：撑满整卡时和下面 140px 的字号框长短悬殊（Antigravity 第 4 轮审查）
-        self._font_family.setFixedWidth(260)
+        fm = self._font_family.fontMetrics()
+        self._font_family.setFixedWidth(max(260, fm.horizontalAdvance("默认（内置字体）") + 64))
         font_row.addWidget(self._font_family)
         font_row.addStretch(1)
         size_row = QHBoxLayout()
@@ -536,9 +537,10 @@ class SettingsDialog(QDialog):
         self._font_scale.setCurrentIndex(
             idx if idx >= 0 else self._font_scale.count() - 1)
         self._font_scale.currentIndexChanged.connect(self._sync_font_scale_custom)
-        self._sync_font_scale_custom()
         size_row.addWidget(self._font_scale)
         size_row.addWidget(self._font_scale_custom)
+        # 先进布局再同步显隐：没有父对象时 setVisible(True) 会闪出一个独立小窗
+        self._sync_font_scale_custom()
         size_row.addStretch(1)
         font_apply = QPushButton("应用")
         font_apply.clicked.connect(self._apply_font)
