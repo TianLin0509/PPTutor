@@ -379,6 +379,8 @@ class DashboardView(QWidget):
             nm.setObjectName("legName")
             pc = QLabel("")
             pc.setObjectName("legPc")
+            pc.setMinimumWidth(44)
+            pc.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
             r.addWidget(dot)
             r.addWidget(nm, 1)
             r.addWidget(pc)
@@ -408,6 +410,8 @@ class DashboardView(QWidget):
         layout.addWidget(self._spark, 1)
         self._week_shield = QLabel("")
         self._week_shield.setObjectName("dashSub")
+        self._week_shield.setWordWrap(True)
+        self._week_shield.linkActivated.connect(lambda _link: self._open_version_settings())
         layout.addWidget(self._week_shield)
         return w
 
@@ -433,6 +437,8 @@ class DashboardView(QWidget):
         lay.addLayout(col, 1)
         self._health_score = QLabel("")
         self._health_score.setObjectName("kpiNum")
+        self._health_score.setMinimumWidth(72)
+        self._health_score.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self._health_score.setToolTip("库健康分（0-100）")
         lay.addWidget(self._health_score)
         arrow = QLabel("›")
@@ -447,8 +453,8 @@ class DashboardView(QWidget):
         if i == 1:
             if callable(getattr(win, "_version_feature_enabled", None)) and win._version_feature_enabled():
                 win._switch_page("version")
-            elif callable(getattr(win, "_toast", None)):
-                win._toast("版本管理还没开启，可在设置 → 功能里打开")
+            else:
+                self._open_version_settings()
             return
         if callable(getattr(win, "_switch_page", None)):
             win._switch_page("search")
@@ -459,6 +465,15 @@ class DashboardView(QWidget):
         fn = getattr(self._win, "_open_health_center", None)
         if callable(fn):
             fn()
+
+    def _version_is_enabled(self) -> bool:
+        fn = getattr(self._win, "_version_feature_enabled", None)
+        return bool(fn()) if callable(fn) else getattr(self._win, "_version_mgr", None) is not None
+
+    def _open_version_settings(self) -> None:
+        fn = getattr(self._win, "open_settings_page", None)
+        if callable(fn):
+            fn("功能")
 
     def _render_health(self, h: dict | None) -> None:
         if not h or not h.get("deck_count"):
@@ -603,7 +618,9 @@ class DashboardView(QWidget):
                 _log.warning("db files query failed in dashboard", exc_info=True)
                 rows = []
 
-        version_summary = _version_summary(version_mgr)
+        enabled_fn = getattr(self._win, "_version_feature_enabled", None)
+        version_enabled = bool(enabled_fn()) if callable(enabled_fn) else version_mgr is not None
+        version_summary = _version_summary(version_mgr if version_enabled else None)
         protected = int(version_summary["protected_docs"])
         total_versions = int(version_summary["total_versions"])
         rollback_docs = int(version_summary["rollback_docs"])
@@ -653,7 +670,8 @@ class DashboardView(QWidget):
             "kpi_vals": [
                 (f"{file_count:,}", "PPT 文档", "全文可搜"),
                 (f"{rollback_docs:,}" if version_available else "—", "可回退 PPT",
-                 f"已留版 {protected:,} · 共 {total_versions:,} 版" if version_available else "版本数据未加载"),
+                 f"已留版 {protected:,} · 共 {total_versions:,} 版" if version_available else
+                 ("暂时读不到版本记录 · 点击查看" if version_enabled else "未开启 · 点击去设置开启")),
                 (f"{page_count:,}", "PPT 页", "命中即定位"),
                 (f"{recent_week:,}", "本周改动", "周一至今"),
             ],
@@ -663,7 +681,8 @@ class DashboardView(QWidget):
             "week": week if any(week) else [0] * 7,
             "week_shield_text": (
                 f"🛡 已留版 {protected} 份 · {rollback_docs} 份可回退" if version_available
-                else "🛡 改存即自动留版，随时回到旧版本"),
+                else ("暂时读不到版本记录，请点击上方卡片查看" if version_enabled else
+                      "版本管理未开启 · 开启后，每次保存可自动留存历史版本")),
             "recent": recents,
         }
 
@@ -699,7 +718,8 @@ class DashboardView(QWidget):
 
         # 版本 KPI 三数分开：留版文档 / 快照总数 / 真正可回退文档。
         vm = getattr(self._win, "_version_mgr", None)
-        version_summary = _version_summary(vm)
+        version_enabled = self._version_is_enabled()
+        version_summary = _version_summary(vm if version_enabled else None)
         protected = int(version_summary["protected_docs"])
         total_versions = int(version_summary["total_versions"])
         rollback_docs = int(version_summary["rollback_docs"])
@@ -732,7 +752,8 @@ class DashboardView(QWidget):
         self._kpi_vals = [
             (f"{file_count:,}", "PPT 文档", "全文可搜"),
             (f"{rollback_docs:,}" if version_available else "—", "可回退 PPT",
-             f"已留版 {protected:,} · 共 {total_versions:,} 版" if version_available else "版本数据未加载"),
+             f"已留版 {protected:,} · 共 {total_versions:,} 版" if version_available else
+             ("暂时读不到版本记录 · 点击查看" if version_enabled else "未开启 · 点击去设置开启")),
             (f"{page_count:,}", "PPT 页", "命中即定位"),
             (f"{recent_week:,}", "本周改动", "周一至今"),
         ]
@@ -742,7 +763,8 @@ class DashboardView(QWidget):
         self._week = week if any(week) else [0] * 7
         self._week_shield_text = (
             f"🛡 已留版 {protected} 份 · {rollback_docs} 份可回退" if version_available
-            else "🛡 改存即自动留版，随时回到旧版本")
+            else ("暂时读不到版本记录，请点击上方卡片查看" if version_enabled else
+                  "版本管理未开启 · 开启后，每次保存可自动留存历史版本"))
 
         # 最近活跃列表（取真实最近文件名 + 相对时间）
         recents: list[tuple[str, str, str, str]] = []
@@ -773,6 +795,7 @@ class DashboardView(QWidget):
                 pc.show()
                 nm.setText(str(lab))
                 pc.setText(f"{round(v / total * 100)}%")
+                pc.setMinimumWidth(max(44, pc.fontMetrics().horizontalAdvance("100%") + 12))
             else:
                 dot.hide()
                 nm.hide()
@@ -782,7 +805,10 @@ class DashboardView(QWidget):
         while self._rec_box.count():
             it = self._rec_box.takeAt(0)
             if it.widget():
-                it.widget().deleteLater()
+                w = it.widget()
+                w.hide()
+                w.setParent(None)
+                w.deleteLater()
         if self._recent:
             for rec in self._recent:
                 name, tm, ver = rec[0], rec[1], rec[2]
@@ -802,16 +828,28 @@ class DashboardView(QWidget):
                 il.addWidget(tml)
                 il.addWidget(vr)
                 self._rec_box.addWidget(it)
+                it.show()
         else:
-            empty = QLabel("还没有最近活跃的文件 · 索引好后这里会列出")
+            worker = getattr(self._win, "_indexer", None)
+            scanning = worker is not None and worker.isRunning()
+            empty = QLabel("正在建立索引，已发现的 PPT 会陆续显示在这里" if scanning else
+                           "暂未在索引范围内发现 PPT 文档")
             empty.setObjectName("dashSub")
             empty.setWordWrap(True)
             self._rec_box.addWidget(empty)
+            empty.show()
+        self._rec_box.invalidate()
+        self._rec_box.activate()
+        self.updateGeometry()
 
         if hasattr(self, "_week_shield"):
-            self._week_shield.setText(getattr(self, "_week_shield_text", ""))
+            text = getattr(self, "_week_shield_text", "")
+            if not self._version_is_enabled():
+                text += ' <a href="features">去设置开启 →</a>'
+            self._week_shield.setText(text)
 
         self._render_health(getattr(self, "_health", None))
+        self._health_score.setMinimumWidth(max(72, self._health_score.fontMetrics().horizontalAdvance("100") + 12))
 
         for ch in (getattr(self, "_donut", None), getattr(self, "_hbars", None),
                    getattr(self, "_spark", None)):

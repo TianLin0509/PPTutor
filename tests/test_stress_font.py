@@ -451,8 +451,9 @@ def test_search_bar_geometry_unchanged_at_or_below_standard_scale(qtbot, monkeyp
         config.set_font_scale(scale)
         win._apply_font()
         assert win.search_box.height() == 34, scale
-        assert win.type_filter.height() == 30, scale
-        assert win.mode.height() == 30, scale
+        # 2026-11-22 起下拉与搜索框同高（HUB-H 一行齐平）
+        assert win.type_filter.height() == 34, scale
+        assert win.mode.height() == 34, scale
 
 
 def test_search_bar_grows_with_a_large_custom_scale(qtbot, monkeypatch, tmp_path):

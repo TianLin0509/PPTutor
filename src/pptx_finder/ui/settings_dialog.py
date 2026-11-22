@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QFrame,
     QMessageBox,
+    QSizePolicy,
     QPlainTextEdit,
     QProgressDialog,
     QPushButton,
@@ -305,6 +306,8 @@ class SettingsDialog(QDialog):
         self._diag_refresh_token = 0
         self._diag_inflight_token: int | None = None
         self._diag_extra_lines: list[str] = []
+        self._vault_audit_line = ""
+        self._vault_audit_note = ""
         self._powerpoint_inflight = False
         self._vault_audit_inflight = False
         self._index_roots_inflight = False
@@ -742,11 +745,17 @@ class SettingsDialog(QDialog):
 
     # ---------- 索引范围 ----------
     def _sync_index_roots_empty(self) -> None:
+        self._sync_index_root_remove()
         if getattr(self, "_index_roots_empty", None) is None:
             return          # 构建页面时先灌列表、后建提示标签
         empty = self.index_roots_list.count() == 0
         self._index_roots_empty.setVisible(empty)
         self.index_roots_list.setVisible(not empty)
+
+    def _sync_index_root_remove(self) -> None:
+        button = getattr(self, "_index_root_remove", None)
+        if button is not None and self._ui_alive() and _qt_is_valid(button) and _qt_is_valid(self.index_roots_list):
+            button.setEnabled(not self._index_roots_inflight and bool(self.index_roots_list.selectedItems()))
 
     def _build_roots_page(self) -> QWidget:
         outer, lay = self._page("索引范围")
@@ -805,10 +814,13 @@ class SettingsDialog(QDialog):
         self._index_root_local_add.clicked.connect(self._add_index_root_local)
         roots_btn_row.addWidget(self._index_root_local_add)
         self._index_root_remove = QPushButton("删除选中")
+        self._index_root_remove.setEnabled(False)
+        self.index_roots_list.itemSelectionChanged.connect(self._sync_index_root_remove)
         self._index_root_remove.clicked.connect(self._remove_index_root)
         roots_btn_row.addWidget(self._index_root_remove)
         roots_btn_row.addStretch(1)
         self._index_roots_save = QPushButton("保存")
+        self._index_roots_save.setObjectName("primary")
         self._index_roots_save.clicked.connect(self._apply_index_roots)
         roots_btn_row.addWidget(self._index_roots_save)
         list_box.addLayout(roots_btn_row)
@@ -1071,6 +1083,7 @@ class SettingsDialog(QDialog):
             self._index_root_remove,
         ):
             w.setEnabled(enabled)
+        self._index_root_remove.setEnabled(enabled and bool(self.index_roots_list.selectedItems()))
 
     def _apply_index_roots(self) -> None:
         if self._index_roots_inflight:
@@ -1499,6 +1512,10 @@ class SettingsDialog(QDialog):
     def _build_health_tab(self) -> QWidget:
         page, lay = self._page("健康诊断", "索引、版本库和运行环境的体检结果；反馈问题时点「复制」把全文发过来。",
                                scroll=False)
+        card = self._card(lay)
+        card.setContentsMargins(18, 16, 18, 16)
+        card.setSpacing(12)
+        card.parentWidget().setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         head = QHBoxLayout()
         head.setSpacing(8)
         self.rescan_btn = QPushButton("重新扫描索引")
@@ -1533,7 +1550,7 @@ class SettingsDialog(QDialog):
         copy.clicked.connect(self._copy_diagnostics)
         head.addWidget(copy)
         head.addStretch(1)
-        lay.addLayout(head)
+        card.addLayout(head)
 
         # 先给人话结论：几个问题、各是什么；完整的英文诊断日志折叠起来，反馈时再展开或直接「复制」
         self.diag_summary = QLabel("正在体检…")
@@ -1541,8 +1558,8 @@ class SettingsDialog(QDialog):
         self.diag_summary.setWordWrap(True)
         self.diag_summary.setTextFormat(Qt.RichText)
         self.diag_summary.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        lay.addWidget(self.diag_summary)
-        self.diag_toggle = QPushButton("展开完整诊断日志")
+        card.addWidget(self.diag_summary)
+        self.diag_toggle = QPushButton("▸ 展开完整诊断日志")
         self.diag_toggle.setObjectName("ghost")
         self.diag_toggle.setCheckable(True)
         self.diag_toggle.toggled.connect(self._toggle_diag_log)
@@ -1555,7 +1572,6 @@ class SettingsDialog(QDialog):
         self.diagnostic_text.setPlainText("诊断加载中…")
         self.diagnostic_text.hide()
         lay.addWidget(self.diagnostic_text, 1)
-        lay.addStretch(1)
         self.schedule_diagnostics_refresh()
         return page
 
@@ -1779,7 +1795,7 @@ class SettingsDialog(QDialog):
 
     def _toggle_diag_log(self, on: bool) -> None:
         self.diagnostic_text.setVisible(on)
-        self.diag_toggle.setText("收起完整诊断日志" if on else "展开完整诊断日志")
+        self.diag_toggle.setText("▾ 收起完整诊断日志" if on else "▸ 展开完整诊断日志")
 
     def _render_diag_summary(self, lines: list[str], note: str = "") -> None:
         """从完整诊断行重新提炼人话结论（深度检查等后追加的行也算进去）。"""
@@ -1787,6 +1803,10 @@ class SettingsDialog(QDialog):
         if not _qt_is_valid(label):
             return
         raw = [ln for ln in lines if ln and not ln.startswith(("diagnostic_summary:", "diagnostic_issue:"))]
+        if self._vault_audit_line:
+            # 普通刷新可能带回检查开始前的后台快照；当前手工检查结果优先。
+            raw = [ln for ln in raw if not ln.startswith(("vault_fsck:", "vault_fsck_manual:"))]
+            raw.append(self._vault_audit_line)
         tail = f'<br><span style="color:#6E7781">{html.escape(note)}</span>' if note else ""
         if any(ln.startswith("diagnostics: unavailable") for ln in raw):
             label.setText('<span style="color:#D97706;font-weight:600">● 诊断没能完成</span>'
@@ -1808,7 +1828,13 @@ class SettingsDialog(QDialog):
 
     def _rerender_diag_summary(self, note: str = "") -> None:
         if _qt_is_valid(getattr(self, "diagnostic_text", None)):
-            self._render_diag_summary(self.diagnostic_text.toPlainText().splitlines(), note)
+            self._render_diag_summary(self.diagnostic_text.toPlainText().splitlines(), note or self._vault_audit_note)
+
+    def _with_latest_vault_audit(self, lines: list[str]) -> list[str]:
+        lines = [ln for ln in lines if not ln.startswith("vault_fsck_manual:")]
+        if self._vault_audit_line:
+            lines.append(self._vault_audit_line)
+        return lines
 
     def _on_diagnostics_ready(self, token: int, result: object) -> None:
         if not self._ui_alive():
@@ -1824,8 +1850,9 @@ class SettingsDialog(QDialog):
         if self._diag_extra_lines:
             lines.extend(self._diag_extra_lines)
             self._diag_extra_lines.clear()
+        lines = self._with_latest_vault_audit(lines)
         self.diagnostic_text.setPlainText("\n".join(lines))
-        self._render_diag_summary(lines)
+        self._render_diag_summary(lines, self._vault_audit_note)
         if get_version_management_enabled():
             self.stat.setText(
                 self._version_stat_text(guarded_docs if isinstance(guarded_docs, int) else None)
@@ -1877,19 +1904,23 @@ class SettingsDialog(QDialog):
             return
         self._vault_audit_inflight = True
         self.vault_audit_btn.setEnabled(False)
-        self.diagnostic_text.appendPlainText(
-            "\nvault_fsck_manual: running deep object verification..."
-        )
-        self._rerender_diag_summary("正在深度检查版本库，大库约需一分钟…")
+        self._vault_audit_line = "vault_fsck_manual: running deep object verification..."
+        self._vault_audit_note = "正在深度检查版本库，大库约需一分钟…"
+        self.diagnostic_text.setPlainText("\n".join(
+            self._with_latest_vault_audit(self.diagnostic_text.toPlainText().splitlines())))
+        self._rerender_diag_summary()
 
         def audit_repository():
             # Attribute resolution initializes the lazy version backend. A
             # multi-gigabyte vault may need migration/locks, so even this
             # lookup belongs off the GUI thread.
-            fn = getattr(self._mgr, "audit_repository", None)
-            if not callable(fn):
-                return {"unavailable": True}
-            return fn(deep=True)
+            try:
+                fn = getattr(self._mgr, "audit_repository", None)
+                if not callable(fn):
+                    return {"unavailable": True}
+                return fn(deep=True)
+            except Exception as exc:  # noqa: BLE001 必须把后台失败原因交回界面
+                return {"error": str(exc) or type(exc).__name__}
 
         task = BackgroundTask(audit_repository, "vault-fsck-deep", None)
         self._track_diag_task(task)
@@ -1898,25 +1929,25 @@ class SettingsDialog(QDialog):
         task.start()
 
     def _on_vault_audit_done(self, result: object) -> None:
-        if not self._ui_alive() or not isinstance(result, dict):
+        if not self._ui_alive():
             return
-        if result.get("unavailable"):
-            line = "vault_fsck_manual: unavailable"
-            self._diag_extra_lines.append(line)
-            self.diagnostic_text.appendPlainText("\n" + line)
-            self._rerender_diag_summary()
-            return
-        line = (
-            "vault_fsck_manual: "
-            f"ok={bool(result.get('ok', False))} "
-            f"versions={int(result.get('versions_checked', 0) or 0)} "
-            f"objects={int(result.get('objects_hashed', 0) or 0)} "
-            f"invalid={int(result.get('quarantined_versions', result.get('invalid_count', 0)) or 0)} "
-            f"missing={int(result.get('missing_objects', 0) or 0)} "
-            f"hash_errors={int(result.get('hash_errors', 0) or 0)}"
-        )
-        self._diag_extra_lines.append(line)
-        self.diagnostic_text.appendPlainText("\n" + line)
+        if not isinstance(result, dict) or result.get("unavailable") or result.get("error"):
+            reason = (result.get("error") or "当前版本库不支持深度检查") if isinstance(result, dict) else "未收到检查结果"
+            self._vault_audit_line = "vault_fsck_manual: ok=False " + str(reason).replace("\n", " ")
+            self._vault_audit_note = f"深度检查未能完成：{reason}；请点「深度检查版本库」重试，仍失败可复制日志反馈。"
+        else:
+            self._vault_audit_note = ""
+            self._vault_audit_line = (
+                "vault_fsck_manual: "
+                f"ok={bool(result.get('ok', False))} "
+                f"versions={int(result.get('versions_checked', 0) or 0)} "
+                f"objects={int(result.get('objects_hashed', 0) or 0)} "
+                f"invalid={int(result.get('quarantined_versions', result.get('invalid_count', 0)) or 0)} "
+                f"missing={int(result.get('missing_objects', 0) or 0)} "
+                f"hash_errors={int(result.get('hash_errors', 0) or 0)}"
+            )
+        self.diagnostic_text.setPlainText("\n".join(
+            self._with_latest_vault_audit(self.diagnostic_text.toPlainText().splitlines())))
         self._rerender_diag_summary()
 
     def _finish_vault_audit(self, task) -> None:

@@ -13,6 +13,11 @@ def app_with_decks(monkeypatch, decks):
     def context():
         yield app
     monkeypatch.setattr(transfer, "existing_app", context)
+    @contextmanager
+    def contexts():
+        yield [app]
+    monkeypatch.setattr(transfer, "existing_apps", contexts)
+    monkeypatch.setattr(transfer, "_app_identity", lambda instance: id(instance))
     return app
 
 

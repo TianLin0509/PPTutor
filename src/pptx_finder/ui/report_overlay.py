@@ -443,7 +443,8 @@ class ReportOverlay(QWidget):
         self._tab_bar.setAccessibleName("胶片报告统计分组")
         self._tab_bar.setExpanding(False)
         self._tab_bar.setUsesScrollButtons(True)
-        self._tab_bar.setElideMode(Qt.ElideRight)
+        # 页签名完整显示（原来「版本时光机」被截成「版本时光…」）；放不下时用滚动按钮
+        self._tab_bar.setElideMode(Qt.ElideNone)
         self._tab_bar.setDrawBase(False)
         for key, label in _REPORT_TABS:
             index = self._tab_bar.addTab(label)
@@ -452,12 +453,12 @@ class ReportOverlay(QWidget):
         self._tab_bar.setStyleSheet(
             "QTabBar{background:transparent;border:none;}"
             f"QTabBar::tab{{background:{tok['field']};color:{tok['ink3']};"
-            f"border:1px solid {tok['bd']};border-radius:9px;padding:7px 14px;margin-right:6px;"
+            "border:1px solid transparent;border-radius:14px;padding:6px 14px;margin-right:6px;"
             "font-size:12px;font-weight:600;min-width:64px;}"
             f"QTabBar::tab:selected{{background:{tok['sel']};color:{tok['acc']};"
             f"border-color:{tok['acc']};}}"
-            f"QTabBar::tab:hover{{color:{tok['ink1']};border-color:{tok['ink4']};}}"
-            f"QTabBar::tab:focus{{border:2px solid {tok['acc']};padding:6px 13px;}}"
+            f"QTabBar::tab:hover{{color:{tok['ink1']};}}"
+            f"QTabBar::tab:focus{{border:2px solid {tok['acc']};padding:5px 13px;}}"
         )
         self._tab_bar.currentChanged.connect(self._on_tab_changed)
         self._card_lay.addWidget(self._tab_bar)
