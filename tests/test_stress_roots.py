@@ -329,5 +329,7 @@ def test_settings_inflight_disables_root_editing(qtbot, mgr, monkeypatch):
     assert dlg.index_root_edit.isEnabled()
     assert dlg._index_root_net_add.isEnabled()
     assert dlg._index_root_local_add.isEnabled()
+    assert not dlg._index_root_remove.isEnabled()  # 校验重建列表后没有选中项。
+    dlg.index_roots_list.setCurrentRow(0)
     assert dlg._index_root_remove.isEnabled()
     assert config.get_index_roots() == (r"\\127.0.0.1\pptx_finder_async_share",)

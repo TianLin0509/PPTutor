@@ -2122,7 +2122,7 @@ class MainWindow(QMainWindow):
         pr.addWidget(self.path_label, 1)
         self.copy_text_btn = QPushButton(" 复制本页文字")
         self.copy_text_btn.setObjectName("headerBtn")
-        self.copy_text_btn.setToolTip("复制当前预览页的文字（取自已索引内容，无需打开 PowerPoint）")
+        self.copy_text_btn.setToolTip("仅复制当前页的纯文本（取自已索引内容，无需打开 PowerPoint）；整张幻灯片请用底部「复制本页」")
         self.copy_text_btn.clicked.connect(self._act_copy_page_text)
         self.copy_text_btn.hide()
         self.copy_path_btn = QPushButton(" 复制路径")
@@ -2209,10 +2209,10 @@ class MainWindow(QMainWindow):
         self.open_btn = QPushButton(" 打开文件")
         self.open_btn.clicked.connect(self._act_open)
         self.copy_slide_btn = QPushButton("复制本页")
-        self.copy_slide_btn.setToolTip("复制当前预览页为 PowerPoint 幻灯片，保留原版式")
+        self.copy_slide_btn.setToolTip("复制整张幻灯片，保留图形与版式。需先在 PowerPoint 中打开目标文稿，复制后在其左侧缩略图栏按 Ctrl+V 粘贴")
         self.copy_slide_btn.clicked.connect(self._act_copy_slide)
         self.insert_slide_btn = QPushButton("插入到 PPT…")
-        self.insert_slide_btn.setToolTip("将当前预览页插到已打开的 PPT 末尾，不自动保存")
+        self.insert_slide_btn.setToolTip("需先在 PowerPoint 中打开目标文稿；将当前预览页直接插到所选文稿末尾，不自动保存")
         self.insert_slide_btn.clicked.connect(self._act_insert_slide)
         self.more_btn = QPushButton("更多")
         more = QMenu(self.more_btn)
@@ -2509,6 +2509,11 @@ class MainWindow(QMainWindow):
                   self.copy_path_btn, self.copy_text_btn,
                   self.prev_btn, self.next_btn):
             w.setEnabled(on)
+        has_text = self._cur is not None and not self._cur.is_dir and self._cur.status != "filename_only" and self._cur.file_id > 0
+        self.copy_text_btn.setEnabled(on and has_text)
+        self.copy_text_btn.setToolTip(
+            "仅复制当前页的纯文本（无需打开 PowerPoint）；整张幻灯片请用底部「复制本页」"
+            if has_text else "当前结果仅登记文件名，没有可复制的正文；请打开文件查看内容。")
         can_goto = on and self._cur is not None and (self._cur.ext or "").lower() in PPT_EXTS
         is_ppt = self._cur is not None and not self._cur.is_dir and (self._cur.ext or "").lower() in PPT_EXTS
         for button in (self.copy_slide_btn, self.insert_slide_btn):
@@ -2589,6 +2594,12 @@ class MainWindow(QMainWindow):
         self.path_label.setToolTip(r.path)
         self.copy_path_btn.show()
         self.copy_text_btn.show()
+        has_text = not r.is_dir and r.status != "filename_only" and r.file_id > 0
+        if not has_text:
+            self.copy_text_btn.setEnabled(False)
+        self.copy_text_btn.setToolTip(
+            "仅复制当前页的纯文本（无需打开 PowerPoint）；整张幻灯片请用底部「复制本页」"
+            if has_text else "当前结果仅登记文件名，没有可复制的正文；请打开文件查看内容。")
         parts = []
         sz = _fmt_size(r.size)
         if sz:
@@ -3956,11 +3967,6 @@ class MainWindow(QMainWindow):
         btn.setText(f"搜「{shown}」")
         btn.setToolTip(f"把搜索词改成：{suggestion}")
         btn.show()
-
-    def _open_update_center(self) -> None:
-        upd = getattr(self, "_updater", None)
-        if upd is not None and hasattr(upd, "open_dialog"):
-            upd.open_dialog()
 
     def _open_settings_from_button(self) -> None:
         # 有新版本时，「设置」先给一个小菜单：第一项就是这个版本的更新（同 AI Hub 的设置菜单）
@@ -5452,7 +5458,19 @@ class MainWindow(QMainWindow):
         self._last_preview_key = None  # F2：非 PPT 文本占位替换画面，去重 key 失效
         self._inflight_preview_key = None
         self.image_label.setPixmap(QPixmap())
-        if ext in (DOCX_EXT, PDF_EXT):
+        r = self._cur
+        if r is not None and r.is_dir:
+            self.image_label.setText(
+                '<div style="font-size:15px;font-weight:600">文件夹</div>'
+                '<div style="color:#888;font-size:12px;margin-top:8px">'
+                '文件夹没有正文和页码；点“打开文件”查看其中的文件。</div>')
+        elif r is not None and (r.status == "filename_only" or r.file_id < 0):
+            kind = "Word" if ext == DOCX_EXT else ext.lstrip(".").upper() or "普通文件"
+            self.image_label.setText(
+                f'<div style="font-size:15px;font-weight:600">{kind} · 仅文件名索引</div>'
+                '<div style="color:#888;font-size:12px;margin-top:8px">'
+                '当前结果只登记了文件名，没有解析正文；点“打开文件”查看内容。</div>')
+        elif ext in (DOCX_EXT, PDF_EXT):
             kind = "Word" if ext == DOCX_EXT else "PDF"
             unit = "段落" if ext == DOCX_EXT else "页面"
             self.image_label.setText(
@@ -6124,6 +6142,9 @@ class MainWindow(QMainWindow):
             return
         if not self._cur:
             return
+        if self._cur.is_dir or self._cur.status == "filename_only" or self._cur.file_id < 0:
+            self._toast("当前结果仅登记文件名，没有可复制的正文；请打开文件查看内容。")
+            return
         page = self._view_page
         file_id = self._cur.file_id
         path = self._cur.path
@@ -6407,11 +6428,12 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         menu.addAction("打开文件", lambda _checked=False, r=r, gen=render_gen:
                        self._run_context_menu_action(gen, lambda: self._open_file_path(r.path)))
-        menu.addAction("打开并跳到命中页", lambda _checked=False, r=r, gen=render_gen:
-                       self._run_context_menu_action(
-                           gen,
-                           lambda: self._open_at_page_bg(
-                               r.path, r.hits[0].page_no if r.hits else 1)))
+        if is_ppt:
+            menu.addAction("打开并跳到命中页", lambda _checked=False, r=r, gen=render_gen:
+                           self._run_context_menu_action(
+                               gen,
+                               lambda: self._open_at_page_bg(
+                                   r.path, r.hits[0].page_no if r.hits else 1)))
         menu.addAction("打开所在文件夹", lambda _checked=False, r=r, gen=render_gen:
                        self._run_context_menu_action(gen, lambda: self._open_folder_path(r.path)))
         if is_ppt:

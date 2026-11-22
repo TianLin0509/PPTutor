@@ -28,14 +28,23 @@ class PresentationTarget:
     full_name: str
     caption: str
     slides: int
+    instance_id: int = 0
 
 
-def _find_app():
+def _app_identity(app) -> int:
+    """Process identity survives active-window and ROT enumeration changes."""
+    import win32process
+    return int(win32process.GetWindowThreadProcessId(int(app.HWND))[1])
+
+
+def _find_apps():
     """WPS also registers PowerPoint's ROT class ID. Inspect all matching entries."""
     import pythoncom
     import win32com.client
     rot = pythoncom.GetRunningObjectTable()
     ctx = pythoncom.CreateBindCtx(0)
+    apps = []
+    seen = set()
     for moniker in rot.EnumRunning():
         try:
             name = moniker.GetDisplayName(ctx, None)
@@ -45,10 +54,21 @@ def _find_app():
             obj = win32com.client.Dispatch(rot.GetObject(moniker).QueryInterface(pythoncom.IID_IDispatch))
             app = obj if is_app else obj.Application
             if (Path(str(app.Path)) / "POWERPNT.EXE").is_file():
-                return win32com.client.gencache.EnsureDispatch(app)
+                identity = _app_identity(app)
+                if identity not in seen:
+                    apps.append(win32com.client.gencache.EnsureDispatch(app))
+                    seen.add(identity)
         except Exception:
             log.debug("unavailable PowerPoint ROT entry", exc_info=True)
-    raise TransferError("请先在 Microsoft PowerPoint 中打开目标 PPT，再重试。")
+    if not apps:
+        raise TransferError("请先在 Microsoft PowerPoint 中打开目标 PPT，再重试。")
+    return apps
+
+
+def _find_app():
+    apps = _find_apps()
+    # 整页复制也需要一个可编辑的目标；首个实例可能没有文稿。
+    return next((app for app in apps if any(_targets(app))), apps[0])
 
 
 def _targets(app):
@@ -57,27 +77,33 @@ def _targets(app):
         if int(pres.Windows.Count) and not bool(pres.ReadOnly):
             yield pres, PresentationTarget(str(pres.Name), str(pres.FullName),
                                            str(pres.Windows.Item(1).Caption),
-                                           int(pres.Slides.Count))
+                                           int(pres.Slides.Count), _app_identity(app))
 
 
 @contextmanager
-def existing_app():
+def existing_apps():
     import pythoncom
     with _lock:
         pythoncom.CoInitializeEx(pythoncom.COINIT_APARTMENTTHREADED)
         try:
             try:
-                app = _find_app()
+                apps = _find_apps()
             except Exception as exc:
                 raise TransferError("请先在 Microsoft PowerPoint 中打开目标 PPT，再重试。") from exc
-            yield app
+            yield apps
         finally:
             pythoncom.CoUninitialize()
 
 
+@contextmanager
+def existing_app():
+    with existing_apps() as apps:
+        yield apps[0]
+
+
 def list_presentations() -> list[PresentationTarget]:
-    with existing_app() as app:
-        return [target for _, target in _targets(app)]
+    with existing_apps() as apps:
+        return [target for app in apps for _, target in _targets(app)]
 
 
 def _validate_page(page: int) -> None:
@@ -102,13 +128,22 @@ def _insert_slide(pres, path: str, page: int = 1) -> int:
 def append_slide(source: str | Path, target: PresentationTarget, page: int = 1) -> int:
     """Re-resolve the exact visible window; never fall back to ActivePresentation."""
     _validate_page(page)
-    with _source_snapshot(source) as path, existing_app() as app:
-        for pres, current in _targets(app):
-            if (current.caption == target.caption and
-                    os.path.normcase(current.full_name) == os.path.normcase(target.full_name)):
-                # Group the explicit edit into the user's undo history when supported.
-                app.StartNewUndoEntry()
-                return _insert_slide(pres, path, page)
+    with _source_snapshot(source) as path, existing_apps() as apps:
+        matches = []
+        for app in apps:
+            if target.instance_id and _app_identity(app) != target.instance_id:
+                continue
+            for pres, current in _targets(app):
+                if (current.caption == target.caption and
+                        os.path.normcase(current.full_name) == os.path.normcase(target.full_name)):
+                    matches.append((app, pres))
+        if len(matches) > 1:
+            raise TransferError("有多个同名目标窗口，请重新选择要插入的 PPT。")
+        if matches:
+            app, pres = matches[0]
+            # Group the explicit edit into the user's undo history when supported.
+            app.StartNewUndoEntry()
+            return _insert_slide(pres, path, page)
         raise TransferError("目标 PPT 已关闭或窗口已变化，请重新选择。")
 
 
@@ -165,7 +200,7 @@ def temporary_presentations(*, require_open=False):
                 renderer._state.app_owned_pid = None
                 renderer._state.app_owned_handle = None
             if require_open and not any(_targets(app)):
-                raise TransferError("请先打开一个可编辑的目标 PPT，再复制整页。")
+                raise TransferError("请先在 Microsoft PowerPoint 中打开可编辑的目标文稿，再复制整页。")
             session = TemporaryPresentations(app)
             yield session
         finally:
