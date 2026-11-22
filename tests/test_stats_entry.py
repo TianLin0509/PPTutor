@@ -265,3 +265,12 @@ def test_stats_report_late_result_ignored_after_main_window_closing(qtbot, tmp_p
     assert overlays == []
     assert getattr(win, "_stats_overlay", None) is None
     assert win._stats_report_loading is False
+
+
+def test_report_overlay_hides_loading_toast(qtbot, tmp_path):
+    """「正在生成胶片报告…」不能从浮层底下透出来（2026-11-22 Antigravity 审查）。"""
+    win = _win(qtbot, tmp_path)
+    from pptx_finder.ui import stats_entry
+    stats_entry._open_report(win)
+    qtbot.waitUntil(lambda: len(win.findChildren(ReportOverlay)) == 1, timeout=3000)
+    assert win._toast_label.isHidden()

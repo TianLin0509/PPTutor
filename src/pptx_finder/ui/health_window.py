@@ -85,7 +85,7 @@ class HealthWindow(QWidget):
 
         head = QHBoxLayout()
         head.setSpacing(10)
-        title = QLabel("🩺 库体检报告")
+        title = QLabel("库体检报告")
         title.setObjectName("dashTitle")
         head.addWidget(title)
         head.addStretch(1)
@@ -212,7 +212,7 @@ class HealthWindow(QWidget):
 
     # ---------- 版本库占用（异步填充：要遍历整个版本库目录，不能阻塞体检渲染） ----------
     def _vault_card(self) -> QFrame:
-        w, lay = self._card("🗄️ 版本库占用")
+        w, lay = self._card("版本库占用")
         self._vault_lines = lay
         self._vault_placeholder = self._muted("正在统计版本库占用…")
         lay.addWidget(self._vault_placeholder)
@@ -255,7 +255,7 @@ class HealthWindow(QWidget):
                 "自动维护会在确认缺失满 30 天后收割它们；想立刻回收，"
                 "去「设置 → 功能 → 版本管理 → 清理失效版本」。"))
         else:
-            lay.addWidget(self._muted("没有源文件已删除的失效留底 ✅"))
+            lay.addWidget(self._muted("没有源文件已删除的失效留底"))
 
     def _score_color(self, score: int) -> str:
         if score >= 85:
@@ -275,7 +275,7 @@ class HealthWindow(QWidget):
         if r.parse_failed:
             bits.append(f"{r.parse_failed} 份解析失败")
         if not bits:
-            return f"共 {r.deck_count} 份 · 库很健康，没发现明显问题 ✅"
+            return f"共 {r.deck_count} 份 · 库很健康，没发现明显问题"
         return f"共 {r.deck_count} 份 · " + "　·　".join(bits)
 
     # ---------- 卡片 ----------
@@ -352,10 +352,10 @@ class HealthWindow(QWidget):
             lay.addWidget(self._mk_link(ex.name, ex.path))
 
     def _dup_card(self, r: health.HealthReport) -> QFrame:
-        w, lay = self._card("🧹 重复堆积")
+        w, lay = self._card("重复堆积")
         groups = r.duplicate_groups
         if not groups:
-            lay.addWidget(self._muted("没有完全相同的副本，干净 ✅"))
+            lay.addWidget(self._muted("没有完全相同的副本，干净"))
             return w
         lay.addWidget(self._muted(
             f"发现 {len(groups)} 组完全相同的副本，共 {r.duplicate_redundant} 份冗余 · "
@@ -427,27 +427,27 @@ class HealthWindow(QWidget):
         return w
 
     def _zombie_card(self, r: health.HealthReport) -> QFrame:
-        w, lay = self._card("🧟 僵尸冷文件")
+        w, lay = self._card("僵尸冷文件")
         if r.zombie_count:
             lay.addWidget(self._line(f"{r.zombie_count} 份超过一年没动过，占 {human_bytes(r.zombie_bytes)}"))
             self._add_example_links(lay, r.zombie_examples)
             lay.addWidget(self._muted("老旧素材可考虑归档，给常用库瘦身。"))
         else:
-            lay.addWidget(self._muted("没有一年以上没碰的冷文件 ✅"))
+            lay.addWidget(self._muted("没有一年以上没碰的冷文件"))
         return w
 
     def _curse_card(self, r: health.HealthReport) -> QFrame:
-        w, lay = self._card("⚠️ 终版诅咒")
+        w, lay = self._card("终版诅咒")
         if r.curse_count:
             lay.addWidget(self._line(f"{r.curse_count} 份命中「最终版 / 终版 / 定稿 / v9」等命名梗"))
             self._add_example_links(lay, r.curse_examples)
             lay.addWidget(self._muted("「最终版」往往不是最终版——交给版本管理，别再手动改名续命。"))
         else:
-            lay.addWidget(self._muted("命名很克制，没有终版诅咒 ✅"))
+            lay.addWidget(self._muted("命名很克制，没有终版诅咒"))
         return w
 
     def _bloat_card(self, r: health.HealthReport) -> QFrame:
-        w, lay = self._card("🐘 体积巨无霸 · 超长页数")
+        w, lay = self._card("体积巨无霸 · 超长页数")
         if r.bloat_biggest:
             lay.addWidget(self._bloat_row("最大", r.bloat_biggest, human_bytes(r.bloat_biggest[1])))
         if r.bloat_longest:
@@ -474,14 +474,14 @@ class HealthWindow(QWidget):
         return w
 
     def _parse_card(self, r: health.HealthReport) -> QFrame:
-        w, lay = self._card("🩹 解析失败")
+        w, lay = self._card("解析失败")
         if r.parse_failed:
             detail = "、".join(f"{k}×{v}" for k, v in r.parse_failed_by_status.items())
             lay.addWidget(self._line(f"{r.parse_failed} 份没能提取内容（{detail}）"))
             self._add_example_links(lay, r.parse_failed_examples)
             lay.addWidget(self._muted("多为加密 / 损坏 / 超大跳过；这些文件搜不到内文。"))
         else:
-            lay.addWidget(self._muted("全部文件都成功解析 ✅"))
+            lay.addWidget(self._muted("全部文件都成功解析"))
         return w
 
     @staticmethod
