@@ -112,6 +112,11 @@ def sync_own_openx(st, latest):
     env = {k: v for k, v in os.environ.items() if k.lower() not in ("http_proxy", "https_proxy", "all_proxy")}
     env["PYTHONIOENCODING"] = "utf-8"
     log(f"同步 v{latest} 到 PPT Doctor 内源项目 {OPENX_PROJECT}")
+    # 安装包先放到备用服务器 openx-stage/，公司电脑从那里取（直连 GitHub 太慢、200 MB 常超时）；放不上也照样同步，退回 GitHub
+    with LOG.open("a", encoding="utf-8") as f:
+        subprocess.run(["uv", "run", "--frozen", "--with", "paramiko", "python", "tools/openx_stage.py", latest],
+                       cwd=ROOT, stdout=f, stderr=subprocess.STDOUT, creationflags=FLAGS,
+                       env=dict(os.environ, PYTHONIOENCODING="utf-8"), timeout=1800)
     r = subprocess.run([sys.executable, "-X", "utf8", str(OPENX_SYNC), "--components", "--only", "ppt-doctor-update",
                         "--project-id", str(OPENX_PROJECT), "--timeout", "3000"],
                        cwd=OPENX_SYNC.parent, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, creationflags=FLAGS,
