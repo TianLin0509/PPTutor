@@ -259,6 +259,47 @@ begin
   end;
 end;
 
+{
+  覆盖安装前先让正在运行的 PPT Doctor 退出（2026-11-23）。
+
+  公司电脑实测：覆盖安装 v2.1.9 时 PPT-Doctor.exe 还被占用，没换掉，其余文件却成了新版，
+  界面一直显示旧版本号，「检查更新」又认为已是最新。CloseApplications 只能关有窗口的进程，
+  托盘常驻的主程序、渲染子进程、AI HUB 起的常驻服务进程都关不掉。
+  做法：只处理从本安装目录启动的进程；先经单实例通道发 quit，让主程序正常收尾，
+  12 秒内没退完的再强制结束（索引库是 SQLite WAL，强制结束不会损坏）。
+}
+function StopRunningCopies(const Dir: string): Boolean;
+var
+  Ps1, D, Script: string;
+  RC: Integer;
+begin
+  Result := True;
+  D := AddBackslash(Dir);
+  StringChangeEx(D, '''', '''''', True);
+  Ps1 := ExpandConstant('{tmp}\stop-ppt-doctor.ps1');
+  Script :=
+    '$d = ''' + D + '''' + #13#10 +
+    'function Mine { @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.StartsWith($d, [System.StringComparison]::OrdinalIgnoreCase) }) }' + #13#10 +
+    'if ((Mine).Count -eq 0) { exit 0 }' + #13#10 +
+    'try { $c = New-Object System.IO.Pipes.NamedPipeClientStream(''.'', ''pptx-finder-singleton-v1'', [System.IO.Pipes.PipeDirection]::InOut); $c.Connect(1500); $b = [System.Text.Encoding]::UTF8.GetBytes(''quit '' + $d); $c.Write($b, 0, $b.Length); $c.Flush(); Start-Sleep -Milliseconds 300; $c.Dispose() } catch {}' + #13#10 +
+    '$deadline = (Get-Date).AddSeconds(12)' + #13#10 +
+    'while ((Get-Date) -lt $deadline) { if ((Mine).Count -eq 0) { exit 0 }; Start-Sleep -Milliseconds 500 }' + #13#10 +
+    'Mine | Stop-Process -Force -ErrorAction SilentlyContinue' + #13#10 +
+    'Start-Sleep -Milliseconds 800' + #13#10;
+  if not SaveStringToFile(Ps1, Script, False) then
+    Exit;
+  Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+    '-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + Ps1 + '"',
+    '', SW_HIDE, ewWaitUntilTerminated, RC);
+  Log('stop running copies: exit ' + IntToStr(RC));
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  Result := '';
+  StopRunningCopies(WizardDirValue);
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   { 必须在新文件装完之后跑：要拿安装目录当「不许删」的排除项，

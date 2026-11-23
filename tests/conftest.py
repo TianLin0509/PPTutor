@@ -5,6 +5,8 @@ import tempfile
 os.environ.setdefault(
     "PPTX_FINDER_DATA_DIR", tempfile.mkdtemp(prefix="pptxfinder_test_")
 )
+# 公司内源更新源只在打包版里开；有的用例把 is_frozen 改成真，别让它们真去连内源
+os.environ.setdefault("PPTX_FINDER_OPENX", "0")
 
 import time
 

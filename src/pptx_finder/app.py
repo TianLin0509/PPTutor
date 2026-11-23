@@ -639,6 +639,36 @@ class _HotkeyFilter(QAbstractNativeEventFilter):
 SINGLETON_NAME = "pptx-finder-singleton-v1"
 
 
+def _on_singleton_message(sock, win) -> None:
+    """单实例通道的消息：show = 把窗口带到前台；quit = 安装器覆盖安装前请本程序正常退出。
+
+    2026-11-23：覆盖安装时 PPT-Doctor.exe 还被占着没换掉（界面一直是旧版本号）。安装器现在
+    先发 quit，走和托盘「退出」相同的收尾，等不到才强制结束。
+    """
+    try:
+        data = bytes(sock.readAll().data())
+    except Exception:  # noqa: BLE001
+        data = b""
+    text = data.decode("utf-8", "replace").strip()
+    if text.startswith("quit"):
+        # 只认「要覆盖的正是我所在的目录」：别处的安装（开发版、另一份解压版）收到了也不理
+        if _same_install_dir(text[4:].strip(), os.path.dirname(sys.executable)):
+            logging.getLogger(__name__).info("quit requested over singleton channel (installer)")
+            win.force_quit()
+        return
+    _show_window(win)
+
+
+def _same_install_dir(target: str, mine: str) -> bool:
+    if not target:
+        return False
+    norm = lambda p: os.path.normcase(os.path.abspath(p)).rstrip("\\/")  # noqa: E731
+    try:
+        return norm(target) == norm(mine)
+    except (OSError, ValueError):
+        return False
+
+
 def _singleton_name() -> str:
     """默认保持单实例；只允许测试/便携沙箱显式换一个本地 socket 名。"""
     return os.environ.get("PPTX_FINDER_SINGLETON_NAME", "").strip() or SINGLETON_NAME
@@ -880,7 +910,7 @@ def main() -> int:
     def _on_singleton_conn() -> None:
         sock = singleton_server.nextPendingConnection()
         if sock is not None:
-            sock.readyRead.connect(lambda: _show_window(win))
+            sock.readyRead.connect(lambda s=sock: _on_singleton_message(s, win))
     singleton_server.newConnection.connect(_on_singleton_conn)
     app._singleton_server = singleton_server  # 防 GC
 
