@@ -112,16 +112,18 @@ def sync_own_openx(st, latest):
     env = {k: v for k, v in os.environ.items() if k.lower() not in ("http_proxy", "https_proxy", "all_proxy")}
     env["PYTHONIOENCODING"] = "utf-8"
     log(f"同步 v{latest} 到 PPT Doctor 内源项目 {OPENX_PROJECT}")
+    r = subprocess.run([sys.executable, "-X", "utf8", str(OPENX_SYNC), "--components", "--only", "ppt-doctor-update",
+                        "--project-id", str(OPENX_PROJECT), "--timeout", "3000"],
+                       cwd=OPENX_SYNC.parent, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, creationflags=FLAGS,
+                       env=env, timeout=3600, text=True, encoding="utf-8", errors="replace")
     with LOG.open("a", encoding="utf-8") as f:
-        r = subprocess.run([sys.executable, "-X", "utf8", str(OPENX_SYNC), "--components", "--only", "ppt-doctor-update",
-                            "--project-id", str(OPENX_PROJECT), "--timeout", "3000"],
-                           cwd=OPENX_SYNC.parent, stdout=f, stderr=subprocess.STDOUT, creationflags=FLAGS, env=env,
-                           timeout=3600)
-    if r.returncode == 0:
+        f.write(r.stdout or "")
+    # 同步工具在「6 小时内失败过、先不重试」时也返回 0，但输出里带 pending：这种不算同步成功（2026-11-23 实测误记过一次）
+    if r.returncode == 0 and '"pending"' not in (r.stdout or ""):
         st["openx_own"] = latest
         log(f"v{latest} 内源项目 {OPENX_PROJECT} 已同步")
     else:
-        log(f"v{latest} 内源项目 {OPENX_PROJECT} 同步失败，退出码 {r.returncode}（6 小时后自动再试）")
+        log(f"v{latest} 内源项目 {OPENX_PROJECT} 未完成，退出码 {r.returncode}（下一轮自动再试）")
 
 
 def main():
