@@ -30,6 +30,7 @@ _WEB_PAGE_MAX = 256 * 1024
 SOURCE_NAMES = {
     "github-release": "GitHub",
     "self-hosted": "备用服务器",
+    "openx": "公司内源",
 }
 
 

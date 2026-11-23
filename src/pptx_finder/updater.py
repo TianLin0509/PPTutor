@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -28,6 +29,8 @@ import urllib.request
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 MANIFEST_NAME = "manifest.json"
 _CHECK_TIMEOUT = 8       # 拉清单超时（秒）
@@ -67,6 +70,44 @@ class UpdateSource:
         return self.package_url.format(version=version) if self.package_url else ""
 
 
+@dataclass(frozen=True)
+class OpenxSource(UpdateSource):
+    """公司内源：地址不是固定模板，按附件名在内源的更新版本里现查（见 openx_source.py）。"""
+
+    manifest_file: str = "manifest.json"
+    package_file: str = ""        # 含 "{version}"；内源单附件上限约 200 MB，只放得下基础版整包
+
+    def manifest_target(self, timeout: float) -> str:
+        from .openx_source import INDEX
+        url, _ver = INDEX.latest_file(self.manifest_file, timeout=min(timeout, 5.0))
+        return url
+
+    def block(self, sha256: str) -> str:
+        from .openx_source import INDEX, OpenxUnavailable
+        try:
+            return INDEX.find(sha256)
+        except OpenxUnavailable as e:
+            raise BlockUnavailableError(f"{sha256[:12]}… 在公司内源上取不到") from e
+
+    def package(self, version: str) -> str:
+        if not self.package_file:
+            return ""
+        from .openx_source import INDEX, OpenxUnavailable
+        try:
+            return INDEX.find(self.package_file.format(version=version))
+        except OpenxUnavailable as e:
+            raise BlockUnavailableError(f"公司内源上没有 v{version} 的整包") from e
+
+
+def openx_source(edition: str = "full") -> OpenxSource:
+    from .editions import manifest_name, package_suffix
+    suffix = package_suffix(edition)
+    return OpenxSource(
+        label="openx", manifest_url="openx:" + manifest_name(edition), block_url="openx:{hash}",
+        package_url="openx:package", manifest_file=manifest_name(edition),
+        package_file="PPT-Doctor-v{version}" + suffix + ".zip")
+
+
 def _is_default_base(base: str) -> bool:
     from .config import _DEFAULT_UPDATE_URL
     return base.rstrip("/") == _DEFAULT_UPDATE_URL.rstrip("/")
@@ -100,11 +141,15 @@ def update_sources(base_url: str, *, edition='full') -> list[UpdateSource]:
         # 落后好几版的用户需要的块可能没随最新一版发布，那时回落到整包。
         package_url=GITHUB_RELEASE_LATEST + "/PPT-Doctor-v{version}" + suffix + '.zip',
     )
+    # 2026-11-23 田哥定：公司内源排第一（和 AI HUB 一样）。公司里内源 20 MB/s 以上，GitHub 常常很慢；
+    # 公司外连不上内源，查版本时这一项静默略过、5 分钟内不再试。
+    from .openx_source import enabled as _openx_enabled
+    first = [openx_source(edition)] if _openx_enabled(is_frozen()) else []
     if os.environ.get("PPTX_FINDER_UPDATE_NO_GITHUB", "").strip() in ("1", "true", "yes"):
-        return hosted
+        return first + hosted
     if bases and all(_is_default_base(b) for b in bases):
-        return [github] + hosted
-    return hosted + [github]
+        return first + [github] + hosted
+    return first + hosted + [github]
 
 
 def _source_for_base(base_url: str) -> UpdateSource:
@@ -297,7 +342,8 @@ def fetch_manifest_from(
     timeout: float = _CHECK_TIMEOUT,
     response_callback=None,
 ) -> dict:
-    return _fetch_manifest_url(source.manifest_url, timeout, response_callback)
+    url = source.manifest_target(timeout) if isinstance(source, OpenxSource) else source.manifest_url
+    return _fetch_manifest_url(url, timeout, response_callback)
 
 
 def fetch_remote_manifest(
@@ -602,6 +648,23 @@ try {
   if ($MainPid -gt 0) { try { Wait-Process -Id $MainPid -Timeout 60 -ErrorAction Stop } catch { Log "wait: $_" } }
   Start-Sleep -Milliseconds 500
   $staging = $p.staging; $dest = $p.dest
+  # Every process started from the install dir keeps PPT-Doctor.exe open: renderer
+  # workers, a second instance, AI HUB's long-running `serve`. On 2026-11-11 one of
+  # them outlived the main window and the exe copy failed. Give them 15 s, then stop them.
+  try {
+    $destFull = [System.IO.Path]::GetFullPath([string]$dest).TrimEnd('\') + '\'
+    $deadline = (Get-Date).AddSeconds(15)
+    do {
+      $left = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Id -ne $PID -and $_.Path -and $_.Path.StartsWith($destFull, [System.StringComparison]::OrdinalIgnoreCase) })
+      if ($left.Count -eq 0) { break }
+      Start-Sleep -Milliseconds 500
+    } while ((Get-Date) -lt $deadline)
+    if ($left.Count -gt 0) {
+      Log ("stopping " + $left.Count + " leftover process(es): " + (($left | ForEach-Object { $_.Id }) -join ','))
+      $left | Stop-Process -Force -ErrorAction SilentlyContinue
+      Start-Sleep -Milliseconds 800
+    }
+  } catch { Log "leftover check: $_" }
   $updates = @($p.updates) | Where-Object { $_ }
   # Preflight. A half-applied swap leaves exe and DLLs from two different builds
   # in the install dir, which typically cannot start at all -- and the user has
@@ -791,9 +854,45 @@ def local_manifest() -> dict | None:
         except Exception:  # noqa: BLE001
             return None
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
+        data = json.loads(p.read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001
         return None
+    try:
+        from . import __version__
+        return reconcile_manifest(data, install_dir(), __version__, write_to=p)
+    except Exception:  # noqa: BLE001
+        log.warning("local manifest reconcile failed", exc_info=True)
+        return data
+
+
+def reconcile_manifest(data: dict, root: Path, running_version: str, *, write_to: Path | None = None) -> dict:
+    """清单说的版本和正在运行的程序对不上时，按磁盘上的真实文件重算一遍。
+
+    2026-11-23 公司电脑实测：覆盖安装 v2.1.9 时 PPT-Doctor.exe 被占用没换掉，其余文件和
+    manifest.json 都成了 2.1.9——界面显示 2.1.0，「检查更新」却比对清单认为已是最新，
+    永远不再提示更新。清单只是「上次以为装好的样子」，正在运行的版本号才是事实。
+    只重算清单里已列出的文件（不把卸载程序等安装器自己的文件收进来，免得更新时被当成多余文件删掉）。
+    """
+    if not isinstance(data, dict) or str(data.get("version", "")) == str(running_version):
+        return data
+    files = {}
+    for rel, meta in (data.get("files") or {}).items():
+        try:
+            f = Path(root) / safe_relpath(rel)
+        except UnsafeManifestError:
+            continue
+        if f.is_file():
+            files[rel] = {"hash": _sha256_file(f), "size": f.stat().st_size}
+    fixed = dict(data, version=str(running_version), files=files,
+                 notes=f"按实际文件校正（清单原写 v{data.get('version', '?')}）")
+    log.warning("install manifest says v%s but running v%s; rebuilt from disk (%d files)",
+                data.get("version"), running_version, len(files))
+    if write_to is not None:
+        try:
+            Path(write_to).write_text(json.dumps(fixed, ensure_ascii=False, indent=0), encoding="utf-8")
+        except OSError:
+            log.warning("corrected manifest not written", exc_info=True)
+    return fixed
 
 
 def check_sources(
@@ -845,6 +944,8 @@ def check_sources(
 
     with ThreadPoolExecutor(max_workers=max(1, len(sources))) as pool:
         results = list(pool.map(_one, sources))
+    # 公司外连不上内源是常态，不在源列表里显示成一条失败（真正下载时也不会选它）
+    results = [(s, i, c) for s, i, c in results if c.ok or s.label != "openx"]
     checks = [c for _s, _i, c in results]
     best: UpdateInfo | None = None
     for source, info, _check in results:
