@@ -1,7 +1,7 @@
 """公司内源（openx）更新源：在公司电脑上，更新清单和文件先从内源取（2026-11-23）。
 
 照搬 AI HUB 公开版 core/app-update/openx-source.js 在公司实测过的做法：
-- 内源项目 AI-Hub-Huawei（7938）上，每发一版 PPT Doctor 就发一个版本 ``ppt-doctor-update-<版本>``，
+- 内源项目 PPT-Doctor（8214）和 AI-Hub-Huawei（7938）上，每发一版 PPT Doctor 就发一个版本 ``ppt-doctor-update-<版本>``，
   附件是三份版本清单（manifest.json / manifest-Base.json / manifest-Ocr.json）、本版变化的文件块
   （附件名 = sha256，和 GitHub 发布页同名）和基础版安装包；
 - 接口匿名可用（2026-11-23 公司电脑实测：版本列表一次约 2 秒，直连和公司代理都通）：
@@ -23,7 +23,8 @@ import urllib.request
 from urllib.parse import quote, urlparse
 
 API = "https://openx.huawei.com/openxApi/project/version/release/query/"
-PROJECT_ID = 7938
+PROJECT_ID = 7938          # AI-Hub-Huawei（11-23 先挂在这里）
+PROJECT_IDS = (8214, 7938)  # 8214 = PPT-Doctor 自己的内源项目（11-23 审核通过），优先；两边都发
 ALLOWED_HOST = "openx.huawei.com"
 RELEASE_PREFIX = "ppt-doctor-update-"
 
@@ -171,4 +172,34 @@ class OpenxIndex:
         raise OpenxUnavailable(f"内源上没有 {name}")
 
 
-INDEX = OpenxIndex()
+class MultiIndex:
+    """按顺序查几个内源项目：清单取各项目里版本最高的那份，文件按项目顺序找。"""
+
+    def __init__(self, indexes):
+        self.indexes = list(indexes)
+
+    def latest_file(self, name: str, timeout: float = LIST_TIMEOUT) -> tuple[str, str]:
+        best, errors = None, []
+        for idx in self.indexes:
+            try:
+                url, ver = idx.latest_file(name, timeout)
+            except OpenxUnavailable as e:
+                errors.append(str(e))
+                continue
+            if best is None or _ver_key(ver) > _ver_key(best[1]):
+                best = (url, ver)
+        if best is None:
+            raise OpenxUnavailable(errors[0] if errors else "内源上还没有 PPT Doctor 更新")
+        return best
+
+    def find(self, name: str, timeout: float = LIST_TIMEOUT) -> str:
+        errors = []
+        for idx in self.indexes:
+            try:
+                return idx.find(name, timeout)
+            except OpenxUnavailable as e:
+                errors.append(str(e))
+        raise OpenxUnavailable(errors[0] if errors else f"内源上没有 {name}")
+
+
+INDEX = MultiIndex(OpenxIndex(project_id=pid) for pid in PROJECT_IDS)
