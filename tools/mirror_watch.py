@@ -100,6 +100,30 @@ def single_instance():
     return handle
 
 
+# 2026-11-23 田哥定：公司内源是第一更新源。AI-Hub-Huawei（7938）那份由 AI HUB 的发车任务每 15 分钟同步；
+# PPT Doctor 自己的内源项目（8214）由这里同步。只在本机有内源同步工具时做；同一版本成功一次就不再跑。
+OPENX_SYNC = Path(os.environ.get("PPTD_OPENX_SYNC", r"D:\DevTools\aihub-collab\openx_sync.py"))
+OPENX_PROJECT = 8214
+
+
+def sync_own_openx(st, latest):
+    if st.get("openx_own") == latest or not OPENX_SYNC.is_file():
+        return
+    env = {k: v for k, v in os.environ.items() if k.lower() not in ("http_proxy", "https_proxy", "all_proxy")}
+    env["PYTHONIOENCODING"] = "utf-8"
+    log(f"同步 v{latest} 到 PPT Doctor 内源项目 {OPENX_PROJECT}")
+    with LOG.open("a", encoding="utf-8") as f:
+        r = subprocess.run([sys.executable, "-X", "utf8", str(OPENX_SYNC), "--components", "--only", "ppt-doctor-update",
+                            "--project-id", str(OPENX_PROJECT), "--timeout", "3000"],
+                           cwd=OPENX_SYNC.parent, stdout=f, stderr=subprocess.STDOUT, creationflags=FLAGS, env=env,
+                           timeout=3600)
+    if r.returncode == 0:
+        st["openx_own"] = latest
+        log(f"v{latest} 内源项目 {OPENX_PROJECT} 已同步")
+    else:
+        log(f"v{latest} 内源项目 {OPENX_PROJECT} 同步失败，退出码 {r.returncode}（6 小时后自动再试）")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--status", action="store_true")
@@ -124,6 +148,10 @@ def main():
     st.update(github=latest, mirror=mirror)
     if mirror_is_current(manifests, latest):
         st.update(last_result="已同步", fails={})
+        try:
+            sync_own_openx(st, latest)
+        except Exception as e:  # noqa: BLE001 内源同步出错不影响备用服务器这条线
+            log(f"内源同步出错：{e}")
         save_state(st)
         return 0
     fails = st.get("fails") or {}

@@ -255,3 +255,15 @@ def test_openx_download_redirected_off_site_is_refused():
     with pytest.raises(netfetch.SourceFailure):
         updater._check_final_host(updater.openx_source("full"), R())
     updater._check_final_host(updater.UpdateSource("github-release", "m", "b{hash}"), R())   # 别的源不管
+
+
+def test_both_projects_are_searched_newest_manifest_wins():
+    own = _index(FakeOpener([(9, "ppt-doctor-update-2.1.10")], {9: [("manifest.json", F + "own10"), ("x", F + "x-own")]}))
+    hub = _index(FakeOpener([(3, "ppt-doctor-update-2.1.11")], {3: [("manifest.json", F + "hub11"), ("y", F + "y-hub")]}))
+    multi = openx_source.MultiIndex([own, hub])
+    assert multi.latest_file("manifest.json") == (F + "hub11", "2.1.11")
+    assert multi.find("x") == F + "x-own" and multi.find("y") == F + "y-hub"
+    down = _index(FakeOpener([], {}, fail=True))
+    assert openx_source.MultiIndex([down, hub]).latest_file("manifest.json")[1] == "2.1.11"   # 一个项目连不上不影响另一个
+    with pytest.raises(openx_source.OpenxUnavailable):
+        openx_source.MultiIndex([down]).find("x")
