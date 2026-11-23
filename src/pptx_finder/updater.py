@@ -416,6 +416,21 @@ class CheckReport:
         return bool(self.checks) and not any(c.ok for c in self.checks)
 
 
+def _check_final_host(source, response) -> None:
+    """内源附件只认内源自己的域名：被跳转到别处（含 http）就当这个源失败，换下一个源。"""
+    if not isinstance(source, OpenxSource):
+        return
+    from .openx_source import safe_url
+    final = getattr(response, "geturl", lambda: "")() or ""
+    if not safe_url(final):
+        try:
+            response.close()
+        except Exception:  # noqa: BLE001
+            pass
+        from .netfetch import SourceFailure
+        raise SourceFailure("公司内源的下载被跳转到了别的网站，已停止")
+
+
 def download_delta(base_url: str, info: UpdateInfo, staging: Path,
                    progress=None, timeout: float = _DL_TIMEOUT, cancel=None,
                    response_callback=None) -> Path:
@@ -458,6 +473,7 @@ def download_delta(base_url: str, info: UpdateInfo, staging: Path,
             raise
         got_bytes = 0
         head = b""
+        _check_final_host(source, opened)
         with opened as r, open(dest, "wb") as f:
             if response_callback is not None:
                 response_callback(r)
@@ -511,6 +527,7 @@ def download_package(info: UpdateInfo, staging: Path,
     done = 0
     from .netfetch import check_response_is_not_page
     with urllib.request.urlopen(url, timeout=timeout) as r, open(tmp, "wb") as f:
+        _check_final_host(source, r)
         check_response_is_not_page(r, None, "安装包")
         total = int(r.headers.get("Content-Length") or 0)
         while True:
@@ -857,11 +874,14 @@ def local_manifest() -> dict | None:
         data = json.loads(p.read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001
         return None
+    from . import __version__
     try:
-        from . import __version__
         return reconcile_manifest(data, install_dir(), __version__, write_to=p)
     except Exception:  # noqa: BLE001
         log.warning("local manifest reconcile failed", exc_info=True)
+        if isinstance(data, dict) and str(data.get("version", "")) != str(__version__):
+            # 算不出来就当全部文件都要换：多下一些，也不能再把错误的高版本当成本机版本
+            return dict(data, version=str(__version__), files={})
         return data
 
 
@@ -881,8 +901,11 @@ def reconcile_manifest(data: dict, root: Path, running_version: str, *, write_to
             f = Path(root) / safe_relpath(rel)
         except UnsafeManifestError:
             continue
-        if f.is_file():
-            files[rel] = {"hash": _sha256_file(f), "size": f.stat().st_size}
+        try:
+            if f.is_file():
+                files[rel] = {"hash": _sha256_file(f), "size": f.stat().st_size}
+        except OSError:
+            continue          # 读不了的文件不进清单 = 更新时会重新下载它
     fixed = dict(data, version=str(running_version), files=files,
                  notes=f"按实际文件校正（清单原写 v{data.get('version', '?')}）")
     log.warning("install manifest says v%s but running v%s; rebuilt from disk (%d files)",

@@ -229,3 +229,29 @@ def test_helper_stops_leftover_process_holding_the_exe(tmp_path):
     finally:
         if proc.poll() is None:
             proc.kill()
+
+
+def test_unreadable_manifest_reconcile_never_keeps_the_wrong_version(monkeypatch, tmp_path):
+    monkeypatch.setattr(updater, "install_dir", lambda: tmp_path)
+    (tmp_path / "manifest.json").write_text(json.dumps({"version": "99.0.0", "files": {"a": {"hash": "0", "size": 1}}}),
+                                            encoding="utf-8")
+
+    def boom(*a, **k):
+        raise RuntimeError("disk")
+    monkeypatch.setattr(updater, "reconcile_manifest", boom)
+    from pptx_finder import __version__
+    got = updater.local_manifest()
+    assert got["version"] == __version__ and got["files"] == {}
+
+
+def test_openx_download_redirected_off_site_is_refused():
+    class R:
+        def geturl(self):
+            return "http://evil.example.com/x"
+
+        def close(self):
+            pass
+    from pptx_finder import netfetch
+    with pytest.raises(netfetch.SourceFailure):
+        updater._check_final_host(updater.openx_source("full"), R())
+    updater._check_final_host(updater.UpdateSource("github-release", "m", "b{hash}"), R())   # 别的源不管
