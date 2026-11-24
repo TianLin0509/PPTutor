@@ -344,3 +344,37 @@ def test_rgba_tokens_are_normalized_for_custom_painting():
     for key in ("surface_hover", "accent_soft", "accent", "warn_soft"):
         assert QColor(t[key]).isValid(), key
     assert QColor(t["surface_hover"]).alpha() == 13 and t["accent"].lower() == "#ff0a59f7"
+
+
+def test_minimum_height_is_state_independent(qtbot, core, tmp_path):
+    """m1 复核 MF-1：从 900 高缩下来也能到 520；最小高度不随当前是否「矮态」变化。"""
+    tab, _ = _tab(qtbot, tmp_path)
+    tab.set_header_compact(True)
+    tab.resize(1326, 754)
+    tab.show()
+    qtbot.wait(100)
+    tall = tab.minimumSizeHint().height()
+    tab.resize(1178, 520)
+    qtbot.wait(100)
+    short = tab.minimumSizeHint().height()
+    assert tall <= 520 and short <= 520, (tall, short)
+    assert tab.height() == 520
+    for w in (tab.insert_btn, tab.copy_btn):
+        assert w.mapTo(tab, w.rect().bottomLeft()).y() <= tab.height()
+    tab.apply_theme({"name": "night_glass", "is_dark": True, "surface": "#252529"})
+    qtbot.wait(50)
+    assert tab.minimumSizeHint().height() <= 520
+    tab.shutdown()
+
+
+def test_compact_header_buttons_keep_content_width(qtbot, core, tmp_path):
+    """m1 复核 MF-5：紧凑页头的按钮保持内容宽度、靠右。"""
+    tab, _ = _tab(qtbot, tmp_path)
+    tab.resize(1326, 754)
+    tab.show()
+    tab.set_header_compact(True)
+    qtbot.wait(50)
+    for b in (tab.fetch_btn, tab.capture_btn, tab.import_btn):
+        assert b.width() <= b.sizeHint().width() + 4, b.text()
+    assert tab.capture_btn.x() > tab.width() // 2 and tab.fetch_btn.x() > tab.width() // 2
+    tab.shutdown()

@@ -387,23 +387,30 @@ class PreviewView(QWidget):
         self.image: QImage | None = None
         self.label = ""
         self._press = None
-        self.setMinimumHeight(60)
-        self.max_height = 10_000
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        # 最小高度与状态无关（m1 MF-1）：理想 4:3，空间不够时布局把它压到最小 80
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.setMinimumHeight(80)
 
     def set_image(self, image: QImage | None, label: str):
         self.image, self.label = image, label
         self.setToolTip("按住拖进 PowerPoint（拖出的是图片）" if image is not None else "")
         self.update()
 
+    def sizeHint(self):  # noqa: N802
+        from PySide6.QtCore import QSize
+        w = max(self.width(), 240)
+        return QSize(w, w * 3 // 4)
+
+    def minimumSizeHint(self):  # noqa: N802
+        from PySide6.QtCore import QSize
+        return QSize(120, 80)
+
     def resizeEvent(self, e):  # noqa: N802
         super().resizeEvent(e)
-        self.refit()
-
-    def refit(self):
-        h = max(60, min(self.width() * 3 // 4, self.max_height))
-        if self.height() != h:
-            self.setFixedHeight(h)
+        cap = max(80, self.width() * 3 // 4)
+        if self.maximumHeight() != cap:
+            self.setMaximumHeight(cap)
+            self.updateGeometry()
 
     def paintEvent(self, _):  # noqa: N802
         p = QPainter(self)
@@ -543,7 +550,8 @@ class MaterialTabWidget(QWidget):
         self.import_btn.setObjectName("mtGhost")
         self.import_btn.clicked.connect(self._pick_import)
         head.addWidget(self.title)
-        head.addWidget(self.subtitle, 1)
+        head.addWidget(self.subtitle)
+        head.addStretch(1)
         head.addWidget(self.pill)
         head.addWidget(self.fetch_btn)
         head.addWidget(self.capture_btn)
@@ -817,10 +825,13 @@ class MaterialTabWidget(QWidget):
                               "大图可直接拖进 PPT（拖出的是图片）。")
         self.caption.setObjectName("mtCaption")
         self.caption.setWordWrap(True)
+        self.caption.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Ignored)
         lay.addWidget(self.caption)
         self.status = QLabel("")
         self.status.setObjectName("mtCaption")
         self.status.setWordWrap(True)
+        self.status.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Ignored)
+        self.status.setMinimumHeight(0)
         self.status.setTextFormat(Qt.PlainText)
         lay.addWidget(self.status)
         self._sync_detail()
@@ -1555,8 +1566,6 @@ QProgressBar#mtBar::chunk {{ background: {t['accent']}; border-radius: 2px; }}
         short = self.height() < 640
         self.caption.setVisible(not short)
         self.left_foot.setVisible(not short)
-        self.preview.max_height = max(80, self.height() - 400) if short else 10_000
-        self.preview.refit()
         if self._loaded and not self._closing:
             self._relayout_timer.start()
 
