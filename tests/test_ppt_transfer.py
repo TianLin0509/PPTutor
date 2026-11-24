@@ -253,3 +253,19 @@ def test_material_error_codes_are_the_contract_seven():
                                              "no_target_slide", "busy", "pack_missing", "timeout"}
     with pytest.raises(ValueError):
         transfer.MaterialTransferError("whatever")
+
+
+def test_multiple_instances_use_most_recently_focused_powerpoint(monkeypatch):
+    """多个 PowerPoint 实例：按窗口 Z 序选最近在前台的那个，不按 ROT 枚举顺序。"""
+    def app(hwnd, name):
+        slide = SimpleNamespace(SlideIndex=1)
+        pres = SimpleNamespace(Name=name, ReadOnly=False)
+        window = SimpleNamespace(Presentation=pres, View=SimpleNamespace(Slide=slide))
+        return SimpleNamespace(HWND=hwnd, Windows=SimpleNamespace(Count=1), ActiveWindow=window)
+    older, recent = app(111, "旧窗口.pptx"), app(222, "正在编辑.pptx")
+    monkeypatch.setattr(transfer, "_zorder", lambda: [999, 222, 555, 111])
+    _, pres, _ = transfer._active_target([older, recent])        # ROT 里 older 排前面
+    assert pres.Name == "正在编辑.pptx"
+    monkeypatch.setattr(transfer, "_zorder", lambda: (_ for _ in ()).throw(OSError("no desktop")))
+    _, pres, _ = transfer._active_target([older, recent])        # 拿不到 Z 序时退回原顺序
+    assert pres.Name == "旧窗口.pptx"

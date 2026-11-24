@@ -336,10 +336,39 @@ def _material_shapes(pres, slide_index: int):
     return shapes
 
 
+def _zorder() -> list[int]:
+    """顶层窗口句柄，按 Z 序从前到后（EnumWindows 的顺序）。"""
+    import win32gui
+    handles = []
+    win32gui.EnumWindows(lambda h, _: handles.append(int(h)) or True, None)
+    return handles
+
+
+def _by_recent_focus(apps):
+    """多个 PowerPoint 实例时，最近在前台的那个排第一（主框架窗口在 Z 序里最靠前）。"""
+    if len(apps) < 2:
+        return list(apps)
+    try:
+        order = {h: i for i, h in enumerate(_zorder())}
+    except Exception:  # noqa: BLE001
+        order = {}
+
+    def rank(app):
+        try:
+            return order.get(int(app.HWND), len(order) + 1)
+        except Exception:  # noqa: BLE001
+            return len(order) + 2
+    return sorted(apps, key=rank)
+
+
 def _active_target(apps):
-    """用户正在看的那份文稿和那一页；不碰其他文稿。"""
+    """用户最近在用的那个 PowerPoint 的活动文稿和当前页；不碰其他文稿。
+
+    多个实例并存时按窗口 Z 序取最近在前台的那个（不是 ROT 枚举顺序）；
+    实例内取它自己的 ActiveWindow（该实例里最后激活的文稿窗口）。
+    """
     saw_window = False
-    for app in apps:
+    for app in _by_recent_focus(apps):
         try:
             if not int(app.Windows.Count):
                 continue
