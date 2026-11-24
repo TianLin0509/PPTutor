@@ -3268,7 +3268,7 @@ def test_theme_toggle(qtbot, tmp_path):
     qtbot.addWidget(win)
     win._apply_theme("cloud")
     win._toggle_theme()
-    assert win._theme == "atelier"   # cloud 是列表末位，循环回绕到静白（列表首位）
+    assert win._theme == "mist_glass"   # cloud 是列表末位，循环回绕到晨雾玻璃（列表首位）
 
 
 def test_show_recent_loads_uncached_files_in_background(qtbot, monkeypatch, tmp_path):

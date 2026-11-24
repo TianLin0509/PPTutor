@@ -666,6 +666,29 @@ def tok(theme: str) -> dict:
     return TOKENS.get(theme, TOKENS["atelier"])
 
 
+def _qt_color_str(v):
+    """把 CSS 的 rgb()/rgba() 写法转成 QColor 和 QSS 都认的 #RRGGBB / #AARRGGBB。
+
+    QColor("rgba(…)") 不认，会变成无效色（自绘时画成黑块），外部控件直接拿 token 画图时必须是这种格式。
+    """
+    if not isinstance(v, str):
+        return v
+    t = v.strip()
+    low = t.lower()
+    if not (low.startswith("rgb(") or low.startswith("rgba(")):
+        return v
+    try:
+        parts = [x.strip() for x in t[t.index("(") + 1:t.rindex(")")].split(",")]
+        r, g, b = (max(0, min(255, int(round(float(x))))) for x in parts[:3])
+        a = 255
+        if len(parts) > 3:
+            av = float(parts[3])
+            a = max(0, min(255, int(round(av * 255 if av <= 1 else av))))
+    except (ValueError, IndexError):
+        return v
+    return f"#{r:02X}{g:02X}{b:02X}" if a == 255 else f"#{a:02X}{r:02X}{g:02X}{b:02X}"
+
+
 def contract_tokens(theme: str) -> dict:
     """第二阶段合同 §3.2：给素材页（MaterialTabWidget.apply_theme）等外部控件的标准 token。
 
@@ -674,7 +697,7 @@ def contract_tokens(theme: str) -> dict:
     name = theme if theme in TOKENS else "atelier"
     t = TOKENS[name]
     dark = not t.get("is_light", False)
-    return {
+    out = {
         "name": name,
         "label": dict(THEMES).get(name, name),
         "is_dark": dark,
@@ -702,6 +725,8 @@ def contract_tokens(theme: str) -> dict:
         "hl_bg": t["hl_bg"],
         "hl_fg": t["hl_fg"],
     }
+    # 颜色一律给 QColor 能直接解析的十六进制（含透明度用 #AARRGGBB）
+    return {k: (_qt_color_str(v) if k not in ("name", "label", "blobs") else v) for k, v in out.items()}
 
 
 def highlight_css(theme: str) -> str:
