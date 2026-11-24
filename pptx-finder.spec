@@ -13,6 +13,10 @@ datas = [
     ('tools/formula_sidecar/licenses/KaTeX-MIT.txt', 'assets'),
     # 图片转可编辑文字的空白母版：注入背景图与文本框的底板（28 KB）
     ('assets/blank_16x9.pptx', 'assets'),
+    # 团队素材内置精选（约 0.92 MiB）：逐文件精确列出，不用目录通配；完整团队库走内源组件，不进安装包
+    ('assets/materials-core/team-materials-core.pptx', 'assets/materials-core'),
+    ('assets/materials-core/index.json', 'assets/materials-core'),
+    ('assets/materials-core/thumbs.zip', 'assets/materials-core'),
 ]
 binaries = []
 hiddenimports = ["pptx_finder.imgtext_cli", "pptx_finder.imgtext", "pptx_finder.imgtext_ocr",
