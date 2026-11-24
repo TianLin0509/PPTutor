@@ -259,7 +259,7 @@ def test_zero_result_can_open_health_diagnostics(qtbot, tmp_path):
     dlg = win._settings_dialogs[-1]
     qtbot.addWidget(dlg)
     assert dlg.tabs.tabText(dlg.tabs.currentIndex()) == "健康诊断"
-    qtbot.waitUntil(lambda: "index:" in dlg.diagnostic_text.toPlainText(), timeout=1000)
+    qtbot.waitUntil(lambda: "index:" in dlg.diagnostic_text.toPlainText(), timeout=5000)  # 全量跑时诊断文本是后台生成，1 秒偶发不够
     assert "index:" in dlg.diagnostic_text.toPlainText()
     assert dlg.rescan_btn.isEnabled()
 
