@@ -42,7 +42,10 @@ DIST = ROOT / "dist" / DIST_DIR_NAME
 ISS = ROOT / "tools" / "installer.iss"
 OUT_DIR = ROOT / "artifacts"
 LEAK_EXTS = {".pptx", ".ppt", ".db", ".db-wal", ".db-shm"}
-ALLOWED_DATA_FILES = {"_internal/assets/blank_16x9.pptx"}
+ALLOWED_DATA_FILES = {
+    "_internal/assets/blank_16x9.pptx",
+    "_internal/assets/materials-core/team-materials-core.pptx",
+}
 
 _ISCC_CANDIDATES = [
     Path(r"C:\Users\lintian\pptx-finder\scratchpad\inno62") / "{app}" / "ISCC.exe",

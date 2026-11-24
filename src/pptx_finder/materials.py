@@ -149,7 +149,17 @@ class MaterialLibrary:
         trash = self.root / ".trash"
         trash.mkdir(exist_ok=True)
         for item_id in item_ids:
-            self.folder(item_id).rename(trash / f"{item_id}-{uuid.uuid4().hex}")
+            src = self.folder(item_id)
+            dst = trash / f"{item_id}-{uuid.uuid4().hex}"
+            for attempt in range(10):
+                try:
+                    src.rename(dst)
+                    break
+                except PermissionError:
+                    # Windows 下后台缩略图线程或杀软可能短暂占用目录内文件句柄
+                    if attempt == 9:
+                        raise
+                    time.sleep(0.05)
 
     def capture(self, name: str = "", category: str = "") -> Material:
         import win32clipboard

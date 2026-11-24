@@ -23,7 +23,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QButtonGroup, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QFrame, QHBoxLayout,
-    QLabel, QLineEdit, QProgressBar, QPushButton, QScrollArea, QSizePolicy, QStackedWidget,
+    QLabel, QLineEdit, QMenu, QProgressBar, QPushButton, QScrollArea, QSizePolicy, QStackedWidget,
     QVBoxLayout, QWidget,
 )
 
@@ -494,6 +494,8 @@ class MaterialTabWidget(QWidget):
         self._accordion = False
         self._user_collapsed = False
         self._loaded = False
+        self._load_gen = 0
+        self._last_menu = None
         self._personal_bytes = 0
         self._last_error_code = ""
         self.tok = resolve_tokens(theme_tokens)
@@ -688,6 +690,8 @@ class MaterialTabWidget(QWidget):
         self.grid.selectedChanged.connect(self._on_selected)
         self.grid.activated.connect(lambda _: self._copy_shape())
         self.grid.pagingChanged.connect(self._on_paging)
+        self.grid.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.grid.customContextMenuRequested.connect(self._grid_context_menu)
         self.empty = QWidget()
         el = QVBoxLayout(self.empty)
         el.setAlignment(Qt.AlignCenter)
@@ -923,7 +927,9 @@ QProgressBar#mtBar::chunk {{ background: {t['accent']}; border-radius: 2px; }}
                 self._center.check_latest("materials")
             except Exception:  # noqa: BLE001
                 log.debug("check_latest unavailable", exc_info=True)
-        self._run(self._load, self._loaded_done, "读取素材库", op=False)
+        self._load_gen += 1
+        gen = self._load_gen
+        self._run(self._load, lambda data, g=gen: self._loaded_done(data, g), "读取素材库", op=False)
 
     def focus_search(self) -> None:
         self.search.setFocus()
@@ -969,7 +975,12 @@ QProgressBar#mtBar::chunk {{ background: {t['accent']}; border-radius: 2px; }}
                     pass
         return {"team": team, "imported": imported, "mine": mine, "personal_bytes": personal}
 
-    def _loaded_done(self, data: dict):
+    def _loaded_done(self, data: dict, gen: int | None = None):
+        if gen is not None and gen != self._load_gen:
+            for reader in [data.get("team"), *(data.get("imported") or [])]:
+                if reader is not None and reader is not self._team_reader and reader not in self._imported_readers:
+                    reader.close()
+            return
         for reader in [self._team_reader, *self._imported_readers]:
             if reader is not None and reader is not data["team"] and reader not in data["imported"]:
                 reader.close()
@@ -1220,6 +1231,35 @@ QProgressBar#mtBar::chunk {{ background: {t['accent']}; border-radius: 2px; }}
     def _on_selected(self, _index: int):
         self.warn.hide()
         self._sync_detail()
+
+    def _grid_context_menu(self, pos: QPoint):
+        i = self.grid.index_at(pos)
+        if i >= 0:
+            self.grid.select(i)
+        e = self._current()
+        if e is None:
+            return
+        from . import owner_actions
+        menu = QMenu(self)
+        act_ins = menu.addAction("插入到当前 PPT", self._insert)
+        act_copy = menu.addAction("复制形状（回 PPT 粘贴）\tCtrl+C", self._copy_shape)
+        act_img = menu.addAction("复制为图片", self._copy_image)
+        for act in (act_ins, act_copy, act_img):
+            act.setEnabled(not self._busy_op)
+        menu.addSeparator()
+        if e.source == "mine":
+            act_edit = menu.addAction("改名 / 分类\tF2", self._edit_mine)
+            act_del = menu.addAction("移出收藏\tDel", self._delete_mine)
+            act_edit.setEnabled(not self._busy_op)
+            act_del.setEnabled(not self._busy_op)
+        else:
+            act_save = menu.addAction("收藏一份到我的", self._save_to_mine)
+            act_save.setEnabled(not self._busy_op)
+            if e.source == "imported":
+                act_rm = menu.addAction("移除这个导入包", self._remove_imported)
+                act_rm.setEnabled(not self._busy_op)
+        self._last_menu = menu
+        owner_actions.popup(menu, self.grid.mapToGlobal(pos))
 
     def _sync_detail(self):
         e = self._current()

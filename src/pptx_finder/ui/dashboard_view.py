@@ -345,20 +345,25 @@ class DashboardView(QWidget):
         grid = QGridLayout(charts)
         grid.setContentsMargins(0, 0, 0, 0)
         grid.setSpacing(14)
-        grid.addWidget(self._topic_card(), 0, 0)
-        grid.addWidget(self._recent_card(), 0, 1)
-        grid.addWidget(self._folder_card(), 1, 0)
-        grid.addWidget(self._week_card(), 1, 1)
+        self._card_topic = self._topic_card()
+        self._card_recent = self._recent_card()
+        self._card_folder = self._folder_card()
+        self._card_week = self._week_card()
+        # 库里不足 5 份 PPT 时，三张统计图数据过少：左侧换成摘要卡，右侧「最近活跃」仍保留以便直接打开已有文档
+        self._few_card = self._build_few_card()
+        self._few_card.hide()
+        grid.addWidget(self._card_topic, 0, 0)
+        grid.addWidget(self._few_card, 0, 0)
+        grid.addWidget(self._card_recent, 0, 1)
+        grid.addWidget(self._card_folder, 1, 0)
+        grid.addWidget(self._card_week, 1, 1)
         grid.setColumnStretch(0, 1)
         grid.setColumnStretch(1, 1)
         grid.setRowStretch(0, 1)
         grid.setRowStretch(1, 1)
+        self._charts_grid = grid
         self._charts = charts
         root.addWidget(charts, 1)
-        # 库里不足 5 份 PPT 时，四张图都是空的：换成一张摘要卡，说清还差什么、下一步点哪
-        self._few_card = self._build_few_card()
-        self._few_card.hide()
-        root.addWidget(self._few_card, 1)
 
     #: 少于这个份数时，用摘要卡代替四张空图
     FEW_DOCS = 5
@@ -840,15 +845,18 @@ class DashboardView(QWidget):
             docs = 0
         few = docs < self.FEW_DOCS
         if hasattr(self, "_few_card"):
-            self._charts.setVisible(not few)
+            for card in (self._card_topic, self._card_folder, self._card_week):
+                card.setVisible(not few)
             self._few_card.setVisible(few)
+            self._card_recent.setVisible(True)
+            self._charts_grid.setRowStretch(1, 0 if few else 1)
             if few:
                 worker = getattr(self._win, "_indexer", None)
                 scanning = worker is not None and worker.isRunning()
                 self._few_text.setText(
                     (f"目前索引到 {docs} 份 PPT，正在继续查找；" if scanning else f"目前索引到 {docs} 份 PPT。")
-                    + "份数多起来以后，这里会显示新鲜度、最近活跃、文件夹分布和本周改动。"
-                    "现在就可以搜任意一页里的字；如果你的 PPT 放在别的盘或文件夹，把它加进索引范围。")
+                    + "份数多起来以后，这里会显示新鲜度、文件夹分布和本周改动。"
+                    "现在就可以在右侧直接打开最近文档，或搜任意一页里的字；如果你的 PPT 放在别的盘或文件夹，把它加进索引范围。")
 
         total = sum(v for _, v in self._topics) or 1
         for i, (dot, nm, pc) in enumerate(self._leg_rows):

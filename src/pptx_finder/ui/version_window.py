@@ -1154,7 +1154,7 @@ class VersionWindow(QWidget):
         self.ver_list.setCurrentItem(item)
         menu = QMenu(self)
         menu.addAction("生成预览", self._preview_selected_version)
-        act_restore = menu.addAction("恢复（覆盖当前）…", self._restore)
+        act_restore = menu.addAction("恢复此版本（覆盖当前）…", self._restore)
         act_restore.setEnabled(self.btn_restore.isEnabled())
         act_export = menu.addAction("导出此版本…", self._export)
         act_export.setEnabled(self.btn_export.isEnabled())

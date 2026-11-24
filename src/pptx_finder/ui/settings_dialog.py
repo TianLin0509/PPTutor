@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFontComboBox,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -594,12 +595,14 @@ class SettingsDialog(QDialog):
         from . import theme as _th
 
         current = get_theme(_th.DEFAULT_THEME)
-        # 方案 D：主推四套用缩略卡直接点选（晨雾玻璃 / 暗夜玻璃 / 静白 / 静黑），
-        # 其余 10 套旧玻璃收进「更多主题」下拉；两处选中同一个 _apply_theme_choice。
-        cards = QHBoxLayout()
-        cards.setSpacing(10)
+        # 方案 D：主推四套用 2×2 缩略卡直接点选（上排晨雾/暗夜玻璃、下排静白/静黑），
+        # 760px 最小设置窗下也能完整放进可视区不出横向滚动条；其余 10 套旧玻璃收进「更多主题」下拉。
+        cards = QGridLayout()
+        cards.setHorizontalSpacing(10)
+        cards.setVerticalSpacing(10)
+        cards.setContentsMargins(0, 0, 0, 0)
         self._theme_cards: dict[str, QToolButton] = {}
-        for key in _th.MAIN_THEMES:
+        for idx, key in enumerate(_th.MAIN_THEMES):
             label = dict(_th.THEMES).get(key, key)
             btn = QToolButton()
             btn.setObjectName("themeCard")
@@ -612,8 +615,8 @@ class SettingsDialog(QDialog):
             btn.setChecked(key == current)
             btn.clicked.connect(lambda _c=False, k=key: self._pick_theme(k))
             self._theme_cards[key] = btn
-            cards.addWidget(btn)
-        cards.addStretch(1)
+            cards.addWidget(btn, idx // 2, idx % 2)
+        cards.setColumnStretch(2, 1)
         self._theme_combo = QComboBox()
         self._theme_combo.addItem("更多主题…", "")
         for key in _th.MORE_THEMES:
@@ -1397,6 +1400,7 @@ class SettingsDialog(QDialog):
             name.setObjectName("setRowTitle")
             purpose = QLabel("用于" + comp.purpose)
             purpose.setObjectName("setRowDesc")
+            purpose.setWordWrap(True)
             status = QLabel("")
             status.setObjectName(f"componentStatus_{comp.key}")
             status.setWordWrap(True)
