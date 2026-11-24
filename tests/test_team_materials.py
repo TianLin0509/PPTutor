@@ -256,6 +256,22 @@ def test_corrupted_current_rolls_back_to_previous_on_start(tmp_path):
     reader.close()
 
 
+@pytest.mark.parametrize("member", ["thumbs.zip", "index.json"])
+def test_any_corrupted_member_rolls_back_and_keeps_old_library(tmp_path, member):
+    """m4 MF-M2-03：只坏缩略图或索引也要回 previous，且不能清旧库。"""
+    _fresh_process()
+    for version, n in (("1.2.0", 2), ("1.3.0", 4)):
+        out, _, _ = build_pack_dir(tmp_path, rows(n), version)
+        team_materials.install_from_file(out / "component.zip")
+    state = team_materials.read_state()
+    prev_dir = team_materials.root() / "packs" / state["previous"]["dir"]
+    target = team_materials.root() / "packs" / state["current"]["dir"] / member
+    target.write_bytes(target.read_bytes()[:-7] + b"corrupt")
+    _fresh_process()
+    assert team_materials.startup_check(force=True) == "rolled_back"
+    assert team_materials.read_state()["current"]["version"] == "1.2.0" and prev_dir.is_dir()
+
+
 def test_failed_install_keeps_old_library(tmp_path, mirror):
     _fresh_process()
     out1, _, _ = build_pack_dir(tmp_path, rows(2), "1.2.0")

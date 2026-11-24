@@ -116,6 +116,13 @@ def verify_entry(entry: dict | None) -> bool:
     try:
         if sha256_file(folder / PACK_FILE) != entry.get("pptx_sha256"):
             return False
+        # 激活时登记的每个成员（pptx / index.json / thumbs.zip）都要在、hash 都要对
+        files = entry.get("files")
+        if not isinstance(files, dict) or PACK_FILE not in files:
+            return False
+        for name, digest in files.items():
+            if name not in PACK_FILES or sha256_file(folder / name) != digest:
+                return False
         reader = _m.PackReader(folder, "team")
         ok = len(reader.items) == int(entry.get("items", -1))
         reader.close()
@@ -236,7 +243,8 @@ def activate(stage: Path, version: str, *, pptx_sha256: str = "", archive_sha256
         name = f"{version or 'local'}-{uuid.uuid4().hex[:8]}"
         os.replace(stage, packs / name)
         state = read_state()
-        entry = {"version": version, "dir": name, "items": count,
+        files = {n: sha256_file(packs / name / n) for n in PACK_FILES if (packs / name / n).is_file()}
+        entry = {"version": version, "dir": name, "items": count, "files": files,
                  "pptx_sha256": pptx_sha256 or sha256_file(packs / name / PACK_FILE),
                  "archive_sha256": archive_sha256, "installed_at": time.time(), "confirmed": False,
                  "verified": verified}
