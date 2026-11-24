@@ -170,6 +170,7 @@ def test_primary_ui_text_stays_readable_chinese(qtbot, tmp_path):
         win.next_btn.text(),
         win.goto_btn.text(),
         win.open_btn.text(),
+        win.open_btn.toolTip(),   # 方案 D：PPT 时「打开文件」收成图标按钮，文字在提示里
         win.folder_btn.text(),
         win.clip_btn.text(),
         win.clip_btn.toolTip(),

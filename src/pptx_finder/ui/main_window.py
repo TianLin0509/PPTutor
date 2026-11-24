@@ -1581,6 +1581,8 @@ class MainWindow(QMainWindow):
         ll.addWidget(self.list_head)
         self.result_list = QListWidget()
         self.result_list.setObjectName("resultList")
+        # 方案 D：结果列表不出横向滚动条（路径已中间省略 + 悬停看全路径）
+        self.result_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.result_list.currentItemChanged.connect(self._on_select)
         self.result_list.itemActivated.connect(self._on_activate)
         self.result_list.itemDoubleClicked.connect(self._on_activate)
@@ -2249,9 +2251,23 @@ class MainWindow(QMainWindow):
         self.preview_powerpoint_btn = QPushButton("检测 PowerPoint")
         self.preview_powerpoint_btn.clicked.connect(lambda: self.open_settings_page("PowerPoint"))
         error_actions.addWidget(self.preview_powerpoint_btn)
+        self.preview_error_open_btn = QPushButton("打开文件")
+        self.preview_error_open_btn.setToolTip("用默认程序打开整份文件")
+        self.preview_error_open_btn.clicked.connect(self._act_open)
+        error_actions.addWidget(self.preview_error_open_btn)
         error_actions.addStretch()
         bl.addWidget(self.preview_error_actions)
         self.preview_error_actions.hide()
+        # 原图出不来时，用已索引的本页文字兜底，至少能判断是不是要找的那页
+        self.preview_error_text = QLabel("")
+        self.preview_error_text.setObjectName("dashSub")
+        self.preview_error_text.setWordWrap(True)
+        self.preview_error_text.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.preview_error_text.setMaximumHeight(150)
+        self.preview_error_text.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        bl.addWidget(self.preview_error_text)
+        self.preview_error_text.hide()
+        self._preview_error_text_token = 0
 
         # 命中页缩略图条
         self.thumb_row = QHBoxLayout()
@@ -2283,12 +2299,16 @@ class MainWindow(QMainWindow):
         self.goto_btn = QPushButton(" 打开并跳到此页")
         self.goto_btn.setObjectName("primary")
         self.goto_btn.clicked.connect(self._act_goto)
-        self.open_btn = QPushButton(" 打开文件")
+        self.open_btn = QPushButton("")
+        self.open_btn.setAccessibleName("打开文件")
+        self.open_btn.setToolTip("打开文件（用默认程序打开整份文件）")
         self.open_btn.clicked.connect(self._act_open)
-        self.copy_slide_btn = QPushButton("复制本页")
-        self.copy_slide_btn.setToolTip("复制整张幻灯片，保留图形与版式。需先在 PowerPoint 中打开目标文稿，复制后在其左侧缩略图栏按 Ctrl+V 粘贴")
+        # 方案 D 操作行：主「打开并跳到此页」/ 次「插入到当前 PPT」/ 图标「复制本页」「打开文件」/ 更多
+        self.copy_slide_btn = QPushButton("")
+        self.copy_slide_btn.setAccessibleName("复制本页")
+        self.copy_slide_btn.setToolTip("复制本页：复制整张幻灯片，保留图形与版式。需先在 PowerPoint 中打开目标文稿，复制后在其左侧缩略图栏按 Ctrl+V 粘贴")
         self.copy_slide_btn.clicked.connect(self._act_copy_slide)
-        self.insert_slide_btn = QPushButton("插入到 PPT…")
+        self.insert_slide_btn = QPushButton("插入到当前 PPT")
         self.insert_slide_btn.setToolTip("需先在 PowerPoint 中打开目标文稿；将当前预览页直接插到所选文稿末尾，不自动保存")
         self.insert_slide_btn.clicked.connect(self._act_insert_slide)
         self.more_btn = QPushButton("更多")
@@ -2302,10 +2322,10 @@ class MainWindow(QMainWindow):
         more.addAction(self.folder_btn)
         more.addAction(self.clip_btn)
         self.more_btn.setMenu(more)
-        for b in (self.goto_btn, self.open_btn, self.copy_slide_btn, self.insert_slide_btn, self.more_btn):
+        for b in (self.goto_btn, self.insert_slide_btn, self.copy_slide_btn, self.open_btn, self.more_btn):
             b.setMinimumHeight(34)       # 下限 34；大字号时随字体长高
-            # 窄窗口时允许按钮收窄，避免操作行把整窗最小宽度顶到 1400+。
-            b.setMinimumWidth(64)
+            # 窄窗口时允许按钮收窄，避免操作行把整窗最小宽度顶到 1400+；图标按钮 38 宽。
+            b.setMinimumWidth(38 if b in (self.copy_slide_btn, self.open_btn) else 64)
             b.setIconSize(QSize(16, 16))
             b.setCursor(Qt.PointingHandCursor)
             ops.addWidget(b)
@@ -2754,6 +2774,9 @@ class MainWindow(QMainWindow):
         for button in (self.copy_slide_btn, self.insert_slide_btn):
             button.setVisible(is_ppt)
             button.setEnabled(on and is_ppt)
+        # 非 PPT（不能跳页、不能插入）时「打开文件」就是主操作，带上文字；PPT 时收成图标按钮
+        if self._active_heavy_op is None:
+            self.open_btn.setText("" if (is_ppt or self._cur is None) else " 打开文件")
         self.goto_btn.setEnabled(can_goto)
         self.goto_btn.setToolTip(
             "用 PowerPoint 打开并跳到当前页"
@@ -2801,6 +2824,7 @@ class MainWindow(QMainWindow):
         for attr, name, color in (("copy_text_btn", "copy", ink), ("copy_path_btn", "link", ink),
                                   ("prev_btn", "arrow_left", ink), ("next_btn", "arrow_right", ink),
                                   ("goto_btn", "open", t["acctext"]), ("open_btn", "file", ink),
+                                  ("copy_slide_btn", "copy", ink),
                                   ("folder_btn", "folder", ink), ("clip_btn", "clipboard", ink)):
             btn = getattr(self, attr, None)
             if btn is not None:
@@ -5770,6 +5794,48 @@ class MainWindow(QMainWindow):
     def _hide_preview_error_actions(self) -> None:
         if hasattr(self, "preview_error_actions"):
             self.preview_error_actions.hide()
+        if hasattr(self, "preview_error_text"):
+            self._preview_error_text_token = getattr(self, "_preview_error_text_token", 0) + 1
+            self.preview_error_text.hide()
+
+    def _load_preview_error_text(self) -> None:
+        """预览失败卡：后台读已索引的本页文字填进卡片下方（只读本地索引库，不碰源文件）。"""
+        label = getattr(self, "preview_error_text", None)
+        r = self._cur
+        if label is None:
+            return
+        self._preview_error_text_token = getattr(self, "_preview_error_text_token", 0) + 1
+        label.hide()
+        if r is None or r.is_dir or r.status == "filename_only" or r.file_id < 0:
+            return
+        conn_path = _sqlite_file_path(self._conn)
+        if not conn_path:
+            return
+        token = self._preview_error_text_token
+        file_id, page = r.file_id, self._view_page
+        task = BackgroundTask(
+            lambda conn_path=conn_path, file_id=file_id, page=page:
+            self._load_page_text(conn_path, file_id, page),
+            "preview-error-text",
+        )
+        self._bg_tasks.append(task)
+
+        def done(text, token=token, file_id=file_id, page=page):
+            if (self._closing or token != self._preview_error_text_token or self._cur is None
+                    or self._cur.file_id != file_id or self._view_page != page
+                    or not self.preview_error_actions.isVisibleTo(self)):
+                return
+            body = " ".join(str(text or "").split())
+            if not body:
+                return
+            if len(body) > 400:
+                body = body[:400] + "…"
+            label.setText(f"本页已索引的文字：{body}")
+            label.show()
+
+        task.done.connect(done)
+        task.finished.connect(lambda task=task: self._bg_tasks.remove(task) if task in self._bg_tasks else None)
+        task.start()
 
     def _retry_preview(self) -> None:
         self._last_preview_key = None
@@ -5794,7 +5860,9 @@ class MainWindow(QMainWindow):
             f'{hint}</div>')
         self._cur_pixmap = None
         self.preview_powerpoint_btn.setVisible(category == "powerpoint_unavailable")
+        self.preview_error_open_btn.setVisible(category != "missing_file")
         self.preview_error_actions.show()
+        self._load_preview_error_text()
 
     def _show_non_powerpoint_preview(self, ext: str) -> None:
         self._hide_preview_error_actions()
@@ -6727,8 +6795,8 @@ class MainWindow(QMainWindow):
         def finish(payload):
             # Release before opening the chooser: its confirmed insertion is another task.
             self._active_heavy_op = None
-            self.copy_slide_btn.setText("复制本页")
-            self.insert_slide_btn.setText("插入到 PPT…")
+            self.copy_slide_btn.setText("")
+            self.insert_slide_btn.setText("插入到当前 PPT")
             self._set_ops_enabled(self._cur is not None)
             self._flush_deferred_preview_if_idle()
             if not isinstance(payload, dict) or "error" in payload:

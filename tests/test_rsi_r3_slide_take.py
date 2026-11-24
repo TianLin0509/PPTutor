@@ -256,8 +256,9 @@ def test_more_actions_keep_folder_and_whole_file_copy(preview, monkeypatch):
 def test_action_row_at_desktop_width(preview, qtbot):
     preview.resize(1440, 900)
     qtbot.wait(50)
-    buttons = [preview.goto_btn, preview.open_btn, preview.copy_slide_btn,
-               preview.insert_slide_btn, preview.more_btn]
+    # 方案 D 顺序：主 / 次 / 图标（复制本页、打开文件）/ 更多
+    buttons = [preview.goto_btn, preview.insert_slide_btn, preview.copy_slide_btn,
+               preview.open_btn, preview.more_btn]
     assert preview.width() == 1440
     for left, right in zip(buttons, buttons[1:]):
         assert left.geometry().right() < right.geometry().left()
