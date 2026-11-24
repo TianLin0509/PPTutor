@@ -302,7 +302,7 @@ def download_file(url: str, dest: Path, *, expect_size: int | None, expect_sha25
                         head = chunk[:256]
                     received += len(chunk)
                     if expect_size and received > expect_size:
-                        raise SourceFailure(
+                        raise IntegrityFailure(
                             f"收到的内容比应有的 {fmt_bytes(expect_size)} 还大，已停止")
                     out.write(chunk)
                     hasher.update(chunk)

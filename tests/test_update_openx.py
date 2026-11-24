@@ -515,3 +515,41 @@ def test_openx_content_length_mismatch_stops_before_external(tmp_path, monkeypat
         netfetch.download_with_fallback([("openx", F + "s"), ("github-release", "https://github.com/s")],
                                         tmp_path / "s.zip", expect_size=12, expect_sha256="0" * 64)
     assert opened == [F + "s"] and "文件大小不对" in ei.value.attempts[0].reason
+
+
+def test_openx_oversize_body_and_bad_manifest_stop_before_external(tmp_path, monkeypatch):
+    """实际收到的比清单大、内源清单不是合法 JSON：都算内源完整性失败，不换外网。"""
+    from pptx_finder import imgtext_ocr, netfetch
+    opened = []
+
+    class _R(_Resp):
+        headers = {"Content-Type": "application/octet-stream"}
+
+        def geturl(self):
+            return self.u
+
+    def fake_urlopen(req, timeout=None):
+        u = req.full_url if hasattr(req, "full_url") else str(req)
+        opened.append(u)
+        r = _R(b"X" * 64)
+        r.u = u
+        return r
+    monkeypatch.setattr(netfetch.urllib.request, "urlopen", fake_urlopen)
+    with pytest.raises(netfetch.AllSourcesFailed):
+        netfetch.download_with_fallback([("openx", F + "o"), ("github-release", "https://github.com/o")],
+                                        tmp_path / "o.zip", expect_size=8, expect_sha256="0" * 64)
+    assert opened == [F + "o"]
+
+    asked = []
+
+    class _M(_Resp):
+        headers = {"Content-Type": "application/json"}
+
+    def fake_open(base, timeout):
+        asked.append(base)
+        return _M(b"{not json")
+    monkeypatch.setattr(imgtext_ocr, "_open_manifest", fake_open)
+    with pytest.raises(imgtext_ocr.OcrUnavailable):
+        imgtext_ocr.fetch_manifest_from_sources(
+            [("openx", "openx:ocr"), ("github-release", "https://github.com/x")], 3, "识别组件")
+    assert asked == ["openx:ocr"]

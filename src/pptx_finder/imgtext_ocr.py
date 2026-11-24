@@ -329,9 +329,14 @@ def fetch_manifest_from_sources(sources: list[tuple[str, str]], timeout: float =
                 pass
             if looks_like_web_page(ctype, raw):
                 raise SourceFailure("收到的是网页而不是组件清单，可能被公司代理拦截")
-            data = _json.loads(raw.decode("utf-8"))
+            from .netfetch import IntegrityFailure
+            bad = IntegrityFailure if label == "openx" else SourceFailure
+            try:
+                data = _json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError) as e:
+                raise bad(f"组件清单无效：{e}"[:120]) from e
             if not (isinstance(data, dict) and data.get("files")):
-                raise SourceFailure("组件清单无效")
+                raise bad("组件清单无效")
             found.append((label, base, data))
             checks.append({"label": label, "name": source_name(label), "ok": True,
                            "version": str(data.get("version", "")), "reason": ""})

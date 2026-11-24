@@ -405,12 +405,13 @@ def _fetch_manifest_url(
             ctype = ""
     if looks_like_web_page(ctype, raw):
         raise SourceFailure(f"收到的是网页（{fmt_bytes(len(raw))}）而不是版本清单，可能被公司代理拦截")
+    bad = IntegrityFailure if openx else SourceFailure   # 内源的清单内容不对：不许拿外网顶替
     try:
         data = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError) as e:
-        raise SourceFailure(f"版本清单无效：{e}"[:120]) from e
+        raise bad(f"版本清单无效：{e}"[:120]) from e
     if not isinstance(data, dict):
-        raise SourceFailure("版本清单无效：不是 JSON 对象")
+        raise bad("版本清单无效：不是 JSON 对象")
     return data
 
 
@@ -574,7 +575,12 @@ def download_package(info: UpdateInfo, staging: Path,
             if progress:
                 progress(done, total or done)
     try:
-        with zipfile.ZipFile(tmp) as z:
+        try:
+            archive = zipfile.ZipFile(tmp)
+        except zipfile.BadZipFile as e:
+            from .netfetch import IntegrityFailure
+            raise IntegrityFailure("整包不是有效的压缩包") from e
+        with archive as z:
             names = {n.replace("\\", "/"): n for n in z.namelist()}
             # 包内是 PPT-Doctor/<relpath>；剥掉这一层顶层目录
             roots = {n.split("/", 1)[0] for n in names if "/" in n}
@@ -582,7 +588,8 @@ def download_package(info: UpdateInfo, staging: Path,
             for rel, want_hash in wanted.items():
                 member = names.get(prefix + rel)
                 if member is None:
-                    raise ValueError(f"整包里缺少 {rel}")
+                    from .netfetch import IntegrityFailure
+                    raise IntegrityFailure(f"整包里缺少 {rel}")
                 dest = staging / rel          # rel 已过 safe_relpath，无法越界
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 data = z.read(member)
