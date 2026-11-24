@@ -1,4 +1,4 @@
-"""主界面线条图标（v2.0）：24 网格、圆头 1.75 线宽，按屏幕实际缩放比渲染。
+"""主界面线条图标（v2.0；方案 D 统一 1.5 线宽）：24 网格、圆头线条，按屏幕实际缩放比渲染。
 
 旧图标是 18px 位图直接放大，在 225% 缩放的屏幕上发虚；这里统一走矢量，
 任何缩放比下都清晰。路径风格对齐 Lucide（MIT），只保留本应用用到的几枚。
@@ -64,6 +64,22 @@ PATHS: dict[str, str] = {
     "restore": ('<rect x="4" y="8" width="12" height="12" rx="1.5"/>'
                 '<path d="M8 8V5.5A1.5 1.5 0 0 1 9.5 4h9A1.5 1.5 0 0 1 20 5.5v9a1.5 1.5 0 0 1-1.5 1.5H16"/>'),
     "close": '<path d="m6 6 12 12M18 6 6 18"/>',
+    # —— 方案 D 新增（2026-11-25）：深浅切换、浮窗角标、欢迎页与健康 / 组件页的线性图标 ——
+    "moon": '<path d="M20.5 14.5A8.5 8.5 0 1 1 9.5 3.5a6.8 6.8 0 0 0 11 11Z"/>',
+    "sun": ('<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4'
+            'M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>'),
+    "popout": '<path d="M9 5h10v10M19 5 6 18"/>',
+    "alert": '<path d="M12 3 2 20h20L12 3Z"/><path d="M12 10v4M12 17h.01"/>',
+    "check": '<path d="m5 12 5 5L20 7"/>',
+    "refresh": '<path d="M20 11A8 8 0 0 0 5.6 6.6L3 9"/><path d="M3 4v5h5"/><path d="M4 13a8 8 0 0 0 14.4 4.4L21 15"/><path d="M21 20v-5h-5"/>',
+    "trash": '<path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/>',
+    "star": '<path d="m12 3 2.8 5.7 6.2.9-4.5 4.4 1.1 6.2L12 17.3 6.4 20.2l1.1-6.2L3 9.6l6.2-.9z"/>',
+    "box": '<path d="M21 8 12 3 3 8v8l9 5 9-5z"/><path d="M3 8l9 5 9-5M12 13v8"/>',
+    "plug": '<path d="M9 2v5M15 2v5M6 7h12v4a6 6 0 0 1-12 0zM12 17v5"/>',
+    "palette": ('<path d="M12 3a9 9 0 1 0 0 18c1.1 0 1.6-.9 1.2-1.8-.5-1-.1-2.2 1.1-2.2H17a4 4 0 0 0 4-4'
+                'c0-5.5-4-10-9-10Z"/><circle cx="7.5" cy="11" r="1"/><circle cx="10" cy="7" r="1"/>'
+                '<circle cx="14.5" cy="7" r="1"/>'),
+    "disk": '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 14h18M7 17h.01"/>',
 }
 
 
@@ -92,6 +108,6 @@ def _pixmap(name: str, color: str, size: int, stroke: float, ratio: float) -> QP
     return pm
 
 
-def icon(name: str, color: str = "#667085", size: int = 18, stroke: float = 1.75) -> QIcon:
+def icon(name: str, color: str = "#667085", size: int = 18, stroke: float = 1.5) -> QIcon:
     """按名字取一枚线条图标；颜色由调用方按主题 token 传入。"""
     return QIcon(_pixmap(name, color, int(size), float(stroke), _ratio()))

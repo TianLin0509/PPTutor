@@ -47,7 +47,7 @@ def test_nav_rail_exists_and_default_page_is_dashboard(qtbot, tmp_path):
     assert rail is not None
     # v2.0 整高侧栏：宽窗口图标 + 文字，窄窗口（<1360）自动收成图标列
     assert rail.width() in (win._RAIL_W, win._RAIL_COMPACT_W)
-    assert set(win._rail_page_btns) == {"search", "dashboard", "version", "health"}
+    assert set(win._rail_page_btns) == {"search", "material", "dashboard", "version", "health"}
     assert win.rail_report_btn is not None
     assert win.rail_settings_btn is not None
 

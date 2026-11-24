@@ -170,6 +170,7 @@ def test_primary_ui_text_stays_readable_chinese(qtbot, tmp_path):
         win.next_btn.text(),
         win.goto_btn.text(),
         win.open_btn.text(),
+        win.open_btn.toolTip(),   # 方案 D：PPT 时「打开文件」收成图标按钮，文字在提示里
         win.folder_btn.text(),
         win.clip_btn.text(),
         win.clip_btn.toolTip(),
@@ -3268,7 +3269,7 @@ def test_theme_toggle(qtbot, tmp_path):
     qtbot.addWidget(win)
     win._apply_theme("cloud")
     win._toggle_theme()
-    assert win._theme == "atelier"   # cloud 是列表末位，循环回绕到静白（列表首位）
+    assert win._theme == "mist_glass"   # cloud 是列表末位，循环回绕到晨雾玻璃（列表首位）
 
 
 def test_show_recent_loads_uncached_files_in_background(qtbot, monkeypatch, tmp_path):

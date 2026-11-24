@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import QSignalBlocker, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QKeySequence
+from PySide6.QtGui import QColor, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
     QKeySequenceEdit,
@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QStackedWidget,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -291,6 +292,10 @@ QLabel#setRowTitle, QCheckBox#setRowTitle {{ font-size: 14px; font-weight: 600; 
 QLabel#setRowDesc, QLabel#setNote {{ font-size: 12.5px; color: {t['ink3']}; }}
 QLabel#setWarn {{ font-size: 12.5px; color: #9a6a00; }}
 QPlainTextEdit#setDiag {{ font-family: Consolas, "Microsoft YaHei UI"; font-size: 12px; color: {t['ink2']}; padding: 10px 12px; }}
+QToolButton#themeCard {{ background: {t['panel2']}; border: 1px solid {t['bd']}; border-radius: 14px;
+    padding: 8px 8px 6px 8px; color: {t['ink2']}; font-size: 12.5px; }}
+QToolButton#themeCard:hover {{ background: {t['hover']}; }}
+QToolButton#themeCard:checked {{ border: 2px solid {t['acc']}; color: {t['acc']}; font-weight: 600; }}
 """
 
 
@@ -335,7 +340,7 @@ class SettingsDialog(QDialog):
         try:
             from ..config import get_theme
             from . import theme as _th
-            _tok = _th.tok(get_theme())
+            _tok = _th.tok(get_theme(_th.DEFAULT_THEME))
             self.setStyleSheet(_settings_qss(_tok))
         except Exception:  # noqa: BLE001 样式失败不影响功能
             _tok = None
@@ -588,19 +593,59 @@ class SettingsDialog(QDialog):
         from ..config import get_theme
         from . import theme as _th
 
+        current = get_theme(_th.DEFAULT_THEME)
+        # 方案 D：主推四套用缩略卡直接点选（晨雾玻璃 / 暗夜玻璃 / 静白 / 静黑），
+        # 其余 10 套旧玻璃收进「更多主题」下拉；两处选中同一个 _apply_theme_choice。
+        cards = QHBoxLayout()
+        cards.setSpacing(10)
+        self._theme_cards: dict[str, QToolButton] = {}
+        for key in _th.MAIN_THEMES:
+            label = dict(_th.THEMES).get(key, key)
+            btn = QToolButton()
+            btn.setObjectName("themeCard")
+            btn.setCheckable(True)
+            btn.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+            btn.setText(label + ("（推荐）" if key == _th.DEFAULT_THEME else ""))
+            btn.setIcon(QIcon(_th.preview_pixmap(key, 132, 74)))
+            btn.setIconSize(QSize(132, 74))
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setChecked(key == current)
+            btn.clicked.connect(lambda _c=False, k=key: self._pick_theme(k))
+            self._theme_cards[key] = btn
+            cards.addWidget(btn)
+        cards.addStretch(1)
         self._theme_combo = QComboBox()
-        for key, label in _th.THEMES:
-            suffix = "（推荐）" if key == "atelier" else ""
-            self._theme_combo.addItem(label + suffix, key)
-        index = self._theme_combo.findData(get_theme())
+        self._theme_combo.addItem("更多主题…", "")
+        for key in _th.MORE_THEMES:
+            self._theme_combo.addItem(dict(_th.THEMES).get(key, key), key)
+        index = self._theme_combo.findData(current) if current in _th.MORE_THEMES else 0
         self._theme_combo.setCurrentIndex(max(0, index))
         self._theme_combo.setMinimumWidth(170)
         self._theme_combo.currentIndexChanged.connect(self._apply_theme_choice)
-        self._row(card, "界面主题", "「静白」是 2.0 的默认工作台外观，其余为早期版本保留的主题。",
-                  self._theme_combo)
+        more = QHBoxLayout()
+        more.addWidget(self._theme_combo)
+        more.addStretch(1)
+        self._row(card, "界面主题", "「晨雾玻璃」是方案 D 的默认外观；暗夜玻璃是它的深色版。早期版本的 10 套主题在「更多主题」里。",
+                  below=[cards, more])
+
+    def _pick_theme(self, name: str) -> None:
+        """主推缩略卡点选：同步卡片勾选、把「更多主题」下拉复位，再走同一条应用链路。"""
+        combo = getattr(self, "_theme_combo", None)
+        if combo is not None and combo.currentIndex() != 0:
+            combo.blockSignals(True)
+            combo.setCurrentIndex(0)
+            combo.blockSignals(False)
+        self._apply_theme_name(name)
 
     def _apply_theme_choice(self, _index: int) -> None:
         name = str(self._theme_combo.currentData() or "")
+        if not name:
+            return
+        self._apply_theme_name(name)
+
+    def _apply_theme_name(self, name: str) -> None:
+        for key, btn in getattr(self, "_theme_cards", {}).items():
+            btn.setChecked(key == name)
         parent = self._diagnostic_parent
         apply_theme = getattr(parent, "_apply_theme", None)
         if callable(apply_theme):
@@ -1371,6 +1416,22 @@ class SettingsDialog(QDialog):
             self._component_rows[comp.key] = {"status": status, "download": download,
                                               "remove": remove, "size": None, "busy": False,
                                               "note": ""}
+        # 方案 D：写明预览不靠组件——只用本机 PowerPoint（不新增任何渲染运行时）
+        ppt_card = QFrame()
+        ppt_card.setObjectName("setCard")
+        ppt_row = QVBoxLayout(ppt_card)
+        ppt_row.setContentsMargins(14, 12, 14, 12)
+        ppt_row.setSpacing(2)
+        ppt_name = QLabel("PowerPoint 预览")
+        ppt_name.setObjectName("setRowTitle")
+        ppt_desc = QLabel("原图预览、复制本页、插入到 PPT 都直接用本机 PowerPoint，不需要额外下载预览组件。"
+                          "预览不出来时，到「PowerPoint」页检测一下。")
+        ppt_desc.setObjectName("setRowDesc")
+        ppt_desc.setWordWrap(True)
+        ppt_row.addWidget(ppt_name)
+        ppt_row.addWidget(ppt_desc)
+        self._ppt_preview_note = ppt_card
+        lay.addWidget(ppt_card)
         hint = QLabel("公司网络连不上 GitHub 和备用服务器时，可以改装「完整版」安装包，它已内置识别组件。")
         hint.setWordWrap(True)
         hint.setObjectName("setNote")
