@@ -423,7 +423,9 @@ class ComponentDialog(QDialog):
         self._center.start(self.key)
 
     def _open_release(self) -> None:
-        QDesktopServices.openUrl(QUrl(RELEASE_PAGE))
+        from ..openx_source import release_page
+        from ..updater import is_frozen
+        QDesktopServices.openUrl(QUrl(release_page(is_frozen())))
 
     def _on_state(self, key: str) -> None:
         if key == self.key:

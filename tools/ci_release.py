@@ -232,7 +232,9 @@ def cmd_build(work: Path):
                 assert digest(block) == meta["hash"]
         env = dict(os.environ, PPTX_FINDER_DATA_DIR=str(out / ("frozen-" + edition)),
                    APPDATA=str(out / ("roaming-" + edition)), PYTHONIOENCODING="utf-8",
-                   PPTX_FINDER_SINGLETON_NAME="pptdoctor-release-selftest-" + edition)
+                   PPTX_FINDER_SINGLETON_NAME="pptdoctor-release-selftest-" + edition,
+                   # 打包版默认只走公司内源（2026-11-24）；构建机在公司外，自检下载组件要显式用外网源
+                   PPTX_FINDER_OPENX="0", PPTX_FINDER_UPDATE_EXTERNAL="1")
         for key in ("PPTUTOR_OCR_CMD", "PPTUTOR_FORMULA_CMD", "QT_QPA_PLATFORM"):
             env.pop(key, None)
         exe = dist / "PPT-Doctor.exe"
@@ -245,7 +247,7 @@ def cmd_build(work: Path):
         assert json.loads((out / (edition + "-gif") / "result.json").read_text("utf-8"))["passed"]
         run(edition + "-selftest", [exe, "--selftest", selftest_set, out / (edition + "-selftest.json")], env)
         assert json.loads((out / (edition + "-selftest.json")).read_text("utf-8"))["all_pass"]
-        # 基础版不带组件：这一步会真实联网下载识别组件（GitHub 优先、备用服务器兜底）
+        # 基础版不带组件：这一步会真实联网下载识别组件（构建机在公司外：GitHub 优先、备用服务器兜底）
         run(edition + "-text", [exe, "--imgtext", FIXTURES / "imgtext-clear_mixed.png",
                                 out / (edition + "-text.pptx"), "--install-component"], env)
         if edition == "full":

@@ -68,6 +68,19 @@ class SourceFailure(ValueError):
         self.reason = reason
 
 
+class IntegrityFailure(SourceFailure):
+    """收到的东西不对（大小 / SHA-256 不符，或内源被跳转到别的网站）。
+
+    和「连不上 / 没这个文件」不同：这说明源上的文件本身有问题。内源出这种错时
+    **不换到外网源接着下**——否则坏包被外网的好包盖过去，问题被悄悄掩盖（2026-11-24 田哥要求）。
+    """
+
+
+def stops_fallback(label: str, exc: BaseException) -> bool:
+    """内源的完整性失败到此为止，不回退到 GitHub / 备用服务器。"""
+    return label == "openx" and isinstance(exc, IntegrityFailure)
+
+
 class AllSourcesFailed(RuntimeError):
     """所有源都试过了。attempts 里有每个源的结果，界面逐条列出。"""
 
@@ -238,7 +251,7 @@ def check_response_is_not_page(response, expect_size: int | None, what: str = "�
             pass
         if looks_like_web_page(ctype, body):
             raise SourceFailure(f"收到 {fmt_bytes(len(body) or length)} 的网页而不是{what}，可能被公司代理拦截")
-        raise SourceFailure(
+        raise IntegrityFailure(
             f"文件大小不对：应为 {fmt_bytes(expect_size)}，服务器给的是 {fmt_bytes(length)}")
 
 
@@ -255,22 +268,32 @@ def download_file(url: str, dest: Path, *, expect_size: int | None, expect_sha25
     part = dest.with_name(dest.name + ".part")
     if cancel is not None and cancel():
         raise InterruptedError("下载已取消")
+    # url 可以是一个地址、按顺序拼接的几段地址（内源上被切片的大文件），或返回这两者的函数
+    # （内源附件地址要现查；查不到就算这个源失败，换下一个源）。
+    urls = url() if callable(url) else url
+    urls = [urls] if isinstance(urls, str) else list(urls)
+    if not urls:
+        raise SourceFailure(f"源上没有这个{what}")
     hasher = hashlib.sha256()
     received = 0
     head = b""
-    response = urllib.request.urlopen(url, timeout=timeout)
+    ctype = ""
+    out = None
     try:
-        with response as r:
-            if response_callback is not None:
-                response_callback(r)
-            check_response_is_not_page(r, expect_size, what)
-            headers = getattr(r, "headers", None)
-            ctype = ""
-            try:
-                ctype = (headers.get("Content-Type") if headers is not None else "") or ""
-            except AttributeError:
-                ctype = ""
-            with open(part, "wb") as out:
+        for i, one in enumerate(urls):
+            response = urllib.request.urlopen(one, timeout=timeout)
+            with response as r:
+                _refuse_offsite_redirect(one, r)
+                if response_callback is not None:
+                    response_callback(r)
+                check_response_is_not_page(r, expect_size if len(urls) == 1 else None, what)
+                headers = getattr(r, "headers", None)
+                try:
+                    ctype = (headers.get("Content-Type") if headers is not None else "") or ""
+                except AttributeError:
+                    ctype = ""
+                if out is None:
+                    out = open(part, "wb")
                 while True:
                     chunk = r.read(_BUF)
                     if not chunk:
@@ -279,7 +302,7 @@ def download_file(url: str, dest: Path, *, expect_size: int | None, expect_sha25
                         head = chunk[:256]
                     received += len(chunk)
                     if expect_size and received > expect_size:
-                        raise SourceFailure(
+                        raise IntegrityFailure(
                             f"收到的内容比应有的 {fmt_bytes(expect_size)} 还大，已停止")
                     out.write(chunk)
                     hasher.update(chunk)
@@ -287,20 +310,28 @@ def download_file(url: str, dest: Path, *, expect_size: int | None, expect_sha25
                         on_bytes(received)
                     if cancel is not None and cancel():
                         raise InterruptedError("下载已取消")
-        if response_callback is not None:
-            response_callback(None)
+            if response_callback is not None:
+                response_callback(None)
+        if out is not None:
+            out.close()
+            out = None
         if expect_size and received != expect_size:
             if received < _WEB_PAGE_MAX and looks_like_web_page(ctype, head):
                 raise SourceFailure(f"收到 {fmt_bytes(received)} 的网页而不是{what}，可能被公司代理拦截")
-            raise SourceFailure(
+            raise IntegrityFailure(
                 f"文件不完整：应为 {fmt_bytes(expect_size)}，只收到 {fmt_bytes(received)}")
         if hasher.hexdigest() != str(expect_sha256).lower():
             if received < _WEB_PAGE_MAX and looks_like_web_page(ctype, head):
                 raise SourceFailure(f"收到 {fmt_bytes(received)} 的网页而不是{what}，可能被公司代理拦截")
-            raise SourceFailure("文件校验不一致（内容在传输中被改动，或源上的文件不对）")
+            raise IntegrityFailure("文件校验不一致（内容在传输中被改动，或源上的文件不对）")
         os.replace(part, dest)
         return received
     except BaseException:
+        if out is not None:
+            try:
+                out.close()
+            except OSError:
+                pass
         try:
             part.unlink()
         except OSError:
@@ -308,12 +339,22 @@ def download_file(url: str, dest: Path, *, expect_size: int | None, expect_sha25
         raise
 
 
+def _refuse_offsite_redirect(requested: str, response) -> None:
+    """内源的附件只认内源自己的域名：被跳转到别处就当这个源失败（不从内源以外的地方收文件）。"""
+    from .openx_source import safe_url
+    if not safe_url(requested):
+        return
+    final = getattr(response, "geturl", lambda: requested)() or requested
+    if not safe_url(final):
+        raise IntegrityFailure("内源下载被跳转到内源以外的地址，已拒绝")
+
+
 def download_with_fallback(candidates: list[tuple[str, str]], dest: Path, *,
                            expect_size: int | None, expect_sha256: str,
                            timeout: float = 30, cancel=None, on_status=None,
                            on_attempts=None, response_callback=None,
                            what: str = "更新文件") -> tuple[Attempt, list[Attempt]]:
-    """candidates: [(label, url)] 按顺序。成功返回 (成功的 attempt, 全部 attempts)。
+    """candidates: [(label, url)] 按顺序（url 的几种写法见 download_file）。成功返回 (成功的 attempt, 全部 attempts)。
 
     on_status(dict) 收进度快照（含源名、已收/总、速度、剩余秒数）；on_attempts(list[dict])
     在每个源开始/结束时收到全部源的结果。全部失败抛 AllSourcesFailed。
@@ -327,7 +368,7 @@ def download_with_fallback(candidates: list[tuple[str, str]], dest: Path, *,
     for label, url in candidates:
         if cancel is not None and cancel():
             raise InterruptedError("下载已取消")
-        attempt = Attempt(label=label, name=source_name(label), url=url)
+        attempt = Attempt(label=label, name=source_name(label), url=url if isinstance(url, str) else "")
         attempts.append(attempt)
         _emit()
         meter = ProgressMeter(expect_size or 0, attempt.name)
@@ -345,9 +386,12 @@ def download_with_fallback(candidates: list[tuple[str, str]], dest: Path, *,
             attempt.finish("cancelled", "已取消")
             _emit()
             raise
-        except Exception as exc:  # noqa: BLE001 一个源的任何问题都换下一个
+        except Exception as exc:  # noqa: BLE001 一个源的问题换下一个（内源完整性失败除外）
             attempt.finish("failed", reason_of(exc))
             _emit()
+            if stops_fallback(label, exc):
+                raise AllSourcesFailed(f"下载{what}（内源文件没通过校验，为安全起见不改用外网源）",
+                                       attempts) from exc
             continue
         attempt.finish("ok", "", n)
         _emit()

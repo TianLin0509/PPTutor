@@ -236,19 +236,62 @@ COMPONENT_FALLBACK_URL = (
     "https://github.com/TianLin0509/PPTutor/releases/download/ocr-v1.2.0")
 
 
+#: 内源上的组件「源地址」只是个记号：真实附件地址按版本名 ppt-doctor-<组件>-<版本> 现查（openx_source）。
+OPENX_BASE = "openx:"
+
+
 def component_sources(kind: str = "ocr", github_base: str = COMPONENT_FALLBACK_URL
                       ) -> list[tuple[str, str]]:
-    """[(label, base_url)] 按尝试顺序。显式改了更新地址（测试/灰度）时它排最前。"""
+    """[(label, base_url)] 按尝试顺序。
+
+    2026-11-24 田哥定：打包版默认只走公司内源；GitHub / 备用服务器只在设置里打开
+    「允许外网更新源」后才加上（和软件更新同一个开关，见 openx_source.external_allowed）。
+    显式改了更新地址（测试/灰度）时它照旧排在外网源最前。
+    """
     from .config import update_base_url
-    from .updater import _is_default_base
+    from .openx_source import enabled, external_allowed
+    from .updater import _is_default_base, is_frozen
+    frozen = is_frozen()
+    first = [("openx", OPENX_BASE + kind)] if enabled(frozen) else []
     hosted_root = update_base_url().split(";")[0].rstrip("/")
+    explicit = not _is_default_base(hosted_root)
     hosted = ("self-hosted", hosted_root + "/" + kind)
     github = ("github-release", github_base)
+    if not external_allowed(frozen):
+        return first + ([hosted] if explicit else [])
     if os.environ.get("PPTX_FINDER_UPDATE_NO_GITHUB", "").strip() in ("1", "true", "yes"):
-        return [hosted]
-    if _is_default_base(hosted_root):
-        return [github, hosted]
-    return [hosted, github]
+        return first + [hosted]
+    if not explicit:
+        return first + [github, hosted]
+    return first + [hosted, github]
+
+
+def _open_manifest(base: str, timeout: float):
+    """打开某个源上的 component.json；内源要先按版本名查出附件地址，且不跟随跳出内源的跳转。"""
+    import urllib.request
+    if base.startswith(OPENX_BASE):
+        from .netfetch import IntegrityFailure
+        from .openx_source import component_manifest_url, safe_url
+        from .updater import _OpenxOnlyRedirect
+        url = component_manifest_url(base[len(OPENX_BASE):], timeout=min(timeout, 6.0))
+        req = urllib.request.Request(url, headers={"Cache-Control": "no-cache"})
+        response = urllib.request.build_opener(_OpenxOnlyRedirect).open(req, timeout=timeout)
+        if not safe_url(getattr(response, "geturl", lambda: url)() or url):
+            response.close()
+            raise IntegrityFailure("公司内源的组件清单被跳转到了别的网站，已拒绝")
+        return response
+    req = urllib.request.Request(base + "/" + COMPONENT_MANIFEST, headers={"Cache-Control": "no-cache"})
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def archive_url(base: str, version: str, archive_name: str):
+    """某个源上的组件压缩包地址。内源返回一个现查地址的函数（可能是几段切片），
+    交给 netfetch.download_file 在下载那一刻再查，查不到就算这个源失败。"""
+    if base.startswith(OPENX_BASE):
+        from .openx_source import component_archive_urls
+        kind = base[len(OPENX_BASE):]
+        return lambda: component_archive_urls(kind, version, archive_name)
+    return base + "/" + archive_name
 
 
 def component_base_urls() -> list[str]:
@@ -269,16 +312,14 @@ def fetch_manifest_from_sources(sources: list[tuple[str, str]], timeout: float =
     import json as _json
     import urllib.request
 
-    from .netfetch import SourceFailure, looks_like_web_page, reason_of, source_name
+    from .netfetch import SourceFailure, looks_like_web_page, reason_of, source_name,         stops_fallback
     from .updater import _ver_tuple
 
     found = []
     checks = []
     for label, base in sources:
         try:
-            req = urllib.request.Request(base + "/" + COMPONENT_MANIFEST,
-                                         headers={"Cache-Control": "no-cache"})
-            with urllib.request.urlopen(req, timeout=timeout) as response:
+            with _open_manifest(base, timeout) as response:
                 raw = response.read(4 * 1024 * 1024)
                 headers = getattr(response, "headers", None)
             ctype = ""
@@ -288,19 +329,35 @@ def fetch_manifest_from_sources(sources: list[tuple[str, str]], timeout: float =
                 pass
             if looks_like_web_page(ctype, raw):
                 raise SourceFailure("收到的是网页而不是组件清单，可能被公司代理拦截")
-            data = _json.loads(raw.decode("utf-8"))
+            from .netfetch import IntegrityFailure
+            bad = IntegrityFailure if label == "openx" else SourceFailure
+            try:
+                data = _json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError) as e:
+                raise bad(f"组件清单无效：{e}"[:120]) from e
             if not (isinstance(data, dict) and data.get("files")):
-                raise SourceFailure("组件清单无效")
+                raise bad("组件清单无效")
             found.append((label, base, data))
             checks.append({"label": label, "name": source_name(label), "ok": True,
                            "version": str(data.get("version", "")), "reason": ""})
         except Exception as exc:      # noqa: BLE001 逐个源试，全部失败才抛
             reason = reason_of(exc)
+            log.info("%s清单取不到（%s）：%s", what, base, reason)
+            if stops_fallback(label, exc):
+                # 内源给的清单不对（被跳到外网等）：停在这里，不拿外网源的清单顶替
+                err = OcrUnavailable(f"{what}清单没通过校验：公司内源：{reason}。为安全起见不改用外网源")
+                err.checks = checks + [{"label": label, "name": source_name(label), "ok": False,
+                                        "version": "", "reason": reason}]
+                raise err from exc
+            if label == "openx" and len(sources) > 1:
+                # 用户打开了外网源（多半在公司外）：连不上内源是常态，不在界面上列成失败
+                continue
             checks.append({"label": label, "name": source_name(label), "ok": False,
                            "version": "", "reason": reason})
-            log.info("%s清单取不到（%s）：%s", what, base, reason)
     if not found:
         detail = "；".join(f"{c['name']}：{c['reason']}" for c in checks)
+        if checks and all(c["label"] == "openx" for c in checks):
+            detail += "。在公司网络里请稍后重试；在公司外，可在「设置 → 常规」打开「允许外网更新源」"
         err = OcrUnavailable(f"{what}清单不可达：{detail}")
         err.checks = checks  # 界面逐个源列出原因
         raise err
@@ -384,7 +441,8 @@ def install(manifest: dict | None = None, *, progress=None, cancel=None,
                 known = dict((b, label) for label, b in component_sources())
                 bases = ([(known.get(first, "self-hosted"), first)] if first else []) + [
                     item for item in component_sources() if item[1] != first]
-            candidates = [(label, base + "/" + archive_name) for label, base in bases]
+            version = str(manifest.get("version", ""))
+            candidates = [(label, archive_url(base, version, archive_name)) for label, base in bases]
             size = int(archive_meta.get("size", 0)) or None
 
             def _status(st):

@@ -39,6 +39,10 @@ class OpenxUnavailable(RuntimeError):
     """内源连不上 / 没有这份文件。"""
 
 
+PAGE_URL = "https://openx.huawei.com/PPT-Doctor/download"   # 内源下载页（手动下载安装包用）
+EXTERNAL_SETTING = "update_external_sources"                  # ui.json 里「允许外网更新源」开关
+
+
 def enabled(frozen: bool) -> bool:
     """PPTX_FINDER_OPENX=0 关、=1 开；默认只在打包版里开（单测和开发环境不碰网络）。"""
     v = os.environ.get("PPTX_FINDER_OPENX", "").strip()
@@ -47,6 +51,40 @@ def enabled(frozen: bool) -> bool:
     if v == "1":
         return True
     return bool(frozen)
+
+
+def external_allowed(frozen: bool) -> bool:
+    """GitHub / 备用服务器（阿里云）这两个外网源用不用。
+
+    2026-11-24 田哥定：公司里默认**只走内源**，检查更新、下载更新、下载组件都不碰外网。
+    外网源只在两种情况下启用：
+    - 用户在设置里手动打开「允许外网更新源」（在公司外用、连不上内源时，界面就地给一键按钮）；
+    - 内源本身被关掉（开发环境、单测，或 PPTX_FINDER_OPENX=0），否则就没有任何源了。
+    PPTX_FINDER_UPDATE_EXTERNAL=1/0 可强制开关（测试用）。
+    """
+    v = os.environ.get("PPTX_FINDER_UPDATE_EXTERNAL", "").strip()
+    if v in ("1", "0"):
+        return v == "1"
+    if not enabled(frozen):
+        return True
+    try:
+        from .config import load_ui_settings
+        return bool(load_ui_settings().get(EXTERNAL_SETTING, False))
+    except Exception:  # noqa: BLE001 读不到设置按默认（只走内源）
+        return False
+
+
+GITHUB_PAGE = "https://github.com/TianLin0509/PPTutor/releases/latest"
+
+
+def release_page(frozen: bool) -> str:
+    """「手动下载」打开的页面：默认内源下载页；打开了外网源才给 GitHub 发布页。"""
+    return GITHUB_PAGE if external_allowed(frozen) else PAGE_URL
+
+
+def set_external_allowed(on: bool) -> None:
+    from .config import update_ui_settings
+    update_ui_settings(**{EXTERNAL_SETTING: bool(on)})
 
 
 def _ver_key(name: str) -> tuple:
@@ -117,11 +155,11 @@ class OpenxIndex:
             self._list_at = self._clock()
             return self._list
 
-    def update_releases(self, timeout: float = LIST_TIMEOUT) -> list:
-        """本产品的更新版本，新到旧。"""
-        out = [r for r in self.releases(timeout) if str(r.get("version", "")).startswith(RELEASE_PREFIX)
-               and re.fullmatch(r"\d+\.\d+\.\d+", str(r["version"])[len(RELEASE_PREFIX):])]
-        return sorted(out, key=lambda r: _ver_key(str(r["version"])[len(RELEASE_PREFIX):]), reverse=True)
+    def update_releases(self, timeout: float = LIST_TIMEOUT, prefix: str = RELEASE_PREFIX) -> list:
+        """某一类版本（默认本产品的更新版本；组件用 ppt-doctor-<组件>-），新到旧。"""
+        out = [r for r in self.releases(timeout) if str(r.get("version", "")).startswith(prefix)
+               and re.fullmatch(r"\d+\.\d+\.\d+", str(r["version"])[len(prefix):])]
+        return sorted(out, key=lambda r: _ver_key(str(r["version"])[len(prefix):]), reverse=True)
 
     def files_of(self, rec: dict, timeout: float = LIST_TIMEOUT) -> dict:
         rid = rec["id"]
@@ -144,16 +182,26 @@ class OpenxIndex:
         return files
 
     # ---- 查找 ----
-    def latest_file(self, name: str, timeout: float = LIST_TIMEOUT) -> tuple[str, str]:
+    def latest_file(self, name: str, timeout: float = LIST_TIMEOUT,
+                    prefix: str = RELEASE_PREFIX) -> tuple[str, str]:
         """最新一个更新版本里的某个附件（版本清单用）。返回 (url, 版本号)。"""
-        rels = self.update_releases(timeout)
+        rels = self.update_releases(timeout, prefix)
         if not rels:
-            raise OpenxUnavailable("内源上还没有 PPT Doctor 更新")
+            raise OpenxUnavailable("内源上还没有 PPT Doctor 更新" if prefix == RELEASE_PREFIX
+                                   else f"内源上还没有 {prefix}*")
         rec = rels[0]
         url = self.files_of(rec, timeout).get(name.lower())
         if not url:
             raise OpenxUnavailable(f"内源最新版本里没有 {name}")
-        return url, str(rec["version"])[len(RELEASE_PREFIX):]
+        return url, str(rec["version"])[len(prefix):]
+
+    def release_files(self, prefix: str, version: str, timeout: float = LIST_TIMEOUT) -> dict:
+        """指定版本（如 ppt-doctor-ocr-1.2.0）的全部附件 {小写文件名: url}。"""
+        want = prefix + str(version)
+        for rec in self.update_releases(timeout, prefix):
+            if str(rec.get("version")) == want:
+                return self.files_of(rec, timeout)
+        raise OpenxUnavailable(f"内源上没有 {want}")
 
     def find(self, name: str, timeout: float = LIST_TIMEOUT) -> str:
         """在各更新版本里按附件名找（新到旧）；找不到抛 OpenxUnavailable。"""
@@ -178,11 +226,12 @@ class MultiIndex:
     def __init__(self, indexes):
         self.indexes = list(indexes)
 
-    def latest_file(self, name: str, timeout: float = LIST_TIMEOUT) -> tuple[str, str]:
+    def latest_file(self, name: str, timeout: float = LIST_TIMEOUT,
+                    prefix: str = RELEASE_PREFIX) -> tuple[str, str]:
         best, errors = None, []
         for idx in self.indexes:
             try:
-                url, ver = idx.latest_file(name, timeout)
+                url, ver = idx.latest_file(name, timeout, prefix)
             except OpenxUnavailable as e:
                 errors.append(str(e))
                 continue
@@ -192,6 +241,15 @@ class MultiIndex:
             raise OpenxUnavailable(errors[0] if errors else "内源上还没有 PPT Doctor 更新")
         return best
 
+    def release_files(self, prefix: str, version: str, timeout: float = LIST_TIMEOUT) -> dict:
+        errors = []
+        for idx in self.indexes:
+            try:
+                return idx.release_files(prefix, version, timeout)
+            except OpenxUnavailable as e:
+                errors.append(str(e))
+        raise OpenxUnavailable(errors[0] if errors else f"内源上没有 {prefix}{version}")
+
     def find(self, name: str, timeout: float = LIST_TIMEOUT) -> str:
         errors = []
         for idx in self.indexes:
@@ -200,6 +258,32 @@ class MultiIndex:
             except OpenxUnavailable as e:
                 errors.append(str(e))
         raise OpenxUnavailable(errors[0] if errors else f"内源上没有 {name}")
+
+
+def component_prefix(kind: str) -> str:
+    """组件在内源上的版本名前缀：ppt-doctor-ocr- / ppt-doctor-formula- / ppt-doctor-materials-。"""
+    return f"ppt-doctor-{kind}-"
+
+
+def component_manifest_url(kind: str, timeout: float = LIST_TIMEOUT, index=None) -> str:
+    url, _ver = (index or INDEX).latest_file("component.json", timeout, component_prefix(kind))
+    return url
+
+
+def component_archive_urls(kind: str, version: str, archive: str, timeout: float = LIST_TIMEOUT,
+                           index=None) -> list:
+    """组件压缩包的下载地址：整包一个地址；超过内源单附件上限被切片的，按 .000、.001… 顺序给出
+    （下载时拼回，整体核 sha256）。"""
+    files = (index or INDEX).release_files(component_prefix(kind), version, timeout)
+    key = archive.lower()
+    if key in files:
+        return [files[key]]
+    parts = []
+    while f"{key}.{len(parts):03d}" in files:
+        parts.append(files[f"{key}.{len(parts):03d}"])
+    if not parts:
+        raise OpenxUnavailable(f"内源上的 {component_prefix(kind)}{version} 里没有 {archive}")
+    return parts
 
 
 INDEX = MultiIndex(OpenxIndex(project_id=pid) for pid in PROJECT_IDS)

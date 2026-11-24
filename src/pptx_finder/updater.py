@@ -27,6 +27,7 @@ import time
 import urllib.error
 import urllib.request
 import zipfile
+import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -141,13 +142,19 @@ def update_sources(base_url: str, *, edition='full') -> list[UpdateSource]:
         # 落后好几版的用户需要的块可能没随最新一版发布，那时回落到整包。
         package_url=GITHUB_RELEASE_LATEST + "/PPT-Doctor-v{version}" + suffix + '.zip',
     )
-    # 2026-11-23 田哥定：公司内源排第一（和 AI HUB 一样）。公司里内源 20 MB/s 以上，GitHub 常常很慢；
-    # 公司外连不上内源，查版本时这一项静默略过、5 分钟内不再试。
-    from .openx_source import enabled as _openx_enabled
-    first = [openx_source(edition)] if _openx_enabled(is_frozen()) else []
+    # 2026-11-23 田哥定：公司内源排第一（和 AI HUB 一样）。公司里内源 20 MB/s 以上，GitHub 常常很慢。
+    # 2026-11-24 田哥定：打包版默认**只走内源**——GitHub 和备用服务器（阿里云）连问都不问；
+    # 只有用户在设置里打开「允许外网更新源」（或内源被关掉的开发/单测环境）才加上。
+    # 显式给了别的地址（PPTX_FINDER_UPDATE_URL，测试/灰度）时照旧用它。
+    from .openx_source import enabled as _openx_enabled, external_allowed
+    frozen = is_frozen()
+    first: list[UpdateSource] = [openx_source(edition)] if _openx_enabled(frozen) else []
+    explicit = bool(bases) and not all(_is_default_base(b) for b in bases)
+    if not external_allowed(frozen):
+        return first + (hosted if explicit else [])
     if os.environ.get("PPTX_FINDER_UPDATE_NO_GITHUB", "").strip() in ("1", "true", "yes"):
         return first + hosted
-    if bases and all(_is_default_base(b) for b in bases):
+    if not explicit and bases:
         return first + [github] + hosted
     return first + hosted + [github]
 
@@ -342,8 +349,21 @@ def fetch_manifest_from(
     timeout: float = _CHECK_TIMEOUT,
     response_callback=None,
 ) -> dict:
-    url = source.manifest_target(timeout) if isinstance(source, OpenxSource) else source.manifest_url
-    return _fetch_manifest_url(url, timeout, response_callback)
+    if isinstance(source, OpenxSource):
+        return _fetch_manifest_url(source.manifest_target(timeout), timeout, response_callback,
+                                   openx=True)
+    return _fetch_manifest_url(source.manifest_url, timeout, response_callback)
+
+
+class _OpenxOnlyRedirect(urllib.request.HTTPRedirectHandler):
+    """内源内部的跳转照常跟；要跳到内源以外的网站就在发请求之前拒绝。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
+        from .netfetch import IntegrityFailure
+        from .openx_source import safe_url
+        if not safe_url(newurl):
+            raise IntegrityFailure("公司内源的版本清单被跳转到了别的网站，已拒绝")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 def fetch_remote_manifest(
@@ -359,10 +379,19 @@ def _fetch_manifest_url(
     url: str,
     timeout: float = _CHECK_TIMEOUT,
     response_callback=None,
+    openx: bool = False,
 ) -> dict:
-    from .netfetch import SourceFailure, fmt_bytes, looks_like_web_page
+    from .netfetch import IntegrityFailure, SourceFailure, fmt_bytes, looks_like_web_page
     req = urllib.request.Request(url, headers={"Cache-Control": "no-cache"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    if openx:
+        opened = urllib.request.build_opener(_OpenxOnlyRedirect).open(req, timeout=timeout)
+    else:
+        opened = urllib.request.urlopen(req, timeout=timeout)
+    with opened as r:
+        if openx:
+            from .openx_source import safe_url
+            if not safe_url(getattr(r, "geturl", lambda: url)() or url):
+                raise IntegrityFailure("公司内源的版本清单被跳转到了别的网站，已拒绝")
         if response_callback is not None:
             response_callback(r)
         try:
@@ -377,12 +406,13 @@ def _fetch_manifest_url(
             ctype = ""
     if looks_like_web_page(ctype, raw):
         raise SourceFailure(f"收到的是网页（{fmt_bytes(len(raw))}）而不是版本清单，可能被公司代理拦截")
+    bad = IntegrityFailure if openx else SourceFailure   # 内源的清单内容不对：不许拿外网顶替
     try:
         data = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError) as e:
-        raise SourceFailure(f"版本清单无效：{e}"[:120]) from e
+        raise bad(f"版本清单无效：{e}"[:120]) from e
     if not isinstance(data, dict):
-        raise SourceFailure("版本清单无效：不是 JSON 对象")
+        raise bad("版本清单无效：不是 JSON 对象")
     return data
 
 
@@ -396,6 +426,7 @@ class SourceCheck:
     version: str = ""
     reason: str = ""
     ms: int = 0
+    integrity: bool = False   # 内源给的东西没通过校验（不是连不上）：不许拿外网源顶替
 
     def as_dict(self) -> dict:
         return {"label": self.label, "name": self.name, "ok": self.ok,
@@ -410,9 +441,13 @@ class CheckReport:
     checks: list
     current: str = ""
     error: str = ""          # 全部源都连不上 / 未打包等，给界面的人话
+    openx_only_failed: bool = False   # 只走内源且内源连不上：界面就地给「改用外网更新源」
+    blocked: bool = False   # 本次按失败处理（内源清单没通过校验 / 一个源都没启用），哪怕有外网源答了
 
     @property
     def all_failed(self) -> bool:
+        if self.blocked:
+            return True
         return bool(self.checks) and not any(c.ok for c in self.checks)
 
 
@@ -427,8 +462,8 @@ def _check_final_host(source, response) -> None:
             response.close()
         except Exception:  # noqa: BLE001
             pass
-        from .netfetch import SourceFailure
-        raise SourceFailure("公司内源的下载被跳转到了别的网站，已停止")
+        from .netfetch import IntegrityFailure
+        raise IntegrityFailure("公司内源的下载被跳转到了别的网站，已停止")
 
 
 def download_delta(base_url: str, info: UpdateInfo, staging: Path,
@@ -447,8 +482,8 @@ def download_delta(base_url: str, info: UpdateInfo, staging: Path,
     staging.mkdir(parents=True, exist_ok=True)
     total = info.total_bytes
     done = 0
-    from .netfetch import SourceFailure, check_response_is_not_page, fmt_bytes, \
-        looks_like_web_page
+    from .netfetch import IntegrityFailure, SourceFailure, check_response_is_not_page, \
+        fmt_bytes, looks_like_web_page
     for rel, h, _size in info.changed:
         if cancel is not None and cancel():
             raise InterruptedError("下载已取消")
@@ -499,7 +534,7 @@ def download_delta(base_url: str, info: UpdateInfo, staging: Path,
         if got != h:
             if got_bytes < 256 * 1024 and looks_like_web_page("", head):
                 raise SourceFailure(f"收到 {fmt_bytes(got_bytes)} 的网页而不是更新文件，可能被公司代理拦截")
-            raise ValueError(f"哈希校验失败 {rel}：期望 {h[:12]}… 实得 {got[:12]}…")
+            raise IntegrityFailure(f"哈希校验失败 {rel}：期望 {h[:12]}… 实得 {got[:12]}…")
     if info.raw:
         (staging / MANIFEST_NAME).write_text(
             json.dumps(info.raw, ensure_ascii=False), encoding="utf-8")
@@ -540,24 +575,13 @@ def download_package(info: UpdateInfo, staging: Path,
             done += len(chunk)
             if progress:
                 progress(done, total or done)
+    from .netfetch import IntegrityFailure
     try:
-        with zipfile.ZipFile(tmp) as z:
-            names = {n.replace("\\", "/"): n for n in z.namelist()}
-            # 包内是 PPT-Doctor/<relpath>；剥掉这一层顶层目录
-            roots = {n.split("/", 1)[0] for n in names if "/" in n}
-            prefix = (roots.pop() + "/") if len(roots) == 1 else ""
-            for rel, want_hash in wanted.items():
-                member = names.get(prefix + rel)
-                if member is None:
-                    raise ValueError(f"整包里缺少 {rel}")
-                dest = staging / rel          # rel 已过 safe_relpath，无法越界
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                data = z.read(member)
-                got = hashlib.sha256(data).hexdigest()
-                if got != want_hash:
-                    raise ValueError(
-                        f"哈希校验失败 {rel}：期望 {want_hash[:12]}… 实得 {got[:12]}…")
-                dest.write_bytes(data)
+        try:
+            _extract_package(tmp, wanted, staging)
+        except (zipfile.BadZipFile, zlib.error, EOFError, NotImplementedError, RuntimeError) as e:
+            # 打开、读目录、逐个解压任何一步坏了，都是包本身不对：不许换外网源顶替
+            raise IntegrityFailure(f"整包损坏（{type(e).__name__}: {e}）"[:160]) from e
     finally:
         try:
             tmp.unlink()
@@ -567,6 +591,28 @@ def download_package(info: UpdateInfo, staging: Path,
         (staging / MANIFEST_NAME).write_text(
             json.dumps(info.raw, ensure_ascii=False), encoding="utf-8")
     return staging
+
+
+def _extract_package(tmp: Path, wanted: dict, staging: Path) -> None:
+    """只解出 wanted 里的文件，逐个核 sha256。"""
+    from .netfetch import IntegrityFailure
+    with zipfile.ZipFile(tmp) as z:
+        names = {n.replace("\\", "/"): n for n in z.namelist()}
+        # 包内是 PPT-Doctor/<relpath>；剥掉这一层顶层目录
+        roots = {n.split("/", 1)[0] for n in names if "/" in n}
+        prefix = (roots.pop() + "/") if len(roots) == 1 else ""
+        for rel, want_hash in wanted.items():
+            member = names.get(prefix + rel)
+            if member is None:
+                raise IntegrityFailure(f"整包里缺少 {rel}")
+            dest = staging / rel          # rel 已过 safe_relpath，无法越界
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            data = z.read(member)
+            got = hashlib.sha256(data).hexdigest()
+            if got != want_hash:
+                raise IntegrityFailure(
+                    f"哈希校验失败 {rel}：期望 {want_hash[:12]}… 实得 {got[:12]}…")
+            dest.write_bytes(data)
 
 
 def download_update(base_url: str, info: UpdateInfo, staging: Path,
@@ -582,7 +628,7 @@ def download_update(base_url: str, info: UpdateInfo, staging: Path,
     on_attempts(list[dict])：每个源开始/结束时，全部源的结果（给弹窗的源列表）。
     全部源失败抛 netfetch.AllSourcesFailed（消息里逐个列出原因）。
     """
-    from .netfetch import AllSourcesFailed, Attempt, ProgressMeter, reason_of
+    from .netfetch import AllSourcesFailed, Attempt, ProgressMeter, reason_of, stops_fallback
 
     sources = list(info.sources or [])
     if not sources:
@@ -633,6 +679,11 @@ def download_update(base_url: str, info: UpdateInfo, staging: Path,
         except Exception as exc:  # noqa: BLE001 这个源不行，记下原因换下一个
             attempt.finish("failed", reason_of(exc))
             _emit()
+            if stops_fallback(source.label, exc):
+                # 内源的文件没通过校验：停下报错，不拿外网的包顶替（半截文件不留给 helper）
+                shutil.rmtree(staging, ignore_errors=True)
+                raise AllSourcesFailed("下载更新（内源文件没通过校验，为安全起见不改用外网源）",
+                                       attempts) from exc
             continue
         attempt.finish("ok", "", meter.received or info.total_bytes)
         info.used_source = source
@@ -934,7 +985,7 @@ def check_sources(
     from concurrent.futures import ThreadPoolExecutor
     import time as _time
 
-    from .netfetch import reason_of
+    from .netfetch import IntegrityFailure, reason_of
 
     if not is_frozen():
         return CheckReport(best=None, checks=[], error="开发环境不检查更新")
@@ -946,6 +997,10 @@ def check_sources(
     # Its marker is authoritative; the manifest only supplies hashes/version.
     edition = current_edition()
     sources = update_sources(base_url, edition=edition)
+    if not sources:
+        # 内源被关掉、外网源也被强制关掉：一个源都没问，不能显示成「已是最新」
+        return CheckReport(best=None, checks=[], current=str(local.get("version", "")), blocked=True,
+                           error="没有启用任何更新源（公司内源和外网源都被关掉了），本次没有检查")
 
     def _one(source):
         started = _time.monotonic()
@@ -963,12 +1018,23 @@ def check_sources(
             reason = "更新包版本类型与当前安装不符" if isinstance(exc, UnsafeManifestError) \
                 else reason_of(exc)
             return source, None, SourceCheck(source.label, source.name, False, reason=reason,
-                                             ms=int((_time.monotonic() - started) * 1000))
+                                             ms=int((_time.monotonic() - started) * 1000),
+                                             integrity=isinstance(exc, IntegrityFailure))
 
     with ThreadPoolExecutor(max_workers=max(1, len(sources))) as pool:
         results = list(pool.map(_one, sources))
-    # 公司外连不上内源是常态，不在源列表里显示成一条失败（真正下载时也不会选它）
-    results = [(s, i, c) for s, i, c in results if c.ok or s.label != "openx"]
+    from .openx_source import external_allowed
+    external = external_allowed(is_frozen())
+    bad = next((c for _s, _i, c in results if c.label == "openx" and c.integrity), None)
+    if bad is not None:
+        # 内源的清单没通过校验（比如被跳转到外网）：整次检查停在这里，不拿外网源的结果顶替
+        return CheckReport(best=None, checks=[c for _s, _i, c in results],
+                           current=str(local.get("version", "")), blocked=True,
+                           error="公司内源返回的版本清单没通过校验（" + bad.reason
+                                 + "），为安全起见本次不更新，也不改用外网源。")
+    if external and any(s.label != "openx" for s in sources):
+        # 用户自己打开了外网源（多半在公司外）：连不上内源是常态，不显示成一条失败
+        results = [(s, i, c) for s, i, c in results if c.ok or s.label != "openx"]
     checks = [c for _s, _i, c in results]
     best: UpdateInfo | None = None
     for source, info, _check in results:
@@ -984,7 +1050,12 @@ def check_sources(
         best.checks = checks
     report = CheckReport(best=best, checks=checks, current=str(local.get("version", "")))
     if report.all_failed:
-        report.error = "所有更新源都连不上：" + "；".join(f"{c.name}：{c.reason}" for c in checks)
+        if not external and checks and all(c.label == "openx" for c in checks):
+            report.openx_only_failed = True
+            report.error = ("连不上公司内源（" + checks[0].reason + "）。在公司网络里请稍后重试；"
+                            "在公司外，可点「改用外网更新源」从 GitHub / 备用服务器更新。")
+        else:
+            report.error = "所有更新源都连不上：" + "；".join(f"{c.name}：{c.reason}" for c in checks)
     return report
 
 
