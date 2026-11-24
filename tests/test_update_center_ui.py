@@ -92,7 +92,7 @@ def test_dialog_renders_every_phase(qtbot, fresh_settings):
     # 查询中
     ctl._state = "checking"
     dlg.refresh()
-    assert "正在向各个更新源查询" in dlg.msg.text()
+    assert "正在查询最新版本" in dlg.msg.text()
     _shot(dlg, "02-查询中")
 
     # 有新版本
@@ -249,3 +249,31 @@ def test_announce_last_result_toasts_once(qtbot, fresh_settings, monkeypatch, tm
     assert ctl.announce_last_result(toasts.append) == "✅ 已更新到 v2.0.0"
     assert ctl.announce_last_result(toasts.append) == ""
     assert toasts == ["✅ 已更新到 v2.0.0"]
+
+
+def test_openx_unreachable_offers_one_click_external(qtbot, fresh_settings, monkeypatch):
+    """2026-11-24：默认只走内源；连不上时就地给「改用外网更新源」，点一下打开开关并立即重查。"""
+    from pptx_finder import openx_source
+    monkeypatch.setenv("PPTX_FINDER_OPENX", "1")
+    monkeypatch.delenv("PPTX_FINDER_UPDATE_EXTERNAL", raising=False)
+    parent = QWidget()
+    qtbot.addWidget(parent)
+    ctl, _chip = _ctl(qtbot, parent)
+    dlg = UpdateDialog(ctl, parent)
+    qtbot.addWidget(dlg)
+    rep = updater.CheckReport(best=None, checks=[updater.SourceCheck(
+        "openx", "公司内源", False, "", "找不到服务器（域名解析失败），可能需要代理或网络不通")], current="2.1.14")
+    rep.openx_only_failed = True
+    rep.error = "连不上公司内源（找不到服务器）。在公司外，可点「改用外网更新源」从 GitHub / 备用服务器更新。"
+    ctl._state = "checking"
+    ctl._on_report(rep)
+    ctl._on_check_failed(rep.error)
+    dlg.refresh()
+    assert dlg.phase_rendered == "error"
+    assert dlg.btn_external.isVisibleTo(dlg) and dlg.btn_manual.text() == "打开内源下载页"
+    assert ctl.snapshot()["release_page"] == openx_source.PAGE_URL
+    _shot(dlg, "07-内源连不上")
+    started = []
+    monkeypatch.setattr(type(ctl), "start_check", lambda self, manual=False: started.append(manual))
+    dlg.btn_external.click()
+    assert openx_source.external_allowed(True) is True and started == [True]

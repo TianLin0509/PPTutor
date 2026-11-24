@@ -81,15 +81,37 @@ def test_unreachable_is_remembered_so_outside_users_are_not_slowed_down():
     assert len(op.calls) == n                     # 5 分钟内不再真去连
 
 
-def test_openx_is_first_source_only_when_enabled(monkeypatch):
+@pytest.fixture
+def ui_settings(monkeypatch):
+    """每个用例一份干净的 ui.json（外网源开关存在这里）。"""
+    store = {}
+    from pptx_finder import config
+    monkeypatch.setattr(config, "load_ui_settings", lambda: dict(store))
+    monkeypatch.setattr(config, "update_ui_settings", lambda **kw: store.update(kw))
+    monkeypatch.delenv("PPTX_FINDER_UPDATE_EXTERNAL", raising=False)
+    return store
+
+
+def test_openx_is_the_only_source_by_default(monkeypatch, ui_settings):
+    """2026-11-24 田哥定：打包版默认只走内源，GitHub / 备用服务器连问都不问。"""
     base = "https://me.lt-stockpartner.tech/pptutor"
     monkeypatch.setattr(updater, "_is_default_base", lambda b: True)
-    monkeypatch.setenv("PPTX_FINDER_OPENX", "0")
+    monkeypatch.setenv("PPTX_FINDER_OPENX", "0")                      # 内源关掉（开发/单测）：只剩外网源
     assert [s.label for s in updater.update_sources(base)] == ["github-release", "self-hosted"]
     monkeypatch.setenv("PPTX_FINDER_OPENX", "1")
     srcs = updater.update_sources(base, edition="base")
-    assert [s.label for s in srcs] == ["openx", "github-release", "self-hosted"]
+    assert [s.label for s in srcs] == ["openx"]
     assert srcs[0].name == "公司内源" and srcs[0].manifest_file == "manifest-Base.json"
+    openx_source.set_external_allowed(True)                            # 用户手动打开外网源
+    assert [s.label for s in updater.update_sources(base)] == ["openx", "github-release", "self-hosted"]
+    openx_source.set_external_allowed(False)
+    assert [s.label for s in updater.update_sources(base)] == ["openx"]
+
+
+def test_explicit_test_url_is_still_honoured_without_external(monkeypatch, ui_settings):
+    monkeypatch.setenv("PPTX_FINDER_OPENX", "1")
+    srcs = updater.update_sources("http://127.0.0.1:8765/pptutor")
+    assert [s.label for s in srcs] == ["openx", "self-hosted"]         # 显式地址照用，GitHub 不加
 
 
 def _two_manifests():
@@ -98,31 +120,119 @@ def _two_manifests():
     return local, remote
 
 
-def test_check_uses_openx_first_and_hides_it_when_unreachable(monkeypatch):
+def test_check_only_asks_openx_and_never_falls_back_silently(monkeypatch, ui_settings):
     local, remote = _two_manifests()
     monkeypatch.setenv("PPTX_FINDER_OPENX", "1")
     monkeypatch.setattr(updater, "is_frozen", lambda: True)
     monkeypatch.setattr(updater, "local_manifest", lambda: local)
+    asked = []
 
     def fake_fetch(source, timeout=8, response_callback=None):
+        asked.append(source.label)
         if source.label == "openx":
             if fake_fetch.openx_down:
                 raise openx_source.OpenxUnavailable("公司内源连不上")
             return remote
-        return dict(remote) if source.label == "github-release" else {"version": "2.1.9", "files": {}}
+        return dict(remote)
     monkeypatch.setattr(updater, "fetch_manifest_from", fake_fetch)
+    base = "https://me.lt-stockpartner.tech/pptutor"
 
     fake_fetch.openx_down = False
-    rep = updater.check_sources("https://me.lt-stockpartner.tech/pptutor")
+    rep = updater.check_sources(base)
     assert rep.best.version == "2.1.10"
-    assert [s.label for s in rep.best.sources][0] == "openx"       # 下载先走内源
-    assert "openx" in [c.label for c in rep.checks]
+    assert [s.label for s in rep.best.sources] == ["openx"]          # 下载也只走内源
+    assert asked == ["openx"]                                         # 外网源连问都没问
 
-    fake_fetch.openx_down = True                                    # 公司外
-    rep = updater.check_sources("https://me.lt-stockpartner.tech/pptutor")
+    asked.clear()
+    fake_fetch.openx_down = True                                      # 内源连不上：报错，不偷偷换外网
+    rep = updater.check_sources(base)
+    assert rep.best is None and asked == ["openx"]
+    assert rep.openx_only_failed and "改用外网更新源" in rep.error
+    assert [c.label for c in rep.checks] == ["openx"]                 # 内源这一条显示成失败
+
+    asked.clear()
+    openx_source.set_external_allowed(True)                           # 用户点了「改用外网更新源」
+    rep = updater.check_sources(base)
     assert rep.best.version == "2.1.10" and rep.best.sources[0].label != "openx"
-    assert "openx" not in [c.label for c in rep.checks]            # 不显示成一条失败
-    assert not rep.error
+    assert "openx" not in [c.label for c in rep.checks]               # 这时内源连不上不再列成失败
+    assert not rep.error and not rep.openx_only_failed
+
+
+def test_release_page_is_openx_unless_external(monkeypatch, ui_settings):
+    monkeypatch.setenv("PPTX_FINDER_OPENX", "1")
+    assert openx_source.release_page(True) == openx_source.PAGE_URL
+    openx_source.set_external_allowed(True)
+    assert "github.com" in openx_source.release_page(True)
+
+
+def test_components_only_use_openx_by_default(monkeypatch, ui_settings):
+    from pptx_finder import imgtext_ocr
+    monkeypatch.setenv("PPTX_FINDER_OPENX", "1")
+    monkeypatch.delenv("PPTX_FINDER_UPDATE_URL", raising=False)
+    assert imgtext_ocr.component_sources("formula", "https://github.com/x") == [("openx", "openx:formula")]
+    openx_source.set_external_allowed(True)
+    assert [lbl for lbl, _b in imgtext_ocr.component_sources("formula", "https://github.com/x")] == [
+        "openx", "github-release", "self-hosted"]
+
+
+def test_component_manifest_and_split_archive_from_openx(tmp_path, monkeypatch, ui_settings):
+    """公式组件 436 MB 超过内源单附件上限，切成 .000/.001 上传；下载时拼回、整体核 sha256。"""
+    from pptx_finder import imgtext_ocr, netfetch
+    whole = b"PART-ONE|" * 10 + b"PART-TWO"
+    a, b = whole[:50], whole[50:]
+    manifest = {"version": "1.0.0", "files": {"x.exe": {"hash": "e" * 64}},
+                "archive": {"name": "component.zip", "hash": hashlib.sha256(whole).hexdigest(), "size": len(whole)}}
+    op = FakeOpener([(7, "ppt-doctor-formula-1.0.0"), (6, "ppt-doctor-formula-0.9.0"), (5, "ppt-doctor-update-2.1.14")],
+                    {7: [("component.json", F + "m"), ("component.zip.000", F + "p0"), ("component.zip.001", F + "p1")],
+                     6: [("component.json", F + "old")]})
+    monkeypatch.setattr(openx_source, "INDEX", openx_source.MultiIndex([_index(op)]))
+    assert openx_source.component_manifest_url("formula") == F + "m"          # 取最新版本的清单
+    assert openx_source.component_archive_urls("formula", "1.0.0", "component.zip") == [F + "p0", F + "p1"]
+    with pytest.raises(openx_source.OpenxUnavailable):
+        openx_source.component_archive_urls("formula", "0.9.0", "component.zip")
+
+    bodies = {F + "p0": a, F + "p1": b, F + "m": json.dumps(manifest).encode()}
+    opened = []
+
+    class _R(_Resp):
+        headers = {"Content-Type": "application/octet-stream"}
+
+        def geturl(self):
+            return self.u
+
+    def fake_urlopen(req, timeout=None):
+        u = req.full_url if hasattr(req, "full_url") else str(req)
+        opened.append(u)
+        r = _R(bodies[u])
+        r.u = u
+        return r
+    monkeypatch.setattr(netfetch.urllib.request, "urlopen", fake_urlopen)
+    dest = tmp_path / "component.zip"
+    url = imgtext_ocr.archive_url("openx:formula", "1.0.0", "component.zip")
+    netfetch.download_with_fallback([("openx", url)], dest, expect_size=len(whole),
+                                    expect_sha256=manifest["archive"]["hash"], what="公式组件")
+    assert dest.read_bytes() == whole and opened == [F + "p0", F + "p1"]
+
+    bodies[F + "p1"] = b"TAMPERED"                                            # 校验不过：这个源失败，不留半个文件
+    with pytest.raises(netfetch.AllSourcesFailed):
+        netfetch.download_with_fallback([("openx", url)], tmp_path / "bad.zip", expect_size=None,
+                                        expect_sha256=manifest["archive"]["hash"], what="公式组件")
+    assert not (tmp_path / "bad.zip").exists() and not (tmp_path / "bad.zip.part").exists()
+
+
+def test_component_download_redirected_off_openx_is_refused(tmp_path, monkeypatch):
+    from pptx_finder import netfetch
+
+    class _R(_Resp):
+        headers = {"Content-Type": "application/octet-stream"}
+
+        def geturl(self):
+            return "https://evil.example.com/x"
+    monkeypatch.setattr(netfetch.urllib.request, "urlopen", lambda u, timeout=None: _R(b"abc"))
+    with pytest.raises(netfetch.AllSourcesFailed) as ei:
+        netfetch.download_with_fallback([("openx", F + "x")], tmp_path / "x", expect_size=3,
+                                        expect_sha256=hashlib.sha256(b"abc").hexdigest())
+    assert "内源以外" in ei.value.attempts[0].reason
 
 
 def test_download_blocks_from_openx(tmp_path, monkeypatch):

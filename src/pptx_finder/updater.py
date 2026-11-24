@@ -141,13 +141,19 @@ def update_sources(base_url: str, *, edition='full') -> list[UpdateSource]:
         # 落后好几版的用户需要的块可能没随最新一版发布，那时回落到整包。
         package_url=GITHUB_RELEASE_LATEST + "/PPT-Doctor-v{version}" + suffix + '.zip',
     )
-    # 2026-11-23 田哥定：公司内源排第一（和 AI HUB 一样）。公司里内源 20 MB/s 以上，GitHub 常常很慢；
-    # 公司外连不上内源，查版本时这一项静默略过、5 分钟内不再试。
-    from .openx_source import enabled as _openx_enabled
-    first = [openx_source(edition)] if _openx_enabled(is_frozen()) else []
+    # 2026-11-23 田哥定：公司内源排第一（和 AI HUB 一样）。公司里内源 20 MB/s 以上，GitHub 常常很慢。
+    # 2026-11-24 田哥定：打包版默认**只走内源**——GitHub 和备用服务器（阿里云）连问都不问；
+    # 只有用户在设置里打开「允许外网更新源」（或内源被关掉的开发/单测环境）才加上。
+    # 显式给了别的地址（PPTX_FINDER_UPDATE_URL，测试/灰度）时照旧用它。
+    from .openx_source import enabled as _openx_enabled, external_allowed
+    frozen = is_frozen()
+    first: list[UpdateSource] = [openx_source(edition)] if _openx_enabled(frozen) else []
+    explicit = bool(bases) and not all(_is_default_base(b) for b in bases)
+    if not external_allowed(frozen):
+        return first + (hosted if explicit else [])
     if os.environ.get("PPTX_FINDER_UPDATE_NO_GITHUB", "").strip() in ("1", "true", "yes"):
         return first + hosted
-    if bases and all(_is_default_base(b) for b in bases):
+    if not explicit and bases:
         return first + [github] + hosted
     return first + hosted + [github]
 
@@ -410,6 +416,7 @@ class CheckReport:
     checks: list
     current: str = ""
     error: str = ""          # 全部源都连不上 / 未打包等，给界面的人话
+    openx_only_failed: bool = False   # 只走内源且内源连不上：界面就地给「改用外网更新源」
 
     @property
     def all_failed(self) -> bool:
@@ -967,8 +974,11 @@ def check_sources(
 
     with ThreadPoolExecutor(max_workers=max(1, len(sources))) as pool:
         results = list(pool.map(_one, sources))
-    # 公司外连不上内源是常态，不在源列表里显示成一条失败（真正下载时也不会选它）
-    results = [(s, i, c) for s, i, c in results if c.ok or s.label != "openx"]
+    from .openx_source import external_allowed
+    external = external_allowed(is_frozen())
+    if external and any(s.label != "openx" for s in sources):
+        # 用户自己打开了外网源（多半在公司外）：连不上内源是常态，不显示成一条失败
+        results = [(s, i, c) for s, i, c in results if c.ok or s.label != "openx"]
     checks = [c for _s, _i, c in results]
     best: UpdateInfo | None = None
     for source, info, _check in results:
@@ -984,7 +994,12 @@ def check_sources(
         best.checks = checks
     report = CheckReport(best=best, checks=checks, current=str(local.get("version", "")))
     if report.all_failed:
-        report.error = "所有更新源都连不上：" + "；".join(f"{c.name}：{c.reason}" for c in checks)
+        if not external and checks and all(c.label == "openx" for c in checks):
+            report.openx_only_failed = True
+            report.error = ("连不上公司内源（" + checks[0].reason + "）。在公司网络里请稍后重试；"
+                            "在公司外，可点「改用外网更新源」从 GitHub / 备用服务器更新。")
+        else:
+            report.error = "所有更新源都连不上：" + "；".join(f"{c.name}：{c.reason}" for c in checks)
     return report
 
 

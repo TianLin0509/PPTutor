@@ -277,8 +277,10 @@ class UpdateController(QObject):
             "status": dict(self._status),
             "ready_source": self._ready_source,
             "error": _friendly_error(error),
-            "release_page": RELEASE_PAGE,
+            "release_page": _release_page(),
             "apply_failed": self._apply_failed and self._state == "error",
+            "openx_only_failed": bool(getattr(report, "openx_only_failed", False))
+            and self.phase() == "error" and info is None,
         }
 
     def pending_version(self) -> str:
@@ -322,6 +324,17 @@ class UpdateController(QObject):
         self._check.failed.connect(self._on_check_failed)
         self._track_thread(self._check, "update-check")
         self._check.start()
+        self._notify()
+
+    def use_external_sources(self) -> None:
+        """「改用外网更新源」：用户在公司外、连不上内源时一键打开外网源并立即重查。"""
+        from ..openx_source import set_external_allowed
+        set_external_allowed(True)
+        log.info("用户打开了外网更新源（GitHub / 备用服务器）")
+        if self._state in ("idle", "error"):
+            self._state = "idle"
+            self._check_error = ""
+            self.start_check(manual=True)
         self._notify()
 
     def check_now(self) -> None:
@@ -654,6 +667,11 @@ def _write_setting(**changes) -> None:
         update_ui_settings(**changes)
     except Exception:  # noqa: BLE001
         log.debug("update reminder state not persisted", exc_info=True)
+
+
+def _release_page() -> str:
+    from ..openx_source import release_page
+    return release_page(updater.is_frozen())
 
 
 def _friendly_error(msg: str) -> str:

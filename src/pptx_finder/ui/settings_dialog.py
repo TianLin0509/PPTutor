@@ -495,8 +495,24 @@ class SettingsDialog(QDialog):
                   hk_row, below=self._hotkey_result)
 
         self._build_screenshot_hotkey_row(card)
+
+        # 2026-11-24 田哥定：默认只从公司内源更新；在公司外（连不上内源）才需要打开
+        self._section(lay, "更新来源")
+        card = self._card(lay)
+        from ..openx_source import external_allowed
+        from ..updater import is_frozen
+        self.external_updates = QCheckBox("允许外网更新源（GitHub / 备用服务器）")
+        self.external_updates.setToolTip("默认关：检查更新、下载更新和组件都只走公司内源，不访问外网。")
+        self.external_updates.setChecked(external_allowed(is_frozen()))
+        self.external_updates.toggled.connect(self._toggle_external_updates)
+        self._row(card, self.external_updates,
+                  "默认只从公司内源更新。在公司外、连不上内源时再打开。")
         lay.addStretch(1)
         return outer
+
+    def _toggle_external_updates(self, on: bool) -> None:
+        from ..openx_source import set_external_allowed
+        set_external_allowed(on)
 
     def _build_appearance_page(self) -> QWidget:
         outer, lay = self._page("外观", "界面主题和字体。")
@@ -1565,7 +1581,7 @@ class SettingsDialog(QDialog):
             pending = updater_ctl.pending_version() if hasattr(updater_ctl, "pending_version") else ""
             if pending:
                 self.check_update_btn.setText(f"⬆ 有新版本 v{pending}")
-            self.check_update_btn.setToolTip("查询 GitHub 与备用服务器上的最新版本")
+            self.check_update_btn.setToolTip("查询公司内源上的最新版本")
             self.check_update_btn.clicked.connect(lambda: updater_ctl.open_dialog())
         else:
             self.check_update_btn.setEnabled(False)

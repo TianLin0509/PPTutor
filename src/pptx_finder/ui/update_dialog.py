@@ -296,10 +296,13 @@ class UpdateDialog(QDialog):
         foot.setSpacing(8)
         foot.addStretch(1)
         self.btn_manual = self._btn("打开发布页手动下载", self._open_release)
+        self.btn_external = self._btn("改用外网更新源", self._use_external)
+        self.btn_external.setToolTip("在公司外连不上内源时用：打开后从 GitHub / 备用服务器更新；"
+                                     "可在「设置 → 常规」随时关掉")
         self.btn_close = self._btn("稍后", self.close)
         self.btn_cancel = self._btn("取消下载", self._ctl.cancel_download)
         self.btn_primary = self._btn("下载更新", self._on_primary, primary=True)
-        for b in (self.btn_manual, self.btn_close, self.btn_cancel, self.btn_primary):
+        for b in (self.btn_manual, self.btn_external, self.btn_close, self.btn_cancel, self.btn_primary):
             foot.addWidget(b)
         lay.addSpacing(4)
         lay.addLayout(foot)
@@ -362,6 +365,9 @@ class UpdateDialog(QDialog):
         else:
             self._ctl.check_now()
 
+    def _use_external(self) -> None:
+        self._ctl.use_external_sources()
+
     def _open_release(self) -> None:
         QDesktopServices.openUrl(QUrl(self._ctl.snapshot().get("release_page", "")))
 
@@ -411,7 +417,7 @@ class UpdateDialog(QDialog):
             self._set_msg(f"已是最新版本 v{s['current']}。", "ok")
             rows, src_title = check_rows(s["checks"]), "更新源"
         elif phase == "checking":
-            self._set_msg("正在向各个更新源查询最新版本…", "info")
+            self._set_msg("正在查询最新版本…", "info")
         elif phase == "available":
             self._set_msg("", "info")
             if s["attempts"]:
@@ -447,6 +453,9 @@ class UpdateDialog(QDialog):
         self.btn_primary.setVisible(bool(primary))
         self.btn_cancel.setVisible(downloading)
         self.btn_manual.setVisible(phase == "error")
+        self.btn_manual.setText("打开内源下载页" if "openx.huawei.com" in str(s.get("release_page", ""))
+                                else "打开发布页手动下载")
+        self.btn_external.setVisible(phase == "error" and bool(s.get("openx_only_failed")))
         self.btn_close.setText({"none": "好的", "ready": "稍后", "available": "稍后"}.get(phase, "关闭"))
         self.btn_close.setVisible(phase != "applying")
         self.card.layout().activate()
