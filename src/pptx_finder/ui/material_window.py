@@ -1,420 +1,48 @@
-"""Native shape collection, clipboard reuse, and PPTX sharing."""
-from pathlib import Path
+"""素材库独立窗口：薄兼容壳，核心视图就是一级页 MaterialTabWidget。
+
+主窗已把素材升为一级页；这个窗口只留给旧入口（托盘、命令行、旧测试）独立打开时用。
+"""
 import logging
 
-from PySide6.QtCore import QSize, Qt
-from PySide6.QtGui import QIcon, QKeySequence, QShortcut
-from PySide6.QtWidgets import (
-    QAbstractItemView, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
-    QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMenu, QPushButton, QStackedWidget, QVBoxLayout, QWidget,
-)
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QLabel, QVBoxLayout, QWidget
 
 from ..materials import MaterialLibrary
-from . import owner_actions
-from .bg_task import BackgroundTask
+from .material_tab import MaterialTabWidget
 
 log = logging.getLogger(__name__)
 
 
 class MaterialWindow(QWidget):
-    def __init__(self, tok=None, parent=None, *, library=None):
+    def __init__(self, tok=None, parent=None, *, library=None, component_center=None):
         super().__init__(parent)
         self.setObjectName("materialWin")
         self.setAttribute(Qt.WA_StyledBackground, True)
-        self.setStyleSheet("QWidget#materialWin { background: palette(window); }")
         self.setWindowFlag(Qt.Window, True)
         self.setWindowTitle("素材库 · PPT Doctor")
-        self.resize(880, 640)
-        self.setMinimumSize(620, 440)
+        self.resize(1280, 760)
+        self.setMinimumSize(960, 600)
         self.library = library or MaterialLibrary()
-        self._tasks = []
-        self._busy = False
-        self._reload_pending = False
-        self._items = []
-        root = QVBoxLayout(self)
-        root.setContentsMargins(20, 18, 20, 18)
-        title = QLabel("素材库")
-        title.setObjectName("dashTitle")
-        root.addWidget(title)
-        hint = QLabel("在 PPT 中选中形状或图片并 Ctrl+C，然后收藏。取用时复制素材，回 PPT 粘贴。")
-        hint.setObjectName("dashSub")
-        hint.setWordWrap(True)
-        root.addWidget(hint)
-        # 团队素材包没装时就地给下载入口（开箱即用，不让用户跑到设置页找）
-        self.pack_bar = QFrame()
-        self.pack_bar.setObjectName("teamPackBar")
-        bar = QHBoxLayout(self.pack_bar)
-        bar.setContentsMargins(12, 8, 8, 8)
-        self.pack_label = QLabel("")
-        self.pack_label.setWordWrap(True)
-        self.pack_btn = QPushButton("下载团队素材包")
-        self.pack_btn.clicked.connect(self._pack_download)
-        bar.addWidget(self.pack_label, 1)
-        bar.addWidget(self.pack_btn, 0, Qt.AlignVCenter)
-        root.addWidget(self.pack_bar)
-        capture = QHBoxLayout()
-        self.name_edit = QLineEdit()
-        self.name_edit.setPlaceholderText("素材名称（可留空，稍后整理）")
-        self.category_edit = QLineEdit()
-        self.category_edit.setPlaceholderText("分类，例如：箭头 / Logo / 框")
-        self.name_edit.setMaxLength(120)
-        self.category_edit.setMaxLength(80)
-        self.capture_btn = QPushButton("从剪贴板收藏")
-        self.capture_btn.setObjectName("primary")
-        self.capture_btn.clicked.connect(self._capture)
-        # 填好名称或分类直接回车 = 收藏
-        self.name_edit.returnPressed.connect(self._capture)
-        self.category_edit.returnPressed.connect(self._capture)
-        capture.addWidget(self.name_edit, 2)
-        capture.addWidget(self.category_edit, 2)
-        capture.addWidget(self.capture_btn)
-        root.addLayout(capture)
-        filters = QHBoxLayout()
-        self.search = QLineEdit()
-        self.search.setPlaceholderText("搜索素材名称或分类…")
-        self.search.setClearButtonEnabled(True)
-        self.search.textChanged.connect(self._render)
-        self.categories = QComboBox()
-        self.categories.addItem("全部分类", "")
-        # 分类名带数量（如「箭头与流程（30）」），按内容放宽，不截断
-        self.categories.setSizeAdjustPolicy(QComboBox.AdjustToContents)
-        self.categories.currentIndexChanged.connect(self._render)
-        filters.addWidget(self.search, 1)
-        filters.addWidget(self.categories)
-        root.addLayout(filters)
-        self.list_widget = QListWidget()
-        self.list_widget.setViewMode(QListWidget.IconMode)
-        self.list_widget.setResizeMode(QListWidget.Adjust)
-        self.list_widget.setMovement(QListWidget.Static)
-        self.list_widget.setIconSize(QSize(140, 96))
-        self.list_widget.setGridSize(QSize(175, 146))
-        self.list_widget.setSpacing(6)
-        self.list_widget.setWordWrap(True)
-        self.list_widget.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.list_widget.itemSelectionChanged.connect(self._sync)
-        self.list_widget.itemDoubleClicked.connect(lambda _: self._copy())
-        # 右键菜单 + 常规快捷键：Ctrl+C 复制、Delete 移出、F2 改名（和资源管理器一致）
-        self.list_widget.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.list_widget.customContextMenuRequested.connect(self._context_menu)
-        self._shortcuts = []
-        for keys, slot in ((QKeySequence(QKeySequence.Copy), self._copy),
-                           (QKeySequence(QKeySequence.Delete), self._delete),
-                           (QKeySequence("F2"), self._edit)):
-            sc = QShortcut(keys, self.list_widget)
-            sc.setContext(Qt.WidgetShortcut)
-            sc.activated.connect(slot)
-            self._shortcuts.append(sc)
-        # 空库时素材区中央直接告诉用户怎么开始（原来大白框里什么都没有，说明压在最底下一行）
-        self._empty_view = QWidget()
-        self._empty_view.setObjectName("materialEmpty")
-        self._empty_view.setAttribute(Qt.WA_StyledBackground, True)
-        ev = QVBoxLayout(self._empty_view)
-        ev.setAlignment(Qt.AlignCenter)
-        ev.setSpacing(8)
-        self._empty_title = QLabel("还没有素材")
-        self._empty_title.setObjectName("emptyTitle")
-        self._empty_title.setAlignment(Qt.AlignCenter)
-        self._empty_tip = QLabel("在 PPT 里选中一个箭头、图标或图片按 Ctrl+C，再点右上角「从剪贴板收藏」。\n"
-                                 "也可以先下载团队素材包，常用形状一次到位。")
-        self._empty_tip.setObjectName("emptyTip")
-        self._empty_tip.setAlignment(Qt.AlignCenter)
-        ev.addWidget(self._empty_title)
-        ev.addWidget(self._empty_tip)
-        self._list_stack = QStackedWidget()
-        self._list_stack.addWidget(self.list_widget)
-        self._list_stack.addWidget(self._empty_view)
-        root.addWidget(self._list_stack, 1)
-        row = QHBoxLayout()
-        self.copy_btn = QPushButton("复制素材")
-        self.copy_btn.clicked.connect(self._copy)
-        self.edit_btn = QPushButton("编辑名称 / 分类")
-        self.edit_btn.clicked.connect(self._edit)
-        self.delete_btn = QPushButton("移出素材库")
-        self.delete_btn.clicked.connect(self._delete)
-        self.import_btn = QPushButton("导入 PPTX 素材包…")
-        self.import_btn.clicked.connect(self._import)
-        self.export_btn = QPushButton("导出选中素材…")
-        self.export_btn.clicked.connect(self._export)
-        for btn in (self.copy_btn, self.edit_btn, self.delete_btn):
-            row.addWidget(btn)
-        # 一行放完：左边是对选中素材的操作，右边是整库的导入导出
-        row.addStretch()
-        row.addWidget(self.import_btn)
-        row.addWidget(self.export_btn)
-        root.addLayout(row)
-        self.status = QLabel("正在读取素材…")
-        self.status.setObjectName("emptyMeta")
-        self.status.setWordWrap(True)
-        self.status.setTextFormat(Qt.PlainText)
-        root.addWidget(self.status)
-        self.open_export_btn = QPushButton("打开导出所在文件夹")
-        self.open_export_btn.clicked.connect(self._open_export_folder)
-        self.open_export_btn.hide()
-        root.addWidget(self.open_export_btn, 0, Qt.AlignLeft)
-        self._center = None
-        try:
-            from .component_center import component_center
-            self._center = component_center()
-            self._center.state_changed.connect(self._on_pack_state)
-            self._center.installed.connect(self._on_pack_installed)
-        except Exception:  # noqa: BLE001 下载中心不可用时素材库照常能用
-            log.exception("component center unavailable")
-        self._refresh_pack_bar()
-        self._run(self.library.list, self._loaded, "读取素材库")
-
-    # ---------- 团队素材包 ----------
-    def _refresh_pack_bar(self):
-        from .. import components
-        center = self._center
-        if center is None:
-            self.pack_bar.hide()
-            return
-        snap = center.snapshot("materials")
-        phase = snap["phase"]
-        if center.busy("materials"):
-            imported = snap.get("import")
-            if phase == "installing" and imported:
-                done_n, total_n = imported
-                text = f"团队素材包：正在导入素材库 {done_n} / {total_n}…" if total_n else "团队素材包：正在打开素材包…"
-            elif phase == "checking":
-                text = "团队素材包：正在连接下载源…"
-            else:
-                st = snap["status"] or {}
-                total = st.get("total") or snap["bytes"] or 0
-                pct = f" {int(st.get('received', 0) * 100 / total)}%" if total else ""
-                text = f"团队素材包：正在下载{pct}…"
-            self.pack_label.setText(text)
-            self.pack_btn.setText("查看进度")
-            self.pack_bar.show()
-            return
-        if components.is_installed("materials"):
-            self.pack_bar.hide()
-            return
-        info = components.MATERIALS
-        text = (f"团队素材包：团队常用的形状、箭头、图标，按分类筛选。约 {info.approx_mb} MB，"
-                "下载后自动导入，不影响你自己收藏的素材。")
-        if phase == "error":
-            text = "团队素材包下载失败：" + (snap["error"] or "未知原因")
-        self.pack_label.setText(text)
-        self.pack_btn.setText("重试" if phase == "error" else "下载团队素材包")
-        self.pack_bar.show()
-
-    def _pack_download(self):
-        if self._center is None:
-            return
-        if self._center.busy("materials"):
-            self._center.open_dialog("materials", self)
-        else:
-            self._center.request("materials", self)
-
-    def _on_pack_state(self, key):
-        if key == "materials":
-            try:
-                self._refresh_pack_bar()
-            except RuntimeError:   # 窗口已销毁
-                pass
-
-    def _on_pack_installed(self, key):
-        if key == "materials":
-            try:
-                if self._busy:
-                    self._reload_pending = True
-                else:
-                    self._refresh_after("团队素材包已导入，可用搜索框右边的分类下拉筛选。")
-            except RuntimeError:
-                pass
-
-    def _selected(self):
-        return [x.data(Qt.UserRole) for x in self.list_widget.selectedItems()]
-
-    def _sync(self):
-        n = len(self._selected())
-        for btn in (self.copy_btn, self.edit_btn):
-            btn.setEnabled(not self._busy and n == 1)
-        for btn in (self.delete_btn, self.export_btn):
-            btn.setEnabled(not self._busy and n > 0)
-        for w in (self.capture_btn, self.import_btn, self.list_widget,
-                  self.name_edit, self.category_edit, self.search, self.categories):
-            w.setEnabled(not self._busy)
-
-    def _render(self, *_):
-        selected = set(self._selected())
-        query = self.search.text().casefold().strip()
-        category = self.categories.currentData() or ""
-        self.list_widget.clear()
-        for item in self._items:
-            if category and item.category != category:
-                continue
-            if query not in f"{item.name} {item.category}".casefold():
-                continue
-            row = QListWidgetItem(QIcon(str(self.library.folder(item.id) / "preview.png")),
-                                  item.name + (f"\n{item.category}" if item.category else ""))
-            row.setData(Qt.UserRole, item.id)
-            row.setToolTip(f"{item.name}\n{item.category or '未分类'}\n双击复制素材")
-            self.list_widget.addItem(row)
-            row.setSelected(item.id in selected)
-        if self._items and not self.list_widget.count():
-            self._empty_title.setText("没有符合条件的素材")
-            self._empty_tip.setText("换个关键词，或把分类切回「全部分类」。")
-        elif not self._items:
-            self._empty_title.setText("还没有素材")
-            self._empty_tip.setText("在 PPT 里选中一个箭头、图标或图片按 Ctrl+C，再点右上角「从剪贴板收藏」。\n"
-                                    "也可以先下载团队素材包，常用形状一次到位。")
-        self._list_stack.setCurrentWidget(
-            self.list_widget if self.list_widget.count() else self._empty_view)
-        self._sync()
-
-    def _loaded(self, items):
-        self._items = items
-        previous = self.categories.currentData()
-        self.categories.blockSignals(True)
-        self.categories.clear()
-        self.categories.addItem("全部分类", "")
-        counts = {}
-        for x in items:
-            if x.category:
-                counts[x.category] = counts.get(x.category, 0) + 1
-        for category in sorted(counts):
-            self.categories.addItem(f"{category}（{counts[category]}）", category)
-        self.categories.setCurrentIndex(max(0, self.categories.findData(previous)))
-        self.categories.blockSignals(False)
-        self._render()
-        # 空库的引导已经放在素材区中央，底部状态行不再重复一遍
-        self.status.setText(f"共 {len(items)} 个素材 · Ctrl / Shift 可多选后导出" if items else "")
-
-    def _run(self, fn, done, label):
-        if self._busy:
-            return
-        self._busy = True
-        self._sync()
-        self.status.setText(f"正在{label}…")
-
-        def work():
-            try:
-                return {"value": fn()}
-            except Exception as exc:
-                log.exception("material operation failed: %s", label)
-                return {"error": str(exc)}
-
-        def complete(result):
-            self._busy = False
-            self._sync()
-            if not isinstance(result, dict) or "error" in result:
-                error = result.get("error") if isinstance(result, dict) else "任务未完成，请重试。"
-                self.status.setText(f"{label}失败：{error}")
-            else:
-                done(result["value"])
-            if self._reload_pending and not self._busy:
-                self._reload_pending = False
-                self._refresh_after("团队素材包已导入，可用搜索框右边的分类下拉筛选。")
-
-        task = BackgroundTask(work, "materials", self)
-        self._tasks.append(task)
-        task.done.connect(complete)
-        task.finished.connect(lambda: self._tasks.remove(task))
-        task.start()
-
-    def _refresh_after(self, message):
-        def finished(items):
-            self._loaded(items)
-            self.status.setText(message)
-        self._run(self.library.list, finished, "刷新素材库")
-
-    def _capture(self):
-        name, category = self.name_edit.text(), self.category_edit.text()
-        self._run(lambda: self.library.capture(name, category),
-                  lambda item: self._refresh_after(f"已收藏：{item.name}。原始 PPT 移动或删除也不会影响素材。"),
-                  "收藏")
-
-    def _copy(self):
-        ids = self._selected()
-        if len(ids) == 1:
-            self._run(lambda: self.library.copy(ids[0]),
-                      lambda _: self.status.setText("素材已复制。回到 PPT 的页面编辑区，按 Ctrl+V 粘贴。"),
-                      "复制素材")
-
-    def _edit(self):
-        ids = self._selected()
-        if len(ids) != 1:
-            return
-        item = next(x for x in self._items if x.id == ids[0])
-        dialog = QDialog(self)
-        dialog.setWindowTitle("编辑素材信息")
-        layout = QFormLayout(dialog)
-        name, category = QLineEdit(item.name), QLineEdit(item.category)
-        name.setMaxLength(120)
-        category.setMaxLength(80)
-        layout.addRow("名称", name)
-        layout.addRow("分类", category)
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.button(QDialogButtonBox.Ok).setText("保存")
-        buttons.button(QDialogButtonBox.Cancel).setText("取消")
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        layout.addRow(buttons)
-        if dialog.exec() == QDialog.Accepted:
-            new_name, new_category = name.text(), category.text()
-            self._run(lambda: self.library.rename(item.id, new_name, new_category),
-                      lambda _: self._refresh_after("素材信息已更新。"), "保存素材信息")
-
-    def _delete(self):
-        ids = self._selected()
-        if self._busy:
-            return
-        if ids and owner_actions.ask(self, "移出素材库", f"将选中的 {len(ids)} 个素材移出素材库？",
-                                     "移出", "取消"):
-            self._run(lambda: self.library.delete(ids),
-                      lambda _: self._refresh_after("已移出素材库；文件仍保留在素材库的回收区。"), "移出素材")
-
-    def _import(self):
-        path, _ = QFileDialog.getOpenFileName(self, "导入 PPT Doctor 素材包", "", "PPTX 素材包 (*.pptx)")
-        if path:
-            self._run(lambda: self.library.import_pack(Path(path)),
-                      lambda items: self._refresh_after(f"已导入 {len(items)} 个素材。"), "导入素材包")
-
-    def _export(self):
-        ids = self._selected()
-        if not ids:
-            return
-        path, _ = QFileDialog.getSaveFileName(self, "导出素材包", "我的素材包.pptx", "PPTX 素材包 (*.pptx)")
-        if path:
-            if not path.lower().endswith(".pptx"):
-                path += ".pptx"
-            def exported(_):
-                self.status.setText(f"已导出 {len(ids)} 个素材：{path}\n同事可直接用 PowerPoint 打开，或导入素材库。")
-                self._exported_path = path
-                self.open_export_btn.show()
-
-            self._run(lambda: self.library.export_pack(ids, Path(path)), exported, "导出素材包")
-
-    def _context_menu(self, pos):
-        item = self.list_widget.itemAt(pos)
-        if item is None or self._busy:
-            return
-        if not item.isSelected():
-            self.list_widget.clearSelection()
-            item.setSelected(True)
-        n = len(self._selected())
-        menu = QMenu(self)
-        act = menu.addAction("复制素材（回 PPT 粘贴）\tCtrl+C", self._copy)
-        act.setEnabled(n == 1)
-        act = menu.addAction("编辑名称 / 分类\tF2", self._edit)
-        act.setEnabled(n == 1)
-        menu.addAction("导出选中素材…", self._export)
-        menu.addSeparator()
-        menu.addAction("移出素材库\tDelete", self._delete)
-        self._last_menu = menu
-        owner_actions.popup(menu, self.list_widget.viewport().mapToGlobal(pos))
-
-    def _open_export_folder(self):
-        path = getattr(self, "_exported_path", "")
-        if path:
-            owner_actions.open_folder(self, path)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        self.tab = MaterialTabWidget(self, theme_tokens=tok, library=self.library,
+                                     component_center=component_center)
+        layout.addWidget(self.tab, 1)
+        # 主窗里由主窗画通透背景；独立窗口自己铺页底色，不透出系统深色调色板
+        self.setStyleSheet(f"QWidget#materialWin {{ background: {self.tab.tok['appbg']}; }}")
+        # 独立窗口没有主窗的 Toast：消息落在底部一行
+        self.toast_line = QLabel("")
+        self.toast_line.setObjectName("emptyMeta")
+        self.toast_line.setContentsMargins(20, 0, 20, 10)
+        self.toast_line.setTextFormat(Qt.PlainText)
+        layout.addWidget(self.toast_line)
+        self.tab.toastRequested.connect(lambda message, _level: self.toast_line.setText(message))
 
     def closeEvent(self, event):
-        if self._tasks:
-            self.status.setText("操作仍在进行，完成后即可关闭窗口。")
+        if self.tab._busy_op:
+            self.toast_line.setText("操作仍在进行，完成后即可关闭窗口。")
             event.ignore()
             return
+        self.tab.close()
         super().closeEvent(event)
