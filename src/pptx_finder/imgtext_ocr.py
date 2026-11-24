@@ -340,7 +340,7 @@ def fetch_manifest_from_sources(sources: list[tuple[str, str]], timeout: float =
     if not found:
         detail = "；".join(f"{c['name']}：{c['reason']}" for c in checks)
         if checks and all(c["label"] == "openx" for c in checks):
-            detail += "。在公司网络里请稍后重试；在公司外，可在「设置 → 版本」打开「允许外网更新源」"
+            detail += "。在公司网络里请稍后重试；在公司外，可在「设置 → 常规」打开「允许外网更新源」"
         err = OcrUnavailable(f"{what}清单不可达：{detail}")
         err.checks = checks  # 界面逐个源列出原因
         raise err
