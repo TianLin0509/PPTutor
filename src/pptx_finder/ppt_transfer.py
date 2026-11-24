@@ -344,55 +344,66 @@ def _zorder() -> list[int]:
     return handles
 
 
-def _by_recent_focus(apps):
-    """多个 PowerPoint 实例时，最近在前台的那个排第一（主框架窗口在 Z 序里最靠前）。"""
-    if len(apps) < 2:
-        return list(apps)
+AMBIGUOUS_TARGET = ("开着多个 PowerPoint，分不清要插到哪一个：先点一下目标 PPT 的窗口再插入，"
+                    "或关掉不用的那个；也可以改用复制形状。")
+
+
+def _visible_apps(apps) -> list:
+    """有可见文稿窗口的实例；读不到窗口数说明实例正忙，直接停。"""
+    out = []
+    for app in apps:
+        try:
+            if int(app.Windows.Count):
+                out.append(app)
+        except Exception as exc:  # noqa: BLE001
+            raise MaterialTransferError("busy") from exc
+    return out
+
+
+def _pick_instance(apps):
+    """确定用户最近在用的那个 PowerPoint 实例；不确定就停，不按 ROT 顺序猜（m4 MF-M2-05）。"""
+    visible = _visible_apps(apps)
+    if not visible:
+        return None
+    if len(visible) == 1:
+        return visible[0]
     try:
         order = {h: i for i, h in enumerate(_zorder())}
-    except Exception:  # noqa: BLE001
-        order = {}
-
-    def rank(app):
-        try:
-            return order.get(int(app.HWND), len(order) + 1)
-        except Exception:  # noqa: BLE001
-            return len(order) + 2
-    return sorted(apps, key=rank)
+        ranks = [order[int(app.HWND)] for app in visible]
+    except Exception as exc:  # noqa: BLE001  Z 序读不到 / 某实例不在 Z 序里
+        raise MaterialTransferError("no_target_slide", AMBIGUOUS_TARGET) from exc
+    return visible[ranks.index(min(ranks))]
 
 
 def _active_target(apps):
     """用户最近在用的那个 PowerPoint 的活动文稿和当前页；不碰其他文稿。
 
-    多个实例并存时按窗口 Z 序取最近在前台的那个（不是 ROT 枚举顺序）；
-    实例内取它自己的 ActiveWindow（该实例里最后激活的文稿窗口）。
+    多个实例并存时按窗口 Z 序取最近在前台的那个；Z 序不可用就停下说明，不跨实例回落。
+    选定实例后，它的活动窗口 / 文稿 / 当前页任何一步读不到都直接报错，不再看别的实例。
     """
-    saw_window = False
-    for app in _by_recent_focus(apps):
+    app = _pick_instance(apps)
+    if app is None:
+        raise MaterialTransferError("no_presentation")
+    try:
+        window = app.ActiveWindow
+        pres = window.Presentation
+    except Exception as exc:  # noqa: BLE001
+        raise MaterialTransferError("no_target_slide") from exc
+    if bool(pres.ReadOnly):
+        raise MaterialTransferError("read_only")
+    slide = None
+    try:
+        slide = window.View.Slide
+    except Exception:  # noqa: BLE001  焦点在缩略图栏 / 大纲 / 幻灯片浏览视图
         try:
-            if not int(app.Windows.Count):
-                continue
-            window = app.ActiveWindow
-            pres = window.Presentation
-        except Exception:  # noqa: BLE001  没有活动窗口
-            continue
-        saw_window = True
-        if bool(pres.ReadOnly):
-            raise MaterialTransferError("read_only")
-        slide = None
-        try:
-            slide = window.View.Slide
-        except Exception:  # noqa: BLE001  焦点在缩略图栏 / 大纲 / 幻灯片浏览视图
-            try:
-                rng = window.Selection.SlideRange
-                if int(rng.Count) >= 1:
-                    slide = rng.Item(1)
-            except Exception:  # noqa: BLE001
-                slide = None
-        if slide is None:
-            raise MaterialTransferError("no_target_slide")
-        return app, pres, slide
-    raise MaterialTransferError("no_target_slide" if saw_window else "no_presentation")
+            rng = window.Selection.SlideRange
+            if int(rng.Count) >= 1:
+                slide = rng.Item(1)
+        except Exception:  # noqa: BLE001
+            slide = None
+    if slide is None:
+        raise MaterialTransferError("no_target_slide")
+    return app, pres, slide
 
 
 def insert_material(pack_path: str | Path, slide_index: int) -> dict:

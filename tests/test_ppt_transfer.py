@@ -255,17 +255,56 @@ def test_material_error_codes_are_the_contract_seven():
         transfer.MaterialTransferError("whatever")
 
 
+def _instance(hwnd, name, *, active_raises=False, windows=1):
+    slide = SimpleNamespace(SlideIndex=1)
+    pres = SimpleNamespace(Name=name, ReadOnly=False)
+    window = SimpleNamespace(Presentation=pres, View=SimpleNamespace(Slide=slide))
+
+    class App:
+        HWND = hwnd
+        Windows = SimpleNamespace(Count=windows)
+
+        @property
+        def ActiveWindow(self):
+            if active_raises:
+                raise RuntimeError("busy")
+            return window
+    return App()
+
+
 def test_multiple_instances_use_most_recently_focused_powerpoint(monkeypatch):
     """多个 PowerPoint 实例：按窗口 Z 序选最近在前台的那个，不按 ROT 枚举顺序。"""
-    def app(hwnd, name):
-        slide = SimpleNamespace(SlideIndex=1)
-        pres = SimpleNamespace(Name=name, ReadOnly=False)
-        window = SimpleNamespace(Presentation=pres, View=SimpleNamespace(Slide=slide))
-        return SimpleNamespace(HWND=hwnd, Windows=SimpleNamespace(Count=1), ActiveWindow=window)
-    older, recent = app(111, "旧窗口.pptx"), app(222, "正在编辑.pptx")
+    older, recent = _instance(111, "旧窗口.pptx"), _instance(222, "正在编辑.pptx")
     monkeypatch.setattr(transfer, "_zorder", lambda: [999, 222, 555, 111])
     _, pres, _ = transfer._active_target([older, recent])        # ROT 里 older 排前面
     assert pres.Name == "正在编辑.pptx"
-    monkeypatch.setattr(transfer, "_zorder", lambda: (_ for _ in ()).throw(OSError("no desktop")))
-    _, pres, _ = transfer._active_target([older, recent])        # 拿不到 Z 序时退回原顺序
+    hidden = _instance(333, "无窗口", windows=0)                   # 没有可见文稿的实例不参与
+    _, pres, _ = transfer._active_target([hidden, older])
     assert pres.Name == "旧窗口.pptx"
+
+
+def test_uncertain_target_stops_instead_of_falling_back(monkeypatch):
+    """m4 MF-M2-05：Z 序读不到、或最近实例出错时，停下说明，不落到旧文稿上。"""
+    older, recent = _instance(111, "旧窗口.pptx"), _instance(222, "正在编辑.pptx")
+    monkeypatch.setattr(transfer, "_zorder", lambda: (_ for _ in ()).throw(OSError("no desktop")))
+    with pytest.raises(transfer.MaterialTransferError) as info:
+        transfer._active_target([older, recent])
+    assert info.value.code == "no_target_slide" and "多个 PowerPoint" in str(info.value)
+    monkeypatch.setattr(transfer, "_zorder", lambda: [222])           # 有实例不在 Z 序里
+    with pytest.raises(transfer.MaterialTransferError):
+        transfer._active_target([older, recent])
+    broken = _instance(222, "正在编辑.pptx", active_raises=True)
+    monkeypatch.setattr(transfer, "_zorder", lambda: [222, 111])
+    with pytest.raises(transfer.MaterialTransferError) as info:
+        transfer._active_target([older, broken])
+    assert info.value.code == "no_target_slide"                     # 不回落到 旧窗口.pptx
+
+    class Busy:
+        HWND = 1
+
+        @property
+        def Windows(self):
+            raise RuntimeError("rejected")
+    with pytest.raises(transfer.MaterialTransferError) as info:
+        transfer._active_target([Busy(), older])
+    assert info.value.code == "busy"
