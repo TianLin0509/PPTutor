@@ -221,13 +221,15 @@ def _powerpoint_process_running() -> bool | None:
             ["tasklist", "/FI", "IMAGENAME eq POWERPNT.EXE", "/FO", "CSV", "/NH"],
             capture_output=True,
             text=True,
+            encoding="mbcs",
+            errors="replace",
             timeout=2,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             check=False,
         )
         if completed.returncode != 0:
             return None
-        return "POWERPNT.EXE" in completed.stdout.upper()
+        return "POWERPNT.EXE" in (completed.stdout or "").upper()
     except (OSError, subprocess.SubprocessError):
         return None
 

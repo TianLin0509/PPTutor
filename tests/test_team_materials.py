@@ -1,4 +1,4 @@
-"""团队素材包组件：按 id 去重导入、整包升级、只动组件自己的素材；下载安装；打包工具；界面入口。"""
+"""团队素材包组件：旧版逐页导入（保留兼容）；新版整包直读的下载安装、原子升级与回滚；界面入口。"""
 from contextlib import contextmanager
 import functools
 import hashlib
@@ -13,6 +13,7 @@ from PySide6.QtCore import Qt
 
 from pptx_finder import components, materials, team_materials
 from pptx_finder.materials import MARKER, Material, MaterialLibrary, pack_item_id
+from materials_testkit import build_pack_dir, make_pack, rows
 
 
 @pytest.fixture(autouse=True)
@@ -175,16 +176,12 @@ def test_cancel_before_publish_leaves_library_unchanged(tmp_path, fake_ppt):
 
 
 # ---------- 下载安装：本地 http 服务模拟备用服务器 ----------
-def _publish(root: Path, version: str, payload: bytes) -> Path:
+def _publish(root: Path, out_dir: Path) -> Path:
+    """把构建工具产出的 component.json + component.zip 放到模拟备用服务器上。"""
     folder = root / "materials"
     folder.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(folder / "component.zip", "w") as z:
-        z.writestr(team_materials.PACK_FILE, payload)
-    data = (folder / "component.zip").read_bytes()
-    (folder / "component.json").write_text(json.dumps({
-        "version": version, "kind": "materials",
-        "files": {team_materials.PACK_FILE: {"hash": hashlib.sha256(payload).hexdigest(), "size": len(payload)}},
-        "archive": {"name": "component.zip", "hash": hashlib.sha256(data).hexdigest(), "size": len(data)}}), "utf-8")
+    for name in ("component.json", "component.zip"):
+        (folder / name).write_bytes((out_dir / name).read_bytes())
     return folder
 
 
@@ -207,41 +204,211 @@ class _Quiet(http.server.SimpleHTTPRequestHandler):
         pass
 
 
-def test_install_downloads_verifies_and_imports_then_upgrades(mirror, monkeypatch):
-    calls = []
+def _fresh_process():
+    """模拟下一次进程启动（startup_check 每个进程只跑一次）。"""
+    team_materials._started = False
 
-    def fake_sync(self, pack, source, version, *, progress=None, cancel=None):
-        calls.append((pack, Path(source).read_bytes(), version))
-        if progress:
-            progress(1, 1)
-        self._write_pack_record(pack, {"version": version, "ids": []})
-        return {}
-    monkeypatch.setattr(MaterialLibrary, "sync_pack", fake_sync)
+
+def test_install_is_direct_read_and_upgrade_is_atomic_with_deferred_cleanup(mirror, tmp_path, monkeypatch):
+    monkeypatch.setattr(MaterialLibrary, "sync_pack", lambda *a, **k: pytest.fail("新版不再逐页导入"))
+    _fresh_process()
     assert not components.is_installed("materials")
-    _publish(mirror, "1.0.0", b"pack-v1")
+    out1, _, _ = build_pack_dir(tmp_path, rows(3), "1.2.0")
+    _publish(mirror, out1)
     seen = []
-    assert components.install("materials", components.fetch_manifest("materials"), status=seen.append) == "1.0.0"
-    assert calls == [("team", b"pack-v1", "1.0.0")]
-    assert components.is_installed("materials") and components.installed_version("materials") == "1.0.0"
-    assert {"import": [1, 1]} in seen
-    assert (team_materials.component_dir() / team_materials.PACK_FILE).read_bytes() == b"pack-v1"
-    _publish(mirror, "1.1.0", b"pack-v2")
-    manifest = components.fetch_manifest("materials")
-    assert components.is_newer(manifest["version"], components.installed_version("materials"))
-    components.install("materials", manifest)
-    assert components.installed_version("materials") == "1.1.0"
-    assert (team_materials.component_dir() / team_materials.PACK_FILE).read_bytes() == b"pack-v2"
+    assert components.install("materials", components.fetch_manifest("materials"), status=seen.append) == "1.2.0"
+    state = team_materials.read_state()
+    assert state["current"]["version"] == "1.2.0" and not state["current"]["confirmed"]
+    assert components.is_installed("materials") and components.installed_version("materials") == "1.2.0"
+    reader = team_materials.current_reader()
+    assert [x.id for x in reader.items] == ["m1", "m2", "m3"] and reader.thumbnail(reader.items[0])
+    reader.close()
+    # 升级：旧 current 记进 previous，新的未确认
+    out2, _, _ = build_pack_dir(tmp_path, rows(5), "1.3.0")
+    _publish(mirror, out2)
+    components.install("materials", components.fetch_manifest("materials"))
+    state = team_materials.read_state()
+    assert state["current"]["version"] == "1.3.0" and state["previous"]["version"] == "1.2.0"
+    packs = sorted(p.name for p in (team_materials.root() / "packs").iterdir())
+    assert len(packs) == 2 and not list((team_materials.root() / "stage").iterdir())
+    # 下一次启动校验通过：才确认并清掉 previous
+    _fresh_process()
+    assert team_materials.startup_check() == "confirmed"
+    state = team_materials.read_state()
+    assert state["current"]["confirmed"] and state["previous"] is None
+    assert len(list((team_materials.root() / "packs").iterdir())) == 1
     assert components.uninstall("materials") > 0
-    assert not components.is_installed("materials") and not team_materials.component_dir().exists()
+    assert not components.is_installed("materials") and not team_materials.root().exists()
 
 
-def test_tampered_archive_is_rejected_before_import(mirror, monkeypatch):
-    monkeypatch.setattr(MaterialLibrary, "sync_pack", lambda *a, **k: pytest.fail("校验失败不应导入"))
-    folder = _publish(mirror, "1.0.0", b"pack-v1")
+def test_corrupted_current_rolls_back_to_previous_on_start(tmp_path):
+    _fresh_process()
+    for version, n in (("1.2.0", 2), ("1.3.0", 4)):
+        out, _, _ = build_pack_dir(tmp_path, rows(n), version)
+        assert team_materials.install_from_file(out / "component.zip")["kind"] == "team"
+    state = team_materials.read_state()
+    bad = team_materials.root() / "packs" / state["current"]["dir"] / team_materials.PACK_FILE
+    bad.write_bytes(b"broken")      # 模拟断电写坏 / 被杀毒软件改动
+    _fresh_process()
+    assert team_materials.startup_check() == "rolled_back"
+    reader = team_materials.current_reader()
+    assert reader.version == "1.2.0" and len(reader.items) == 2
+    reader.close()
+
+
+@pytest.mark.parametrize("member", ["thumbs.zip", "index.json"])
+def test_any_corrupted_member_rolls_back_and_keeps_old_library(tmp_path, member):
+    """m4 MF-M2-03：只坏缩略图或索引也要回 previous，且不能清旧库。"""
+    _fresh_process()
+    for version, n in (("1.2.0", 2), ("1.3.0", 4)):
+        out, _, _ = build_pack_dir(tmp_path, rows(n), version)
+        team_materials.install_from_file(out / "component.zip")
+    state = team_materials.read_state()
+    prev_dir = team_materials.root() / "packs" / state["previous"]["dir"]
+    target = team_materials.root() / "packs" / state["current"]["dir"] / member
+    target.write_bytes(target.read_bytes()[:-7] + b"corrupt")
+    _fresh_process()
+    assert team_materials.startup_check(force=True) == "rolled_back"
+    assert team_materials.read_state()["current"]["version"] == "1.2.0" and prev_dir.is_dir()
+
+
+def test_failed_install_keeps_old_library(tmp_path, mirror):
+    _fresh_process()
+    out1, _, _ = build_pack_dir(tmp_path, rows(2), "1.2.0")
+    team_materials.install_from_file(out1 / "component.zip")
+    before = team_materials.read_state()
+    folder = _publish(mirror, build_pack_dir(tmp_path, rows(3), "1.3.0")[0])
     (folder / "component.zip").write_bytes(b"x" * (folder / "component.zip").stat().st_size)
     with pytest.raises(Exception, match="团队素材包"):
         components.install("materials", components.fetch_manifest("materials"))
-    assert not components.is_installed("materials")
+    assert team_materials.read_state() == before
+    assert not list((team_materials.root() / "stage").iterdir())
+
+
+def test_index_that_disagrees_with_pack_is_rejected(tmp_path):
+    _fresh_process()
+    out, _, _ = build_pack_dir(tmp_path, rows(3), "1.2.0")
+    stage = tmp_path / "stage"
+    with zipfile.ZipFile(out / "component.zip") as z:
+        z.extractall(stage)
+    index = json.loads((stage / "index.json").read_text("utf-8"))
+    index["items"] = index["items"][:2]
+    (stage / "index.json").write_text(json.dumps(index), "utf-8")
+    with pytest.raises(ValueError, match="不一致"):
+        team_materials.activate(stage, "1.2.0")
+    assert team_materials.read_state() == {}
+
+
+def test_legacy_pages_are_cleaned_only_after_next_start(tmp_path, fake_ppt):
+    _fresh_process()
+    library = MaterialLibrary()
+    mine = _own(library)
+    library.sync_pack("team", _pack(tmp_path, "v1.pptx", V1), "1.0.0")
+    legacy = team_materials.legacy_dir()
+    legacy.mkdir(parents=True)
+    make_pack(legacy / team_materials.PACK_FILE, rows(3))
+    # 旧用户：还没装新版时，团队素材直接读旧原件，缩略图借逐页导入的 preview.png
+    reader = team_materials.team_reader()
+    assert reader.source == "team" and reader.version == "1.0.0" and len(reader.items) == 3
+    out, _, _ = build_pack_dir(tmp_path, rows(4), "1.2.0")
+    team_materials.install_from_file(out / "component.zip")
+    assert library.pack_record("team")["version"] == "1.0.0" and legacy.exists()   # 当次不清
+    _fresh_process()
+    assert team_materials.startup_check() == "confirmed"
+    assert library.pack_record("team") == {} and not legacy.exists()
+    assert [x.id for x in library.list()] == [mine.id]                              # 个人收藏不碰
+
+
+def test_offline_zip_with_manifest_is_strict_and_never_falls_back(tmp_path):
+    """m4 MF-M2-02：旁边有 component.json 就只认清单；篡改后重打 CRC 合法的 zip 也必须拒绝。"""
+    _fresh_process()
+    out, _, _ = build_pack_dir(tmp_path, rows(3), "1.2.0")
+    assert team_materials.install_from_file(out / "component.zip")["version"] == "1.2.0"
+    before = team_materials.read_state()
+    forged = tmp_path / "forged"
+    forged.mkdir()
+    (forged / "component.json").write_bytes((out / "component.json").read_bytes())
+    with zipfile.ZipFile(out / "component.zip") as src, zipfile.ZipFile(forged / "component.zip", "w") as dst:
+        for name in src.namelist():
+            data = src.read(name)
+            if name == "index.json":
+                index = json.loads(data)
+                index["version"] = "9.9.9"
+                data = json.dumps(index).encode()
+            dst.writestr(name, data)
+    with pytest.raises(ValueError, match="component.json"):
+        team_materials.install_from_file(forged / "component.zip")
+    (forged / "component.json").write_text("{bad json", "utf-8")
+    with pytest.raises(ValueError, match="合法清单"):
+        team_materials.install_from_file(forged / "component.zip")
+    assert team_materials.read_state() == before
+
+
+def test_offline_zip_without_manifest_cannot_block_official_updates(tmp_path):
+    _fresh_process()
+    out, _, _ = build_pack_dir(tmp_path, rows(3), "9.9.9")
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    (bare / "同事给的.zip").write_bytes((out / "component.zip").read_bytes())
+    assert team_materials.install_from_file(bare / "同事给的.zip")["kind"] == "team"
+    assert team_materials.installed_version() == "0.0.0"
+    assert components.is_newer("1.2.0", components.installed_version("materials"))
+
+
+@pytest.mark.parametrize("claimed", ["../../escaped-probe", "..\\..\\x", "1.2.0/../../y", "C:/abs", "1.2"])
+def test_offline_version_cannot_escape_pack_root(tmp_path, claimed):
+    """m4 MF-M2-04：包里自称的版本号不能变成目录名；越界不可能，旧指针不受影响。"""
+    _fresh_process()
+    good, _, _ = build_pack_dir(tmp_path, rows(2), "1.2.0")
+    team_materials.install_from_file(good / "component.zip")
+    (tmp_path / "evil").mkdir()
+    out, _, _ = build_pack_dir(tmp_path / "evil", rows(3), "1.3.0")
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    with zipfile.ZipFile(out / "component.zip") as src, zipfile.ZipFile(bare / "x.zip", "w") as dst:
+        for name in src.namelist():
+            data = src.read(name)
+            if name == "index.json":
+                index = json.loads(data)
+                index["version"] = claimed
+                data = json.dumps(index).encode()
+            dst.writestr(name, data)
+    result = team_materials.install_from_file(bare / "x.zip")
+    state = team_materials.read_state()
+    assert result["version"] == "local" and state["current"]["version"] == "local"
+    assert not state["current"]["verified"] and team_materials.installed_version() == "0.0.0"
+    packs = team_materials.root() / "packs"
+    assert {p.parent for p in packs.iterdir()} == {packs} and len(list(packs.iterdir())) == 2
+    assert all(len(p.name) == 32 for p in packs.iterdir())
+    assert not [p for p in team_materials.data_dir().iterdir() if "escaped" in p.name or p.name in ("x", "y")]
+    assert state["previous"]["version"] == "1.2.0"
+
+
+def test_state_with_hostile_dir_name_is_ignored():
+    for bad in ("../x", "..", "a/b", "0" * 31, "g" * 32):
+        assert team_materials._pack_path({"dir": bad}) is None
+
+
+def test_import_plain_material_pptx_is_direct_read(tmp_path):
+    _fresh_process()
+    pack = make_pack(tmp_path / "同事的形状.pptx", rows(4, "容器与卡片", "x"))
+    assert team_materials.install_from_file(pack) == {"kind": "imported", "version": "", "items": 4}
+    assert team_materials.install_from_file(pack)["items"] == 4                     # 重复导入不多一份
+    readers = team_materials.imported_readers()
+    assert len(readers) == 1 and [x.source for x in readers[0].items] == ["imported"] * 4
+    team_materials.remove_imported(readers[0])
+    assert team_materials.imported_readers() == []
+    with pytest.raises(ValueError, match=".pptx"):
+        team_materials.install_from_file(tmp_path / "x.txt")
+
+
+def test_builtin_core_is_fallback_source(tmp_path, monkeypatch):
+    _fresh_process()
+    _, core, _ = build_pack_dir(tmp_path, rows(8) + rows(2, "整页模板·方案与原理", "w"), "1.2.0", core=True)
+    monkeypatch.setattr(materials, "builtin_core_dir", lambda: core)
+    reader = team_materials.team_reader()
+    assert reader.source == "builtin" and len(reader.items) == 3 and reader.thumbnail(reader.items[0])
+    assert not components.is_installed("materials")      # 内置精选不算装了完整库
 
 
 def test_manifest_without_pack_file_is_refused():
@@ -252,67 +419,9 @@ def test_manifest_without_pack_file_is_refused():
 def test_materials_catalog_entry():
     assert components.info("materials").name == "团队素材包"
     assert not components.bundled("materials") and not components.MATERIALS.in_full
+    assert components.MATERIALS.approx_mb == 5
     assert components.is_newer("1.1.0", "1.0.0") and not components.is_newer("1.0.0", "1.0.0")
     assert not components.is_newer("", "1.0.0")
-
-
-# ---------- 打包工具 ----------
-def _minimal_pptx(path: Path, rows):
-    P = "http://schemas.openxmlformats.org/presentationml/2006/main"
-    A = "http://schemas.openxmlformats.org/drawingml/2006/main"
-    R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
-    REL = "http://schemas.openxmlformats.org/package/2006/relationships"
-    with zipfile.ZipFile(path, "w") as z:
-        ids = "".join(f'<p:sldId id="{256 + i}" r:id="rId{i + 1}"/>' for i in range(len(rows)))
-        z.writestr("ppt/presentation.xml", f'<p:presentation xmlns:p="{P}" xmlns:r="{R}"><p:sldIdLst>{ids}</p:sldIdLst></p:presentation>')
-        rels = "".join(f'<Relationship Id="rId{i + 1}" Type="{R}/slide" Target="slides/slide{i + 1}.xml"/>' for i in range(len(rows)))
-        z.writestr("ppt/_rels/presentation.xml.rels", f'<Relationships xmlns="{REL}">{rels}</Relationships>')
-        for i, raw in enumerate(rows, 1):
-            z.writestr(f"ppt/slides/slide{i}.xml", f'<p:sld xmlns:p="{P}"/>')
-            z.writestr(f"ppt/slides/_rels/slide{i}.xml.rels",
-                       f'<Relationships xmlns="{REL}"><Relationship Id="rId9" Type="{R}/notesSlide" Target="../notesSlides/notesSlide{i}.xml"/></Relationships>')
-            text = "".join(f"<a:p><a:r><a:t>{line}</a:t></a:r></a:p>" for line in
-                           (MARKER.strip(), json.dumps(raw, ensure_ascii=False).replace("&", "&amp;").replace("<", "&lt;")))
-            z.writestr(f"ppt/notesSlides/notesSlide{i}.xml",
-                       f'<p:notes xmlns:p="{P}" xmlns:a="{A}"><p:cSld><p:spTree><p:sp><p:txBody>{text}</p:txBody></p:sp></p:spTree></p:cSld></p:notes>')
-
-
-def _tool():
-    import importlib.util
-    spec = importlib.util.spec_from_file_location(
-        "build_materials_component", Path(__file__).resolve().parents[1] / "tools" / "build_materials_component.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def test_build_tool_writes_verifiable_component(tmp_path):
-    pack = tmp_path / "pack.pptx"
-    _minimal_pptx(pack, [{"id": "m1", "name": "箭头", "category": "箭头与流程"},
-                         {"id": "m2", "name": "卡片", "category": "容器与卡片"},
-                         {"id": "m3", "name": "图标", "category": "箭头与流程"}])
-    manifest = _tool().build(pack, "1.0.0", tmp_path / "out")
-    assert manifest["items"] == 3 and manifest["categories"] == {"箭头与流程": 2, "容器与卡片": 1}
-    archive = tmp_path / "out" / "component.zip"
-    assert hashlib.sha256(archive.read_bytes()).hexdigest() == manifest["archive"]["hash"]
-    with zipfile.ZipFile(archive) as z:
-        assert z.namelist() == [team_materials.PACK_FILE]
-        assert z.read(team_materials.PACK_FILE) == pack.read_bytes()
-    on_disk = json.loads((tmp_path / "out" / "component.json").read_text("utf-8"))
-    assert on_disk["files"][team_materials.PACK_FILE]["hash"] == hashlib.sha256(pack.read_bytes()).hexdigest()
-
-
-@pytest.mark.parametrize("rows, match", [
-    ([{"id": "m1", "name": "a"}, {"id": "m1", "name": "b"}], "重复"),
-    ([{"id": "m1", "name": ""}], "名称"),
-])
-def test_build_tool_rejects_bad_packs(tmp_path, rows, match):
-    pack = tmp_path / "pack.pptx"
-    _minimal_pptx(pack, rows)
-    with pytest.raises(SystemExit, match=match):
-        _tool().build(pack, "1.0.0", tmp_path / "out")
-    with pytest.raises(SystemExit, match="X.Y.Z"):
-        _tool().build(pack, "v1", tmp_path / "out")
 
 
 # ---------- 界面：素材库就地下载、组件页「有更新」 ----------
@@ -330,49 +439,26 @@ def center(qapp):
     cc.reset_for_tests()
 
 
-def _items(library, rows):
-    for i, (name, category) in enumerate(rows):
-        item = Material(f"{i:032x}", name, category, i)
-        folder = library.folder(item.id)
-        folder.mkdir()
-        library._write(folder, item)
-
-
-def test_material_window_offers_pack_download_in_place(qtbot, center, tmp_path, monkeypatch):
-    from pptx_finder.ui.material_window import MaterialWindow
-    state = {"installed": False}
-    monkeypatch.setattr(components, "is_installed", lambda key: state["installed"])
-    calls = []
-    monkeypatch.setattr(center, "request", lambda key, parent=None, **kw: calls.append(key))
-    library = MaterialLibrary(tmp_path / "lib")
-    win = MaterialWindow(library=library)
-    qtbot.addWidget(win)
-    qtbot.waitUntil(lambda: not win._tasks)
-    assert win.pack_bar.isVisibleTo(win) and win.pack_btn.text() == "下载团队素材包"
-    assert "按分类筛选" in win.pack_label.text()
-    win.pack_btn.click()
-    assert calls == ["materials"]
-    # 装好后：横幅消失、列表刷新、分类下拉带数量并能筛选
-    _items(library, [("箭头 A", "箭头与流程"), ("箭头 B", "箭头与流程"), ("卡片", "容器与卡片")])
-    state["installed"] = True
-    center.installed.emit("materials")
+def test_material_tab_fetch_full_library_inline_without_dialog(qtbot, center, tmp_path, monkeypatch):
+    from pptx_finder.ui.material_tab import MaterialTabWidget
+    _fresh_process()
+    _, core, _ = build_pack_dir(tmp_path, rows(8), "1.2.0", core=True)
+    monkeypatch.setattr(materials, "builtin_core_dir", lambda: core)
+    started, dialogs = [], []
+    monkeypatch.setattr(center, "start", started.append)
+    monkeypatch.setattr(center, "open_dialog", lambda *a, **k: dialogs.append(a))
+    tab = MaterialTabWidget(component_center=center, library=MaterialLibrary(tmp_path / "lib"))
+    qtbot.addWidget(tab)
+    qtbot.waitUntil(lambda: tab._loaded)
+    assert "内置精选 2 条" in tab.pill.text() and tab.fetch_btn.text() == "获取完整库"
+    tab.fetch_btn.click()
+    assert started == ["materials"] and dialogs == []          # 就地进度，不弹下载窗口
+    center._states["materials"].update(phase="downloading", status={"received": 1048576, "total": 3145728})
     center.state_changed.emit("materials")
-    qtbot.waitUntil(lambda: not win._tasks and win.list_widget.count() == 3)
-    assert not win.pack_bar.isVisibleTo(win)
-    labels = [win.categories.itemText(i) for i in range(win.categories.count())]
-    assert labels == ["全部分类", "容器与卡片（1）", "箭头与流程（2）"]
-    win.categories.setCurrentIndex(2)
-    assert win.list_widget.count() == 2
-
-
-def test_material_window_shows_import_progress(qtbot, center, tmp_path, monkeypatch):
-    from pptx_finder.ui.material_window import MaterialWindow
-    monkeypatch.setattr(components, "is_installed", lambda key: False)
-    win = MaterialWindow(library=MaterialLibrary(tmp_path / "lib"))
-    qtbot.addWidget(win)
-    center._states["materials"].update(phase="installing", **{"import": [37, 187]})
+    assert tab.notice.isVisibleTo(tab) and "1.0 / 3.0 MB" in tab.notice_text.text()
+    center._states["materials"].update(phase="error", error="连不上")
     center.state_changed.emit("materials")
-    assert "37 / 187" in win.pack_label.text() and win.pack_btn.text() == "查看进度"
+    assert "内源暂时连不上" in tab.notice_text.text() and tab.notice_import.isVisibleTo(tab)
 
 
 def test_settings_row_shows_update_and_starts_upgrade(qtbot, center, monkeypatch):
@@ -406,7 +492,7 @@ def test_dialog_offers_update_and_shows_import_progress(qtbot, center, monkeypat
     dlg.setAttribute(Qt.WA_DontShowOnScreen, True)
     qtbot.addWidget(dlg)
     assert dlg.phase_rendered == "upgradable" and dlg.btn_primary.text() == "更新"
-    assert "v1.1.0" in dlg.msg.text() and "自动导入素材库" in dlg.sub.text()
+    assert "v1.1.0" in dlg.msg.text() and "不需要 PowerPoint" in dlg.sub.text()
     center._states["materials"].update(phase="installing", **{"import": [5, 187]})
     dlg.refresh()
     assert "正在导入素材库 5 / 187" in dlg.dl_head.text() and dlg.progress.maximum() == 187

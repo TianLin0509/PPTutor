@@ -233,8 +233,12 @@ def test_imgtext_result_buttons_open_and_save_as(qtbot, tmp_path, monkeypatch):
 
 # ---------------------------------------------------------------- 素材库
 def _material_window(qtbot, tmp_path, monkeypatch):
+    from pptx_finder import materials, team_materials
     from pptx_finder.materials import Material, MaterialLibrary
     from pptx_finder.ui.material_window import MaterialWindow
+    monkeypatch.setenv("PPTX_FINDER_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setattr(materials, "builtin_core_dir", lambda: tmp_path / "no-core")
+    team_materials._started = False
     library = MaterialLibrary(tmp_path / "materials")
     items = [Material("a" * 32, "红色箭头", "箭头", 1)]
     calls = []
@@ -242,38 +246,40 @@ def _material_window(qtbot, tmp_path, monkeypatch):
     monkeypatch.setattr(library, "copy", lambda i: calls.append(("copy", i)))
     monkeypatch.setattr(library, "delete", lambda ids: calls.append(("delete", list(ids))))
     monkeypatch.setattr(library, "capture", lambda n, c: calls.append(("capture", n, c)) or items[0])
-    win = MaterialWindow(library=library)
+    win = MaterialWindow(library=library, component_center=None)
     qtbot.addWidget(win)
     win.show()
-    qtbot.waitUntil(lambda: not win._tasks and win.list_widget.count() == 1, timeout=4000)
+    qtbot.waitUntil(lambda: win.tab._loaded and len(win.tab._view) == 1, timeout=4000)
     return win, calls
 
 
 def test_material_keyboard_and_context_menu(qtbot, tmp_path, monkeypatch):
     win, calls = _material_window(qtbot, tmp_path, monkeypatch)
-    win.list_widget.item(0).setSelected(True)
-    win.list_widget.setFocus()
-    qtbot.keyClick(win.list_widget, Qt.Key_C, Qt.ControlModifier)
+    tab = win.tab
+    tab.grid.select(0)
+    tab.grid.setFocus()
+    qtbot.keyClick(tab.grid, Qt.Key_C, Qt.ControlModifier)
     qtbot.waitUntil(lambda: ("copy", "a" * 32) in calls, timeout=3000)
-    qtbot.waitUntil(lambda: not win._tasks, timeout=3000)
+    qtbot.waitUntil(lambda: not tab._busy_op, timeout=3000)
     monkeypatch.setattr(owner_actions, "ask", lambda *a, **k: True)
-    win.list_widget.setFocus()
-    qtbot.keyClick(win.list_widget, Qt.Key_Delete)
+    tab.grid.setFocus()
+    qtbot.keyClick(tab.grid, Qt.Key_Delete)
     qtbot.waitUntil(lambda: ("delete", ["a" * 32]) in calls, timeout=3000)
-    qtbot.waitUntil(lambda: not win._tasks, timeout=3000)
+    qtbot.waitUntil(lambda: not tab._busy_op, timeout=3000)
 
     _no_menu_exec(monkeypatch)
-    rect = win.list_widget.visualItemRect(win.list_widget.item(0))
-    win._context_menu(rect.center())
-    texts = [a.text().split("\t")[0] for a in win._last_menu.actions() if a.text()]
-    assert texts[:2] == ["复制素材（回 PPT 粘贴）", "编辑名称 / 分类"]
-    assert "移出素材库" in texts
+    pos = tab.grid._rect(0).center()
+    tab._grid_context_menu(pos)
+    texts = [a.text().split("\t")[0] for a in tab._last_menu.actions() if a.text()]
+    assert "插入到当前 PPT" in texts
+    assert "复制形状（回 PPT 粘贴）" in texts
+    assert "改名 / 分类" in texts
+    assert "移出收藏" in texts
 
 
 def test_material_enter_in_name_box_captures(qtbot, tmp_path, monkeypatch):
     win, calls = _material_window(qtbot, tmp_path, monkeypatch)
-    win.name_edit.setText("蓝色框")
-    qtbot.keyClick(win.name_edit, Qt.Key_Return)
+    win.tab.capture_btn.click()
     qtbot.waitUntil(lambda: any(c[0] == "capture" for c in calls), timeout=3000)
 
 

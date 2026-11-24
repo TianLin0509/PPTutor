@@ -16,7 +16,7 @@ import time
 from PySide6.QtCore import QRectF, Qt, QTimer
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
-    QFrame, QGridLayout, QHBoxLayout, QLabel, QVBoxLayout, QWidget,
+    QFrame, QGridLayout, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget,
 )
 try:
     from shiboken6 import isValid as _qt_is_valid
@@ -321,8 +321,8 @@ class DashboardView(QWidget):
             cl = QVBoxLayout(card)
             cl.setContentsMargins(18, 14, 18, 14)
             cl.setSpacing(2)
-            num = QLabel("—")
-            num.setObjectName("kpiNum")
+            num = QLabel("")
+            num.setObjectName("kpiNumAcc" if i == 0 else "kpiNum")
             lab = QLabel("")
             lab.setObjectName("kpiLab")
             sub = QLabel("")
@@ -340,17 +340,60 @@ class DashboardView(QWidget):
         root.addWidget(self._build_health_banner())
 
         # 2x2 图表网格
-        grid = QGridLayout()
+        charts = QWidget()
+        charts.setObjectName("dashCharts")
+        grid = QGridLayout(charts)
+        grid.setContentsMargins(0, 0, 0, 0)
         grid.setSpacing(14)
-        grid.addWidget(self._topic_card(), 0, 0)
-        grid.addWidget(self._recent_card(), 0, 1)
-        grid.addWidget(self._folder_card(), 1, 0)
-        grid.addWidget(self._week_card(), 1, 1)
+        self._card_topic = self._topic_card()
+        self._card_recent = self._recent_card()
+        self._card_folder = self._folder_card()
+        self._card_week = self._week_card()
+        # 库里不足 5 份 PPT 时，三张统计图数据过少：左侧换成摘要卡，右侧「最近活跃」仍保留以便直接打开已有文档
+        self._few_card = self._build_few_card()
+        self._few_card.hide()
+        grid.addWidget(self._card_topic, 0, 0)
+        grid.addWidget(self._few_card, 0, 0)
+        grid.addWidget(self._card_recent, 0, 1)
+        grid.addWidget(self._card_folder, 1, 0)
+        grid.addWidget(self._card_week, 1, 1)
         grid.setColumnStretch(0, 1)
         grid.setColumnStretch(1, 1)
         grid.setRowStretch(0, 1)
         grid.setRowStretch(1, 1)
-        root.addLayout(grid, 1)
+        self._charts_grid = grid
+        self._charts = charts
+        root.addWidget(charts, 1)
+
+    #: 少于这个份数时，用摘要卡代替四张空图
+    FEW_DOCS = 5
+
+    def _build_few_card(self) -> QFrame:
+        w, layout = self._card("库里的 PPT 还不多")
+        self._few_text = QLabel("")
+        self._few_text.setObjectName("dashSub")
+        self._few_text.setWordWrap(True)
+        layout.addWidget(self._few_text)
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        go = QPushButton("去搜索")
+        go.setObjectName("primary")
+        go.setCursor(Qt.PointingHandCursor)
+        go.clicked.connect(lambda: self._open_kpi(2))
+        scope = QPushButton("调整索引范围")
+        scope.setCursor(Qt.PointingHandCursor)
+        scope.clicked.connect(self._open_index_scope)
+        row.addWidget(go)
+        row.addWidget(scope)
+        row.addStretch(1)
+        layout.addLayout(row)
+        layout.addStretch(1)
+        return w
+
+    def _open_index_scope(self) -> None:
+        fn = getattr(self._win, "open_settings_page", None)
+        if callable(fn):
+            fn("索引范围")
 
     def _card(self, title: str) -> tuple[QFrame, QVBoxLayout]:
         w = QFrame()
@@ -680,7 +723,7 @@ class DashboardView(QWidget):
             "topics": age_buckets or top_folders,
             "week": week if any(week) else [0] * 7,
             "week_shield_text": (
-                f"🛡 已留版 {protected} 份 · {rollback_docs} 份可回退" if version_available
+                f"已留版 {protected} 份 · {rollback_docs} 份可回退" if version_available
                 else ("暂时读不到版本记录，请点击上方卡片查看" if version_enabled else
                       "版本管理未开启 · 开启后，每次保存可自动留存历史版本")),
             "recent": recents,
@@ -762,7 +805,7 @@ class DashboardView(QWidget):
         self._topics = top_folders
         self._week = week if any(week) else [0] * 7
         self._week_shield_text = (
-            f"🛡 已留版 {protected} 份 · {rollback_docs} 份可回退" if version_available
+            f"已留版 {protected} 份 · {rollback_docs} 份可回退" if version_available
             else ("暂时读不到版本记录，请点击上方卡片查看" if version_enabled else
                   "版本管理未开启 · 开启后，每次保存可自动留存历史版本"))
 
@@ -782,9 +825,38 @@ class DashboardView(QWidget):
     def _apply_data(self) -> None:
         for i, (num, lab, sub) in enumerate(getattr(self, "_kpi_vals",
                                                      [("—", "", "")] * 4)[:4]):
-            self._kpi_nums[i].setText(num)
+            if i == 1 and num == "—":
+                # 方案 D：不显示孤零零的破折号——未开启时整张卡就是「开启版本留存」的行动入口
+                enabled = self._version_is_enabled()
+                num = "读取中" if enabled else "开启版本留存"
+                lab = "可回退 PPT" if enabled else "改坏了也能找回"
+                sub = sub if enabled else "每次保存自动留一版 · 点击开启"
+                self._kpi_nums[i].setObjectName("kpiAction")
+            elif i == 1:
+                self._kpi_nums[i].setObjectName("kpiNum")
+            self._kpi_nums[i].style().unpolish(self._kpi_nums[i])
+            self._kpi_nums[i].style().polish(self._kpi_nums[i])
+            self._kpi_nums[i].setText(num if num != "—" else "0")
             self._kpi_labs[i].setText(lab)
             self._kpi_subs[i].setText(sub)
+        try:
+            docs = int(str(getattr(self, "_kpi_vals", [("0",)])[0][0]).replace(",", ""))
+        except (TypeError, ValueError, IndexError):
+            docs = 0
+        few = docs < self.FEW_DOCS
+        if hasattr(self, "_few_card"):
+            for card in (self._card_topic, self._card_folder, self._card_week):
+                card.setVisible(not few)
+            self._few_card.setVisible(few)
+            self._card_recent.setVisible(True)
+            self._charts_grid.setRowStretch(1, 0 if few else 1)
+            if few:
+                worker = getattr(self._win, "_indexer", None)
+                scanning = worker is not None and worker.isRunning()
+                self._few_text.setText(
+                    (f"目前索引到 {docs} 份 PPT，正在继续查找；" if scanning else f"目前索引到 {docs} 份 PPT。")
+                    + "份数多起来以后，这里会显示新鲜度、文件夹分布和本周改动。"
+                    "现在就可以在右侧直接打开最近文档，或搜任意一页里的字；如果你的 PPT 放在别的盘或文件夹，把它加进索引范围。")
 
         total = sum(v for _, v in self._topics) or 1
         for i, (dot, nm, pc) in enumerate(self._leg_rows):

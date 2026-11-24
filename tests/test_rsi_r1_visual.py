@@ -25,15 +25,20 @@ def test_zero_result_hides_preview_and_results_bring_it_back(qtbot, tmp_path):
     assert not win._preview_panel.isHidden()
 
 
-def test_material_empty_state_is_centered_and_switches_with_items(qtbot, tmp_path):
+def test_material_empty_state_is_centered_and_switches_with_items(qtbot, tmp_path, monkeypatch):
+    from pptx_finder import materials, team_materials
+    monkeypatch.setenv("PPTX_FINDER_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setattr(materials, "builtin_core_dir", lambda: tmp_path / "no-core")
+    team_materials._started = False
     library = MaterialLibrary(tmp_path / "materials")
     win = MaterialWindow(library=library)
     qtbot.addWidget(win)
     win.show()
-    qtbot.waitUntil(lambda: not win._tasks)
-    assert win._list_stack.currentWidget() is win._empty_view
-    assert "还没有素材" in win._empty_title.text()
-    assert win.status.text() == ""                 # 底部不再重复一遍
+    tab = win.tab
+    qtbot.waitUntil(lambda: tab._loaded, timeout=4000)
+    assert tab.stack.currentWidget() is tab.empty
+    assert "还没有" in tab.empty_title.text()
+    assert tab.status.text() == ""                 # 底部不再重复一遍
 
     item = Material("b" * 32, "红色箭头", "箭头", 1)
     folder = library.folder(item.id)
@@ -42,11 +47,13 @@ def test_material_empty_state_is_centered_and_switches_with_items(qtbot, tmp_pat
     image = QImage(40, 20, QImage.Format_RGB32)
     image.fill(Qt.red)
     image.save(str(folder / "preview.png"))
-    win._loaded([item])
-    assert win._list_stack.currentWidget() is win.list_widget
-    win.search.setText("没有这个")
-    assert win._list_stack.currentWidget() is win._empty_view
-    assert "没有符合条件" in win._empty_title.text()
+    tab.refresh_library()
+    qtbot.waitUntil(lambda: len(tab._all) == 1, timeout=4000)
+    assert tab.stack.currentWidget() is tab.grid
+    tab.search.setText("没有这个")
+    tab._apply_filter()
+    assert tab.stack.currentWidget() is tab.empty
+    assert "没有符合条件" in tab.empty_title.text()
 
 
 def test_health_tab_shows_plain_summary_and_folds_raw_log(qtbot, tmp_path, monkeypatch):

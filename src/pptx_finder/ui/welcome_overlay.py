@@ -5,13 +5,15 @@
 """
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor, QPainter, QPen, QPixmap
+from PySide6.QtCore import QRectF, QSize, Qt
+from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
-    QGridLayout, QHBoxLayout, QLabel, QPushButton, QSizePolicy, QVBoxLayout, QWidget,
+    QGridLayout, QHBoxLayout, QLabel, QPushButton, QSizePolicy, QToolButton, QVBoxLayout, QWidget,
 )
 
+from . import icons as _icons
 from . import theme
+from .aurora_bg import paint_aurora
 
 
 def _welcome_logo(size: int = 60) -> QPixmap:
@@ -36,12 +38,22 @@ def _welcome_logo(size: int = 60) -> QPixmap:
     return pm
 
 
+# 方案 D：线性图标代替彩色 emoji（图标名见 icons.PATHS）
 _FEATURES = [
-    ("🔍", "搜内容，直接定位到页", "记得幻灯片里写过的字，搜出来是哪个文件第几页，点开直接跳过去"),
-    ("📋", "复制本页 / 插入到 PPT", "找到需要的那页后，可以复制整页或插入到已打开的 PPT；请先打开目标文稿"),
-    ("✨", "图片转文字 · 素材库", "把截图转成文字可编辑的 PPT；常用箭头、框图也能收藏复用"),
-    ("🎬", "版本留存 · 智能归组", "版本留存可找回历史版本，智能归组把相似 PPT 归在一起；两项默认关闭，可在设置里开启。按 Alt+F 随时唤起搜索"),
+    ("search", "搜内容，直接定位到页", "记得幻灯片里写过的字，搜出来是哪个文件第几页，点开直接跳过去"),
+    ("copy", "复制本页 / 插入到 PPT", "找到需要的那页后，可以复制整页或插入到已打开的 PPT；请先打开目标文稿"),
+    ("materials", "图片转文字 · 素材库", "把截图转成文字可编辑的 PPT；常用箭头、框图也能收藏复用"),
+    ("version", "版本留存 · 智能归组", "版本留存可找回历史版本，智能归组把相似 PPT 归在一起；两项默认关闭，可在设置里开启。按 Alt+F 随时唤起搜索"),
 ]
+
+
+def _is_disk_full(error: object) -> bool:
+    detail = str(error).lower()
+    return any(word in detail for word in ("errno 28", "winerror 112", "no space", "disk full", "磁盘满", "磁盘空间不足"))
+
+
+#: 欢迎层的主题缩略卡：晨雾玻璃（默认）/ 暗夜玻璃 / 静白
+WELCOME_THEMES = ("mist_glass", "night_glass", "atelier")
 
 
 def _index_problem_message(error: object) -> str:
@@ -59,7 +71,7 @@ def _index_problem_message(error: object) -> str:
 
 
 class WelcomeOverlay(QWidget):
-    def __init__(self, parent=None, *, on_start, on_pick_theme, current_theme="cloud", on_settings=None):
+    def __init__(self, parent=None, *, on_start, on_pick_theme, current_theme="cloud", on_settings=None, on_rescan=None):
         super().__init__(parent)
         self._on_start_cb = on_start
         self._on_pick_cb = on_pick_theme
@@ -117,24 +129,54 @@ class WelcomeOverlay(QWidget):
         cl.addSpacing(22)
         cl.addWidget(self._progress_label)
 
-        st = QLabel("顺手挑个外观（更多风格可随时在左下角「主题」切换）")
+        # 磁盘不足：橙色提示条 + 就地按钮（不让用户自己去找设置）
+        self._disk_bar = QWidget()
+        self._disk_bar.setObjectName("wDiskBar")
+        self._disk_bar.setAttribute(Qt.WA_StyledBackground, True)
+        db_lay = QHBoxLayout(self._disk_bar)
+        db_lay.setContentsMargins(14, 8, 8, 8)
+        db_lay.setSpacing(10)
+        self._disk_text = QLabel("磁盘空间不足，索引没能写完。清理一些空间后点右边按钮继续。")
+        self._disk_text.setObjectName("wDiskText")
+        self._disk_text.setWordWrap(True)
+        db_lay.addWidget(self._disk_text, 1)
+        self._disk_btn = QPushButton("清理后重新扫描")
+        self._disk_btn.setObjectName("wDiskBtn")
+        self._disk_btn.setCursor(Qt.PointingHandCursor)
+        # 文案说「重新扫描」就真的重扫；没给重扫回调时如实改成去设置
+        if on_rescan is not None:
+            self._disk_btn.clicked.connect(on_rescan)
+        elif on_settings is not None:
+            self._disk_btn.setText("打开设置")
+            self._disk_btn.clicked.connect(on_settings)
+        else:
+            self._disk_btn.hide()
+        db_lay.addWidget(self._disk_btn)
+        self._disk_bar.hide()
+        cl.addSpacing(10)
+        cl.addWidget(self._disk_bar)
+
+        st = QLabel("顺手挑个外观（更多风格随时可在左下角切深浅，或到「设置 → 外观」换）")
         st.setObjectName("wStyleHint")
         st.setAlignment(Qt.AlignCenter)
         cl.addSpacing(20)
         cl.addWidget(st)
-        # 首次使用只主推静白/静黑；完整主题列表仍保留在主窗的主题入口。
+        # 首次使用主推三张缩略卡：晨雾玻璃 / 暗夜玻璃 / 静白；完整主题列表在设置「外观」页。
         sw = QGridLayout()
-        sw.setSpacing(8)
+        sw.setSpacing(10)
         sw.setContentsMargins(0, 0, 0, 0)
-        per_row = 2
+        per_row = len(WELCOME_THEMES)
         for c in range(per_row):
-            sw.setColumnStretch(c, 1)  # 等宽列，chip 均匀铺满不挤
-        self._theme_btns: dict[str, QPushButton] = {}
-        recommended = [(name, label) for name, label in theme.THEMES
-                       if name in ("atelier", "atelier_dark")]
-        for i, (name, label) in enumerate(recommended):
-            b = QPushButton(label)
+            sw.setColumnStretch(c, 1)
+        self._theme_btns: dict[str, QToolButton] = {}
+        labels = dict(theme.THEMES)
+        for i, name in enumerate(WELCOME_THEMES):
+            b = QToolButton()
             b.setObjectName("wSwatch")
+            b.setText(labels.get(name, name))
+            b.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+            b.setIcon(QIcon(theme.preview_pixmap(name, 132, 74)))
+            b.setIconSize(QSize(132, 74))
             b.setCheckable(True)
             b.setChecked(name == self._theme)
             b.setCursor(Qt.PointingHandCursor)
@@ -160,10 +202,12 @@ class WelcomeOverlay(QWidget):
         h = QHBoxLayout(w)
         h.setContentsMargins(16, 13, 16, 13)
         h.setSpacing(13)
-        icon = QLabel(ic)
+        icon = QLabel()
         icon.setObjectName("wFeatIc")
         icon.setAlignment(Qt.AlignCenter)
         icon.setFixedSize(38, 38)
+        icon.setProperty("iconName", ic)
+        self._feat_icons = getattr(self, "_feat_icons", []) + [icon]
         h.addWidget(icon, 0, Qt.AlignTop)
         col = QVBoxLayout()
         col.setSpacing(3)
@@ -182,6 +226,7 @@ class WelcomeOverlay(QWidget):
         for n, b in self._theme_btns.items():
             b.setChecked(n == name)
         self._apply_qss()
+        self.update()
         self._on_pick_cb(name)
 
     def update_progress(self, found: int, total: int | None = None) -> None:
@@ -190,6 +235,7 @@ class WelcomeOverlay(QWidget):
         self._progress_label.setText(f"{phase}… {count} · 不影响你同时搜索")
 
     def finish_index(self, summary: dict) -> None:
+        self._disk_bar.setVisible(bool(summary.get("error")) and _is_disk_full(summary.get("error")))
         if summary.get("error"):
             text = "首次建立索引遇到问题，已完成的结果仍可搜索。" + _index_problem_message(summary["error"])
         elif summary.get("cancelled"):
@@ -205,11 +251,25 @@ class WelcomeOverlay(QWidget):
             self.resize(self.parent().size())
         super().resizeEvent(e)
 
+    def paintEvent(self, e):  # noqa: N802
+        """欢迎层的底与主窗同一画法：底色 + 静态光团（不模糊、不加阴影效果）。"""
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        paint_aurora(p, QRectF(self.rect()), theme.tok(self._theme))
+        p.end()
+
     def _apply_qss(self) -> None:
         t = theme.tok(self._theme)
+        for icon in getattr(self, "_feat_icons", ()):
+            icon.setPixmap(_icons.icon(icon.property("iconName"), t["acc"], 20).pixmap(20, 20))
+        card_bg = t["panel"] if theme.float_glass(self._theme) else "transparent"
         self.setStyleSheet(f"""
-        #welcomeOverlay {{ background: {t['appbg']}; }}
-        #welcomeCard {{ background: transparent; }}
+        #welcomeOverlay {{ background: transparent; }}
+        #welcomeCard {{ background: {card_bg}; border: 1px solid {t['edge']}; border-radius: 24px; }}
+        #wDiskBar {{ background: rgba(232,120,12,0.12); border: 1px solid rgba(232,120,12,0.35); border-radius: 12px; }}
+        #wDiskText {{ font-size: 12.5px; color: {t['ink1']}; background: transparent; }}
+        #wDiskBtn {{ background: {t['panel2']}; border: 1px solid {t['bd']}; border-radius: 14px; padding: 6px 14px;
+                     color: {t['ink1']}; font-size: 12.5px; }}
         #wTitle {{ font-size: 26px; font-weight: 800; color: {t['ink1']}; }}
         #wSub {{ font-size: 14px; color: {t['ink3']}; }}
         #wFeat {{ background: {t['panel2']}; border: 1px solid {t['bd']}; border-radius: 12px; }}
@@ -219,11 +279,10 @@ class WelcomeOverlay(QWidget):
         #wFeatD {{ font-size: 12px; color: {t['ink3']}; background: transparent; }}
         #wProgress {{ font-size: 13px; color: {t['ink2']}; }}
         #wStyleHint {{ font-size: 11px; color: {t['ink4']}; }}
-        #wSwatch {{ background: {t['field']}; border: 1px solid {t['bd']}; border-radius: 8px;
-                    padding: 6px 10px; color: {t['ink3']}; font-size: 12px; min-width: 44px; }}
-        #wSwatch:checked {{ border-color: {t['acc']}; color: {t['acc']};
-                            background: rgba({t['hl_r']},{t['hl_g']},{t['hl_b']},0.14); }}
-        #wStart {{ background: {t['acc']}; border: 1px solid {t['acc']}; border-radius: 10px;
+        #wSwatch {{ background: {t['panel2']}; border: 1px solid {t['bd']}; border-radius: 14px;
+                    padding: 8px 8px 6px 8px; color: {t['ink2']}; font-size: 12.5px; }}
+        #wSwatch:checked {{ border: 2px solid {t['acc']}; color: {t['acc']}; font-weight: 600; }}
+        #wStart {{ background: {t['accfill']}; border: 1px solid {t['accfill']}; border-radius: 18px;
                    padding: 11px 30px; color: {t['acctext']}; font-size: 14px; font-weight: 600; }}
-        #wStart:hover {{ background: {t['accd']}; }}
+        #wStart:hover {{ background: {t['accfillh']}; }}
         """)

@@ -29,8 +29,8 @@ class ComponentInfo:
 
 OCR = ComponentInfo("ocr", "文字识别组件", "图片转可编辑文字、截图识字", 82)
 FORMULA = ComponentInfo("formula", "公式识别组件", "截图识别公式（LaTeX / Word 公式）", 436)
-MATERIALS = ComponentInfo("materials", "团队素材包", "素材库里的团队常用形状、箭头、图标（可按分类筛选）", 2,
-                          note="下载后自动导入素材库", in_full=False)
+MATERIALS = ComponentInfo("materials", "团队素材包", "完整团队素材库：常用形状、箭头、图标、整页模板（主包已内置精选）", 5,
+                          note="下载后直接可用，不需要 PowerPoint", in_full=False)
 ALL = (OCR, FORMULA, MATERIALS)
 BY_KEY = {c.key: c for c in ALL}
 

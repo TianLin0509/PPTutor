@@ -147,3 +147,84 @@ def test_package_has_regex_and_windows_version_metadata():
     assert f"prodvers=({parts[0]}, {parts[1]}, {parts[2]}, 0)" in version_info
     assert f"'FileVersion', '{__version__}'" in version_info
     assert f"'ProductVersion', '{__version__}'" in version_info
+
+
+# ---------- 团队素材内置精选：逐文件精确白名单（m3 M2-04） ----------
+_CORE = ("team-materials-core.pptx", "index.json", "thumbs.zip")
+
+
+def _package_dist():
+    import importlib.util
+    root = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location("package_dist_under_test", root / "tools" / "package_dist.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_spec_lists_exactly_three_materials_core_files_without_globs():
+    spec = (Path(__file__).resolve().parents[1] / "pptx-finder.spec").read_text(encoding="utf-8")
+    lines = [ln.strip() for ln in spec.splitlines() if "materials-core" in ln and not ln.strip().startswith("#")]
+    assert lines == [f"('assets/materials-core/{n}', 'assets/materials-core')," for n in _CORE]
+    assert "*" not in "".join(lines) and "Tree(" not in spec
+    assert "team-materials.pptx'" not in spec          # 完整团队包不进安装包
+
+
+def test_package_dist_whitelist_is_exact_and_leak_exts_unchanged():
+    pd = _package_dist()
+    assert pd.ALLOWED_DATA_FILES == {"_internal/assets/blank_16x9.pptx",
+                                     "_internal/assets/materials-core/team-materials-core.pptx"}
+    assert pd.REQUIRED_MATERIALS_CORE == tuple(f"_internal/assets/materials-core/{n}" for n in _CORE)
+    assert pd.LEAK_EXTS == {".pptx", ".ppt", ".db", ".db-wal", ".db-shm"}
+    assert not any(c in "".join(pd.ALLOWED_DATA_FILES) for c in "*?[")
+
+
+def _fake_dist(tmp_path, *, extra=(), skip=()):
+    dist = tmp_path / "PPT-Doctor"
+    assets = dist / "_internal" / "assets"
+    (assets / "materials-core").mkdir(parents=True)
+    (assets / "blank_16x9.pptx").write_bytes(b"x")
+    for name in _CORE:
+        if name not in skip:
+            (assets / "materials-core" / name).write_bytes(b"x")
+    for rel in extra:
+        (dist / rel).parent.mkdir(parents=True, exist_ok=True)
+        (dist / rel).write_bytes(b"x")
+    return dist
+
+
+def test_package_dist_rejects_full_team_pack_personal_db_and_incomplete_core(tmp_path, monkeypatch, capsys):
+    pd = _package_dist()
+    for extra, skip, needle in (
+            (["_internal/assets/materials-core/team-materials.pptx"], (), "team-materials.pptx"),
+            (["_internal/materials/abc/material.pptx"], (), "material.pptx"),
+            (["_internal/assets/materials-core/library.db"], (), "library.db"),
+            ([], ("thumbs.zip",), "缺"),
+            (["_internal/assets/materials-core/extra.json"], (), "多出")):
+        dist = _fake_dist(tmp_path / needle.replace(".", "_"), extra=extra, skip=skip)
+        monkeypatch.setattr(pd, "DIST", dist)
+        assert pd.main() == 1
+        assert needle in capsys.readouterr().out
+
+
+def test_bundled_materials_core_passes_release_gate_and_size_budget():
+    import importlib.util
+    import json
+    import zipfile
+    root = Path(__file__).resolve().parents[1]
+    core = root / "assets" / "materials-core"
+    assert sorted(p.name for p in core.iterdir()) == sorted(_CORE)
+    total = sum((core / n).stat().st_size for n in _CORE)
+    assert total < 1.2 * 1024 * 1024                    # 主包增量预算：约 1 MiB
+    spec = importlib.util.spec_from_file_location("bmc", root / "tools" / "build_materials_component.py")
+    tool = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tool)
+    assert tool.gate_failures(tool.scan(core / "team-materials-core.pptx")) == []
+    index = json.loads((core / "index.json").read_text("utf-8"))
+    from pptx_finder.materials import read_pack_index
+    truth = read_pack_index(core / "team-materials-core.pptx")
+    assert [(x["id"], x["page"]) for x in index["items"]] == [(x["id"], x["page"]) for x in truth]
+    with zipfile.ZipFile(core / "thumbs.zip") as z:
+        assert {x["thumb"] for x in index["items"]} <= set(z.namelist())
+    assert {x["group"] for x in index["items"]} == {"零件", "组合件", "整页模板"}
+    assert 100 <= len(index["items"]) <= 125

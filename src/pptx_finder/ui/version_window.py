@@ -196,10 +196,12 @@ class VersionWindow(QWidget):
         preview_row.addLayout(preview_ops, 1)
         rl.addLayout(preview_row)
         ops = QHBoxLayout()
-        self.btn_restore = QPushButton("恢复此版本（覆盖当前）")
-        self.btn_restore.setObjectName("primary")
+        # 方案 D：主按钮是不改动任何文件的「导出此版本」；恢复会覆盖当前文件，降为次按钮并先确认
+        self.btn_restore = QPushButton("恢复（覆盖当前）…")
+        self.btn_restore.setToolTip("先给当前版留底，再用所选版本覆盖当前文件；会先弹窗确认")
         self.btn_restore.clicked.connect(self._restore)
         self.btn_export = QPushButton("导出此版本…")
+        self.btn_export.setObjectName("primary")
         self.btn_export.clicked.connect(self._export)
         self.btn_recover = QPushButton("找回文件")
         self.btn_recover.clicked.connect(self._recover)
@@ -210,8 +212,15 @@ class VersionWindow(QWidget):
         self._last_export_path = ""
         self.btn_open_export.clicked.connect(
             lambda: self._last_export_path and owner_actions.open_folder(self, self._last_export_path))
-        for b in (self.btn_restore, self.btn_export, self.btn_recover, self.btn_open_export):
+        for b in (self.btn_export, self.btn_restore, self.btn_recover, self.btn_open_export):
             ops.addWidget(b)
+        # 选中版本停 0.3 秒再自动出预览（后台生成，只操作本程序自己的临时 PowerPoint 对象；
+        # 结果回来时若选中已变就丢弃，见 _on_version_preview_ready）
+        from PySide6.QtCore import QTimer as _DebounceTimer  # 独立引用：测试会把模块级 QTimer 换成只有 singleShot 的假件
+        self._auto_preview_timer = _DebounceTimer(self)
+        self._auto_preview_timer.setSingleShot(True)
+        self._auto_preview_timer.setInterval(300)
+        self._auto_preview_timer.timeout.connect(self._auto_preview)
         ops.addStretch(1)
         rl.addLayout(ops)
         split.addWidget(right)
@@ -354,6 +363,22 @@ class VersionWindow(QWidget):
     def _on_version_selection_changed(self) -> None:
         self._update_file_ops_state()
         self._show_selected_version_preview()
+        timer = getattr(self, "_auto_preview_timer", None)
+        if timer is not None:
+            it = self.ver_list.currentItem()
+            data = it.data(Qt.UserRole) if it is not None else None
+            needs = (isinstance(data, dict) and data.get("version_id")
+                     and str(data.get("health") or "ok") == "ok" and not data.get("thumb_path"))
+            if needs:
+                timer.start()   # 连续切换时只留最后一次
+            else:
+                timer.stop()
+
+    def _auto_preview(self) -> None:
+        """去抖后的自动预览：窗口不可见、正在做文件操作或已有预览时不触发。"""
+        if not self._ui_alive() or not self.isVisible() or self._active_file_op:
+            return
+        self._preview_selected_version()
 
     def _clear_version_preview(self, text: str = "选择版本后可生成预览") -> None:
         self.version_preview.setPixmap(QPixmap())
@@ -831,10 +856,15 @@ class VersionWindow(QWidget):
             self._finish_restore_prepare(prev_title)
             QMessageBox.warning(self, "恢复", "找不到该版本对应的文档路径")
             return
+        it = self.ver_list.currentItem()
+        ver_label = (it.text().splitlines()[0].strip() if it is not None and it.text() else "所选版本")
         msg = (
-            f"用此版本恢复：\n{os.path.basename(path)}\n\n"
-            "若当前文件可正常读取，会先自动留一版；若文件本身已损坏，"
-            "则直接用所选健康版本恢复。"
+            f"文档：{os.path.basename(path)}\n"
+            f"位置：{os.path.dirname(path)}\n"
+            f"恢复到：{ver_label}\n\n"
+            "这会用所选版本覆盖当前文件。覆盖前先给当前版留底，之后随时能在时间线里找回；"
+            "若当前文件本身已损坏，则直接用所选健康版本恢复。\n"
+            "PowerPoint 正打开这份文件时，请先保存并关闭它。"
         )
         diff = data.get("diff")
         if isinstance(diff, dict):
@@ -846,7 +876,7 @@ class VersionWindow(QWidget):
                     + "\n\n"
                     + msg
                 )
-        if not owner_actions.ask(self, "恢复", msg, "恢复此版本", "取消"):
+        if not owner_actions.ask(self, "恢复到所选版本？", msg, "先留底，再恢复", "取消"):
             self._finish_restore_prepare(prev_title)
             return
 
@@ -1124,7 +1154,7 @@ class VersionWindow(QWidget):
         self.ver_list.setCurrentItem(item)
         menu = QMenu(self)
         menu.addAction("生成预览", self._preview_selected_version)
-        act_restore = menu.addAction("恢复此版本（覆盖当前）", self._restore)
+        act_restore = menu.addAction("恢复此版本（覆盖当前）…", self._restore)
         act_restore.setEnabled(self.btn_restore.isEnabled())
         act_export = menu.addAction("导出此版本…", self._export)
         act_export.setEnabled(self.btn_export.isEnabled())

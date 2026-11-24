@@ -98,3 +98,213 @@ def test_whole_slide_copy_requires_a_live_user_deck_and_uses_a_snapshot(monkeypa
     transfer.copy_slide(source)
     assert source.read_bytes() == b"owned source"
     assert len(opened) == 1 and not opened[0].exists()
+
+
+# ---------- 团队素材一键插入：7 个结构化错误码 ----------
+class _Shapes:
+    def __init__(self, n=2):
+        self.Count = n
+        self.copied = 0
+        self.Left, self.Top, self.Width, self.Height = 100.0, 100.0, 200.0, 80.0
+
+    def Range(self):
+        return self
+
+    def Copy(self):
+        self.copied += 1
+
+
+def _material_world(monkeypatch, tmp_path, *, windows=1, readonly=False, view_slide=True, selection=False,
+                    source_pages=3, source_shapes=2):
+    pasted = []
+    target_slide = SimpleNamespace(SlideIndex=5, Shapes=SimpleNamespace(
+        Paste=lambda: pasted.append(1) or SimpleNamespace(Count=2, Left=10.0, Top=10.0, Width=50.0,
+                                                          Height=20.0, IncrementLeft=lambda d: None,
+                                                          IncrementTop=lambda d: None)))
+    pres = SimpleNamespace(Name="季度汇报.pptx", ReadOnly=readonly,
+                           PageSetup=SimpleNamespace(SlideWidth=960.0, SlideHeight=540.0))
+
+    class View:
+        @property
+        def Slide(self):
+            if not view_slide:
+                raise RuntimeError("thumbnail pane")
+            return target_slide
+    rng = SimpleNamespace(Count=1 if selection else 0, Item=lambda i: target_slide)
+    window = SimpleNamespace(Presentation=pres, View=View(), Selection=SimpleNamespace(SlideRange=rng))
+    undo = []
+    app = SimpleNamespace(Windows=SimpleNamespace(Count=windows), ActiveWindow=window,
+                          StartNewUndoEntry=lambda: undo.append(1))
+
+    @contextmanager
+    def apps():
+        yield [app]
+    monkeypatch.setattr(transfer, "existing_apps", apps)
+    monkeypatch.setattr(transfer, "_find_apps", lambda: [app])
+    shapes = _Shapes(source_shapes)
+    opened = []
+
+    class Session:
+        def open(self, path):
+            opened.append(path)
+            return SimpleNamespace(Slides=SimpleNamespace(Count=source_pages,
+                                                          Item=lambda i: SimpleNamespace(Shapes=shapes)))
+
+    @contextmanager
+    def temp():
+        yield Session()
+    monkeypatch.setattr(transfer, "temporary_presentations", temp)
+    monkeypatch.setattr(transfer, "flush_clipboard", lambda: None)
+    pack = tmp_path / "team-materials.pptx"
+    pack.write_bytes(b"pptx")
+    return SimpleNamespace(pack=pack, pasted=pasted, undo=undo, shapes=shapes, opened=opened)
+
+
+def test_insert_material_pastes_into_active_slide_from_a_snapshot(monkeypatch, tmp_path):
+    w = _material_world(monkeypatch, tmp_path)
+    info = transfer.insert_material(w.pack, 2)
+    assert info == {"presentation": "季度汇报.pptx", "slide": 5, "shapes": 2}
+    assert w.pasted == [1] and w.undo == [1] and w.shapes.copied == 1
+    assert w.opened and transfer.Path(w.opened[0]) != w.pack           # 只开临时副本，不开原件
+
+
+def test_insert_material_uses_thumbnail_pane_selection(monkeypatch, tmp_path):
+    w = _material_world(monkeypatch, tmp_path, view_slide=False, selection=True)
+    assert transfer.insert_material(w.pack, 1)["slide"] == 5
+
+
+@pytest.mark.parametrize("kwargs, page, code", [
+    ({"windows": 0}, 1, "no_presentation"),
+    ({"readonly": True}, 1, "read_only"),
+    ({"view_slide": False}, 1, "no_target_slide"),
+    ({"source_pages": 3}, 9, "pack_missing"),
+    ({"source_shapes": 0}, 1, "pack_missing"),
+])
+def test_insert_material_error_codes(monkeypatch, tmp_path, kwargs, page, code):
+    w = _material_world(monkeypatch, tmp_path, **kwargs)
+    with pytest.raises(transfer.MaterialTransferError) as info:
+        transfer.insert_material(w.pack, page)
+    assert info.value.code == code and str(info.value)
+    assert w.pasted == []
+
+
+def test_insert_material_without_powerpoint_and_missing_pack(monkeypatch, tmp_path):
+    @contextmanager
+    def no_apps():
+        raise transfer.TransferError("请先在 Microsoft PowerPoint 中打开目标 PPT，再重试。")
+        yield
+    monkeypatch.setattr(transfer, "existing_apps", no_apps)
+    monkeypatch.setattr(transfer, "temporary_presentations",
+                        lambda: pytest.fail("没开 PowerPoint 时不应起临时实例"))
+    pack = tmp_path / "p.pptx"
+    pack.write_bytes(b"x")
+    with pytest.raises(transfer.MaterialTransferError) as info:
+        transfer.insert_material(pack, 1)
+    assert info.value.code == "no_powerpoint"
+    with pytest.raises(transfer.MaterialTransferError) as info:
+        transfer.insert_material(tmp_path / "gone.pptx", 1)
+    assert info.value.code == "pack_missing"
+
+
+def test_insert_material_busy_and_timeout(monkeypatch, tmp_path):
+    import threading
+    w = _material_world(monkeypatch, tmp_path)
+    hold = threading.Event()
+    release = threading.Event()
+
+    def holder():
+        with transfer._lock:
+            hold.set()
+            release.wait(5)
+    t = threading.Thread(target=holder)
+    t.start()
+    hold.wait(5)
+    try:
+        with pytest.raises(transfer.MaterialTransferError) as info:
+            transfer.insert_material(w.pack, 1)
+        assert info.value.code == "busy"
+    finally:
+        release.set()
+        t.join()
+    with pytest.raises(transfer.MaterialTransferError) as info:
+        transfer.call_with_timeout(lambda: threading.Event().wait(1), timeout=0.05)
+    assert info.value.code == "timeout"
+    assert transfer.call_with_timeout(lambda: 7, timeout=1) == 7
+
+
+def test_com_call_rejected_maps_to_busy(monkeypatch, tmp_path):
+    w = _material_world(monkeypatch, tmp_path)
+
+    class ComError(Exception):
+        pass
+    err = ComError(-2147418111, "Call was rejected by callee.", None, None)
+    err.hresult = -2147418111
+
+    def boom():
+        raise err
+    w.shapes.Copy = boom
+    with pytest.raises(transfer.MaterialTransferError) as info:
+        transfer.insert_material(w.pack, 1)
+    assert info.value.code == "busy"
+
+
+def test_material_error_codes_are_the_contract_seven():
+    assert set(transfer.MATERIAL_ERRORS) == {"no_powerpoint", "no_presentation", "read_only",
+                                             "no_target_slide", "busy", "pack_missing", "timeout"}
+    with pytest.raises(ValueError):
+        transfer.MaterialTransferError("whatever")
+
+
+def _instance(hwnd, name, *, active_raises=False, windows=1):
+    slide = SimpleNamespace(SlideIndex=1)
+    pres = SimpleNamespace(Name=name, ReadOnly=False)
+    window = SimpleNamespace(Presentation=pres, View=SimpleNamespace(Slide=slide))
+
+    class App:
+        HWND = hwnd
+        Windows = SimpleNamespace(Count=windows)
+
+        @property
+        def ActiveWindow(self):
+            if active_raises:
+                raise RuntimeError("busy")
+            return window
+    return App()
+
+
+def test_multiple_instances_use_most_recently_focused_powerpoint(monkeypatch):
+    """多个 PowerPoint 实例：按窗口 Z 序选最近在前台的那个，不按 ROT 枚举顺序。"""
+    older, recent = _instance(111, "旧窗口.pptx"), _instance(222, "正在编辑.pptx")
+    monkeypatch.setattr(transfer, "_zorder", lambda: [999, 222, 555, 111])
+    _, pres, _ = transfer._active_target([older, recent])        # ROT 里 older 排前面
+    assert pres.Name == "正在编辑.pptx"
+    hidden = _instance(333, "无窗口", windows=0)                   # 没有可见文稿的实例不参与
+    _, pres, _ = transfer._active_target([hidden, older])
+    assert pres.Name == "旧窗口.pptx"
+
+
+def test_uncertain_target_stops_instead_of_falling_back(monkeypatch):
+    """m4 MF-M2-05：Z 序读不到、或最近实例出错时，停下说明，不落到旧文稿上。"""
+    older, recent = _instance(111, "旧窗口.pptx"), _instance(222, "正在编辑.pptx")
+    monkeypatch.setattr(transfer, "_zorder", lambda: (_ for _ in ()).throw(OSError("no desktop")))
+    with pytest.raises(transfer.MaterialTransferError) as info:
+        transfer._active_target([older, recent])
+    assert info.value.code == "no_target_slide" and "多个 PowerPoint" in str(info.value)
+    monkeypatch.setattr(transfer, "_zorder", lambda: [222])           # 有实例不在 Z 序里
+    with pytest.raises(transfer.MaterialTransferError):
+        transfer._active_target([older, recent])
+    broken = _instance(222, "正在编辑.pptx", active_raises=True)
+    monkeypatch.setattr(transfer, "_zorder", lambda: [222, 111])
+    with pytest.raises(transfer.MaterialTransferError) as info:
+        transfer._active_target([older, broken])
+    assert info.value.code == "no_target_slide"                     # 不回落到 旧窗口.pptx
+
+    class Busy:
+        HWND = 1
+
+        @property
+        def Windows(self):
+            raise RuntimeError("rejected")
+    with pytest.raises(transfer.MaterialTransferError) as info:
+        transfer._active_target([Busy(), older])
+    assert info.value.code == "busy"

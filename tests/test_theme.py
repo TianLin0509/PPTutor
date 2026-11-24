@@ -12,7 +12,7 @@ REQUIRED = {
     # 阶段2：氛围背景 + 面板透出 + 圆角
     "base", "appbg", "panel", "panel2", "radius",
 }
-EXPECTED = ["atelier", "atelier_dark",
+EXPECTED = ["mist_glass", "night_glass", "atelier", "atelier_dark",
             "aurora", "cinema", "cyber", "ocean", "magma", "forest", "sakura", "midnight", "graphite", "cloud"]
 
 
@@ -45,7 +45,7 @@ def test_build_qss_default_font_matches_legacy_hardcode():
     qss = theme.build_qss("atelier")
     assert 'font-family: "Microsoft YaHei UI", "Segoe UI", "PingFang SC", sans-serif;' in qss
     assert "font-size: 13px" in qss
-    assert qss.count('"Consolas", "Microsoft YaHei UI"') == 5  # 状态栏的数字和热键改用正文字体，等宽只留版本号、页码等
+    assert qss.count('"Consolas", "Microsoft YaHei UI"') == 6  # 状态栏的数字和热键改用正文字体，等宽只留版本号、页码等
     assert theme.build_qss("atelier", font_family="", font_scale=1.0) == qss
 
 

@@ -40,10 +40,10 @@ def test_welcome_recommends_two_styles_and_explains_reuse(qtbot):
     overlay = WelcomeOverlay(on_start=lambda: None, on_pick_theme=picked.append,
                              current_theme="atelier")
     qtbot.addWidget(overlay)
-    assert set(overlay._theme_btns) == {"atelier", "atelier_dark"}
-    assert len(theme.THEMES) > 2
-    overlay._theme_btns["atelier_dark"].click()
-    assert picked == ["atelier_dark"]
+    assert set(overlay._theme_btns) == {"mist_glass", "night_glass", "atelier"}
+    assert len(theme.THEMES) > 3
+    overlay._theme_btns["night_glass"].click()
+    assert picked == ["night_glass"]
     text = " ".join(label.text() for label in overlay.findChildren(QLabel))
     for phrase in ("复制本页", "插入到 PPT", "图片转文字", "素材库", "更多风格"):
         assert phrase in text
@@ -112,25 +112,36 @@ def test_index_progress_and_empty_search_use_plain_language(win, monkeypatch):
 
 
 def test_material_capture_is_primary_and_delete_uses_plain_language(qtbot, tmp_path, monkeypatch):
-    from pptx_finder.materials import MaterialLibrary
-    widget = MaterialWindow(library=MaterialLibrary(tmp_path / "materials"))
+    from pptx_finder import materials, team_materials
+    from pptx_finder.materials import Material, MaterialLibrary
+    from pptx_finder.ui import owner_actions
+    monkeypatch.setenv("PPTX_FINDER_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setattr(materials, "builtin_core_dir", lambda: tmp_path / "no-core")
+    team_materials._started = False
+    library = MaterialLibrary(tmp_path / "materials")
+    item = Material("c" * 32, "示例箭头", "箭头", 1)
+    folder = library.folder(item.id)
+    folder.mkdir(parents=True)
+    library._write(folder, item)
+    widget = MaterialWindow(library=library)
     qtbot.addWidget(widget)
-    qtbot.waitUntil(lambda: not widget._busy)
-    assert widget.capture_btn.objectName() == "primary"
-    assert widget.pack_btn.objectName() != "primary"
-    widget.setStyleSheet(theme.build_qss("atelier") +
-                        f"QWidget#materialWin {{ background: {theme.tok('atelier')['appbg']}; }}")
+    tab = widget.tab
+    qtbot.waitUntil(lambda: tab._loaded and len(tab._view) == 1, timeout=4000)
+    # 方案 D 三栏主操作是「插入到当前 PPT」，页头收藏/导入为次级按钮（全页只有一个主按钮）
+    assert tab.insert_btn.objectName() == "mtPrimary"
+    assert tab.capture_btn.objectName() != "mtPrimary"
+    assert tab.import_btn.objectName() != "mtPrimary"
     widget.show()
     qtbot.waitExposed(widget)
     assert widget.grab().save(str(Path(__file__).resolve().parents[1] / "artifacts/rsi-r5-material.png"))
-    monkeypatch.setattr(widget, "_selected", lambda: ["example"])
-    monkeypatch.setattr("pptx_finder.ui.material_window.owner_actions.ask", lambda *args: True)
-    monkeypatch.setattr(widget.library, "delete", lambda _: None)
-    messages = []
-    monkeypatch.setattr(widget, "_refresh_after", messages.append)
-    monkeypatch.setattr(widget, "_run", lambda work, done, label: done(work()))
-    widget._delete()
-    assert messages == ["已移出素材库；文件仍保留在素材库的回收区。"]
+    prompts = []
+    monkeypatch.setattr(owner_actions, "ask", lambda _w, title, body, *a, **k: prompts.append(body) or True)
+    deleted = []
+    monkeypatch.setattr(widget.library, "delete", lambda ids: deleted.extend(ids))
+    tab.grid.select(0)
+    tab._delete_mine()
+    qtbot.waitUntil(lambda: deleted == [item.id], timeout=4000)
+    assert prompts and "回收区" in prompts[0]
 
 
 @pytest.fixture

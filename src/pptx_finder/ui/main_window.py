@@ -435,8 +435,9 @@ def _app_logo() -> QPixmap:
 
 
 def _load_theme() -> str:
-    # 主题持久化集中在 config.ui.json（与热键等共用一个文件，合并写不互相清键）
-    return get_theme()
+    # 主题持久化集中在 config.ui.json（与热键等共用一个文件，合并写不互相清键）。
+    # 方案 D：新装用户默认晨雾玻璃；已存过主题的用户保持原选择。
+    return get_theme(theme.DEFAULT_THEME)
 
 
 def _save_theme(name: str) -> None:
@@ -1580,6 +1581,8 @@ class MainWindow(QMainWindow):
         ll.addWidget(self.list_head)
         self.result_list = QListWidget()
         self.result_list.setObjectName("resultList")
+        # 方案 D：结果列表不出横向滚动条（路径已中间省略 + 悬停看全路径）
+        self.result_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.result_list.currentItemChanged.connect(self._on_select)
         self.result_list.itemActivated.connect(self._on_activate)
         self.result_list.itemDoubleClicked.connect(self._on_activate)
@@ -1645,6 +1648,16 @@ class MainWindow(QMainWindow):
         self._page_stack = QStackedWidget()
         self._page_stack.setObjectName("pageStack")
         self._pages: dict[str, QWidget] = {"search": split, "dashboard": dash_scroll}
+        # 「素材」一级页：首次切入才构造（合同 §3.1：有 MaterialTabWidget 就挂，没有就放占位）
+        self._material_tab = None
+        self._material_status = ""
+        mat_page = QWidget()
+        mat_page.setObjectName("page_material")
+        mat_lay = QVBoxLayout(mat_page)
+        mat_lay.setContentsMargins(0, 0, 0, 0)
+        mat_lay.setSpacing(0)
+        self._pages["material"] = mat_page
+        self._material_page_lay = mat_lay
         for key in ("version", "health"):
             container = QWidget()
             container.setObjectName(f"page_{key}")
@@ -1654,7 +1667,7 @@ class MainWindow(QMainWindow):
             self._pages[key] = container
         self._version_page_lay = self._pages["version"].layout()
         self._health_page_lay = self._pages["health"].layout()
-        for key in ("search", "dashboard", "version", "health"):
+        for key in ("search", "material", "dashboard", "version", "health"):
             self._page_stack.addWidget(self._pages[key])
         self._page_stack.setCurrentWidget(dash_scroll)  # 启动默认页 = 概览
 
@@ -1736,160 +1749,196 @@ class MainWindow(QMainWindow):
         self._init_spinner()
         self._install_shortcuts()
 
-    # ---------- 左侧导航栏（品牌 + 页面切换 + 工具入口 + 主题） ----------
-    _RAIL_W = 188
+    # ---------- 左侧导航轨（方案 D：悬浮药丸，图标在上、文字在下） ----------
+    _RAIL_W = 72
+    #: 窄于 _RAIL_COMPACT_BELOW 时只留图标（1280 逻辑宽仍保留文字）
+    _RAIL_COMPACT_W = 60
+    _RAIL_COMPACT_BELOW = 1180
+    #: 矮于这个高度（如 1920×1080@150% 的 672）也收成纯图标，11 个入口才放得下
+    _RAIL_COMPACT_BELOW_H = 760
+    #: 工作页（顺序即侧栏顺序）
+    _RAIL_PAGES = (("search", "搜索", "搜索 PPT 内容与文件名", "search"),
+                   ("material", "素材", "团队素材与我的收藏", "materials"),
+                   ("dashboard", "概览", "库概览", "dashboard"),
+                   ("health", "健康", "库体检与运行诊断", "health"),
+                   ("version", "版本", "版本管理", "version"))
 
     def _build_nav_rail(self) -> QWidget:
-        """整高侧栏：品牌在顶，四个页面（搜索/概览/版本/健康），工具（截图/转字/素材/报告/设置），主题在底。"""
+        """悬浮药丸导航轨：Logo / 工作页（搜索·素材·概览·健康·版本）/ 浮窗工具（截图·转字·报告，
+        带角标）/ 底部（更新·设置·深浅）。装饰容器本身不设 tooltip、不接鼠标事件，空白处仍可拖窗。"""
         rail = QWidget()
         rail.setObjectName("navRail")
         rail.setAttribute(Qt.WA_StyledBackground, True)
         rail.setFixedWidth(self._RAIL_W)
         lay = QVBoxLayout(rail)
-        lay.setContentsMargins(12, 16, 12, 12)
-        lay.setSpacing(2)
+        lay.setContentsMargins(6, 14, 6, 12)
+        lay.setSpacing(4)
+        # 轨的按钮高度不反推整窗最小高度：1280×672 这类矮窗先能缩下来，再由 resizeEvent 收成纯图标
+        lay.setSizeConstraint(QVBoxLayout.SetNoConstraint)
+        rail.setMinimumHeight(0)
+        rail.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Ignored)
 
-        brand = QWidget()
-        brand.setObjectName("railBrand")
-        bl = QHBoxLayout(brand)
-        bl.setContentsMargins(6, 0, 0, 0)
-        bl.setSpacing(10)
         logo = QLabel()
         logo.setObjectName("railLogo")
         logo_pm = QPixmap(_asset_path("logo.png"))
         if not logo_pm.isNull():
             ratio = 3.0
-            logo_pm = logo_pm.scaled(round(34 * ratio), round(34 * ratio),
+            logo_pm = logo_pm.scaled(round(36 * ratio), round(36 * ratio),
                                      Qt.KeepAspectRatio, Qt.SmoothTransformation)
             logo_pm.setDevicePixelRatio(ratio)
             logo.setPixmap(logo_pm)
-        logo.setFixedSize(34, 34)
-        bl.addWidget(logo)
-        names = QVBoxLayout()
-        names.setContentsMargins(0, 0, 0, 0)
-        names.setSpacing(0)
-        name = QLabel("PPT Doctor")
+        logo.setFixedSize(36, 36)
+        logo.setAlignment(Qt.AlignCenter)
+        lay.addWidget(logo, 0, Qt.AlignHCenter)
+        # 品牌文字与版本号收进 Logo 下方的隐藏标签（保留属性供更新提示等复用）
+        name = QLabel("PPT Doctor", rail)
         name.setObjectName("gtName")
-        ver = QLabel(f"v{__version__}")
+        name.hide()
+        ver = QLabel(f"v{__version__}", rail)
         if getattr(sys, 'frozen', False):
             from ..editions import current_edition, LABELS
             ver.setText(f'v{__version__} · {LABELS[current_edition()]}')
         ver.setObjectName("gtVer")
+        ver.hide()
         self.gt_ver = ver
-        names.addWidget(name)
-        names.addWidget(ver)
-        bl.addLayout(names, 1)
-        self._rail_brand_text = (name, ver)
-        lay.addWidget(brand)
-        lay.addSpacing(18)
+        self._rail_brand_text = ()
+        lay.addSpacing(10)
 
-        self._rail_page_btns: dict[str, QPushButton] = {}
-        for key, label, tip in (("search", "搜索", "搜索 PPT 内容与文件名"),
-                                ("dashboard", "概览", "库概览"),
-                                ("version", "版本", "版本管理"),
-                                ("health", "健康", "库健康体检")):
+        self._rail_page_btns: dict[str, QToolButton] = {}
+        for key, label, tip, _icon in self._RAIL_PAGES:
             btn = self._mk_rail_btn(label, tip)
             btn.setCheckable(True)
             btn.clicked.connect(lambda _checked=False, k=key: self._switch_page(k))
-            lay.addWidget(btn)
+            lay.addWidget(btn, 0, Qt.AlignHCenter)
             self._rail_page_btns[key] = btn
-        lay.addSpacing(14)
+        self.rail_material_btn = self._rail_page_btns["material"]
+        self.rail_material_btn.setAccessibleName("素材库")
+        lay.addSpacing(6)
         sep = QFrame()
         sep.setObjectName("railSep")
-        sep.setFixedHeight(1)
-        lay.addWidget(sep)
-        lay.addSpacing(14)
-        self.rail_screenshot_btn = self._mk_rail_btn("截图", "框选任意区域：普通截图、滚动截图、小图模式（每张 ≤50 KB）、录制 GIF")
+        sep.setFixedSize(36, 1)
+        lay.addWidget(sep, 0, Qt.AlignHCenter)
+        lay.addSpacing(6)
+        # 浮窗工具：在桌面上直接操作，不占主窗口；右上角小角标表示「另开浮窗」
+        self.rail_screenshot_btn = self._mk_rail_btn(
+            "截图", "截图（浮窗）：普通截图、滚动截图、小图模式（每张 ≤50 KB）、录制 GIF", popout=True)
         self.rail_screenshot_btn.setAccessibleName("截图")
         self.rail_screenshot_btn.clicked.connect(self._open_screenshot_from_rail)
-        lay.addWidget(self.rail_screenshot_btn)
-        self.rail_imgtext_btn = self._mk_rail_btn("转字", "图片转可编辑文字")
+        lay.addWidget(self.rail_screenshot_btn, 0, Qt.AlignHCenter)
+        self.rail_imgtext_btn = self._mk_rail_btn("转字", "图片转可编辑文字", popout=True)
         self.rail_imgtext_btn.setAccessibleName("图片转可编辑文字")
         self.rail_imgtext_btn.clicked.connect(self._open_imgtext_from_rail)
-        lay.addWidget(self.rail_imgtext_btn)
-        self.rail_material_btn = self._mk_rail_btn("素材", "收藏形状、图标与图片，分享 PPTX 素材包")
-        self.rail_material_btn.setAccessibleName("素材库")
-        self.rail_material_btn.clicked.connect(self._open_materials_from_rail)
-        lay.addWidget(self.rail_material_btn)
-        self.rail_report_btn = self._mk_rail_btn("报告", "我的胶片报告")
+        lay.addWidget(self.rail_imgtext_btn, 0, Qt.AlignHCenter)
+        self.rail_report_btn = self._mk_rail_btn("报告", "我的胶片报告（浮窗）", popout=True)
         self.rail_report_btn.setAccessibleName("打开胶片报告")
         self.rail_report_btn.clicked.connect(self._open_report_from_rail)
-        lay.addWidget(self.rail_report_btn)
+        lay.addWidget(self.rail_report_btn, 0, Qt.AlignHCenter)
+        lay.addStretch(1)
+        # 「更新」常驻侧栏底部（v2.0.3 田哥要求：原来入口藏在设置里、找不到）：
+        # 平时显示「更新」，有新版本 / 下载中 / 待重启时文字跟着变，并亮红点。
+        self.rail_update_btn = self._mk_rail_btn("检查更新", "检查更新、查看下载进度")
+        self.rail_update_btn.setAccessibleName("软件更新")
+        self.rail_update_btn.clicked.connect(self._open_update_center)
+        lay.addWidget(self.rail_update_btn, 0, Qt.AlignHCenter)
+        self._update_dot = QLabel(self.rail_update_btn)
+        self._update_dot.setObjectName("railDot")
+        self._update_dot.setFixedSize(8, 8)
+        self._update_dot.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self._update_dot.hide()
         self.rail_settings_btn = self._mk_rail_btn("设置", "打开设置")
         self.rail_settings_btn.setAccessibleName("设置")
         self.rail_settings_btn.clicked.connect(self._open_settings_from_button)
-        lay.addWidget(self.rail_settings_btn)
+        lay.addWidget(self.rail_settings_btn, 0, Qt.AlignHCenter)
         # 设置上的未读红点：有新版本、用户还没看过时亮（同一版本只自动弹一次窗）
         self._settings_dot = QLabel(self.rail_settings_btn)
         self._settings_dot.setObjectName("railDot")
         self._settings_dot.setFixedSize(8, 8)
         self._settings_dot.setAttribute(Qt.WA_TransparentForMouseEvents)
         self._settings_dot.hide()
-        lay.addStretch(1)
-        sep2 = QFrame()
-        sep2.setObjectName("railSep")
-        sep2.setFixedHeight(1)
-        lay.addWidget(sep2)
-        lay.addSpacing(6)
-        # 「更新」常驻侧栏左下角（v2.0.3 田哥要求：原来入口藏在设置里、找不到）：
-        # 平时显示「检查更新」，有新版本 / 下载中 / 待重启时文字跟着变，并亮红点。
-        self.rail_update_btn = self._mk_rail_btn("检查更新", "检查更新、查看下载进度")
-        self.rail_update_btn.setAccessibleName("软件更新")
-        self.rail_update_btn.clicked.connect(self._open_update_center)
-        lay.addWidget(self.rail_update_btn)
-        self._update_dot = QLabel(self.rail_update_btn)
-        self._update_dot.setObjectName("railDot")
-        self._update_dot.setFixedSize(8, 8)
-        self._update_dot.setAttribute(Qt.WA_TransparentForMouseEvents)
-        self._update_dot.hide()
-        self.theme_btn = self._mk_rail_btn("主题", "切换界面主题")
+        # 深浅快捷切换：晨雾 ⇄ 暗夜、静白 ⇄ 静黑；右键弹出全部主题
+        self.theme_btn = self._mk_rail_btn("深色", "切换深浅")
         self.theme_btn.setAccessibleName("主题")
-        self.theme_btn.clicked.connect(self._show_theme_menu)
-        lay.addWidget(self.theme_btn)
+        self.theme_btn.clicked.connect(self._toggle_dark_light)
+        self.theme_btn.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.theme_btn.customContextMenuRequested.connect(lambda _p: self._show_theme_menu())
+        lay.addWidget(self.theme_btn, 0, Qt.AlignHCenter)
         cur = self._current_page_key()
         for k, btn in self._rail_page_btns.items():
             btn.setChecked(k == cur)
         self._sync_version_rail_btn()
+        self._sync_theme_rail_btn()
         self._refresh_rail_icons()
         self._nav_rail = rail
         return rail
 
-    _RAIL_COMPACT_W = 64
-    _RAIL_COMPACT_BELOW = 1360
-
     def _set_rail_compact(self, compact: bool) -> None:
-        """侧栏两种形态：宽（图标 + 文字）/ 窄（只有图标，悬停出说明）。"""
+        """导航轨两种形态：标准（图标 + 下方文字）/ 窄（只有图标，悬停出说明）。"""
         rail = getattr(self, "_nav_rail", None)
         if rail is None or getattr(self, "_rail_compact", None) == compact:
             return
         self._rail_compact = compact
         rail.setFixedWidth(self._RAIL_COMPACT_W if compact else self._RAIL_W)
-        margin = 10 if compact else 12
-        rail.layout().setContentsMargins(margin, 16, margin, 12)
-        for w in getattr(self, "_rail_brand_text", ()):
-            w.setVisible(not compact)
         for btn in getattr(self, "_rail_all_btns", ()):
-            label = btn.property("railLabel") or ""
-            btn.setText("" if compact else "  " + label)
-            btn.setProperty("compact", compact)
-            btn.style().unpolish(btn)
-            btn.style().polish(btn)
+            self._apply_rail_btn_form(btn)
         if getattr(self, "_settings_dot", None) is not None and self._settings_dot.isVisible():
             self.set_settings_unread(True, getattr(self, "_settings_unread_version", ""))
         self._refresh_update_rail()
 
-    def _mk_rail_btn(self, label: str, tip: str) -> QPushButton:
-        """侧栏条目：图标 + 文字横排，整行可点；选中态的底色与左侧强调条由 QSS #railBtn 承担。"""
-        b = QPushButton("  " + label)  # 图标与文字之间的间距（QSS 没有 icon-spacing）
+    def _apply_rail_btn_form(self, btn) -> None:
+        compact = bool(getattr(self, "_rail_compact", False))
+        short = btn.property("railShort") or btn.property("railLabel") or ""
+        btn.setText("" if compact else short)
+        btn.setToolButtonStyle(Qt.ToolButtonIconOnly if compact else Qt.ToolButtonTextUnderIcon)
+        btn.setFixedSize(*((48, 44) if compact else (60, 52)))
+        btn.setProperty("compact", compact)
+        badge = getattr(btn, "_rail_badge", None)
+        if badge is not None:
+            badge.move(btn.width() - badge.width() - 4, 4)
+
+    def _mk_rail_btn(self, label: str, tip: str, *, popout: bool = False) -> QToolButton:
+        """导航轨条目：图标在上、文字在下；选中态底色由 QSS #railBtn 承担。
+        popout=True 的是浮窗工具，右上角画一枚「↗」角标（不接鼠标事件）。"""
+        b = QToolButton()
         b.setObjectName("railBtn")
         b.setProperty("railLabel", label)
+        b.setProperty("railShort", label)
         self._rail_all_btns = getattr(self, "_rail_all_btns", []) + [b]
-        b.setFixedHeight(40)
         b.setToolTip(tip)
         b.setCursor(Qt.PointingHandCursor)
-        b.setIconSize(QSize(18, 18))
+        b.setIconSize(QSize(20, 20))
         b.setFocusPolicy(Qt.TabFocus)  # 鼠标点完不留焦点框，键盘 Tab 仍可达
+        b.setAutoRaise(True)
+        if popout:
+            badge = QLabel(b)
+            badge.setObjectName("railBadge")
+            badge.setFixedSize(10, 10)
+            badge.setAttribute(Qt.WA_TransparentForMouseEvents)
+            b._rail_badge = badge
+        self._apply_rail_btn_form(b)
         return b
+
+    def _sync_theme_rail_btn(self) -> None:
+        """深浅按钮的文字 / 提示跟当前主题：浅色主题显示「深色」，深色主题显示「浅色」。"""
+        btn = getattr(self, "theme_btn", None)
+        if btn is None:
+            return
+        dark = not self._tok.get("is_light", False)
+        btn.setProperty("railShort", "浅色" if dark else "深色")
+        btn.setProperty("railLabel", "浅色" if dark else "深色")
+        self._apply_rail_btn_form(btn)
+        theme_label = dict(theme.THEMES).get(self._theme, self._theme)
+        btn.setToolTip(f"切换界面主题 · 当前：{theme_label}（点一下切深浅，右键选全部主题）")
+
+    def _toggle_dark_light(self) -> None:
+        """深浅快捷切换：晨雾 ⇄ 暗夜、静白 ⇄ 静黑；旧 10 套按明暗切到晨雾 / 暗夜。"""
+        pair = theme.DARK_LIGHT_PAIR.get(self._theme)
+        if pair is None:
+            pair = "mist_glass" if not self._tok.get("is_light", False) else "night_glass"
+        self._apply_theme(pair)
+
+    def show_materials_page(self) -> None:
+        """侧栏 / 托盘 / 快捷入口统一进「素材」一级页。"""
+        self._switch_page("material")
 
     def set_settings_unread(self, unread: bool, version: str = "") -> None:
         """设置入口的红点：有没看过的新版本时亮。"""
@@ -1899,10 +1948,7 @@ class MainWindow(QMainWindow):
             return
         self._settings_unread_version = version if unread else ""
         if unread:
-            if getattr(self, "_rail_compact", False):
-                dot.move(btn.width() - 14, 6)
-            else:
-                dot.move(btn.width() - 22, (btn.height() - dot.height()) // 2)
+            dot.move(btn.width() - 14, 6)
             dot.show()
             dot.raise_()
             btn.setToolTip(f"打开设置 · 有新版本 v{version}" if version else "打开设置 · 有新版本")
@@ -1939,15 +1985,16 @@ class MainWindow(QMainWindow):
             "checking": ("正在检查…", "正在查询最新版本", False),
         }.get(phase, ("检查更新", f"当前 v{__version__}，点击检查更新", False))
         btn.setProperty("railLabel", label)
-        btn.setText("" if getattr(self, "_rail_compact", False) else "  " + label)
+        # 轨上只放得下短字；完整说明（含版本号、进度）在 railLabel 与悬停提示里
+        short = {"available": "新版本", "downloading": f"下载{pct.strip() or '中'}", "ready": "重启更新",
+                 "applying": "更新中", "error": "更新失败", "checking": "检查中"}.get(phase, "更新")
+        btn.setProperty("railShort", short)
+        self._apply_rail_btn_form(btn)
         btn.setToolTip(tip)
         mark = getattr(self, "_update_dot", None)
         if mark is not None:
             if dot:
-                if getattr(self, "_rail_compact", False):
-                    mark.move(btn.width() - 14, 6)
-                else:
-                    mark.move(btn.width() - 22, (btn.height() - mark.height()) // 2)
+                mark.move(btn.width() - 14, 6)
                 mark.show()
                 mark.raise_()
             else:
@@ -1958,26 +2005,35 @@ class MainWindow(QMainWindow):
         btns = getattr(self, "_rail_page_btns", None)
         if not btns:
             return
-        acc = self._tok["acc"]
+        # 方案 D 浮卡玻璃：选中项是实心深蓝胶囊 + 白图标；其余主题沿用淡底 + 强调色图标
+        on = "#FFFFFF" if theme.float_glass(self._theme) else self._tok["acc"]
         ink = self._tok["ink3"]
-        for key, name in (("search", "search"), ("dashboard", "dashboard"),
-                          ("version", "version"), ("health", "health")):
+        for key, _label, _tip, name in self._RAIL_PAGES:
             btn = btns.get(key)
             if btn is not None:
-                btn.setIcon(_icons.icon(name, acc if btn.isChecked() else ink, 18))
+                btn.setIcon(_icons.icon(name, on if btn.isChecked() else ink, 20))
+        dark = not self._tok.get("is_light", False)
         for attr, name in (("rail_screenshot_btn", "screenshot"), ("rail_imgtext_btn", "imgtext"),
-                           ("rail_material_btn", "materials"), ("rail_report_btn", "report"),
+                           ("rail_report_btn", "report"),
                            ("rail_settings_btn", "settings"), ("rail_update_btn", "update"),
-                           ("theme_btn", "theme")):
+                           ("theme_btn", "sun" if dark else "moon")):
             btn = getattr(self, attr, None)
             if btn is not None:
-                btn.setIcon(_icons.icon(name, ink, 18))
+                btn.setIcon(_icons.icon(name, ink, 20))
+                badge = getattr(btn, "_rail_badge", None)
+                if badge is not None:
+                    badge.setPixmap(_icons.icon("popout", self._tok["ink4"], 10, 2.0).pixmap(10, 10))
 
     def _open_screenshot_from_rail(self) -> None:
         from .screenshot_window import open_screenshot
         open_screenshot(self)
 
     def _open_materials_from_rail(self) -> None:
+        """旧入口名保留：现在直接切到主窗「素材」一级页。"""
+        self.show_materials_page()
+
+    def _open_material_window_fallback(self) -> None:
+        """素材页占位（MaterialTabWidget 未合入时）里的按钮：打开原素材库窗口。"""
         from ..app import _open_material_window
         _open_material_window(self)
 
@@ -2195,9 +2251,23 @@ class MainWindow(QMainWindow):
         self.preview_powerpoint_btn = QPushButton("检测 PowerPoint")
         self.preview_powerpoint_btn.clicked.connect(lambda: self.open_settings_page("PowerPoint"))
         error_actions.addWidget(self.preview_powerpoint_btn)
+        self.preview_error_open_btn = QPushButton("打开文件")
+        self.preview_error_open_btn.setToolTip("用默认程序打开整份文件")
+        self.preview_error_open_btn.clicked.connect(self._act_open)
+        error_actions.addWidget(self.preview_error_open_btn)
         error_actions.addStretch()
         bl.addWidget(self.preview_error_actions)
         self.preview_error_actions.hide()
+        # 原图出不来时，用已索引的本页文字兜底，至少能判断是不是要找的那页
+        self.preview_error_text = QLabel("")
+        self.preview_error_text.setObjectName("dashSub")
+        self.preview_error_text.setWordWrap(True)
+        self.preview_error_text.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.preview_error_text.setMaximumHeight(150)
+        self.preview_error_text.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        bl.addWidget(self.preview_error_text)
+        self.preview_error_text.hide()
+        self._preview_error_text_token = 0
 
         # 命中页缩略图条
         self.thumb_row = QHBoxLayout()
@@ -2229,12 +2299,16 @@ class MainWindow(QMainWindow):
         self.goto_btn = QPushButton(" 打开并跳到此页")
         self.goto_btn.setObjectName("primary")
         self.goto_btn.clicked.connect(self._act_goto)
-        self.open_btn = QPushButton(" 打开文件")
+        self.open_btn = QPushButton("")
+        self.open_btn.setAccessibleName("打开文件")
+        self.open_btn.setToolTip("打开文件（用默认程序打开整份文件）")
         self.open_btn.clicked.connect(self._act_open)
-        self.copy_slide_btn = QPushButton("复制本页")
-        self.copy_slide_btn.setToolTip("复制整张幻灯片，保留图形与版式。需先在 PowerPoint 中打开目标文稿，复制后在其左侧缩略图栏按 Ctrl+V 粘贴")
+        # 方案 D 操作行：主「打开并跳到此页」/ 次「插入到当前 PPT」/ 图标「复制本页」「打开文件」/ 更多
+        self.copy_slide_btn = QPushButton("")
+        self.copy_slide_btn.setAccessibleName("复制本页")
+        self.copy_slide_btn.setToolTip("复制本页：复制整张幻灯片，保留图形与版式。需先在 PowerPoint 中打开目标文稿，复制后在其左侧缩略图栏按 Ctrl+V 粘贴")
         self.copy_slide_btn.clicked.connect(self._act_copy_slide)
-        self.insert_slide_btn = QPushButton("插入到 PPT…")
+        self.insert_slide_btn = QPushButton("插入到当前 PPT")
         self.insert_slide_btn.setToolTip("需先在 PowerPoint 中打开目标文稿；将当前预览页直接插到所选文稿末尾，不自动保存")
         self.insert_slide_btn.clicked.connect(self._act_insert_slide)
         self.more_btn = QPushButton("更多")
@@ -2248,10 +2322,10 @@ class MainWindow(QMainWindow):
         more.addAction(self.folder_btn)
         more.addAction(self.clip_btn)
         self.more_btn.setMenu(more)
-        for b in (self.goto_btn, self.open_btn, self.copy_slide_btn, self.insert_slide_btn, self.more_btn):
+        for b in (self.goto_btn, self.insert_slide_btn, self.copy_slide_btn, self.open_btn, self.more_btn):
             b.setMinimumHeight(34)       # 下限 34；大字号时随字体长高
-            # 窄窗口时允许按钮收窄，避免操作行把整窗最小宽度顶到 1400+。
-            b.setMinimumWidth(64)
+            # 窄窗口时允许按钮收窄，避免操作行把整窗最小宽度顶到 1400+；图标按钮 38 宽。
+            b.setMinimumWidth(38 if b in (self.copy_slide_btn, self.open_btn) else 64)
             b.setIconSize(QSize(16, 16))
             b.setCursor(Qt.PointingHandCursor)
             ops.addWidget(b)
@@ -2291,6 +2365,22 @@ class MainWindow(QMainWindow):
         self.gt_theme = QLabel(dict(theme.THEMES).get(self._theme, self._theme), tb)
         self.gt_theme.setObjectName("gtTheme")
         self.gt_theme.hide()  # 当前主题名已在侧栏「主题」按钮的提示里
+        # 非搜索类页面的页头：本页标题 + 一行说明（切页时与搜索胶囊互换，不残留搜索词）
+        head = QWidget()
+        head.setObjectName("pageHead")
+        hl = QHBoxLayout(head)
+        hl.setContentsMargins(4, 0, 0, 0)
+        hl.setSpacing(12)
+        self._page_head_title = QLabel("")
+        self._page_head_title.setObjectName("pageHeadTitle")
+        self._page_head_sub = QLabel("")
+        self._page_head_sub.setObjectName("pageHeadSub")
+        self._page_head_sub.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        hl.addWidget(self._page_head_title)
+        hl.addWidget(self._page_head_sub, 1)
+        head.hide()
+        self._page_head = head
+        lay.addWidget(head, 1)
 
         # —— 搜索框是顶栏的主角 ——
         self.search_box = QLineEdit()
@@ -2354,6 +2444,7 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.search_btn)
         self._sync_mode_for_scope()
         self._sync_search_bar_metrics()  # 大字号下不让搜索行把字切掉半截
+        self._search_title_widgets = (self.search_box, self.type_filter, self.mode, self.search_btn)
         lay.addStretch(0)
         lay.addSpacing(12)
         # 下载中 / 已就绪才出现的更新提示（「有新版本」改由一次性弹窗 + 设置红点提醒）
@@ -2383,7 +2474,7 @@ class MainWindow(QMainWindow):
             btn.clicked.connect(slot)
             wl.addWidget(btn)
             self._win_btns[oid] = btn
-        lay.addWidget(win_box, 0, Qt.AlignTop)
+        lay.addWidget(win_box, 0, Qt.AlignVCenter)
         return tb
 
     def _refresh_window_buttons(self) -> None:
@@ -2442,7 +2533,10 @@ class MainWindow(QMainWindow):
             return
         if key == "health":
             self._ensure_health_page()
+        if key == "material":
+            self._ensure_material_page()
         stack.setCurrentWidget(page)
+        self._sync_title_for_page(key)
         for k, btn in getattr(self, "_rail_page_btns", {}).items():
             btn.setChecked(k == key)
         self._refresh_rail_icons()
@@ -2457,6 +2551,103 @@ class MainWindow(QMainWindow):
             win = self._health_page_win
             if win is not None:
                 win.refresh()  # 进入健康页即重新体检（构造内的首次扫描有 _scan_inflight 挡重）
+            self._refresh_health_diagnostics()
+        if key == "material":
+            tab = self._material_tab
+            if tab is not None and hasattr(tab, "refresh_library"):
+                try:
+                    tab.refresh_library()
+                except Exception:  # noqa: BLE001 —— 素材页刷新失败只记日志，不挡切页
+                    _log.exception("material tab refresh failed")
+
+    # —— 页头：搜索 / 概览页是搜索胶囊（概览 = 搜索首页），其余页换成本页标题 ——
+    _PAGE_HEADS = {
+        "material": ("素材库", "团队素材只读 · 我的收藏可改名、移出、导出"),
+        "health": ("健康", "库体检与运行诊断 · 全部离线检查，不联网"),
+        "version": ("版本", "每次保存自动留一版 · 恢复前先给当前版留底"),
+    }
+
+    def _sync_title_for_page(self, key: str) -> None:
+        head = getattr(self, "_page_head", None)
+        if head is None:
+            return
+        searchy = key in ("search", "dashboard") or key not in self._PAGE_HEADS
+        for w in getattr(self, "_search_title_widgets", ()):
+            w.setVisible(searchy)
+        head.setVisible(not searchy)
+        if not searchy:
+            title, sub = self._PAGE_HEADS[key]
+            if key == "material" and self._material_status:
+                sub = self._material_status
+            self._page_head_title.setText(title)
+            self._page_head_sub.setText(sub)
+
+    def _ensure_material_page(self) -> None:
+        """首次进入素材页：能导入 MaterialTabWidget 就挂上，否则放一个说明 + 打开素材库窗口的占位。"""
+        lay = getattr(self, "_material_page_lay", None)
+        if lay is None or lay.count():
+            return
+        tab = None
+        try:
+            from .material_tab import MaterialTabWidget
+        except ImportError:
+            MaterialTabWidget = None
+        if MaterialTabWidget is not None:
+            try:
+                tab = MaterialTabWidget(self._pages["material"],
+                                        theme_tokens=theme.contract_tokens(self._theme))
+            except Exception:  # noqa: BLE001 —— 素材页构造失败退回占位，主窗照常
+                _log.exception("MaterialTabWidget init failed")
+                tab = None
+        if tab is not None:
+            sig = getattr(tab, "toastRequested", None)
+            if sig is not None:
+                sig.connect(lambda msg, _level="info": self._toast(msg))
+            sig = getattr(tab, "statusTextChanged", None)
+            if sig is not None:
+                sig.connect(self._on_material_status)
+            compact = getattr(tab, "set_header_compact", None)
+            if callable(compact):
+                compact(True)   # 标题与状态由主窗页头显示，控件只留右侧操作按钮
+            self._material_tab = tab
+            lay.addWidget(tab, 1)
+            return
+        lay.addWidget(self._build_material_placeholder(), 1)
+
+    def _on_material_status(self, text: str) -> None:
+        self._material_status = text or ""
+        if self._current_page_key() == "material":
+            self._sync_title_for_page("material")
+
+    def _build_material_placeholder(self) -> QWidget:
+        box = QWidget()
+        box.setObjectName("pageIsland")
+        box.setAttribute(Qt.WA_StyledBackground, True)
+        v = QVBoxLayout(box)
+        v.setContentsMargins(40, 40, 40, 40)
+        v.setSpacing(10)
+        v.addStretch(1)
+        title = QLabel("团队素材库")
+        title.setObjectName("emptyTitle")
+        title.setAlignment(Qt.AlignCenter)
+        tip = QLabel("内置精选可离线浏览，分类、搜索、一键插入到当前 PPT。\n"
+                     "这一版先在素材库窗口里使用：")
+        tip.setObjectName("emptyTip")
+        tip.setAlignment(Qt.AlignCenter)
+        btn = QPushButton("打开素材库")
+        btn.setObjectName("primary")
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.clicked.connect(self._open_material_window_fallback)
+        self._material_open_btn = btn
+        v.addWidget(title)
+        v.addWidget(tip)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        row.addWidget(btn)
+        row.addStretch(1)
+        v.addLayout(row)
+        v.addStretch(2)
+        return box
 
     def _current_page_key(self) -> str:
         stack = getattr(self, "_page_stack", None)
@@ -2520,7 +2711,41 @@ class MainWindow(QMainWindow):
         )
         self._health_page_lay.addWidget(win)
         self._health_page_win = win
+        self._refresh_health_diagnostics()
         return win
+
+    def _refresh_health_diagnostics(self) -> None:
+        """健康页底部 4 盏离线诊断灯：只读已有状态，不联网、不启动 PowerPoint。"""
+        win = getattr(self, "_health_page_win", None)
+        if win is None or not hasattr(win, "set_diagnostics"):
+            return
+        items = []
+        try:
+            st = db.stats(self._conn, exts=PPT_EXTS)
+            items.append(("索引", "ok", f"{st['file_count']:,} 份 PPT · {st['page_count']:,} 页", "", None))
+        except Exception:  # noqa: BLE001
+            items.append(("索引", "warn", "暂时读不到索引统计", "重新扫描", self._request_full_rescan))
+        if self._version_feature_enabled():
+            items.append(("版本库", "ok", "版本留存已开启", "", None))
+        else:
+            items.append(("版本库", "idle", "版本留存未开启", "去开启",
+                          lambda: self.open_settings_page("功能")))
+        items.append(("PowerPoint", "idle", "预览与插入依赖本机 PowerPoint", "检测",
+                      lambda: self.open_settings_page("PowerPoint")))
+        upd = getattr(self, "_updater", None)
+        snap = upd.snapshot() if upd is not None else None
+        if snap is None:
+            items.append(("内源更新", "idle", "开发版不联网检查", "", None))
+        else:
+            phase = snap.get("phase")
+            if phase in ("available", "ready"):
+                items.append(("内源更新", "warn", f"有新版本 v{snap.get('latest') or ''}", "查看",
+                              self._open_update_center))
+            elif phase == "error":
+                items.append(("内源更新", "warn", "上次检查没有成功", "重试", self._open_update_center))
+            else:
+                items.append(("内源更新", "ok", "当前已是最新", "检查", self._open_update_center))
+        win.set_diagnostics(items, copy_fn=lambda: self.open_settings_page("健康诊断"))
 
     # ---------- 列表 / 仪表盘首屏切换 ----------
     def _show_dashboard(self, *, force_refresh: bool = False) -> None:
@@ -2549,6 +2774,9 @@ class MainWindow(QMainWindow):
         for button in (self.copy_slide_btn, self.insert_slide_btn):
             button.setVisible(is_ppt)
             button.setEnabled(on and is_ppt)
+        # 非 PPT（不能跳页、不能插入）时「打开文件」就是主操作，带上文字；PPT 时收成图标按钮
+        if self._active_heavy_op is None:
+            self.open_btn.setText("" if (is_ppt or self._cur is None) else " 打开文件")
         self.goto_btn.setEnabled(can_goto)
         self.goto_btn.setToolTip(
             "用 PowerPoint 打开并跳到当前页"
@@ -2596,6 +2824,7 @@ class MainWindow(QMainWindow):
         for attr, name, color in (("copy_text_btn", "copy", ink), ("copy_path_btn", "link", ink),
                                   ("prev_btn", "arrow_left", ink), ("next_btn", "arrow_right", ink),
                                   ("goto_btn", "open", t["acctext"]), ("open_btn", "file", ink),
+                                  ("copy_slide_btn", "copy", ink),
                                   ("folder_btn", "folder", ink), ("clip_btn", "clipboard", ink)):
             btn = getattr(self, attr, None)
             if btn is not None:
@@ -2677,9 +2906,21 @@ class MainWindow(QMainWindow):
         if outer is None or col is None:
             return
         on = theme.islands(self._theme)
-        outer.setContentsMargins(*((10, 10, 10, 6) if on else (0, 0, 0, 0)))
-        outer.setSpacing(10 if on else 0)
-        col.setContentsMargins(*((5, 5, 5, 5) if on else (0, 0, 0, 0)))
+        glass = theme.float_glass(self._theme)
+        if glass:
+            # 方案 D：页头胶囊、列表、预览各自是一块玻璃岛，缝里透出同一个 AuroraCentral
+            outer.setContentsMargins(14, 14, 14, 6)
+            outer.setSpacing(14)
+            col.setContentsMargins(0, 0, 0, 0)
+            col.setSpacing(12)
+        else:
+            outer.setContentsMargins(*((10, 10, 10, 6) if on else (0, 0, 0, 0)))
+            outer.setSpacing(10 if on else 0)
+            col.setContentsMargins(*((5, 5, 5, 5) if on else (0, 0, 0, 0)))
+            col.setSpacing(0)
+        split = getattr(self, "_split", None)
+        if split is not None:
+            split.setHandleWidth(12 if glass else 5)
 
     def _apply_titlebar_theme(self) -> None:
         """Windows 系统标题栏深浅跟随主题（深色主题 → 深色标题栏，消除白条割裂）。"""
@@ -2704,9 +2945,15 @@ class MainWindow(QMainWindow):
             theme.apply_to_app(app, name, get_font_family(), get_font_scale())
         if getattr(self, "index_bar", None) is not None:
             self.index_bar.set_accent_color(self._tok["acc"])
-        theme_label = dict(theme.THEMES).get(name, name)
-        self.theme_btn.setToolTip(f"切换界面主题 · 当前：{theme_label}")
+        self._sync_theme_rail_btn()
         self._refresh_toolbar_icons()
+        self._refresh_rail_icons()
+        mat = getattr(self, "_material_tab", None)
+        if mat is not None and hasattr(mat, "apply_theme"):
+            try:
+                mat.apply_theme(theme.contract_tokens(name))
+            except Exception:  # noqa: BLE001 —— 素材页样式失败不拖垮主窗换主题
+                pass
         if persist:
             _save_theme(name)
         if self._results_raw:
@@ -4414,6 +4661,12 @@ class MainWindow(QMainWindow):
         if q:
             self._open_version_window_for(query=q)
 
+    def _welcome_rescan(self) -> None:
+        """欢迎层磁盘不足条的「清理后重新扫描」：关欢迎层，直接发起后台全量重扫。"""
+        self._dismiss_welcome()
+        if self._request_full_rescan():
+            self._toast("正在重新扫描…")
+
     def _request_full_rescan(self) -> bool:
         """健康诊断里的「重新扫描全盘」入口：只发起后台索引，不阻塞设置对话框。"""
         return self._start_indexing(None, None)
@@ -5547,6 +5800,48 @@ class MainWindow(QMainWindow):
     def _hide_preview_error_actions(self) -> None:
         if hasattr(self, "preview_error_actions"):
             self.preview_error_actions.hide()
+        if hasattr(self, "preview_error_text"):
+            self._preview_error_text_token = getattr(self, "_preview_error_text_token", 0) + 1
+            self.preview_error_text.hide()
+
+    def _load_preview_error_text(self) -> None:
+        """预览失败卡：后台读已索引的本页文字填进卡片下方（只读本地索引库，不碰源文件）。"""
+        label = getattr(self, "preview_error_text", None)
+        r = self._cur
+        if label is None:
+            return
+        self._preview_error_text_token = getattr(self, "_preview_error_text_token", 0) + 1
+        label.hide()
+        if r is None or r.is_dir or r.status == "filename_only" or r.file_id < 0:
+            return
+        conn_path = _sqlite_file_path(self._conn)
+        if not conn_path:
+            return
+        token = self._preview_error_text_token
+        file_id, page = r.file_id, self._view_page
+        task = BackgroundTask(
+            lambda conn_path=conn_path, file_id=file_id, page=page:
+            self._load_page_text(conn_path, file_id, page),
+            "preview-error-text",
+        )
+        self._bg_tasks.append(task)
+
+        def done(text, token=token, file_id=file_id, page=page):
+            if (self._closing or token != self._preview_error_text_token or self._cur is None
+                    or self._cur.file_id != file_id or self._view_page != page
+                    or not self.preview_error_actions.isVisibleTo(self)):
+                return
+            body = " ".join(str(text or "").split())
+            if not body:
+                return
+            if len(body) > 400:
+                body = body[:400] + "…"
+            label.setText(f"本页已索引的文字：{body}")
+            label.show()
+
+        task.done.connect(done)
+        task.finished.connect(lambda task=task: self._bg_tasks.remove(task) if task in self._bg_tasks else None)
+        task.start()
 
     def _retry_preview(self) -> None:
         self._last_preview_key = None
@@ -5571,7 +5866,9 @@ class MainWindow(QMainWindow):
             f'{hint}</div>')
         self._cur_pixmap = None
         self.preview_powerpoint_btn.setVisible(category == "powerpoint_unavailable")
+        self.preview_error_open_btn.setVisible(category != "missing_file")
         self.preview_error_actions.show()
+        self._load_preview_error_text()
 
     def _show_non_powerpoint_preview(self, ext: str) -> None:
         self._hide_preview_error_actions()
@@ -5932,6 +6229,7 @@ class MainWindow(QMainWindow):
             on_start=self._dismiss_welcome,
             on_pick_theme=self._apply_theme,
             on_settings=self._welcome_open_features,
+            on_rescan=self._welcome_rescan,
             current_theme=self._theme)
         ov.move(0, 0)
         ov.resize(self.size())
@@ -5959,7 +6257,8 @@ class MainWindow(QMainWindow):
     def resizeEvent(self, e):  # noqa: N802
         super().resizeEvent(e)
         # 窄窗口（如 1920x1080@150% 的 1280 逻辑宽）侧栏收成图标列，给搜索结果和预览让出宽度
-        self._set_rail_compact(self.width() < self._RAIL_COMPACT_BELOW)
+        self._set_rail_compact(self.width() < self._RAIL_COMPACT_BELOW
+                               or self.height() < self._RAIL_COMPACT_BELOW_H)
         # Smooth QPixmap scaling is deliberately expensive. Windows emits a
         # resize event for every drag pixel; doing the transform in every event
         # made the whole app stutter at high DPI. Keep the previous frame while
@@ -6503,8 +6802,8 @@ class MainWindow(QMainWindow):
         def finish(payload):
             # Release before opening the chooser: its confirmed insertion is another task.
             self._active_heavy_op = None
-            self.copy_slide_btn.setText("复制本页")
-            self.insert_slide_btn.setText("插入到 PPT…")
+            self.copy_slide_btn.setText("")
+            self.insert_slide_btn.setText("插入到当前 PPT")
             self._set_ops_enabled(self._cur is not None)
             self._flush_deferred_preview_if_idle()
             if not isinstance(payload, dict) or "error" in payload:
@@ -7753,6 +8052,13 @@ class MainWindow(QMainWindow):
             screenshot.close()
         from ..ocr_session import session as ocr_session
         ocr_session.close()
+        # 素材页嵌在主窗里收不到 closeEvent：由主窗统一让它停后台读取、关闭素材包句柄
+        mat_shutdown = getattr(getattr(self, "_material_tab", None), "shutdown", None)
+        if callable(mat_shutdown):
+            try:
+                mat_shutdown()
+            except Exception:  # noqa: BLE001 best-effort cleanup
+                _log.exception("material tab did not shut down cleanly")
         # The updater exits through ``force_quit`` instead of the tray action.
         # Keep optional watchers/version reconciliation tied to the window's
         # single shutdown path so an update can never leave background threads
