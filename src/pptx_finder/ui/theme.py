@@ -1,4 +1,8 @@
-"""主题体系：静白工作室（方向 A，默认）+ 旧极光玻璃 10 套。
+"""主题体系：方案 D 通透玻璃（晨雾 / 暗夜，默认晨雾）+ 静白工作室 + 旧极光玻璃 10 套。
+
+方案 D「通透玻璃」（2026-11-25 田哥拍板落地）：AuroraCentral 按 appbg + blobs 画静态光团，
+面板是半透明 rgba，不用任何实时模糊；浮卡留缝只对新晨雾 / 暗夜与静白 / 静黑开启，
+旧 10 套玻璃保持 14c78a1 的贴边。暗夜实心按钮与选中轨用独立深蓝 accfill（白字 ≥5.5:1）。
 
 方向 A「静白工作室」核心纪律（2026-07-16 定稿）：
 - 蓝色预算：同屏强调色 ≤3 处（选中指示条 / 主按钮 / 焦点环），其余一律灰阶。
@@ -79,8 +83,51 @@ def _mk_atelier(light: bool) -> dict:
     return d
 
 
-# 静白/静黑（方向 A）在前；旧 10 套：(fx,fy,fr,(r,g,b,a)) 极光光团供 central 自绘
+def _mk_glass(light: bool) -> dict:
+    """方案 D 通透玻璃：晨雾（浅）/ 暗夜（深）。
+
+    对比度按「面板叠在最浓光团上」的合成色核算（晨雾约 #F0F5FF，暗夜约 #182344）：
+    晨雾 ink3 5.7:1、ink4 4.6:1；暗夜 ink3 6.1:1、ink4 5.2:1。
+    实心按钮 / 选中轨用 accfill：晨雾 #0A59F7 白字 5.55:1，暗夜 #2464CD 白字 5.56:1
+    （hover #0047D9 7.23:1 / #1F57B5 6.80:1）；亮蓝 acc 只给链接、描边、选中文字。
+    """
+    if light:
+        d = dict(
+            win="#EEF3FA", appbg="#EEF3FA", base="transparent",
+            blobs=[(0.08, 0.04, 0.66, (138, 182, 255, 175)), (0.92, 0.08, 0.60, (206, 180, 255, 150)),
+                   (0.58, 1.02, 0.76, (140, 224, 212, 135)), (0.36, 0.55, 0.50, (190, 210, 255, 80))],
+            panel="rgba(255,255,255,0.82)", panel2="rgba(255,255,255,0.96)", field="rgba(226,232,243,0.72)",
+            rail="rgba(255,255,255,0.82)",
+            hover="rgba(30,60,120,0.06)", sel="rgba(10,89,247,0.11)", selblur="rgba(30,50,90,0.07)",
+            bd="rgba(40,60,100,0.18)", bd2="rgba(40,60,100,0.09)", edge="rgba(36,56,100,0.08)",
+            ink1="#121A2A", ink2="#2F3A4E", ink3="#566176", ink4="#666F80",
+            acc="#0A59F7", accd="#0047D9", accfill="#0A59F7", accfillh="#0047D9", acctext="#FFFFFF",
+            grn="#3A9E42", scroll="rgba(24,36,49,0.26)", scrollh="rgba(24,36,49,0.46)",
+            canvas="#F7F9FD", is_light=True, hl_bg="#FFF1B8", hl_fg="#121A2A",
+        )
+    else:
+        d = dict(
+            win="#0B1020", appbg="#0B1020", base="transparent",
+            blobs=[(0.10, 0.04, 0.66, (40, 92, 255, 120)), (0.92, 0.10, 0.60, (124, 58, 237, 95)),
+                   (0.60, 1.02, 0.76, (0, 150, 170, 85)), (0.34, 0.58, 0.50, (59, 130, 246, 45))],
+            panel="rgba(24,30,48,0.78)", panel2="rgba(28,35,56,0.96)", field="rgba(255,255,255,0.08)",
+            rail="rgba(24,30,48,0.78)",
+            hover="rgba(255,255,255,0.06)", sel="rgba(61,139,255,0.20)", selblur="rgba(255,255,255,0.07)",
+            bd="rgba(255,255,255,0.16)", bd2="rgba(255,255,255,0.08)", edge="rgba(255,255,255,0.08)",
+            ink1="#F2F5FB", ink2="#CDD4E2", ink3="#9AA3B6", ink4="#8E97AA",
+            acc="#3D8BFF", accd="#5C9DFF", accfill="#2464CD", accfillh="#1F57B5", acctext="#FFFFFF",
+            grn="#32D74B", scroll="rgba(255,255,255,0.24)", scrollh="rgba(255,255,255,0.44)",
+            canvas="#161B2C", is_light=False, hl_bg="rgba(255,214,10,0.22)", hl_fg="#FFE047",
+        )
+    ar, ag, ab = _rgb(d["acc"])
+    d.update(hl_r=str(ar), hl_g=str(ag), hl_b=str(ab), hl_a="0.22", radius="12")
+    return d
+
+
+# 方案 D 两套在前，静白/静黑（方向 A）其次；旧 10 套：(fx,fy,fr,(r,g,b,a)) 极光光团供 central 自绘
 TOKENS: dict[str, dict] = {
+    "mist_glass": _mk_glass(True),
+    "night_glass": _mk_glass(False),
     "atelier": _mk_atelier(True),
     "atelier_dark": _mk_atelier(False),
     "aurora": _mk("#0A0817",
@@ -125,12 +172,31 @@ TOKENS: dict[str, dict] = {
         "#0A84FF", "#0A66D6", ("#1D1D1F", "#494B50", "#6E6E73", "#A0A4AB"), light=True),
 }
 
+for _t in TOKENS.values():  # 旧主题补齐方案 D 新键（= 原值，QSS 字节不变）
+    _t.setdefault("accfill", _t["acc"])
+    _t.setdefault("accfillh", _t["accd"])
+    _t.setdefault("edge", _t["bd2"])
+del _t
+
 THEMES: list[tuple[str, str]] = [
+    ("mist_glass", "晨雾玻璃"), ("night_glass", "暗夜玻璃"),
     ("atelier", "静白"), ("atelier_dark", "静黑"),
     ("aurora", "极光玻璃"), ("cinema", "胶片放映厅"), ("cyber", "赛博霓虹"), ("ocean", "深海极光"),
     ("magma", "熔岩黄昏"), ("forest", "森林晨雾"), ("sakura", "樱花粉黛"), ("midnight", "午夜电蓝"),
     ("graphite", "石墨极简"), ("cloud", "云白晨光"),
 ]
+
+#: 方案 D 默认首选主题（新装用户；已存过主题的用户保持原选择）
+DEFAULT_THEME = "mist_glass"
+#: 设置页 / 欢迎页主推的四套；其余收进「更多主题」
+MAIN_THEMES: tuple[str, ...] = ("mist_glass", "night_glass", "atelier", "atelier_dark")
+MORE_THEMES: tuple[str, ...] = tuple(n for n, _ in THEMES if n not in MAIN_THEMES)
+#: 深浅快捷切换的配对（旧 10 套切到晨雾 / 暗夜）
+DARK_LIGHT_PAIR = {"mist_glass": "night_glass", "night_glass": "mist_glass",
+                   "atelier": "atelier_dark", "atelier_dark": "atelier"}
+
+#: 方案 D 浮卡玻璃：页头胶囊、列表 / 预览分岛、药丸轨（只这两套；旧 10 套保持贴边）
+FLOAT_GLASS_THEMES = frozenset({"mist_glass", "night_glass"})
 
 # 控件语言（方向 A）：圆角三档 卡$radius/控件8/小件5；hover 只变底色；焦点环统一 1.5px 强调色。
 _QSS = Template("""
@@ -147,8 +213,8 @@ QLabel#gtDot { color: $acc; font-size: 12px; background: transparent; }
 QLabel#gtName { color: $ink1; font-size: 15px; font-weight: 700; background: transparent; }
 QLabel#gtVer { color: $ink4; font-size: 11px; font-family: $mono_family; background: transparent; }
 QLabel#gtTheme { color: $ink3; font-size: 12px; background: transparent; }
-QPushButton#updateChip { background: $acc; color: #FFFFFF; border: none; border-radius: 8px; padding: 6px 10px; font-size: 12px; font-weight: 600; }
-QPushButton#updateChip:hover { background: $accd; }
+QPushButton#updateChip { background: $accfill; color: #FFFFFF; border: none; border-radius: 8px; padding: 6px 10px; font-size: 12px; font-weight: 600; }
+QPushButton#updateChip:hover { background: $accfillh; }
 QPushButton#updateChip:disabled { background: rgba($hl_r,$hl_g,$hl_b,0.45); color: $ink3; }
 QPushButton#winMin, QPushButton#winMax, QPushButton#winClose { background: transparent; border: none; border-radius: 0; color: $ink3; font-size: 13px; padding: 0; }
 QPushButton#winMin:hover, QPushButton#winMax:hover { background: $hover; color: $ink1; }
@@ -158,15 +224,19 @@ QPushButton#winClose:hover { background: #E81123; color: #FFFFFF; }
 QWidget#navRail { background: $rail; $rail_frame }
 QWidget#railBrand { background: transparent; }
 QLabel#railLogo { background: transparent; }
-QPushButton#railBtn {
-  background: transparent; border: none; border-radius: 12px; text-align: left;
-  padding: 0 12px; color: $ink2; font-size: 14px;
+QToolButton#railBtn {
+  background: transparent; border: none; border-radius: 16px;
+  padding: 5px 0 4px 0; color: $ink2; font-size: 11.5px;
 }
-QPushButton#railBtn:hover { background: $hover; color: $ink1; }
-QPushButton#railBtn:pressed { background: $sel; }
-QPushButton#railBtn:checked { background: $sel; color: $acc; font-weight: 600; }
-QPushButton#railBtn:focus { border: none; }
-QPushButton#railBtn[compact="true"] { text-align: center; padding: 0; }
+QToolButton#railBtn:hover { background: $hover; color: $ink1; }
+QToolButton#railBtn:pressed { background: $sel; }
+QToolButton#railBtn:checked { background: $rail_on_bg; color: $rail_on_fg; font-weight: 600; }
+QToolButton#railBtn:focus { border: none; }
+QLabel#railBadge { background: transparent; border: none; }
+QLabel#railLogoMark { background: transparent; }
+QWidget#pageHead { background: transparent; }
+QLabel#pageHeadTitle { color: $ink1; font-size: 19px; font-weight: 700; background: transparent; }
+QLabel#pageHeadSub { color: $ink3; font-size: 12.5px; background: transparent; }
 QFrame#railSep { background: $bd2; border: none; }
 QLabel#railDot { background: #F04438; border-radius: 4px; }
 
@@ -208,9 +278,9 @@ QPushButton {
 QPushButton:hover { background: $bd; }
 QPushButton:pressed { background: $sel; color: $acc; }
 QPushButton:disabled { color: $ink4; background: transparent; border-color: $bd2; }
-QPushButton#primary { background: $acc; border: 1px solid $acc; color: $acctext; font-weight: 600; }
-QPushButton#primary:hover { background: $accd; border-color: $accd; }
-QPushButton#primary:pressed { background: $accd; border-color: $accd; }
+QPushButton#primary { background: $accfill; border: 1px solid $accfill; color: $acctext; font-weight: 600; }
+QPushButton#primary:hover { background: $accfillh; border-color: $accfillh; }
+QPushButton#primary:pressed { background: $accfillh; border-color: $accfillh; }
 QPushButton#primary:disabled { background: $selblur; border-color: transparent; color: $ink4; }
 QPushButton#ghost { background: transparent; border: none; border-radius: 14px; color: $ink2; padding: 5px 10px; }
 QPushButton#ghost:hover { background: $hover; color: $ink1; }
@@ -309,7 +379,7 @@ QLabel#verPreview { background: $field; border: 1px solid $bd2; border-radius: 6
 QLabel#versionPreview { background: $field; border: 1px solid $bd2; border-radius: 6px; color: $ink4; font-size: 11px; }
 QPushButton#verBtn { background: transparent; border: 1px solid $bd2; border-radius: 5px; padding: 2px 9px; color: $ink2; font-size: 11px; }
 QPushButton#verBtn:hover { background: $hover; color: $ink1; }
-QPushButton#verBtnPri { background: $acc; border: 1px solid $acc; border-radius: 5px; padding: 2px 9px; color: $acctext; font-size: 11px; font-weight: 600; }
+QPushButton#verBtnPri { background: $accfill; border: 1px solid $accfill; border-radius: 5px; padding: 2px 9px; color: $acctext; font-size: 11px; font-weight: 600; }
 QPushButton#verPreviewBtn { background: transparent; border: 1px solid $bd2; border-radius: 5px; padding: 3px 10px; color: $ink2; font-size: 11px; }
 QPushButton#verPreviewBtn:hover { background: $hover; color: $ink1; }
 QPushButton#outlineItem { background: transparent; border: none; text-align: left; padding: 4px 6px; color: $ink2; font-size: 11.5px; border-radius: 5px; }
@@ -385,7 +455,8 @@ QFrame#dashCard, QFrame#dashCardLink { background: $panel; border: 1px solid $bd
 QFrame#dashCardLink:hover { border-color: rgba($hl_r,$hl_g,$hl_b,0.55); background: $sel; }
 QLabel#dashTitle { color: $ink1; font-size: 22px; font-weight: 700; background: transparent; }
 QLabel#dashSub { color: $ink3; font-size: 12.5px; background: transparent; }
-QLabel#kpiNum { color: $acc; font-size: 28px; font-weight: 700; font-family: $mono_family; background: transparent; }
+QLabel#kpiNum { color: $ink1; font-size: 28px; font-weight: 700; font-family: $mono_family; background: transparent; }
+QLabel#kpiNumAcc { color: $acc; font-size: 28px; font-weight: 700; font-family: $mono_family; background: transparent; }
 QLabel#kpiLab { color: $ink2; font-size: 12.5px; font-weight: 600; background: transparent; }
 QLabel#kpiSub { color: $ink4; font-size: 11px; background: transparent; }
 QLabel#dashCardT { color: $ink1; font-size: 14px; font-weight: 700; background: transparent; }
@@ -489,12 +560,31 @@ QLabel#toast {
 
 /* 素材库顶部的团队素材包条：白卡，不再用系统灰粗边 */
 QFrame#teamPackBar { background: $panel; border: 1px solid $bd2; border-radius: 16px; }
+$float_glass_qss""")
+
+# 方案 D 浮卡玻璃的追加样式（只拼给 FLOAT_GLASS_THEMES）：页头胶囊、列表 / 预览分岛、药丸轨、
+# 卡片 22 圆角。全部是 rgba 底 + 1px 描边，不用 backdrop-filter / 阴影效果。
+_FLOAT_GLASS_QSS = Template("""
+/* —— 方案 D 通透玻璃：浮卡 —— */
+QWidget#mainColumn { background: transparent; border-radius: 0px; }
+QWidget#glassTitle { background: $panel; border: 1px solid $edge; border-radius: 26px; }
+QWidget#topBar { background: transparent; }
+QWidget#listPane, QWidget#previewPanel { background: $panel; border: 1px solid $edge; border-radius: 22px; }
+QSplitter#mainSplit::handle:horizontal { width: 12px; background: transparent; border: none; }
+QSplitter#mainSplit::handle:horizontal:hover { background: transparent; }
+QFrame#dashCard, QFrame#dashCardLink { background: $panel; border: 1px solid $edge; border-radius: 22px; }
+QFrame#card { background: $panel; border: 1px solid $edge; border-radius: 22px; }
+QWidget#materialEmpty, QFrame#teamPackBar { background: $panel; border: 1px solid $edge; border-radius: 22px; }
+QWidget#pageIsland { background: $panel; border: 1px solid $edge; border-radius: 22px; }
+QLabel#toast { background: $panel2; border: 1px solid $bd; border-radius: 18px; }
+QLineEdit#searchBox { border-radius: 18px; }
+QLineEdit#searchBox:focus { background: $panel2; }
 """)
 
 # substitute 只替换字符串 $var，TOKENS 里的 blobs(list) 会被忽略（不影响 QSS）
 _QSS_KEYS = ("win", "base", "appbg", "panel", "panel2", "field", "rail", "hover", "sel", "selblur",
              "ink1", "ink2", "ink3", "ink4", "bd", "bd2", "acc", "accd", "acctext", "grn",
-             "scroll", "scrollh", "hl_r", "hl_g", "hl_b", "radius", "canvas")
+             "scroll", "scrollh", "hl_r", "hl_g", "hl_b", "radius", "canvas", "accfill", "accfillh", "edge")
 
 # 界面字体默认字族：与 2026-08 前硬编码值一致；用户覆盖走 ui.json 的 font_family
 DEFAULT_FONT_FAMILY = '"Microsoft YaHei UI", "Segoe UI", "PingFang SC", sans-serif'
@@ -543,8 +633,13 @@ def build_qss(theme: str, font_family: str = "", font_scale: float = 1.0) -> str
         font_family=_font_family_qss(font_family),
         mono_family=DEFAULT_MONO_FAMILY,
         col_radius="16px" if islands(theme) else "0px",
-        rail_frame=("border: none; border-radius: 20px;" if islands(theme)
+        rail_frame=(f"border: 1px solid {t['edge']}; border-radius: 30px;" if float_glass(theme)
+                    else "border: none; border-radius: 20px;" if islands(theme)
                     else f"border: none; border-right: 1px solid {t['bd2']}; border-radius: 0px;"),
+        rail_on_bg=t["accfill"] if float_glass(theme) else t["sel"],
+        rail_on_fg="#FFFFFF" if float_glass(theme) else t["acc"],
+        float_glass_qss=(_FLOAT_GLASS_QSS.substitute({k: t[k] for k in _QSS_KEYS})
+                         if float_glass(theme) else ""),
     )
     qss = _QSS.substitute(values)
     if abs(font_scale - 1.0) > 1e-9:
@@ -554,15 +649,58 @@ def build_qss(theme: str, font_family: str = "", font_scale: float = 1.0) -> str
 
 #: 「灰画布上浮白卡」（导航岛与内容面板留缝、圆角）只给实色主题；玻璃主题的面板半透明，
 #: 留缝会在玻璃上再叠一圈深色底（2026-11-24 同事反馈「多加了层黑底」），保持贴边。
-ISLAND_THEMES = frozenset({"atelier", "atelier_dark"})
+ISLAND_THEMES = frozenset({"atelier", "atelier_dark", "mist_glass", "night_glass"})
 
 
 def islands(theme: str) -> bool:
     return theme in ISLAND_THEMES
 
 
+def float_glass(theme: str) -> bool:
+    """方案 D 浮卡玻璃（晨雾 / 暗夜）：页头胶囊、列表与预览分岛、药丸轨。"""
+    return theme in FLOAT_GLASS_THEMES
+
+
 def tok(theme: str) -> dict:
     return TOKENS.get(theme, TOKENS["atelier"])
+
+
+def contract_tokens(theme: str) -> dict:
+    """第二阶段合同 §3.2：给素材页（MaterialTabWidget.apply_theme）等外部控件的标准 token。
+
+    返回新 dict，改它不影响主题本身；未知主题回退静白。
+    """
+    name = theme if theme in TOKENS else "atelier"
+    t = TOKENS[name]
+    dark = not t.get("is_light", False)
+    return {
+        "name": name,
+        "label": dict(THEMES).get(name, name),
+        "is_dark": dark,
+        "is_glass": name not in ("atelier", "atelier_dark"),
+        "floating_cards": islands(name),
+        "appbg": t["appbg"],
+        "blobs": list(t.get("blobs") or []),
+        "surface": t["panel"],
+        "surface_hover": t["hover"],
+        "surface_border": t["edge"],
+        "text": t["ink1"],
+        "text_secondary": t["ink2"],
+        "text_muted": t["ink3"],
+        "text_faint": t["ink4"],
+        "field": t["field"],
+        "selected": t["sel"],
+        "accent": t["accfill"],
+        "accent_hover": t["accfillh"],
+        "accent_text": t["acctext"],
+        "accent_soft": t["sel"],
+        "link": t["acc"],
+        "danger": "#FF453A" if dark else "#CF0A2C",
+        "warn": "#FF9F0A" if dark else "#E8780C",
+        "ok": t["grn"],
+        "hl_bg": t["hl_bg"],
+        "hl_fg": t["hl_fg"],
+    }
 
 
 def highlight_css(theme: str) -> str:
