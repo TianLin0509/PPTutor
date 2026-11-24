@@ -2586,6 +2586,9 @@ class MainWindow(QMainWindow):
             sig = getattr(tab, "statusTextChanged", None)
             if sig is not None:
                 sig.connect(self._on_material_status)
+            compact = getattr(tab, "set_header_compact", None)
+            if callable(compact):
+                compact(True)   # 标题与状态由主窗页头显示，控件只留右侧操作按钮
             self._material_tab = tab
             lay.addWidget(tab, 1)
             return
@@ -7974,6 +7977,13 @@ class MainWindow(QMainWindow):
             screenshot.close()
         from ..ocr_session import session as ocr_session
         ocr_session.close()
+        # 素材页嵌在主窗里收不到 closeEvent：由主窗统一让它停后台读取、关闭素材包句柄
+        mat_shutdown = getattr(getattr(self, "_material_tab", None), "shutdown", None)
+        if callable(mat_shutdown):
+            try:
+                mat_shutdown()
+            except Exception:  # noqa: BLE001 best-effort cleanup
+                _log.exception("material tab did not shut down cleanly")
         # The updater exits through ``force_quit`` instead of the tray action.
         # Keep optional watchers/version reconciliation tied to the window's
         # single shutdown path so an update can never leave background threads
