@@ -37,7 +37,7 @@ GAP = 12
 CARD_H, CARD_H_NARROW = 150, 128
 CARD_MIN_W = 128
 LIST_ROW_H = 60
-NARROW_WIDTH = 1150
+NARROW_WIDTH = 1100
 PERSONAL_SOFT_LIMIT = 200 * 1024 * 1024
 
 #: 方案 D 晨雾玻璃的默认值（主窗没传主题时用；键名按 phase2-contract §3.2）

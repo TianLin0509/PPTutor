@@ -131,7 +131,7 @@ def test_one_screen_layout_without_overflow(qtbot, core, tmp_path, size, min_per
     qtbot.wait(150)
     info = sizes_for_tests(tab)
     assert info["per_page"] >= min_per_page
-    narrow = size[0] < 1150
+    narrow = size[0] < 1100
     assert info["left"] == (176 if narrow else 196) and info["right"] == (270 if narrow else 320)
     # 右栏动作区完整可见
     for w in (tab.insert_btn, tab.copy_btn, tab.copy_image_link):
