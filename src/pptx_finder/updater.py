@@ -440,9 +440,12 @@ class CheckReport:
     current: str = ""
     error: str = ""          # 全部源都连不上 / 未打包等，给界面的人话
     openx_only_failed: bool = False   # 只走内源且内源连不上：界面就地给「改用外网更新源」
+    blocked: bool = False   # 本次按失败处理（内源清单没通过校验 / 一个源都没启用），哪怕有外网源答了
 
     @property
     def all_failed(self) -> bool:
+        if self.blocked:
+            return True
         return bool(self.checks) and not any(c.ok for c in self.checks)
 
 
@@ -984,7 +987,7 @@ def check_sources(
     sources = update_sources(base_url, edition=edition)
     if not sources:
         # 内源被关掉、外网源也被强制关掉：一个源都没问，不能显示成「已是最新」
-        return CheckReport(best=None, checks=[], current=str(local.get("version", "")),
+        return CheckReport(best=None, checks=[], current=str(local.get("version", "")), blocked=True,
                            error="没有启用任何更新源（公司内源和外网源都被关掉了），本次没有检查")
 
     def _one(source):
@@ -1014,7 +1017,7 @@ def check_sources(
     if bad is not None:
         # 内源的清单没通过校验（比如被跳转到外网）：整次检查停在这里，不拿外网源的结果顶替
         return CheckReport(best=None, checks=[c for _s, _i, c in results],
-                           current=str(local.get("version", "")),
+                           current=str(local.get("version", "")), blocked=True,
                            error="公司内源返回的版本清单没通过校验（" + bad.reason
                                  + "），为安全起见本次不更新，也不改用外网源。")
     if external and any(s.label != "openx" for s in sources):

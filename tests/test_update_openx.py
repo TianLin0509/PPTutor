@@ -466,6 +466,7 @@ def test_check_refuses_external_when_openx_manifest_fails_integrity(monkeypatch,
     monkeypatch.setattr(updater, "fetch_manifest_from", fake_fetch)
     rep = updater.check_sources("https://me.lt-stockpartner.tech/pptutor")
     assert rep.best is None and "不改用外网源" in rep.error and "跳转" in rep.error
+    assert rep.all_failed           # 外网源答了也按失败报：界面走报错，不显示「已是最新」
 
 
 def test_no_source_enabled_is_an_error_not_up_to_date(monkeypatch):
@@ -474,7 +475,7 @@ def test_no_source_enabled_is_an_error_not_up_to_date(monkeypatch):
     monkeypatch.setattr(updater, "is_frozen", lambda: True)
     monkeypatch.setattr(updater, "local_manifest", lambda: {"version": "2.1.15", "files": {}})
     rep = updater.check_sources("https://me.lt-stockpartner.tech/pptutor")
-    assert rep.best is None and "没有启用任何更新源" in rep.error
+    assert rep.best is None and "没有启用任何更新源" in rep.error and rep.all_failed
 
 
 def test_component_manifest_integrity_failure_stops_before_external(monkeypatch):
@@ -489,3 +490,28 @@ def test_component_manifest_integrity_failure_stops_before_external(monkeypatch)
         imgtext_ocr.fetch_manifest_from_sources(
             [("openx", "openx:ocr"), ("github-release", "https://github.com/x")], 3, "识别组件")
     assert asked == ["openx:ocr"] and "不改用外网源" in str(ei.value)
+
+
+def test_openx_content_length_mismatch_stops_before_external(tmp_path, monkeypatch):
+    """服务器声明的大小就不对（还没下完就能看出来）：同样算内源完整性失败，不换外网。"""
+    from pptx_finder import netfetch
+    opened = []
+
+    class _R(_Resp):
+        def __init__(self, data, u):
+            super().__init__(data)
+            self.u = u
+            self.headers = {"Content-Type": "application/octet-stream", "Content-Length": str(len(data))}
+
+        def geturl(self):
+            return self.u
+
+    def fake_urlopen(req, timeout=None):
+        u = req.full_url if hasattr(req, "full_url") else str(req)
+        opened.append(u)
+        return _R(b"SHORT", u)
+    monkeypatch.setattr(netfetch.urllib.request, "urlopen", fake_urlopen)
+    with pytest.raises(netfetch.AllSourcesFailed) as ei:
+        netfetch.download_with_fallback([("openx", F + "s"), ("github-release", "https://github.com/s")],
+                                        tmp_path / "s.zip", expect_size=12, expect_sha256="0" * 64)
+    assert opened == [F + "s"] and "文件大小不对" in ei.value.attempts[0].reason

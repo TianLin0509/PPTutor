@@ -251,7 +251,7 @@ def check_response_is_not_page(response, expect_size: int | None, what: str = "�
             pass
         if looks_like_web_page(ctype, body):
             raise SourceFailure(f"收到 {fmt_bytes(len(body) or length)} 的网页而不是{what}，可能被公司代理拦截")
-        raise SourceFailure(
+        raise IntegrityFailure(
             f"文件大小不对：应为 {fmt_bytes(expect_size)}，服务器给的是 {fmt_bytes(length)}")
 
 
