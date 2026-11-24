@@ -377,3 +377,115 @@ def test_both_projects_are_searched_newest_manifest_wins():
     assert openx_source.MultiIndex([down, hub]).latest_file("manifest.json")[1] == "2.1.11"   # 一个项目连不上不影响另一个
     with pytest.raises(openx_source.OpenxUnavailable):
         openx_source.MultiIndex([down]).find("x")
+
+
+# ---------- Codex 审查 2026-11-24：内源完整性失败不许回退外网；清单跳转；零个源 ----------
+def test_openx_integrity_failure_never_falls_back_to_external(tmp_path, monkeypatch):
+    """外网开关打开时，内源包校验不过也要停下报错，不拿 GitHub 的包顶替。"""
+    from pptx_finder import netfetch
+    good = b"GOOD-ARCHIVE"
+    bodies = {F + "z": b"BAD-ARCHIVE!", "https://github.com/z": good, "https://mirror.example/z": good}
+    opened = []
+
+    class _R(_Resp):
+        headers = {"Content-Type": "application/octet-stream"}
+
+        def geturl(self):
+            return self.u
+
+    def fake_urlopen(req, timeout=None):
+        u = req.full_url if hasattr(req, "full_url") else str(req)
+        opened.append(u)
+        r = _R(bodies[u])
+        r.u = u
+        return r
+    monkeypatch.setattr(netfetch.urllib.request, "urlopen", fake_urlopen)
+    sha = hashlib.sha256(good).hexdigest()
+    with pytest.raises(netfetch.AllSourcesFailed) as ei:
+        netfetch.download_with_fallback([("openx", F + "z"), ("github-release", "https://github.com/z")],
+                                        tmp_path / "c.zip", expect_size=None, expect_sha256=sha)
+    assert opened == [F + "z"] and "不改用外网源" in str(ei.value)
+    assert not (tmp_path / "c.zip").exists()
+
+    opened.clear()                                                   # 外网源之间照旧：GitHub 坏了换备用服务器
+    bodies["https://github.com/z"] = b"BAD-ARCHIVE!"
+    netfetch.download_with_fallback([("github-release", "https://github.com/z"),
+                                     ("self-hosted", "https://mirror.example/z")],
+                                    tmp_path / "c.zip", expect_size=None, expect_sha256=sha)
+    assert (tmp_path / "c.zip").read_bytes() == good
+
+
+def test_update_download_stops_on_openx_integrity_but_not_on_unreachable(tmp_path, monkeypatch):
+    from pptx_finder import netfetch
+    tried = []
+    gh = updater.UpdateSource("github-release", "https://github.com/m", "https://github.com/b/{hash}")
+
+    def fake_delta(base, info, staging, **kw):
+        tried.append(info.source.label)
+        if info.source.label == "openx":
+            raise fake_delta.err
+        Path(staging).mkdir(parents=True, exist_ok=True)
+        return staging
+    monkeypatch.setattr(updater, "download_delta", fake_delta)
+    info = updater.UpdateInfo(version="2.1.15", notes="", changed=[("a.exe", "b" * 64, 3)], deleted=[])
+    info.sources = [updater.openx_source("base"), gh]
+
+    fake_delta.err = netfetch.IntegrityFailure("哈希校验失败 a.exe")
+    with pytest.raises(netfetch.AllSourcesFailed):
+        updater.download_update("", info, tmp_path / "s1")
+    assert tried == ["openx"] and not (tmp_path / "s1").exists()
+
+    tried.clear()
+    fake_delta.err = openx_source.OpenxUnavailable("公司内源连不上")    # 连不上：用户开了外网源才会走到这里，照常换源
+    updater.download_update("", info, tmp_path / "s2")
+    assert tried == ["openx", "github-release"] and info.used_source is gh
+
+
+def test_openx_manifest_redirect_off_site_is_refused_before_request():
+    import urllib.request
+    from pptx_finder import netfetch
+    h = updater._OpenxOnlyRedirect()
+    req = urllib.request.Request(F + "manifest")
+    with pytest.raises(netfetch.IntegrityFailure):
+        h.redirect_request(req, None, 302, "Found", {}, "https://evil.example.com/manifest.json")
+    assert h.redirect_request(req, None, 302, "Found", {}, F + "other") is not None   # 内源内部跳转照常
+
+
+def test_check_refuses_external_when_openx_manifest_fails_integrity(monkeypatch, ui_settings):
+    from pptx_finder import netfetch
+    local, remote = _two_manifests()
+    monkeypatch.setenv("PPTX_FINDER_OPENX", "1")
+    monkeypatch.setattr(updater, "is_frozen", lambda: True)
+    monkeypatch.setattr(updater, "local_manifest", lambda: local)
+    openx_source.set_external_allowed(True)
+
+    def fake_fetch(source, timeout=8, response_callback=None):
+        if source.label == "openx":
+            raise netfetch.IntegrityFailure("公司内源的版本清单被跳转到了别的网站，已拒绝")
+        return dict(remote)
+    monkeypatch.setattr(updater, "fetch_manifest_from", fake_fetch)
+    rep = updater.check_sources("https://me.lt-stockpartner.tech/pptutor")
+    assert rep.best is None and "不改用外网源" in rep.error and "跳转" in rep.error
+
+
+def test_no_source_enabled_is_an_error_not_up_to_date(monkeypatch):
+    monkeypatch.setenv("PPTX_FINDER_OPENX", "0")
+    monkeypatch.setenv("PPTX_FINDER_UPDATE_EXTERNAL", "0")
+    monkeypatch.setattr(updater, "is_frozen", lambda: True)
+    monkeypatch.setattr(updater, "local_manifest", lambda: {"version": "2.1.15", "files": {}})
+    rep = updater.check_sources("https://me.lt-stockpartner.tech/pptutor")
+    assert rep.best is None and "没有启用任何更新源" in rep.error
+
+
+def test_component_manifest_integrity_failure_stops_before_external(monkeypatch):
+    from pptx_finder import imgtext_ocr, netfetch
+    asked = []
+
+    def fake_open(base, timeout):
+        asked.append(base)
+        raise netfetch.IntegrityFailure("公司内源的组件清单被跳转到了别的网站，已拒绝")
+    monkeypatch.setattr(imgtext_ocr, "_open_manifest", fake_open)
+    with pytest.raises(imgtext_ocr.OcrUnavailable) as ei:
+        imgtext_ocr.fetch_manifest_from_sources(
+            [("openx", "openx:ocr"), ("github-release", "https://github.com/x")], 3, "识别组件")
+    assert asked == ["openx:ocr"] and "不改用外网源" in str(ei.value)

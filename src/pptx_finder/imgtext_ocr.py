@@ -270,10 +270,16 @@ def _open_manifest(base: str, timeout: float):
     """打开某个源上的 component.json；内源要先按版本名查出附件地址，且不跟随跳出内源的跳转。"""
     import urllib.request
     if base.startswith(OPENX_BASE):
-        from .openx_source import _NoRedirect, component_manifest_url
+        from .netfetch import IntegrityFailure
+        from .openx_source import component_manifest_url, safe_url
+        from .updater import _OpenxOnlyRedirect
         url = component_manifest_url(base[len(OPENX_BASE):], timeout=min(timeout, 6.0))
         req = urllib.request.Request(url, headers={"Cache-Control": "no-cache"})
-        return urllib.request.build_opener(_NoRedirect).open(req, timeout=timeout)
+        response = urllib.request.build_opener(_OpenxOnlyRedirect).open(req, timeout=timeout)
+        if not safe_url(getattr(response, "geturl", lambda: url)() or url):
+            response.close()
+            raise IntegrityFailure("公司内源的组件清单被跳转到了别的网站，已拒绝")
+        return response
     req = urllib.request.Request(base + "/" + COMPONENT_MANIFEST, headers={"Cache-Control": "no-cache"})
     return urllib.request.urlopen(req, timeout=timeout)
 
@@ -306,7 +312,7 @@ def fetch_manifest_from_sources(sources: list[tuple[str, str]], timeout: float =
     import json as _json
     import urllib.request
 
-    from .netfetch import SourceFailure, looks_like_web_page, reason_of, source_name
+    from .netfetch import SourceFailure, looks_like_web_page, reason_of, source_name,         stops_fallback
     from .updater import _ver_tuple
 
     found = []
@@ -332,6 +338,12 @@ def fetch_manifest_from_sources(sources: list[tuple[str, str]], timeout: float =
         except Exception as exc:      # noqa: BLE001 逐个源试，全部失败才抛
             reason = reason_of(exc)
             log.info("%s清单取不到（%s）：%s", what, base, reason)
+            if stops_fallback(label, exc):
+                # 内源给的清单不对（被跳到外网等）：停在这里，不拿外网源的清单顶替
+                err = OcrUnavailable(f"{what}清单没通过校验：公司内源：{reason}。为安全起见不改用外网源")
+                err.checks = checks + [{"label": label, "name": source_name(label), "ok": False,
+                                        "version": "", "reason": reason}]
+                raise err from exc
             if label == "openx" and len(sources) > 1:
                 # 用户打开了外网源（多半在公司外）：连不上内源是常态，不在界面上列成失败
                 continue

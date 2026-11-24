@@ -68,6 +68,19 @@ class SourceFailure(ValueError):
         self.reason = reason
 
 
+class IntegrityFailure(SourceFailure):
+    """收到的东西不对（大小 / SHA-256 不符，或内源被跳转到别的网站）。
+
+    和「连不上 / 没这个文件」不同：这说明源上的文件本身有问题。内源出这种错时
+    **不换到外网源接着下**——否则坏包被外网的好包盖过去，问题被悄悄掩盖（2026-11-24 田哥要求）。
+    """
+
+
+def stops_fallback(label: str, exc: BaseException) -> bool:
+    """内源的完整性失败到此为止，不回退到 GitHub / 备用服务器。"""
+    return label == "openx" and isinstance(exc, IntegrityFailure)
+
+
 class AllSourcesFailed(RuntimeError):
     """所有源都试过了。attempts 里有每个源的结果，界面逐条列出。"""
 
@@ -305,12 +318,12 @@ def download_file(url: str, dest: Path, *, expect_size: int | None, expect_sha25
         if expect_size and received != expect_size:
             if received < _WEB_PAGE_MAX and looks_like_web_page(ctype, head):
                 raise SourceFailure(f"收到 {fmt_bytes(received)} 的网页而不是{what}，可能被公司代理拦截")
-            raise SourceFailure(
+            raise IntegrityFailure(
                 f"文件不完整：应为 {fmt_bytes(expect_size)}，只收到 {fmt_bytes(received)}")
         if hasher.hexdigest() != str(expect_sha256).lower():
             if received < _WEB_PAGE_MAX and looks_like_web_page(ctype, head):
                 raise SourceFailure(f"收到 {fmt_bytes(received)} 的网页而不是{what}，可能被公司代理拦截")
-            raise SourceFailure("文件校验不一致（内容在传输中被改动，或源上的文件不对）")
+            raise IntegrityFailure("文件校验不一致（内容在传输中被改动，或源上的文件不对）")
         os.replace(part, dest)
         return received
     except BaseException:
@@ -333,7 +346,7 @@ def _refuse_offsite_redirect(requested: str, response) -> None:
         return
     final = getattr(response, "geturl", lambda: requested)() or requested
     if not safe_url(final):
-        raise SourceFailure("内源下载被跳转到内源以外的地址，已拒绝")
+        raise IntegrityFailure("内源下载被跳转到内源以外的地址，已拒绝")
 
 
 def download_with_fallback(candidates: list[tuple[str, str]], dest: Path, *,
@@ -373,9 +386,12 @@ def download_with_fallback(candidates: list[tuple[str, str]], dest: Path, *,
             attempt.finish("cancelled", "已取消")
             _emit()
             raise
-        except Exception as exc:  # noqa: BLE001 一个源的任何问题都换下一个
+        except Exception as exc:  # noqa: BLE001 一个源的问题换下一个（内源完整性失败除外）
             attempt.finish("failed", reason_of(exc))
             _emit()
+            if stops_fallback(label, exc):
+                raise AllSourcesFailed(f"下载{what}（内源文件没通过校验，为安全起见不改用外网源）",
+                                       attempts) from exc
             continue
         attempt.finish("ok", "", n)
         _emit()
