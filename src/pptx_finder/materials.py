@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import shutil
 import tempfile
+import threading
 import time
 import uuid
 import xml.etree.ElementTree as ET
@@ -376,4 +377,202 @@ class MaterialLibrary:
                 except OSError:
                     pass
         return total
+
+
+# ---------- 团队素材「整包直读」：不拆页、不开 PowerPoint 就能浏览 / 搜索 / 预览 ----------
+#
+# 组件包（以及主包内置精选）目录里放 3 个文件：
+#     team-materials.pptx  素材原件（PPT Doctor Material v1，每页一个素材）
+#     index.json           {"schema", "version", "items": [{id, name, category, page, kind, w, h, thumb}]}
+#     thumbs.zip           <id>.png 预渲染缩略图（PNG 调色板）
+# 老组件只有 pptx：直接读备注 XML 建索引，缩略图缺省（界面画名称占位）。
+PACK_PPTX = "team-materials.pptx"
+INDEX_FILE = "index.json"
+THUMBS_FILE = "thumbs.zip"
+INDEX_SCHEMA = "ppt-doctor-materials-index/1"
+GROUPS = ("零件", "组合件", "整页模板")
+_GROUP_PREFIX = (("组合件·", "组合件"), ("整页模板·", "整页模板"))
+_NS_P = "{http://schemas.openxmlformats.org/presentationml/2006/main}"
+_NS_A = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+_NS_R = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+_REL_TAG = "{http://schemas.openxmlformats.org/package/2006/relationships}Relationship"
+
+
+def category_group(category: str) -> str:
+    """18 类两级折叠：「组合件·xx」「整页模板·xx」各成一组，其余都是零件。"""
+    for prefix, group in _GROUP_PREFIX:
+        if category.startswith(prefix):
+            return group
+    return GROUPS[0]
+
+
+def short_category(category: str) -> str:
+    for prefix, _ in _GROUP_PREFIX:
+        if category.startswith(prefix):
+            return category[len(prefix):]
+    return category
+
+
+def search_tokens(query: str) -> list[str]:
+    return [t for t in query.casefold().split() if t]
+
+
+def matches(tokens: list[str], *fields: str) -> bool:
+    """空格分词，每个词都要在名称或分类里出现。"""
+    hay = " ".join(fields).casefold()
+    return all(t in hay for t in tokens)
+
+
+def part_rels(z: zipfile.ZipFile, part: str) -> dict:
+    """零件的关系表 {rId: (类型, 包内绝对路径或外部地址)}。"""
+    folder, name = part.rsplit("/", 1)
+    try:
+        root = ET.fromstring(z.read(f"{folder}/_rels/{name}.rels"))
+    except KeyError:
+        return {}
+    out = {}
+    for rel in root.iter(_REL_TAG):
+        target = rel.get("Target", "")
+        if rel.get("TargetMode") != "External":
+            if target.startswith("/"):
+                target = target.lstrip("/")
+            else:
+                parts = folder.split("/")
+                for seg in target.split("/"):
+                    if seg == "..":
+                        if parts:
+                            parts.pop()
+                    elif seg and seg != ".":
+                        parts.append(seg)
+                target = "/".join(parts)
+        out[rel.get("Id")] = (rel.get("Type", ""), target)
+    return out
+
+
+def slide_order(z: zipfile.ZipFile) -> list[str]:
+    """按放映顺序列出幻灯片零件名（ppt/slides/slideN.xml）。"""
+    rels = part_rels(z, "ppt/presentation.xml")
+    root = ET.fromstring(z.read("ppt/presentation.xml"))
+    return [rels[s.get(f"{_NS_R}id")][1] for s in root.iter(f"{_NS_P}sldId")]
+
+
+def _notes_marker_text(z: zipfile.ZipFile, slide_part: str) -> str:
+    notes = [t for kind, t in part_rels(z, slide_part).values() if kind.endswith("/notesSlide")]
+    if not notes:
+        return ""
+    root = ET.fromstring(z.read(notes[0]))
+    for sp in root.iter(f"{_NS_P}sp"):
+        paras = ["".join(t.text or "" for t in p.iter(f"{_NS_A}t")) for p in sp.iter(f"{_NS_A}p")]
+        text = "\n".join(paras)
+        if text.startswith(MARKER):
+            return text
+    return ""
+
+
+def read_pack_index(path: Path) -> list[dict]:
+    """只读 XML 取每页素材信息 [{id, name, category, page}]；不开 PowerPoint。
+
+    任一页不合格（缺标记、缺 id/名称、id 重复）都报 ValueError，带页码。
+    """
+    items, seen = [], set()
+    with zipfile.ZipFile(path) as z:
+        order = slide_order(z)
+        if not 1 <= len(order) <= MAX_PACK_ITEMS:
+            raise ValueError(f"素材包需要 1–{MAX_PACK_ITEMS} 页，实际 {len(order)} 页。")
+        for page, slide in enumerate(order, 1):
+            text = _notes_marker_text(z, slide)
+            if not text:
+                raise ValueError(f"第 {page} 页备注没有素材信息，不是 PPT Doctor 素材包。")
+            try:
+                data = json.loads(text[len(MARKER):])
+            except ValueError as exc:
+                raise ValueError(f"第 {page} 页素材信息格式不对。") from exc
+            sid, name, category = data.get("id"), data.get("name"), data.get("category", "")
+            if not isinstance(sid, str) or not sid.strip():
+                raise ValueError(f"第 {page} 页素材缺少 id。")
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError(f"第 {page} 页素材缺少名称。")
+            if not isinstance(category, str):
+                raise ValueError(f"第 {page} 页素材分类格式不对。")
+            if sid in seen:
+                raise ValueError(f"第 {page} 页素材 id 重复：{sid}")
+            seen.add(sid)
+            items.append({"id": sid, "name": name.strip()[:120],
+                          "category": category.strip()[:80], "page": page})
+    return items
+
+
+@dataclass(frozen=True)
+class PackItem:
+    """整包直读里的一条素材：pack_path 的第 page 页。"""
+    id: str
+    name: str
+    category: str
+    page: int
+    source: str            # "team"（团队完整库）/ "builtin"（内置精选）/ "imported"（导入的素材包）
+    pack_path: Path
+    thumb: str = ""        # thumbs.zip 里的文件名；空 = 没有预渲染图
+    w: int = 0
+    h: int = 0
+    kind: str = ""
+
+    @property
+    def group(self) -> str:
+        return category_group(self.category)
+
+
+class PackReader:
+    """读一个素材包目录（pptx + 可选 index.json / thumbs.zip），只读、线程安全。"""
+
+    def __init__(self, folder: Path, source: str = "team"):
+        self.folder = Path(folder)
+        self.source = source
+        self.pptx = self.folder / PACK_PPTX
+        if not self.pptx.is_file():
+            raise FileNotFoundError(f"素材包文件不在了：{self.pptx}")
+        index_path = self.folder / INDEX_FILE
+        if index_path.is_file():
+            data = json.loads(index_path.read_text("utf-8"))
+            if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+                raise ValueError("素材索引损坏。")
+            self.version = str(data.get("version") or "")
+            raw = data["items"]
+        else:
+            self.version = ""
+            raw = read_pack_index(self.pptx)
+        self.items: list[PackItem] = [
+            PackItem(str(x["id"]), str(x["name"]), str(x.get("category", "")), int(x["page"]),
+                     source, self.pptx, str(x.get("thumb", "")), int(x.get("w", 0) or 0),
+                     int(x.get("h", 0) or 0), str(x.get("kind", "")))
+            for x in raw]
+        self._thumbs_path = self.folder / THUMBS_FILE
+        self._zip = None
+        self._zip_lock = threading.Lock()
+
+    def thumbnail(self, item: PackItem) -> bytes | None:
+        if not item.thumb or not self._thumbs_path.is_file():
+            return None
+        with self._zip_lock:
+            try:
+                if self._zip is None:
+                    self._zip = zipfile.ZipFile(self._thumbs_path)
+                return self._zip.read(item.thumb)
+            except (KeyError, OSError, zipfile.BadZipFile):
+                return None
+
+    def close(self):
+        with self._zip_lock:
+            if self._zip is not None:
+                self._zip.close()
+                self._zip = None
+
+    def search(self, query: str = "", category: str = "") -> list[PackItem]:
+        tokens = search_tokens(query)
+        return [x for x in self.items
+                if (not category or x.category == category) and matches(tokens, x.name, x.category)]
+
+
+def builtin_core_dir() -> Path:
+    """主安装包内置的精选素材（只读程序资源）。"""
+    return config.resource_path("assets", "materials-core")
 
