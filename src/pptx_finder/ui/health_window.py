@@ -57,24 +57,26 @@ class _ScoreRing(QWidget):
 
     def paintEvent(self, e):  # noqa: N802
         from PySide6.QtCore import QRectF
-        from PySide6.QtGui import QColor, QFont, QPainter, QPen
+        from PySide6.QtGui import QFont, QPainter, QPen
+
+        from . import theme as _th
         tok = self._owner._tok
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         side = min(self.width(), self.height())
         r = QRectF(8, 8, side - 16, side - 16)
-        track = QPen(QColor(tok.get("bd2", "#E2E6EA")))
+        track = QPen(_th.qcolor(tok.get("bd2"), "#E2E6EA"))
         track.setWidth(10)
         p.setPen(track)
         p.drawEllipse(r)
         score = self._score
         if score is not None:
-            arc = QPen(QColor(self._owner._score_color(score)))
+            arc = QPen(_th.qcolor(self._owner._score_color(score), "#3A9E42"))
             arc.setWidth(10)
             arc.setCapStyle(Qt.RoundCap)
             p.setPen(arc)
             p.drawArc(r, 90 * 16, -int(360 * 16 * max(0, min(100, score)) / 100))
-        p.setPen(QColor(tok.get("ink1", "#182431")))
+        p.setPen(_th.qcolor(tok.get("ink1"), "#182431"))
         f = QFont(self.font())
         f.setPixelSize(round(side * 0.26))
         f.setBold(True)
@@ -83,7 +85,7 @@ class _ScoreRing(QWidget):
         f.setPixelSize(12)
         f.setBold(False)
         p.setFont(f)
-        p.setPen(QColor(tok.get("ink3", "#6E7781")))
+        p.setPen(_th.qcolor(tok.get("ink3"), "#6E7781"))
         p.drawText(r.adjusted(0, side * 0.30, 0, 0), Qt.AlignCenter, "健康分")
         p.end()
 

@@ -184,3 +184,33 @@ def test_preview_action_row_primary_secondary_icon(qtbot, tmp_path):
     assert "打开文件" in win.open_btn.toolTip()
     assert win.more_btn.text() == "更多"
     assert win.preview_error_open_btn.text() == "打开文件"
+
+
+def test_qcolor_parses_rgba_tokens_never_black():
+    for name, _ in theme.THEMES:
+        for k, v in theme.TOKENS[name].items():
+            if isinstance(v, str) and v.strip().lower().startswith("rgb"):
+                q = theme.qcolor(v)
+                assert q.isValid(), (name, k, v)
+                assert theme._qt_color_str(v).startswith("#"), (name, k, v)
+    q = theme.qcolor("rgba(40,60,100,0.09)")
+    assert (q.red(), q.green(), q.blue(), q.alpha()) == (40, 60, 100, 23)
+    assert theme.qcolor("not-a-color", "#123456").name() == "#123456"
+
+
+def test_health_score_ring_track_not_black(qtbot):
+    from pptx_finder.ui.health_window import _ScoreRing
+
+    class Owner:
+        _tok = dict(theme.TOKENS["mist_glass"])
+
+        def _score_color(self, s):
+            return "#3A9E42"
+
+    ring = _ScoreRing(Owner(), 132)
+    qtbot.addWidget(ring)
+    ring.set_score(None)   # 只画轨道
+    img = ring.grab().toImage()
+    c = img.pixelColor(int(img.width() / 2), int(13 * img.height() / 132))   # 顶部轨道中线
+    assert c.alpha() > 0
+    assert not (c.red() < 40 and c.green() < 40 and c.blue() < 40), c.name()

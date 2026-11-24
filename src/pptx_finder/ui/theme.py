@@ -832,17 +832,15 @@ def apply_to_app(app, theme: str, font_family: str = "", font_scale: float = 1.0
     app.setStyleSheet(build_qss(theme, font_family, font_scale))
 
 
-def _qcolor(color: str):
-    """token 颜色（#hex / rgba(r,g,b,浮点α) / rgb()）→ 带 alpha 的 QColor（缩略图绘制用）。"""
+def _qcolor(color: str, fallback: str = "#808080"):
+    """token 颜色（#hex / #AARRGGBB / rgba(r,g,b,α) / rgb()）→ QColor；解析不了用 fallback，绝不返回无效色（无效色自绘成黑块）。"""
     from PySide6.QtGui import QColor
 
-    c = (color or "").strip()
-    if c.startswith("rgba(") and c.endswith(")"):
-        r, g, b, a = [x.strip() for x in c[5:-1].split(",")]
-        q = QColor(int(r), int(g), int(b))
-        q.setAlphaF(float(a))
-        return q
-    return QColor(c)
+    q = QColor(_qt_color_str(color or ""))
+    return q if q.isValid() else QColor(fallback)
+
+
+qcolor = _qcolor  # 自绘控件取 token 颜色统一走这里
 
 
 def preview_pixmap(theme_name: str, width: int = 150, height: int = 84, ratio: float = 3.0):
