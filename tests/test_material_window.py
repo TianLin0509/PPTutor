@@ -258,9 +258,11 @@ def test_status_text_and_theme_tokens(qtbot, core, tmp_path):
     assert seen[-1].startswith("团队素材 v1.2.0")
     tab.apply_theme({"name": "night_glass", "is_dark": True, "surface": "#252529", "accent": "#2464CD",
                      "accent_hover": "#1F57B5", "text": "#F5F5F7"})
-    assert tab.tok["accent"] == "#2464CD" and "#2464CD" in tab.styleSheet()
+    from PySide6.QtGui import QColor
+    assert QColor(tab.tok["accent"]) == QColor("#2464CD") and tab.tok["accent"] in tab.styleSheet()
     legacy = resolve_tokens({"panel": "#111111", "ink1": "#EEEEEE", "acc": "#0A84FF", "is_light": False})
-    assert legacy["surface"] == "#111111" and legacy["accent"] == "#0A84FF" and legacy["is_dark"]
+    assert QColor(legacy["surface"]) == QColor("#111111") and QColor(legacy["accent"]) == QColor("#0A84FF")
+    assert legacy["is_dark"]
 
 
 def test_offline_component_unreachable_notice(qtbot, core, tmp_path):
@@ -282,3 +284,63 @@ def test_material_window_shell_hosts_tab_without_native_children(qtbot, core, tm
     win.tab.toastRequested.emit("你好", "info")
     assert win.toast_line.text() == "你好"
     assert window_drag.native_children(win) == []
+
+
+# ---------- m1 第二轮评审：嵌入主窗的问题 ----------
+def test_loading_state_hides_both_empty_buttons(qtbot, core, tmp_path):
+    """MF-3：加载中只显示「正在读取素材…」，两个空态按钮都不可见。"""
+    tab = MaterialTabWidget(component_center=_Center(), library=MaterialLibrary(tmp_path / "lib"))
+    qtbot.addWidget(tab)
+    tab.show()
+    assert not tab.empty_primary.isVisibleTo(tab) and not tab.empty_secondary.isVisibleTo(tab)
+    qtbot.waitUntil(lambda: tab._loaded, timeout=10000)
+    tab.shutdown()
+
+
+@pytest.mark.parametrize("compact", [False, True])
+def test_minimum_height_fits_1280x672_main_window(qtbot, core, tmp_path, compact):
+    """MF-1：素材页最小高度 ≤ 520，主窗 1280×672 不会被撑高；矮时预览图先缩。"""
+    tab, _ = _tab(qtbot, tmp_path)
+    tab.set_header_compact(compact)
+    tab.resize(1178, 520)
+    tab.show()
+    qtbot.wait(100)
+    assert tab.minimumSizeHint().height() <= 520
+    assert tab.preview.height() < 216 and not tab.caption.isVisible()
+    for w in (tab.insert_btn, tab.copy_btn):
+        assert w.mapTo(tab, w.rect().bottomLeft()).y() <= tab.height()
+    tab.shutdown()
+
+
+def test_header_compact_keeps_only_actions(qtbot, core, tmp_path):
+    """MF-4：主窗页头已有标题和状态，嵌入时只留操作按钮。"""
+    tab, _ = _tab(qtbot, tmp_path)
+    tab.show()
+    tab.set_header_compact(True)
+    assert not tab.title.isVisible() and not tab.pill.isVisible() and not tab.subtitle.isVisible()
+    assert tab.capture_btn.isVisible() and tab.import_btn.isVisible() and tab.fetch_btn.isVisible()
+    tab.set_header_compact(False)
+    assert tab.title.isVisible() and tab.pill.isVisible()
+
+
+def test_shutdown_right_after_switching_is_safe_and_idempotent(qtbot, core, tmp_path):
+    """MF-2：切页后马上关：等后台任务、关读取器、之后回调不碰界面；可重复调用。"""
+    for _ in range(5):
+        tab = MaterialTabWidget(component_center=_Center(), library=MaterialLibrary(tmp_path / "lib"))
+        tab.show()
+        tab.refresh_library()
+        tab.shutdown()
+        assert all(not t.isRunning() for t in tab._tasks)
+        tab.shutdown()
+        tab.refresh_library()                      # 关闭后不再起任务
+        tab.deleteLater()
+    qtbot.wait(1200)
+
+
+def test_rgba_tokens_are_normalized_for_custom_painting():
+    from PySide6.QtGui import QColor
+    t = resolve_tokens({"surface_hover": "rgba(24,36,49,0.05)", "accent_soft": "rgba(10, 89, 247, 0.14)",
+                        "accent": "not-a-color", "is_dark": False})
+    for key in ("surface_hover", "accent_soft", "accent", "warn_soft"):
+        assert QColor(t[key]).isValid(), key
+    assert QColor(t["surface_hover"]).alpha() == 13 and t["accent"].lower() == "#ff0a59f7"

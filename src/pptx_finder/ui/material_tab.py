@@ -74,6 +74,32 @@ def resolve_tokens(tokens: dict | None) -> dict:
     out.update({k: v for k, v in tokens.items() if k in DEFAULT_TOKENS})
     if out["is_dark"] and "warn_soft" not in tokens:
         out["warn_soft"] = "rgba(255,170,40,0.14)"
+    return _normalize_colors(out)
+
+
+_RGBA = __import__("re").compile(r"rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)\s*(?:,\s*([\d.]+)\s*)?\)")
+_BOOL_KEYS = {"name", "is_dark", "is_glass", "floating_cards"}
+
+
+def _to_hex(value: str) -> str | None:
+    m = _RGBA.fullmatch(value.strip())
+    if m:
+        r, g, b = (max(0, min(255, int(float(x)))) for x in m.group(1, 2, 3))
+        a = float(m.group(4)) if m.group(4) is not None else 1.0
+        a = max(0, min(255, round(a * 255 if a <= 1 else a)))
+        return QColor(r, g, b, a).name(QColor.HexArgb)
+    color = QColor(value)
+    return color.name(QColor.HexArgb) if color.isValid() else None
+
+
+def _normalize_colors(tokens: dict) -> dict:
+    """自绘用 QColor(str)：它不认 rgba(...)，会画成黑块。统一转 #AARRGGBB，坏值退默认。"""
+    out = dict(tokens)
+    for key, value in tokens.items():
+        if key in _BOOL_KEYS or not isinstance(value, str):
+            continue
+        fixed = _to_hex(value)
+        out[key] = fixed if fixed is not None else _to_hex(DEFAULT_TOKENS.get(key, "#000000"))
     return out
 
 
@@ -146,7 +172,7 @@ class MaterialGrid(QWidget):
         self.setFocusPolicy(Qt.StrongFocus)
         self.setMouseTracking(True)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.setMinimumSize(300, 200)
+        self.setMinimumSize(200, 110)
         self.cache = cache
         self.entries: list[Entry] = []
         self.page = 0
@@ -323,6 +349,8 @@ class MaterialGrid(QWidget):
         i = self.index_at(e.position().toPoint())
         if i != self.hover:
             self.hover = i
+            e_ = self.entries[i] if i >= 0 else None
+            self.setToolTip(f"{e_.name}\n{e_.category or '未分类'} · 双击复制形状" if e_ else "")
             self.update()
 
     def leaveEvent(self, e):  # noqa: N802
@@ -359,7 +387,8 @@ class PreviewView(QWidget):
         self.image: QImage | None = None
         self.label = ""
         self._press = None
-        self.setMinimumHeight(120)
+        self.setMinimumHeight(60)
+        self.max_height = 10_000
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
     def set_image(self, image: QImage | None, label: str):
@@ -369,7 +398,10 @@ class PreviewView(QWidget):
 
     def resizeEvent(self, e):  # noqa: N802
         super().resizeEvent(e)
-        h = self.width() * 3 // 4
+        self.refit()
+
+    def refit(self):
+        h = max(60, min(self.width() * 3 // 4, self.max_height))
         if self.height() != h:
             self.setFixedHeight(h)
 
@@ -451,6 +483,7 @@ class MaterialTabWidget(QWidget):
         self._src = "all"
         self._cat = ""
         self._collapsed: set[str] = set()
+        self._closing = False
         self._accordion = False
         self._user_collapsed = False
         self._loaded = False
@@ -663,6 +696,8 @@ class MaterialTabWidget(QWidget):
         self.empty_primary = QPushButton("")
         self.empty_primary.setObjectName("mtPrimary")
         self.empty_secondary = QPushButton("")
+        self.empty_primary.hide()
+        self.empty_secondary.hide()
         self.empty_secondary.setObjectName("mtSecondary")
         eb.addWidget(self.empty_primary)
         eb.addWidget(self.empty_secondary)
@@ -860,7 +895,7 @@ QPushButton#mtCat {{ background: transparent; border: none; border-radius: 8px; 
     padding: 0 10px; color: {t['text']}; font-size: 13px; }}
 QPushButton#mtCat:hover {{ background: {t['surface_hover']}; }}
 QPushButton#mtCat:checked {{ background: {t['accent_soft']}; color: {t['accent']}; font-weight: 600; }}
-QPushButton#mtGroup {{ background: transparent; border: none; text-align: left; padding: 10px 10px 4px 10px;
+QPushButton#mtGroup {{ background: transparent; border: none; text-align: left; padding: 4px 10px 0 10px;
     color: {t['text_muted']}; font-size: 12px; }}
 QScrollArea#mtCatScroll, QScrollArea#mtCatScroll > QWidget > QWidget {{ background: transparent; }}
 QProgressBar#mtBar {{ background: {t['field']}; border: none; border-radius: 2px; max-height: 4px; }}
@@ -870,6 +905,8 @@ QProgressBar#mtBar::chunk {{ background: {t['accent']}; border-radius: 2px; }}
     # ---------------------------------------------------------- 合同方法
     def refresh_library(self) -> None:
         """后台重读团队包 / 导入包 / 我的收藏；不阻塞界面。"""
+        if self._closing:
+            return
         if self._center is not None:
             try:
                 self._center.check_latest("materials")
@@ -958,7 +995,9 @@ QProgressBar#mtBar::chunk {{ background: {t['accent']}; border-radius: 2px; }}
                 counts[e.category] = counts.get(e.category, 0) + 1
         mine_n = sum(1 for e in self._all if e.source == "mine")
         narrow = self.width() and self.width() < NARROW_WIDTH
-        h = 28 if narrow else 30
+        short = 0 < self.height() < 640
+        h = 26 if short else (28 if narrow else 30)
+        fixed_h = 28 if short else 32
 
         def cat_button(key, text, n, height=32):
             b = QPushButton()
@@ -979,8 +1018,8 @@ QProgressBar#mtBar::chunk {{ background: {t['accent']}; border-radius: 2px; }}
             self.cat_layout.addWidget(b)
             return b
 
-        cat_button("@all", "全部", len(self._all))
-        cat_button("@mine", "☆ 我的收藏", mine_n)
+        cat_button("@all", "全部", len(self._all), fixed_h)
+        cat_button("@mine", "☆ 我的收藏", mine_n, fixed_h)
         self._auto_collapse(counts, h)
         for group in mat.GROUPS:
             cats = sorted((c for c in counts if mat.category_group(c) == group), key=lambda c: -counts[c])
@@ -990,6 +1029,7 @@ QProgressBar#mtBar::chunk {{ background: {t['accent']}; border-radius: 2px; }}
             arrow = "›" if group in self._collapsed else "⌄"
             g = QPushButton(f"{arrow}  {group}    {total}")
             g.setObjectName("mtGroup")
+            g.setFixedHeight(26 if short else 32)
             g.clicked.connect(lambda _=False, k=group: self._toggle_group(k))
             self.cat_layout.addWidget(g)
             if group in self._collapsed:
@@ -1012,7 +1052,8 @@ QProgressBar#mtBar::chunk {{ background: {t['accent']}; border-radius: 2px; }}
         groups = {g: sum(1 for c in counts if mat.category_group(c) == g) for g in mat.GROUPS}
         present = [g for g in mat.GROUPS if groups[g]]
         available = self.left.height() - self.left_foot.sizeHint().height() - 16
-        need_all = 2 * 33 + len(present) * 32 + sum(groups.values()) * (row_h + 1)
+        fixed = 29 if row_h <= 26 else 33
+        need_all = 2 * fixed + len(present) * (27 if row_h <= 26 else 33) + sum(groups.values()) * (row_h + 1)
         self._accordion = available > 0 and need_all > available
         if not self._accordion:
             if not self._user_collapsed:
@@ -1128,10 +1169,12 @@ QProgressBar#mtBar::chunk {{ background: {t['accent']}; border-radius: 2px; }}
         self.page_label.setText(f"{page + 1} / {pages}")
         self.prev_btn.setEnabled(page > 0)
         self.next_btn.setEnabled(page + 1 < pages)
-        self.pager_hint.setText(f"每页 {per} 个，按窗口大小自动算 · 双击 = 复制形状")
+        self.pager_hint.setText("双击 = 复制形状")
         self._decode_visible()
 
     def _decode_visible(self):
+        if self._closing:
+            return
         todo = [self._view[i] for i in self.grid.visible_range() if self.cache.needs(self._view[i])]
         if self.grid.selected >= 0 and self.cache.needs(self._view[self.grid.selected]):
             todo.append(self._view[self.grid.selected])
@@ -1141,6 +1184,8 @@ QProgressBar#mtBar::chunk {{ background: {t['accent']}; border-radius: 2px; }}
         self._tasks.append(task)
 
         def done(decoded):
+            if self._closing:
+                return
             if isinstance(decoded, dict):
                 self.cache.store(decoded)
                 try:
@@ -1327,6 +1372,8 @@ QProgressBar#mtBar::chunk {{ background: {t['accent']}; border-radius: 2px; }}
                 return {"error": str(exc) or exc.__class__.__name__}
 
         def complete(result):
+            if self._closing:
+                return
             if op:
                 self._busy_op = False
             try:
@@ -1504,13 +1551,50 @@ QProgressBar#mtBar::chunk {{ background: {t['accent']}; border-radius: 2px; }}
         self.right.setFixedWidth(270 if narrow else 320)
         self.search.setMaximumWidth(240 if narrow else 380)
         self.pager_hint.setVisible(not narrow)
-        if self._loaded:
+        # 矮窗：预览图按剩余高度缩（右栏其余内容约 360 px），说明文字收起
+        short = self.height() < 640
+        self.caption.setVisible(not short)
+        self.left_foot.setVisible(not short)
+        self.preview.max_height = max(80, self.height() - 400) if short else 10_000
+        self.preview.refit()
+        if self._loaded and not self._closing:
             self._relayout_timer.start()
 
-    def closeEvent(self, e):  # noqa: N802
+    # ---------------------------------------------------------- 嵌入主窗的补充接口
+    def set_header_compact(self, compact: bool = True) -> None:
+        """主窗页头已显示标题和状态时调用：只保留右侧操作按钮（m1 MF-4）。"""
+        for w in (self.title, self.subtitle, self.pill):
+            w.setVisible(not compact)
+
+    def shutdown(self) -> None:
+        """主窗关闭时调用（嵌入时收不到 closeEvent）；可重复调用（m1 MF-2）。
+
+        停止定时器、断开下载中心回调、等后台任务跑完（它们不可中断，最多各等 5 s），
+        再关掉素材包读取器。之后的回调一律不再碰界面。
+        """
+        if self._closing:
+            return
+        self._closing = True
+        for timer in (self._search_timer, self._relayout_timer):
+            timer.stop()
+        if self._center is not None:
+            for signal, slot in ((self._center.state_changed, self._on_center_state),
+                                 (self._center.installed, self._on_center_installed)):
+                try:
+                    signal.disconnect(slot)
+                except (RuntimeError, TypeError):
+                    pass
+        for task in list(self._tasks):
+            try:
+                task.wait(5000)
+            except RuntimeError:
+                pass
         for reader in [self._team_reader, *self._imported_readers]:
             if reader is not None:
                 reader.close()
+
+    def closeEvent(self, e):  # noqa: N802
+        self.shutdown()
         super().closeEvent(e)
 
 
