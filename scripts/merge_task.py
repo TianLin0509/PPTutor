@@ -16,6 +16,7 @@
 用法：
     python scripts/merge_task.py <分支名>
     python scripts/merge_task.py <分支名> --dry-run    # 只验不合
+    python scripts/merge_task.py <分支名> --no-push    # 完整验证并本地合入，不推送
 
 项目差异全部读 .agents/project.json，本脚本对项目一无所知。
 """
@@ -232,6 +233,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("branch", help="要合并的任务分支")
     ap.add_argument("--dry-run", action="store_true", help="只 rebase 和跑测试，不真合")
+    ap.add_argument("--no-push", action="store_true", help="保留完整合入与验证流程，仅跳过远端推送")
     ap.add_argument("--repo", type=Path, help="首次升级合入脚本时指定主检出；仍须在该主检出运行")
     ap.add_argument("--accept-test-change", action="store_true",
                     help="审查后显式接受本次合并对测试命令的修改；默认发现变化即失败回滚")
@@ -424,8 +426,10 @@ def main():
         return 1
 
     # ⑥ 推远端（有就推，没有也不算失败 —— 远端只是备份，不是关卡）
-    say("⑤ 推远端")
-    if run(["git", "remote", "get-url", "origin"], check=False).returncode == 0:
+    if args.no_push:
+        say("⑤ --no-push，本地已合入，跳过远端推送")
+    elif run(["git", "remote", "get-url", "origin"], check=False).returncode == 0:
+        say("⑤ 推远端")
         r = run(["git", "push", "origin", trunk], env=bypass, check=False)
         if r.returncode == 0:
             say("   已推送")
@@ -438,6 +442,7 @@ def main():
         else:
             say(f"   推送失败（本地已合，下次合并会一起推）：{(r.stderr or '').strip()[:200]}")
     else:
+        say("⑤ 推远端")
         say("   没配 origin，跳过")
 
     # ⑦ 合并后动作 —— 项目专属的东西全在这里，脚本本身不知道是什么
