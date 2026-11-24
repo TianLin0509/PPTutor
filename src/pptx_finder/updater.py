@@ -27,6 +27,7 @@ import time
 import urllib.error
 import urllib.request
 import zipfile
+import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -574,31 +575,13 @@ def download_package(info: UpdateInfo, staging: Path,
             done += len(chunk)
             if progress:
                 progress(done, total or done)
+    from .netfetch import IntegrityFailure
     try:
         try:
-            archive = zipfile.ZipFile(tmp)
-        except zipfile.BadZipFile as e:
-            from .netfetch import IntegrityFailure
-            raise IntegrityFailure("整包不是有效的压缩包") from e
-        with archive as z:
-            names = {n.replace("\\", "/"): n for n in z.namelist()}
-            # 包内是 PPT-Doctor/<relpath>；剥掉这一层顶层目录
-            roots = {n.split("/", 1)[0] for n in names if "/" in n}
-            prefix = (roots.pop() + "/") if len(roots) == 1 else ""
-            for rel, want_hash in wanted.items():
-                member = names.get(prefix + rel)
-                if member is None:
-                    from .netfetch import IntegrityFailure
-                    raise IntegrityFailure(f"整包里缺少 {rel}")
-                dest = staging / rel          # rel 已过 safe_relpath，无法越界
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                data = z.read(member)
-                got = hashlib.sha256(data).hexdigest()
-                if got != want_hash:
-                    from .netfetch import IntegrityFailure
-                    raise IntegrityFailure(
-                        f"哈希校验失败 {rel}：期望 {want_hash[:12]}… 实得 {got[:12]}…")
-                dest.write_bytes(data)
+            _extract_package(tmp, wanted, staging)
+        except (zipfile.BadZipFile, zlib.error, EOFError, NotImplementedError, RuntimeError) as e:
+            # 打开、读目录、逐个解压任何一步坏了，都是包本身不对：不许换外网源顶替
+            raise IntegrityFailure(f"整包损坏（{type(e).__name__}: {e}）"[:160]) from e
     finally:
         try:
             tmp.unlink()
@@ -608,6 +591,28 @@ def download_package(info: UpdateInfo, staging: Path,
         (staging / MANIFEST_NAME).write_text(
             json.dumps(info.raw, ensure_ascii=False), encoding="utf-8")
     return staging
+
+
+def _extract_package(tmp: Path, wanted: dict, staging: Path) -> None:
+    """只解出 wanted 里的文件，逐个核 sha256。"""
+    from .netfetch import IntegrityFailure
+    with zipfile.ZipFile(tmp) as z:
+        names = {n.replace("\\", "/"): n for n in z.namelist()}
+        # 包内是 PPT-Doctor/<relpath>；剥掉这一层顶层目录
+        roots = {n.split("/", 1)[0] for n in names if "/" in n}
+        prefix = (roots.pop() + "/") if len(roots) == 1 else ""
+        for rel, want_hash in wanted.items():
+            member = names.get(prefix + rel)
+            if member is None:
+                raise IntegrityFailure(f"整包里缺少 {rel}")
+            dest = staging / rel          # rel 已过 safe_relpath，无法越界
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            data = z.read(member)
+            got = hashlib.sha256(data).hexdigest()
+            if got != want_hash:
+                raise IntegrityFailure(
+                    f"哈希校验失败 {rel}：期望 {want_hash[:12]}… 实得 {got[:12]}…")
+            dest.write_bytes(data)
 
 
 def download_update(base_url: str, info: UpdateInfo, staging: Path,

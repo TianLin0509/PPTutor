@@ -553,3 +553,32 @@ def test_openx_oversize_body_and_bad_manifest_stop_before_external(tmp_path, mon
         imgtext_ocr.fetch_manifest_from_sources(
             [("openx", "openx:ocr"), ("github-release", "https://github.com/x")], 3, "识别组件")
     assert asked == ["openx:ocr"]
+
+
+def test_package_with_bad_crc_is_an_integrity_failure(tmp_path, monkeypatch):
+    """压缩包目录完好、成员内容被改（CRC 不符）：解压时才发现，也要算完整性失败。"""
+    import zipfile
+    from pptx_finder import netfetch
+    payload = b"NEW-EXE-CONTENT" * 20
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as z:
+        z.writestr("PPT-Doctor/a.exe", payload)
+    raw = bytearray(buf.getvalue())
+    i = raw.index(payload)
+    raw[i] ^= 0xFF                                                    # 改一个字节，目录仍可读
+    with zipfile.ZipFile(io.BytesIO(bytes(raw))) as z:
+        assert z.namelist() == ["PPT-Doctor/a.exe"]
+
+    class _R(_Resp):
+        headers = {"Content-Type": "application/zip", "Content-Length": str(len(raw))}
+
+        def geturl(self):
+            return "https://github.com/p.zip"
+    monkeypatch.setattr(updater.urllib.request, "urlopen", lambda u, timeout=None: _R(bytes(raw)))
+    src = updater.UpdateSource("github-release", "https://github.com/m", "https://github.com/b/{hash}",
+                               "https://github.com/p-{version}.zip")
+    info = updater.UpdateInfo(version="2.1.15", notes="", deleted=[], source=src,
+                              changed=[("a.exe", hashlib.sha256(payload).hexdigest(), len(payload))])
+    with pytest.raises(netfetch.IntegrityFailure):
+        updater.download_package(info, tmp_path / "st")
+    assert not (tmp_path / "st" / "_package.zip").exists()
