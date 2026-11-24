@@ -1925,7 +1925,7 @@ class MainWindow(QMainWindow):
         btn.setProperty("railLabel", "浅色" if dark else "深色")
         self._apply_rail_btn_form(btn)
         theme_label = dict(theme.THEMES).get(self._theme, self._theme)
-        btn.setToolTip(f"切换深浅 · 当前：{theme_label}（右键可选全部主题）")
+        btn.setToolTip(f"切换界面主题 · 当前：{theme_label}（点一下切深浅，右键选全部主题）")
 
     def _toggle_dark_light(self) -> None:
         """深浅快捷切换：晨雾 ⇄ 暗夜、静白 ⇄ 静黑；旧 10 套按明暗切到晨雾 / 暗夜。"""
