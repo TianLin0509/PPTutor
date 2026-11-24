@@ -272,12 +272,162 @@ def copy_slide(source: str | Path, page: int = 1):
             flush_clipboard()
 
 
-def copy_material(source: str | Path):
+def copy_material(source: str | Path, slide_index: int = 1):
+    """把素材包第 slide_index 页的形状复制成可编辑的原生对象（不需要用户开着 PowerPoint）。"""
     from .native_clipboard import normalize_shapes
-    with temporary_presentations() as session:
-        pres = session.open(source)
-        shapes = pres.Slides.Item(1).Shapes
-        if not int(shapes.Count):
-            raise TransferError("素材中没有可复制的对象。")
-        shapes.Range().Copy()
-        normalize_shapes(required=True)
+    source = Path(source)
+    if not source.is_file():
+        raise MaterialTransferError("pack_missing")
+    with _material_errors():
+        with _source_snapshot(source) as snapshot, temporary_presentations() as session:
+            pres = session.open(snapshot)
+            shapes = _material_shapes(pres, slide_index)
+            shapes.Range().Copy()
+            normalize_shapes(required=True)
+
+
+# ---------- 团队素材：一键插入当前 PPT（移植自 HUB-H transferMaterial） ----------
+MATERIAL_ERRORS = {
+    "no_powerpoint": "先打开要放素材的 PPT，并点一下目标页；不会动你已打开的其他文稿。",
+    "no_presentation": "PowerPoint 里没有打开的文稿：先打开要放素材的 PPT，再点插入。",
+    "read_only": "当前文稿是只读的：另存一份可编辑的再插入。",
+    "no_target_slide": "没点中目标页：在 PowerPoint 左侧缩略图里点一下要放的那页。",
+    "busy": "PowerPoint 正忙，或上一个素材还在处理，稍等几秒再试。",
+    "pack_missing": "素材包文件不在了：刷新素材库，或重新获取团队素材。",
+    "timeout": "PowerPoint 60 秒没有响应：看看它是否弹出了对话框，处理后再试。",
+}
+#: COM 「对方正忙，稍后再试」类错误
+_BUSY_HRESULTS = {-2147418111, -2147417846, -2147417848}
+
+
+class MaterialTransferError(TransferError):
+    """带 code 的插入 / 复制失败；界面按 code 选文案，不解析异常字符串。"""
+
+    def __init__(self, code: str, message: str = ""):
+        if code not in MATERIAL_ERRORS:
+            raise ValueError(f"unknown material error code: {code}")
+        super().__init__(message or MATERIAL_ERRORS[code])
+        self.code = code
+
+
+@contextmanager
+def _material_errors():
+    try:
+        yield
+    except MaterialTransferError:
+        raise
+    except Exception as exc:  # noqa: BLE001  pywintypes.com_error 等
+        hresult = getattr(exc, "hresult", None)
+        if hresult is None and getattr(exc, "args", None):
+            hresult = exc.args[0] if isinstance(exc.args[0], int) else None
+        if hresult in _BUSY_HRESULTS:
+            raise MaterialTransferError("busy") from exc
+        raise
+
+
+def _material_shapes(pres, slide_index: int):
+    if isinstance(slide_index, bool) or not isinstance(slide_index, int) or slide_index < 1:
+        raise MaterialTransferError("pack_missing", "素材页码不对：请刷新素材库。")
+    if slide_index > int(pres.Slides.Count):
+        raise MaterialTransferError("pack_missing", "素材包页数已变化：请刷新素材库。")
+    shapes = pres.Slides.Item(slide_index).Shapes
+    if not int(shapes.Count):
+        raise MaterialTransferError("pack_missing", "这一页素材是空的：请刷新素材库。")
+    return shapes
+
+
+def _active_target(apps):
+    """用户正在看的那份文稿和那一页；不碰其他文稿。"""
+    saw_window = False
+    for app in apps:
+        try:
+            if not int(app.Windows.Count):
+                continue
+            window = app.ActiveWindow
+            pres = window.Presentation
+        except Exception:  # noqa: BLE001  没有活动窗口
+            continue
+        saw_window = True
+        if bool(pres.ReadOnly):
+            raise MaterialTransferError("read_only")
+        slide = None
+        try:
+            slide = window.View.Slide
+        except Exception:  # noqa: BLE001  焦点在缩略图栏 / 大纲 / 幻灯片浏览视图
+            try:
+                rng = window.Selection.SlideRange
+                if int(rng.Count) >= 1:
+                    slide = rng.Item(1)
+            except Exception:  # noqa: BLE001
+                slide = None
+        if slide is None:
+            raise MaterialTransferError("no_target_slide")
+        return app, pres, slide
+    raise MaterialTransferError("no_target_slide" if saw_window else "no_presentation")
+
+
+def insert_material(pack_path: str | Path, slide_index: int) -> dict:
+    """把素材包第 slide_index 页的形状贴到当前活动文稿的当前页。
+
+    只读、无窗口打开素材包的临时副本，只关自己开的那份；不保存、不关闭用户文稿；
+    插入记成一步可撤销。失败抛 MaterialTransferError（7 个 code 之一）。
+    """
+    pack_path = Path(pack_path)
+    if not pack_path.is_file():
+        raise MaterialTransferError("pack_missing")
+    if not _lock.acquire(timeout=0.5):
+        raise MaterialTransferError("busy")
+    try:
+        with _material_errors():
+            try:
+                with existing_apps() as apps:
+                    _active_target(apps)        # 先把「没开 / 只读 / 没点页」问清楚，不起临时实例
+            except MaterialTransferError:
+                raise
+            except TransferError as exc:
+                raise MaterialTransferError("no_powerpoint") from exc
+            with _source_snapshot(pack_path) as snapshot, temporary_presentations() as session:
+                app, pres, slide = _active_target(_find_apps())
+                source = session.open(snapshot)
+                _material_shapes(source, slide_index).Range().Copy()
+                flush_clipboard()
+                app.StartNewUndoEntry()
+                pasted = slide.Shapes.Paste()
+                _keep_on_slide(pres, pasted)
+                return {"presentation": str(pres.Name), "slide": int(slide.SlideIndex),
+                        "shapes": int(pasted.Count)}
+    finally:
+        _lock.release()
+
+
+def _keep_on_slide(pres, shapes):
+    """目标文稿比例不同（如 4:3）时，跑出页面的素材整体挪回页面中央。"""
+    try:
+        sw, sh = float(pres.PageSetup.SlideWidth), float(pres.PageSetup.SlideHeight)
+        left, top = float(shapes.Left), float(shapes.Top)
+        width, height = float(shapes.Width), float(shapes.Height)
+        if left < 0 or top < 0 or left + width > sw or top + height > sh:
+            shapes.IncrementLeft((sw - width) / 2 - left)
+            shapes.IncrementTop((sh - height) / 2 - top)
+    except Exception:  # noqa: BLE001  挪不动不算失败，形状已经贴上
+        log.debug("cannot recenter pasted material", exc_info=True)
+
+
+def call_with_timeout(fn, timeout: float = 60.0):
+    """在独立线程里跑 COM 操作；超时抛 timeout（线程继续跑完，期间再点会得到 busy）。"""
+    box = {}
+
+    def work():
+        try:
+            box["value"] = fn()
+        except BaseException as exc:  # noqa: BLE001  原样带回调用方线程
+            box["error"] = exc
+
+    thread = threading.Thread(target=work, name="material-transfer", daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        raise MaterialTransferError("timeout")
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
