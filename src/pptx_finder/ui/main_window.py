@@ -2531,6 +2531,7 @@ class MainWindow(QMainWindow):
             win = self._health_page_win
             if win is not None:
                 win.refresh()  # 进入健康页即重新体检（构造内的首次扫描有 _scan_inflight 挡重）
+            self._refresh_health_diagnostics()
         if key == "material":
             tab = self._material_tab
             if tab is not None and hasattr(tab, "refresh_library"):
@@ -2687,7 +2688,41 @@ class MainWindow(QMainWindow):
         )
         self._health_page_lay.addWidget(win)
         self._health_page_win = win
+        self._refresh_health_diagnostics()
         return win
+
+    def _refresh_health_diagnostics(self) -> None:
+        """健康页底部 4 盏离线诊断灯：只读已有状态，不联网、不启动 PowerPoint。"""
+        win = getattr(self, "_health_page_win", None)
+        if win is None or not hasattr(win, "set_diagnostics"):
+            return
+        items = []
+        try:
+            st = db.stats(self._conn, exts=PPT_EXTS)
+            items.append(("索引", "ok", f"{st['file_count']:,} 份 PPT · {st['page_count']:,} 页", "", None))
+        except Exception:  # noqa: BLE001
+            items.append(("索引", "warn", "暂时读不到索引统计", "重新扫描", self._request_full_rescan))
+        if self._version_feature_enabled():
+            items.append(("版本库", "ok", "版本留存已开启", "", None))
+        else:
+            items.append(("版本库", "idle", "版本留存未开启", "去开启",
+                          lambda: self.open_settings_page("功能")))
+        items.append(("PowerPoint", "idle", "预览与插入依赖本机 PowerPoint", "检测",
+                      lambda: self.open_settings_page("PowerPoint")))
+        upd = getattr(self, "_updater", None)
+        snap = upd.snapshot() if upd is not None else None
+        if snap is None:
+            items.append(("内源更新", "idle", "开发版不联网检查", "", None))
+        else:
+            phase = snap.get("phase")
+            if phase in ("available", "ready"):
+                items.append(("内源更新", "warn", f"有新版本 v{snap.get('latest') or ''}", "查看",
+                              self._open_update_center))
+            elif phase == "error":
+                items.append(("内源更新", "warn", "上次检查没有成功", "重试", self._open_update_center))
+            else:
+                items.append(("内源更新", "ok", "当前已是最新", "检查", self._open_update_center))
+        win.set_diagnostics(items, copy_fn=lambda: self.open_settings_page("健康诊断"))
 
     # ---------- 列表 / 仪表盘首屏切换 ----------
     def _show_dashboard(self, *, force_refresh: bool = False) -> None:

@@ -457,6 +457,7 @@ QLabel#dashTitle { color: $ink1; font-size: 22px; font-weight: 700; background: 
 QLabel#dashSub { color: $ink3; font-size: 12.5px; background: transparent; }
 QLabel#kpiNum { color: $ink1; font-size: 28px; font-weight: 700; font-family: $mono_family; background: transparent; }
 QLabel#kpiNumAcc { color: $acc; font-size: 28px; font-weight: 700; font-family: $mono_family; background: transparent; }
+QLabel#kpiAction { color: $acc; font-size: 17px; font-weight: 700; background: transparent; padding: 6px 0 5px 0; }
 QLabel#kpiLab { color: $ink2; font-size: 12.5px; font-weight: 600; background: transparent; }
 QLabel#kpiSub { color: $ink4; font-size: 11px; background: transparent; }
 QLabel#dashCardT { color: $ink1; font-size: 14px; font-weight: 700; background: transparent; }
@@ -804,3 +805,57 @@ def apply_to_app(app, theme: str, font_family: str = "", font_scale: float = 1.0
     else:
         app.setFont(QFont(_DEFAULT_APP_FONT))
     app.setStyleSheet(build_qss(theme, font_family, font_scale))
+
+
+def _qcolor(color: str):
+    """token 颜色（#hex / rgba(r,g,b,浮点α) / rgb()）→ 带 alpha 的 QColor（缩略图绘制用）。"""
+    from PySide6.QtGui import QColor
+
+    c = (color or "").strip()
+    if c.startswith("rgba(") and c.endswith(")"):
+        r, g, b, a = [x.strip() for x in c[5:-1].split(",")]
+        q = QColor(int(r), int(g), int(b))
+        q.setAlphaF(float(a))
+        return q
+    return QColor(c)
+
+
+def preview_pixmap(theme_name: str, width: int = 150, height: int = 84, ratio: float = 3.0):
+    """主题缩略卡（设置外观页 / 欢迎层共用）：底色 + 光团 + 药丸轨 + 半透明面板 + 主按钮。
+
+    与主窗同一画法（aurora_bg.paint_aurora + 面板 rgba），所以缩略图里看到的就是切过去的样子。
+    """
+    from PySide6.QtCore import QRectF, Qt
+    from PySide6.QtGui import QPainter, QPixmap
+
+    from .aurora_bg import paint_aurora
+
+    t = tok(theme_name)
+    pm = QPixmap(round(width * ratio), round(height * ratio))
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.scale(ratio, ratio)
+    paint_aurora(p, QRectF(0, 0, width, height), t)
+    floating = islands(theme_name)
+    pad = 6 if floating else 0
+    panel = _qcolor(t["panel"])
+    edge = _qcolor(t["edge"])
+    p.setPen(edge)
+    p.setBrush(_qcolor(t["rail"]))
+    p.drawRoundedRect(QRectF(pad, pad, 16, height - 2 * pad), 8 if floating else 0, 8 if floating else 0)
+    p.setBrush(panel)
+    x0 = pad + 16 + (5 if floating else 0)
+    p.drawRoundedRect(QRectF(x0, pad, width - x0 - pad, 14), 7 if floating else 0, 7 if floating else 0)
+    p.drawRoundedRect(QRectF(x0, pad + 18, width - x0 - pad, height - 2 * pad - 18),
+                      7 if floating else 2, 7 if floating else 2)
+    p.setPen(Qt.NoPen)
+    p.setBrush(_qcolor(t["sel"]))
+    p.drawRoundedRect(QRectF(x0 + 8, pad + 26, (width - x0) * 0.45, 5), 2.5, 2.5)
+    p.setBrush(_qcolor(t["field"]))
+    p.drawRoundedRect(QRectF(x0 + 8, pad + 36, (width - x0) * 0.3, 5), 2.5, 2.5)
+    p.setBrush(_qcolor(t["accfill"]))
+    p.drawRoundedRect(QRectF(width - pad - 34, height - pad - 14, 26, 8), 4, 4)
+    p.end()
+    pm.setDevicePixelRatio(ratio)
+    return pm

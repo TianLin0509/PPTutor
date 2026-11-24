@@ -42,6 +42,52 @@ _RECYCLE_CHUNK = 20   # 底层 _shell_recycle 单次批量无进度回调 → �
 _EXAMPLE_SHOW_LIMIT = 10  # 病灶卡最多列出的可点示例条数（数据层已 cap 10，UI 侧再挡一道）
 
 
+class _ScoreRing(QWidget):
+    """健康分圆环（QPainter 自绘，静态，无动画）。"""
+
+    def __init__(self, owner: "HealthWindow", size: int = 132):
+        super().__init__()
+        self._owner = owner
+        self._score: int | None = None
+        self.setFixedSize(size, size)
+
+    def set_score(self, score: int | None) -> None:
+        self._score = score
+        self.update()
+
+    def paintEvent(self, e):  # noqa: N802
+        from PySide6.QtCore import QRectF
+        from PySide6.QtGui import QColor, QFont, QPainter, QPen
+        tok = self._owner._tok
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        side = min(self.width(), self.height())
+        r = QRectF(8, 8, side - 16, side - 16)
+        track = QPen(QColor(tok.get("bd2", "#E2E6EA")))
+        track.setWidth(10)
+        p.setPen(track)
+        p.drawEllipse(r)
+        score = self._score
+        if score is not None:
+            arc = QPen(QColor(self._owner._score_color(score)))
+            arc.setWidth(10)
+            arc.setCapStyle(Qt.RoundCap)
+            p.setPen(arc)
+            p.drawArc(r, 90 * 16, -int(360 * 16 * max(0, min(100, score)) / 100))
+        p.setPen(QColor(tok.get("ink1", "#182431")))
+        f = QFont(self.font())
+        f.setPixelSize(round(side * 0.26))
+        f.setBold(True)
+        p.setFont(f)
+        p.drawText(r.adjusted(0, -8, 0, -8), Qt.AlignCenter, str(score) if score is not None else "…")
+        f.setPixelSize(12)
+        f.setBold(False)
+        p.setFont(f)
+        p.setPen(QColor(tok.get("ink3", "#6E7781")))
+        p.drawText(r.adjusted(0, side * 0.30, 0, 0), Qt.AlignCenter, "健康分")
+        p.end()
+
+
 class HealthWindow(QWidget):
     """库体检窗口。scan_fn() -> HealthReport（后台调）；recycle_fn(paths) -> dict（后台调）。"""
 
@@ -86,7 +132,7 @@ class HealthWindow(QWidget):
 
         head = QHBoxLayout()
         head.setSpacing(10)
-        title = QLabel("库体检报告")
+        title = QLabel("库体检" if self._embedded else "库体检报告")
         title.setObjectName("dashTitle")
         head.addWidget(title)
         head.addStretch(1)
@@ -114,7 +160,112 @@ class HealthWindow(QWidget):
         self._body.setSpacing(12)
         self._body.addStretch(1)
         scroll.setWidget(body)
-        root.addWidget(scroll, 1)
+        if not self._embedded:
+            root.addWidget(scroll, 1)
+            return
+        # 方案 D 健康页（嵌入主窗）：左侧评分环 + 可回收空间 + 一键回收重复副本；
+        # 右侧 6 项体检卡（原样，冷文件 / 解析失败只提示不删除）；底部一行离线运行诊断灯。
+        self._score_lab.hide()  # 分数在左侧圆环里
+        mid = QHBoxLayout()
+        mid.setSpacing(14)
+        mid.addWidget(self._build_side())
+        mid.addWidget(scroll, 1)
+        root.addLayout(mid, 1)
+        root.addWidget(self._build_diag_strip())
+
+    def _build_side(self) -> QFrame:
+        side = QFrame()
+        side.setObjectName("dashCard")
+        side.setFixedWidth(280)
+        lay = QVBoxLayout(side)
+        lay.setContentsMargins(18, 18, 18, 18)
+        lay.setSpacing(8)
+        self._ring = _ScoreRing(self)
+        lay.addWidget(self._ring, 0, Qt.AlignHCenter)
+        self._reclaim_lab = QLabel("…")
+        self._reclaim_lab.setObjectName("kpiNum")
+        self._reclaim_lab.setAlignment(Qt.AlignCenter)
+        lay.addWidget(self._reclaim_lab)
+        cap = self._muted("可回收空间\n只来自重复副本（每组保留最新 1 份）")
+        cap.setAlignment(Qt.AlignCenter)
+        lay.addWidget(cap)
+        lay.addStretch(1)
+        self._side_recycle_btn = QPushButton("回收全部重复副本")
+        self._side_recycle_btn.setObjectName("primary")
+        self._side_recycle_btn.setCursor(Qt.PointingHandCursor)
+        self._side_recycle_btn.setToolTip("全部重复组各保留 1 份，其余送入系统回收站，可随时还原")
+        self._side_recycle_btn.clicked.connect(self._recycle_all)
+        self._side_recycle_btn.setEnabled(False)
+        lay.addWidget(self._side_recycle_btn)
+        note = self._muted("冷文件、解析失败只提醒，不删除；版本库的恢复点不参与回收。")
+        note.setAlignment(Qt.AlignCenter)
+        lay.addWidget(note)
+        return side
+
+    def _build_diag_strip(self) -> QFrame:
+        """运行诊断：一行 4 盏灯（索引 / 版本库 / PowerPoint / 内源更新），全部离线检查。
+        英文诊断全文不再摊开，收进「复制诊断信息」。数据由主窗经 set_diagnostics 填。"""
+        strip = QFrame()
+        strip.setObjectName("dashCard")
+        lay = QHBoxLayout(strip)
+        lay.setContentsMargins(18, 10, 12, 10)
+        lay.setSpacing(18)
+        t = QLabel("运行诊断")
+        t.setObjectName("dashCardT")
+        lay.addWidget(t)
+        self._diag_box = QHBoxLayout()
+        self._diag_box.setSpacing(22)
+        lay.addLayout(self._diag_box, 1)
+        self._copy_diag_btn = QPushButton("复制诊断信息…")
+        self._copy_diag_btn.setObjectName("ghost")
+        self._copy_diag_btn.setCursor(Qt.PointingHandCursor)
+        self._copy_diag_btn.setToolTip("打开「设置 → 健康诊断」生成完整诊断文字，点「复制」即可发给维护者")
+        self._copy_diag_btn.clicked.connect(self._copy_diagnostics)
+        self._copy_diag_btn.setVisible(False)
+        lay.addWidget(self._copy_diag_btn)
+        self._diag_items: list = []
+        self._copy_diag_fn = None
+        return strip
+
+    def set_diagnostics(self, items, copy_fn=None) -> None:
+        """items: [(名称, 状态 'ok'|'warn'|'idle', 一行说明, 动作文字或 '', 回调或 None)]。"""
+        self._diag_items = list(items or [])
+        self._copy_diag_fn = copy_fn
+        box = getattr(self, "_diag_box", None)
+        if box is None:
+            return
+        self._clear(box)
+        colors = {"ok": self._tok.get("grn", "#3A9E42"), "warn": "#E8780C",
+                  "idle": self._tok.get("ink4", "#A2A8AF")}
+        for name, state, text, action, cb in self._diag_items:
+            cell = QWidget()
+            cl = QVBoxLayout(cell)
+            cl.setContentsMargins(0, 0, 0, 0)
+            cl.setSpacing(1)
+            head = QLabel(f'<span style="color:{colors.get(state, colors["idle"])}">●</span>&nbsp;<b>{html.escape(name)}</b>')
+            head.setTextFormat(Qt.RichText)
+            head.setObjectName("recName")
+            cl.addWidget(head)
+            line = QHBoxLayout()
+            line.setSpacing(6)
+            d = QLabel(text)
+            d.setObjectName("dashSub")
+            line.addWidget(d)
+            if action and cb is not None:
+                b = QPushButton(action)
+                b.setObjectName("linkBtn")
+                b.setCursor(Qt.PointingHandCursor)
+                b.clicked.connect(lambda _c=False, f=cb: f())
+                line.addWidget(b)
+            line.addStretch(1)
+            cl.addLayout(line)
+            box.addWidget(cell, 1)
+        self._copy_diag_btn.setVisible(copy_fn is not None)
+
+    def _copy_diagnostics(self) -> None:
+        fn = self._copy_diag_fn
+        if fn is not None:
+            fn()
 
     def _apply_window_bg(self) -> None:
         if self._embedded:
@@ -184,6 +335,10 @@ class HealthWindow(QWidget):
 
     def _set_controls_enabled(self, on: bool) -> None:
         self._refresh_btn.setEnabled(on)
+        side = getattr(self, "_side_recycle_btn", None)
+        if side is not None:
+            r = self._report
+            side.setEnabled(on and r is not None and bool(r.duplicate_groups))
         for attr in ("_recycle_btn", "_recycle_all_btn"):
             btn = getattr(self, attr)
             if btn is not None:
@@ -196,6 +351,11 @@ class HealthWindow(QWidget):
     def _render(self, r: health.HealthReport) -> None:
         self._score_lab.setText(str(r.score) if r.deck_count else "—")
         self._score_lab.setStyleSheet(f"color:{self._score_color(r.score)}; font-weight:800;")
+        if getattr(self, "_ring", None) is not None:
+            self._ring.set_score(r.score if r.deck_count else None)
+            self._reclaim_lab.setText(human_bytes(r.duplicate_reclaimable) if r.duplicate_groups else "0 B")
+            self._side_recycle_btn.setText(
+                f"回收 {len(r.duplicate_groups)} 组重复副本" if r.duplicate_groups else "没有可回收的副本")
         self._summary.setText(self._verdict(r))
         self._clear(self._body)
         self._dup_checks = []
@@ -361,7 +521,7 @@ class HealthWindow(QWidget):
             lay.addWidget(self._mk_link(ex.name, ex.path))
 
     def _dup_card(self, r: health.HealthReport) -> QFrame:
-        w, lay = self._card("重复堆积")
+        w, lay = self._card("重复副本 · 可回收")
         groups = r.duplicate_groups
         if not groups:
             lay.addWidget(self._muted("没有完全相同的副本，干净"))
@@ -435,7 +595,7 @@ class HealthWindow(QWidget):
         return w
 
     def _zombie_card(self, r: health.HealthReport) -> QFrame:
-        w, lay = self._card("僵尸冷文件")
+        w, lay = self._card("一年没动的冷文件 · 只提醒")
         if r.zombie_count:
             lay.addWidget(self._line(f"{r.zombie_count} 份超过一年没动过，占 {human_bytes(r.zombie_bytes)}"))
             self._add_example_links(lay, r.zombie_examples)
@@ -445,7 +605,7 @@ class HealthWindow(QWidget):
         return w
 
     def _curse_card(self, r: health.HealthReport) -> QFrame:
-        w, lay = self._card("终版诅咒")
+        w, lay = self._card("命名混乱（多个「终版」）")
         if r.curse_count:
             lay.addWidget(self._line(f"{r.curse_count} 份命中「最终版 / 终版 / 定稿 / v9」等命名梗"))
             self._add_example_links(lay, r.curse_examples)
@@ -487,7 +647,7 @@ class HealthWindow(QWidget):
         return w
 
     def _parse_card(self, r: health.HealthReport) -> QFrame:
-        w, lay = self._card("解析失败")
+        w, lay = self._card("解析失败 · 只提醒")
         if r.parse_failed:
             names = {"encrypted": "加密", "too_large": "超大跳过", "error": "无法读取",
                      "cloud_placeholder": "云盘未下载", "corrupt": "文件损坏", "timeout": "解析超时",
