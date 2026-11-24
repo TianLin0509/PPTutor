@@ -71,7 +71,7 @@ def _index_problem_message(error: object) -> str:
 
 
 class WelcomeOverlay(QWidget):
-    def __init__(self, parent=None, *, on_start, on_pick_theme, current_theme="cloud", on_settings=None):
+    def __init__(self, parent=None, *, on_start, on_pick_theme, current_theme="cloud", on_settings=None, on_rescan=None):
         super().__init__(parent)
         self._on_start_cb = on_start
         self._on_pick_cb = on_pick_theme
@@ -143,8 +143,14 @@ class WelcomeOverlay(QWidget):
         self._disk_btn = QPushButton("清理后重新扫描")
         self._disk_btn.setObjectName("wDiskBtn")
         self._disk_btn.setCursor(Qt.PointingHandCursor)
-        if on_settings is not None:
+        # 文案说「重新扫描」就真的重扫；没给重扫回调时如实改成去设置
+        if on_rescan is not None:
+            self._disk_btn.clicked.connect(on_rescan)
+        elif on_settings is not None:
+            self._disk_btn.setText("打开设置")
             self._disk_btn.clicked.connect(on_settings)
+        else:
+            self._disk_btn.hide()
         db_lay.addWidget(self._disk_btn)
         self._disk_bar.hide()
         cl.addSpacing(10)

@@ -214,3 +214,22 @@ def test_health_score_ring_track_not_black(qtbot):
     c = img.pixelColor(int(img.width() / 2), int(13 * img.height() / 132))   # 顶部轨道中线
     assert c.alpha() > 0
     assert not (c.red() < 40 and c.green() < 40 and c.blue() < 40), c.name()
+
+
+def test_welcome_disk_button_really_rescans(qtbot, tmp_path, monkeypatch):
+    from pptx_finder.ui.welcome_overlay import WelcomeOverlay
+
+    hits = {"rescan": 0, "settings": 0}
+    ov = WelcomeOverlay(on_start=lambda: None, on_pick_theme=lambda n: None,
+                        on_settings=lambda: hits.__setitem__("settings", hits["settings"] + 1),
+                        on_rescan=lambda: hits.__setitem__("rescan", hits["rescan"] + 1))
+    qtbot.addWidget(ov)
+    ov._disk_btn.click()
+    assert hits == {"rescan": 1, "settings": 0}
+    # 主窗装配：按钮接到真实的全量重扫入口，而不是功能设置
+    win = _win(qtbot, tmp_path)
+    calls = []
+    monkeypatch.setattr(win, "_request_full_rescan", lambda: calls.append(1) or True)
+    monkeypatch.setattr(win, "open_settings_page", lambda *a, **k: calls.append("settings"))
+    win._welcome_rescan()
+    assert calls == [1]

@@ -4661,6 +4661,12 @@ class MainWindow(QMainWindow):
         if q:
             self._open_version_window_for(query=q)
 
+    def _welcome_rescan(self) -> None:
+        """欢迎层磁盘不足条的「清理后重新扫描」：关欢迎层，直接发起后台全量重扫。"""
+        self._dismiss_welcome()
+        if self._request_full_rescan():
+            self._toast("正在重新扫描…")
+
     def _request_full_rescan(self) -> bool:
         """健康诊断里的「重新扫描全盘」入口：只发起后台索引，不阻塞设置对话框。"""
         return self._start_indexing(None, None)
@@ -6223,6 +6229,7 @@ class MainWindow(QMainWindow):
             on_start=self._dismiss_welcome,
             on_pick_theme=self._apply_theme,
             on_settings=self._welcome_open_features,
+            on_rescan=self._welcome_rescan,
             current_theme=self._theme)
         ov.move(0, 0)
         ov.resize(self.size())
