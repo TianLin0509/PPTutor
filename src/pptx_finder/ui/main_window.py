@@ -1452,6 +1452,7 @@ class MainWindow(QMainWindow):
         # v2.0 白色工作台：左侧整高侧栏（品牌 + 导航 + 工具 + 主题），右侧是顶栏与页面
         outer = QHBoxLayout(central)
         # HUB-H 冷白工作室：灰画布上浮起白色导航岛与内容面板，彼此留 10px 缝
+        self._outer_layout = outer
         outer.setContentsMargins(10, 10, 10, 6)
         outer.setSpacing(10)
         right_col = QWidget()
@@ -1460,6 +1461,7 @@ class MainWindow(QMainWindow):
         root = QVBoxLayout(right_col)
         # 内缩 5px：子控件是方角的同色底，贴边会把面板 16px 圆角盖成直角
         root.setContentsMargins(5, 5, 5, 5)
+        self._column_layout = root
         root.setSpacing(0)
 
         root.addWidget(self._build_glass_title())  # 无边框窗口的自绘顶栏（搜索 + 窗口按钮）
@@ -2668,6 +2670,17 @@ class MainWindow(QMainWindow):
         self._ui_loop_timer.stop()
         super().hideEvent(e)
 
+    def _apply_islands_layout(self) -> None:
+        """实色主题：灰画布上浮卡片、彼此留缝；玻璃主题：贴边铺满（见 theme.ISLAND_THEMES）。"""
+        outer = getattr(self, "_outer_layout", None)
+        col = getattr(self, "_column_layout", None)
+        if outer is None or col is None:
+            return
+        on = theme.islands(self._theme)
+        outer.setContentsMargins(*((10, 10, 10, 6) if on else (0, 0, 0, 0)))
+        outer.setSpacing(10 if on else 0)
+        col.setContentsMargins(*((5, 5, 5, 5) if on else (0, 0, 0, 0)))
+
     def _apply_titlebar_theme(self) -> None:
         """Windows 系统标题栏深浅跟随主题（深色主题 → 深色标题栏，消除白条割裂）。"""
         try:
@@ -2702,6 +2715,7 @@ class MainWindow(QMainWindow):
             self._sync_facet_empty_and_count()
         self._apply_titlebar_theme()
         # 玻璃化顶屏同步刷新：central 极光 + 标题栏主题名 + 仪表盘图表
+        self._apply_islands_layout()
         if getattr(self, "_central", None) is not None:
             self._central.update()
         if getattr(self, "gt_theme", None) is not None:

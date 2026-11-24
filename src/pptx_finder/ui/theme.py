@@ -142,7 +142,7 @@ QToolTip { background: $panel; color: $ink1; border: 1px solid $bd; border-radiu
 
 /* 合一工具栏（无边框窗口自绘标题栏：品牌 + 搜索 + 筛选 + 图标按钮 + 窗口控制） */
 QWidget#glassTitle { background: $panel; border-bottom: 1px solid $bd2; }
-QWidget#mainColumn { background: $panel; border-radius: 16px; }
+QWidget#mainColumn { background: $panel; border-radius: $col_radius; }
 QLabel#gtDot { color: $acc; font-size: 12px; background: transparent; }
 QLabel#gtName { color: $ink1; font-size: 15px; font-weight: 700; background: transparent; }
 QLabel#gtVer { color: $ink4; font-size: 11px; font-family: $mono_family; background: transparent; }
@@ -155,7 +155,7 @@ QPushButton#winMin:hover, QPushButton#winMax:hover { background: $hover; color: 
 QPushButton#winClose:hover { background: #E81123; color: #FFFFFF; }
 
 /* 左侧导航栏：品牌 + 页面切换（搜索/概览/版本/健康）+ 工具（截图/转字/素材/报告/设置）+ 主题 */
-QWidget#navRail { background: $rail; border: none; border-radius: 20px; }
+QWidget#navRail { background: $rail; $rail_frame }
 QWidget#railBrand { background: transparent; }
 QLabel#railLogo { background: transparent; }
 QPushButton#railBtn {
@@ -542,11 +542,23 @@ def build_qss(theme: str, font_family: str = "", font_scale: float = 1.0) -> str
         ),
         font_family=_font_family_qss(font_family),
         mono_family=DEFAULT_MONO_FAMILY,
+        col_radius="16px" if islands(theme) else "0px",
+        rail_frame=("border: none; border-radius: 20px;" if islands(theme)
+                    else f"border: none; border-right: 1px solid {t['bd2']}; border-radius: 0px;"),
     )
     qss = _QSS.substitute(values)
     if abs(font_scale - 1.0) > 1e-9:
         qss = _FONT_SIZE_RE.sub(lambda m: _scale_font_size(m, font_scale), qss)
     return qss
+
+
+#: 「灰画布上浮白卡」（导航岛与内容面板留缝、圆角）只给实色主题；玻璃主题的面板半透明，
+#: 留缝会在玻璃上再叠一圈深色底（2026-11-24 同事反馈「多加了层黑底」），保持贴边。
+ISLAND_THEMES = frozenset({"atelier", "atelier_dark"})
+
+
+def islands(theme: str) -> bool:
+    return theme in ISLAND_THEMES
 
 
 def tok(theme: str) -> dict:
