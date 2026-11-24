@@ -44,7 +44,18 @@ LEAK_EXTS = {".pptx", ".ppt", ".db", ".db-wal", ".db-shm"}
 # 打进来的。此前它没在白名单上，闸门一律拒绝，于是官方打包路径根本跑不通，只能
 # 手工压 zip；v1.5.1 的分发包因此漏掉了 manifest.json（首次启动要自己重算一遍全量哈希）。
 # 白名单按**精确相对路径**匹配，不是按扩展名放行：新混进来的 pptx 照样拦。
-ALLOWED_DATA_FILES = {"_internal/assets/blank_16x9.pptx"}
+ALLOWED_DATA_FILES = {
+    "_internal/assets/blank_16x9.pptx",
+    # 团队素材内置精选（只读程序资源，已过脱敏发布硬闸门）：同样按精确路径放行，
+    # 完整团队包 / 个人素材库 / 任何其他 pptx 都不在名单上，照拦。
+    "_internal/assets/materials-core/team-materials-core.pptx",
+}
+#: 内置精选的另外两件（不是 .pptx/.db，本就不在拦截扩展名里）：打包前核对必须齐全，缺一件就拒绝
+REQUIRED_MATERIALS_CORE = (
+    "_internal/assets/materials-core/team-materials-core.pptx",
+    "_internal/assets/materials-core/index.json",
+    "_internal/assets/materials-core/thumbs.zip",
+)
 
 
 def main() -> int:
@@ -62,6 +73,15 @@ def main() -> int:
         print("[!] 拒绝打包：dist 内混入了不该分发的数据文件，请清理后重试：")
         for p in leaks[:20]:
             print("   ", p.relative_to(DIST))
+        return 1
+
+    core_dir = DIST / "_internal" / "assets" / "materials-core"
+    extra = sorted(p.relative_to(DIST).as_posix() for p in core_dir.rglob("*") if p.is_file())         if core_dir.is_dir() else []
+    missing = [n for n in REQUIRED_MATERIALS_CORE if not (DIST / n).is_file()]
+    unexpected = [n for n in extra if n not in REQUIRED_MATERIALS_CORE]
+    if missing or unexpected:
+        print("[!] 拒绝打包：内置精选素材必须恰好是 3 个文件："
+              + "；".join([f"缺 {n}" for n in missing] + [f"多出 {n}" for n in unexpected]))
         return 1
 
     # 刷新增量更新清单（随包发布，供自动更新比对）
