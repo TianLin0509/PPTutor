@@ -468,7 +468,7 @@ class SettingsDialog(QDialog):
 
     # ---------- 常规：开机自启 / 唤起热键 / 界面字体 ----------
     def _build_general_page(self) -> QWidget:
-        outer, lay = self._page("常规", "启动方式和快捷键。")
+        outer, lay = self._page("常规", "启动方式、快捷键和更新来源。")
         self._section(lay, "启动")
         card = self._card(lay)
 
