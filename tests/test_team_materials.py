@@ -355,6 +355,40 @@ def test_offline_zip_without_manifest_cannot_block_official_updates(tmp_path):
     assert components.is_newer("1.2.0", components.installed_version("materials"))
 
 
+@pytest.mark.parametrize("claimed", ["../../escaped-probe", "..\\..\\x", "1.2.0/../../y", "C:/abs", "1.2"])
+def test_offline_version_cannot_escape_pack_root(tmp_path, claimed):
+    """m4 MF-M2-04：包里自称的版本号不能变成目录名；越界不可能，旧指针不受影响。"""
+    _fresh_process()
+    good, _, _ = build_pack_dir(tmp_path, rows(2), "1.2.0")
+    team_materials.install_from_file(good / "component.zip")
+    (tmp_path / "evil").mkdir()
+    out, _, _ = build_pack_dir(tmp_path / "evil", rows(3), "1.3.0")
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    with zipfile.ZipFile(out / "component.zip") as src, zipfile.ZipFile(bare / "x.zip", "w") as dst:
+        for name in src.namelist():
+            data = src.read(name)
+            if name == "index.json":
+                index = json.loads(data)
+                index["version"] = claimed
+                data = json.dumps(index).encode()
+            dst.writestr(name, data)
+    result = team_materials.install_from_file(bare / "x.zip")
+    state = team_materials.read_state()
+    assert result["version"] == "local" and state["current"]["version"] == "local"
+    assert not state["current"]["verified"] and team_materials.installed_version() == "0.0.0"
+    packs = team_materials.root() / "packs"
+    assert {p.parent for p in packs.iterdir()} == {packs} and len(list(packs.iterdir())) == 2
+    assert all(len(p.name) == 32 for p in packs.iterdir())
+    assert not [p for p in team_materials.data_dir().iterdir() if "escaped" in p.name or p.name in ("x", "y")]
+    assert state["previous"]["version"] == "1.2.0"
+
+
+def test_state_with_hostile_dir_name_is_ignored():
+    for bad in ("../x", "..", "a/b", "0" * 31, "g" * 32):
+        assert team_materials._pack_path({"dir": bad}) is None
+
+
 def test_import_plain_material_pptx_is_direct_read(tmp_path):
     _fresh_process()
     pack = make_pack(tmp_path / "同事的形状.pptx", rows(4, "容器与卡片", "x"))

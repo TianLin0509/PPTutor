@@ -43,6 +43,7 @@ PACK_FILES = (_m.PACK_PPTX, _m.INDEX_FILE, _m.THUMBS_FILE)
 #: GitHub 上首个素材包的独立标签（只在「允许外网更新源」打开时才会用到）
 RELEASE_BASE = "https://github.com/TianLin0509/PPTutor/releases/download/materials-v1.0.0"
 STATE_FILE = "state.json"
+_SEMVER = __import__("re").compile(r"(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})")
 
 _lock = threading.RLock()
 _started = False
@@ -103,7 +104,7 @@ def _pack_path(entry: dict | None) -> Path | None:
     if not entry or not isinstance(entry.get("dir"), str):
         return None
     name = entry["dir"]
-    if "/" in name or "\\" in name or name in ("", ".", ".."):
+    if not __import__("re").fullmatch(r"[0-9a-f]{32}", name):
         return None
     return root() / "packs" / name
 
@@ -236,12 +237,18 @@ def _new_stage() -> Path:
 def activate(stage: Path, version: str, *, pptx_sha256: str = "", archive_sha256: str = "",
              verified: bool = True) -> str:
     """把校验好的暂存目录换成 current（原子），旧 current 记进 previous。"""
+    if not _SEMVER.fullmatch(str(version or "")):
+        # 版本号来自包内容，不可信：不合 X.Y.Z 的一律按未核验的本地包处理
+        version, verified = "local", False
     count = verify_pack_dir(stage, pptx_sha256)
     with _lock:
-        packs = root() / "packs"
+        packs = (root() / "packs").resolve()
         packs.mkdir(parents=True, exist_ok=True)
-        name = f"{version or 'local'}-{uuid.uuid4().hex[:8]}"
-        os.replace(stage, packs / name)
+        name = uuid.uuid4().hex          # 目录名只用随机 ID，版本号只写进 state.json
+        target = (packs / name).resolve()
+        if target.parent != packs:
+            raise ValueError("素材包目标目录越界，已停止。")
+        os.replace(stage, target)
         state = read_state()
         files = {n: sha256_file(packs / name / n) for n in PACK_FILES if (packs / name / n).is_file()}
         entry = {"version": version, "dir": name, "items": count, "files": files,
@@ -330,7 +337,8 @@ def install_from_file(path: Path) -> dict:
             # 没有清单的离线包：版本号是包自己说的，不可信。记为未核验，对外按 0.0.0 报，
             # 正式发布的任何版本都比它新，不会被一个自称 9.9.9 的包挡住更新。
             activate(stage, version or "local", archive_sha256=sha256_file(path), verified=False)
-            return {"kind": "team", "version": version or "local", "items": read_state()["current"]["items"]}
+            cur = read_state()["current"]
+            return {"kind": "team", "version": cur["version"], "items": cur["items"]}
         finally:
             shutil.rmtree(stage, ignore_errors=True)
     if suffix == ".pptx":
