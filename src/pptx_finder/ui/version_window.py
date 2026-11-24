@@ -216,7 +216,8 @@ class VersionWindow(QWidget):
             ops.addWidget(b)
         # 选中版本停 0.3 秒再自动出预览（后台生成，只操作本程序自己的临时 PowerPoint 对象；
         # 结果回来时若选中已变就丢弃，见 _on_version_preview_ready）
-        self._auto_preview_timer = QTimer(self)
+        from PySide6.QtCore import QTimer as _DebounceTimer  # 独立引用：测试会把模块级 QTimer 换成只有 singleShot 的假件
+        self._auto_preview_timer = _DebounceTimer(self)
         self._auto_preview_timer.setSingleShot(True)
         self._auto_preview_timer.setInterval(300)
         self._auto_preview_timer.timeout.connect(self._auto_preview)

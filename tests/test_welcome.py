@@ -26,8 +26,8 @@ def test_overlay_theme_pick_calls_back(qtbot):
     ov = WelcomeOverlay(on_start=lambda: None,
                         on_pick_theme=lambda n: picked.append(n), current_theme="cloud")
     qtbot.addWidget(ov)
-    ov._theme_btns["atelier_dark"].click()
-    assert picked == ["atelier_dark"]
+    ov._theme_btns["night_glass"].click()
+    assert picked == ["night_glass"]
 
 
 def test_overlay_progress_shows_count(qtbot):

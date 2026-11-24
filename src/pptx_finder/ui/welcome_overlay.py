@@ -150,7 +150,7 @@ class WelcomeOverlay(QWidget):
         cl.addSpacing(10)
         cl.addWidget(self._disk_bar)
 
-        st = QLabel("顺手挑个外观（随时可在左下角切深浅，或到「设置 → 外观」换别的）")
+        st = QLabel("顺手挑个外观（更多风格随时可在左下角切深浅，或到「设置 → 外观」换）")
         st.setObjectName("wStyleHint")
         st.setAlignment(Qt.AlignCenter)
         cl.addSpacing(20)

@@ -40,10 +40,10 @@ def test_welcome_recommends_two_styles_and_explains_reuse(qtbot):
     overlay = WelcomeOverlay(on_start=lambda: None, on_pick_theme=picked.append,
                              current_theme="atelier")
     qtbot.addWidget(overlay)
-    assert set(overlay._theme_btns) == {"atelier", "atelier_dark"}
-    assert len(theme.THEMES) > 2
-    overlay._theme_btns["atelier_dark"].click()
-    assert picked == ["atelier_dark"]
+    assert set(overlay._theme_btns) == {"mist_glass", "night_glass", "atelier"}
+    assert len(theme.THEMES) > 3
+    overlay._theme_btns["night_glass"].click()
+    assert picked == ["night_glass"]
     text = " ".join(label.text() for label in overlay.findChildren(QLabel))
     for phrase in ("复制本页", "插入到 PPT", "图片转文字", "素材库", "更多风格"):
         assert phrase in text
