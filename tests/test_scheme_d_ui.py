@@ -233,3 +233,19 @@ def test_welcome_disk_button_really_rescans(qtbot, tmp_path, monkeypatch):
     monkeypatch.setattr(win, "open_settings_page", lambda *a, **k: calls.append("settings"))
     win._welcome_rescan()
     assert calls == [1]
+
+
+def test_narrow_1280x672_after_opening_health_and_materials(qtbot, tmp_path):
+    """嵌入全部工作页（含健康页与素材页）后，主窗仍可缩到 1280×672 而不被最小高度撑破。"""
+    win = _win(qtbot, tmp_path)
+    win.resize(1440, 900)
+    win._apply_theme("mist_glass", persist=False)
+    win.show()
+    for page_key in ("material", "health", "version", "search"):
+        win._switch_page(page_key)
+        qtbot.wait(50)
+    win.resize(1280, 672)
+    qtbot.wait(50)
+    assert win.width() == 1280
+    assert win.height() == 672
+

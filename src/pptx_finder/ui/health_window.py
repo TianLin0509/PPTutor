@@ -129,8 +129,12 @@ class HealthWindow(QWidget):
     # ---------- 结构 ----------
     def _build(self) -> None:
         root = QVBoxLayout(self)
-        root.setContentsMargins(18, 16, 18, 16)
-        root.setSpacing(12)
+        if self._embedded:
+            root.setContentsMargins(18, 10, 18, 10)
+            root.setSpacing(8)
+        else:
+            root.setContentsMargins(18, 16, 18, 16)
+            root.setSpacing(12)
 
         head = QHBoxLayout()
         head.setSpacing(10)
@@ -180,9 +184,9 @@ class HealthWindow(QWidget):
         side.setObjectName("dashCard")
         side.setFixedWidth(280)
         lay = QVBoxLayout(side)
-        lay.setContentsMargins(18, 18, 18, 18)
-        lay.setSpacing(8)
-        self._ring = _ScoreRing(self)
+        lay.setContentsMargins(16, 14, 16, 14)
+        lay.setSpacing(6)
+        self._ring = _ScoreRing(self, size=116)
         lay.addWidget(self._ring, 0, Qt.AlignHCenter)
         self._reclaim_lab = QLabel("…")
         self._reclaim_lab.setObjectName("kpiNum")
