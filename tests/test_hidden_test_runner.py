@@ -346,22 +346,45 @@ def test_closed_guard_releases_handle_ownership_before_objects_are_collected():
     guard.close()
 
 
-@pytest.mark.parametrize(('failures', 'exit_status', 'rerun_exit', 'expected', 'rerun_args'), [
-    (['tests/a.py::t1', 'tests/b.py::t2'], 1, 0, 0, ['-q', 'tests/a.py::t1', 'tests/b.py::t2']),
-    (['tests/a.py::t1'], 1, 1, 1, ['-q', 'tests/a.py::t1']),
-    ([f'tests/a.py::t{i}' for i in range(13)], 1, 0, 1, None),   # 失败太多：真问题，不重跑
-    (['tests/a.py::t1'], None, 0, 1, None),                       # 没跑完（崩溃/被杀）：不重跑
-])
-def test_gate_reruns_a_few_failures_once(tmp_path, monkeypatch, failures, exit_status,
-                                         rerun_exit, expected, rerun_args):
-    runner = load_script('run_tests_hidden')
-    report = tmp_path / 'hidden.json'
-    report.write_text(json.dumps({'pytest': {
+
+def _gate_report(path, failures, exit_status=1):
+    path.write_text(json.dumps({'pytest': {
         'exitStatus': exit_status,
         'failures': [{'nodeid': n, 'phase': 'call'} for n in failures]}}), 'utf-8')
-    calls = []
-    monkeypatch.setattr(runner, 'run_windows', lambda args, path, probe=None:
-                        calls.append((args, path)) or rerun_exit)
-    assert runner.rerun_failed_once(['-q', 'tests'], report) == expected
-    assert [c[0] for c in calls] == ([rerun_args] if rerun_args else [])
+
+
+@pytest.mark.parametrize(('failures', 'exit_status', 'rounds', 'expected', 'reruns'), [
+    # 第 1 次重跑就过
+    (['tests/a.py::t1', 'tests/b.py::t2'], 1, [(0, [])], 0,
+     [['-q', 'tests/a.py::t1', 'tests/b.py::t2']]),
+    # 第 1 次还剩一条，第 2 次只重跑那一条并通过
+    (['tests/a.py::t1', 'tests/b.py::t2'], 1, [(1, ['tests/b.py::t2']), (0, [])], 0,
+     [['-q', 'tests/a.py::t1', 'tests/b.py::t2'], ['-q', 'tests/b.py::t2']]),
+    # 单独重跑 3 次都挂：真问题
+    (['tests/a.py::t1'], 1, [(1, ['tests/a.py::t1'])] * 3, 1, [['-q', 'tests/a.py::t1']] * 3),
+    ([f'tests/a.py::t{i}' for i in range(31)], 1, [], 1, []),   # 失败太多：真问题，不重跑
+    (['tests/a.py::t1'], None, [], 1, []),                       # 没跑完（崩溃/被杀）：不重跑
+])
+def test_gate_reruns_failures_until_they_pass(tmp_path, monkeypatch, failures, exit_status,
+                                              rounds, expected, reruns):
+    runner = load_script('run_tests_hidden')
+    report = tmp_path / 'hidden.json'
+    _gate_report(report, failures, exit_status)
+    calls, waits = [], []
+
+    def fake_run(args, path, probe=None):
+        code, still = rounds[len(calls)]
+        calls.append((args, path))
+        _gate_report(path, still, 1 if code else 0)
+        return code
+    monkeypatch.setattr(runner, 'run_windows', fake_run)
+    assert runner.rerun_failed_once(['-q', 'tests'], report, wait=lambda: waits.append(1)) == expected
+    assert [c[0] for c in calls] == reruns and len(waits) == len(reruns)
     assert all(c[1] != report for c in calls)   # 重跑另写报告，首轮证据保留
+
+
+def test_quiet_wait_gives_up_waiting_and_runs(monkeypatch):
+    runner = load_script('run_tests_hidden')
+    monkeypatch.setattr(runner, 'cpu_busy_percent', lambda: 99)
+    monkeypatch.setattr(runner.time, 'sleep', lambda s: None)
+    runner.wait_for_quiet_machine(limit=0)   # 到点照跑，不卡死

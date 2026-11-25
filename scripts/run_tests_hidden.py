@@ -451,30 +451,76 @@ def main():
     return exit_code
 
 
-RERUN_LIMIT = 12
+RERUN_LIMIT = 30
+RERUN_ATTEMPTS = 3
+QUIET_CPU_PERCENT = 60
+QUIET_WAIT_SECONDS = 30 * 60
 
 
-def rerun_failed_once(pytest_args, report_path):
-    """全量跑完后只有少数用例失败时，把它们单独再跑一次。
+def cpu_busy_percent(sample=2.0):
+    """整机 CPU 占用（GetSystemTimes 两次采样之差）；取不到时返回 0，不挡重跑。"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        def times():
+            idle, kernel, user = (wintypes.FILETIME() for _ in range(3))
+            ctypes.windll.kernel32.GetSystemTimes(ctypes.byref(idle), ctypes.byref(kernel),
+                                                  ctypes.byref(user))
+            return [(t.dwHighDateTime << 32) | t.dwLowDateTime for t in (idle, kernel, user)]
+        i0, k0, u0 = times()
+        time.sleep(sample)
+        i1, k1, u1 = times()
+        total = (k1 - k0) + (u1 - u0)
+        return 0 if total <= 0 else round(100 * (1 - (i1 - i0) / total))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def wait_for_quiet_machine(limit=QUIET_WAIT_SECONDS):
+    """等整机忙劲过去再重跑计时类用例；最多等 limit 秒，到点照跑。"""
+    started = time.monotonic()
+    while True:
+        busy = cpu_busy_percent()
+        waited = time.monotonic() - started
+        if busy < QUIET_CPU_PERCENT or waited >= limit:
+            print(f'[隐藏测试] 整机 CPU {busy}%（已等 {waited / 60:.0f} 分钟），开始重跑', flush=True)
+            return
+        print(f'[隐藏测试] 整机 CPU {busy}%，等它降到 {QUIET_CPU_PERCENT}% 以下再重跑'
+              f'（已等 {waited / 60:.0f} 分钟）', flush=True)
+        time.sleep(30)
+
+
+def rerun_failed_once(pytest_args, report_path, attempts=RERUN_ATTEMPTS, wait=wait_for_quiet_machine):
+    """全量跑完后有用例失败时，等机器空一些再把它们单独重跑，最多 attempts 次。
 
     2026-11-25 合入闸门连续两轮在整机 CPU 90%+ 时各挂 4、6 条计时类用例（两轮不是同一批），
-    单独重跑全部通过，整轮回滚后重跑一次要 80 分钟。可见窗口、崩溃、没跑完都不走这里。
+    单独重跑全部通过；而整轮回滚后重跑一次要 80 分钟。田哥定：可以多等，不要因超时回滚。
+    所以只有「单独重跑 attempts 次仍失败」的用例才算真问题。可见窗口、崩溃、没跑完不走这里。
     """
     progress = json.loads(report_path.read_text('utf-8')).get('pytest') or {}
     failed = sorted({row['nodeid'] for row in progress.get('failures', [])})
     if progress.get('exitStatus') != 1 or not failed or len(failed) > RERUN_LIMIT:
         return 1
     options = [a for a in pytest_args if a.startswith('-')]
-    print(f'[隐藏测试] 首轮 {len(failed)} 条失败，单独重跑一次：', flush=True)
-    for nodeid in failed:
-        print(f'  {nodeid}', flush=True)
-    rerun_report = report_path.with_name(report_path.stem + '-rerun.json')
-    exit_code = run_windows([*options, *failed], rerun_report)
-    if exit_code == 0:
-        print(f'[隐藏测试] 重跑 {len(failed)} 条全部通过，按整机负载造成的计时抖动处理；'
-              f'首轮报告 {report_path}', flush=True)
+    exit_code = 1
+    for attempt in range(1, attempts + 1):
+        print(f'[隐藏测试] 第 {attempt}/{attempts} 次单独重跑 {len(failed)} 条：', flush=True)
+        for nodeid in failed:
+            print(f'  {nodeid}', flush=True)
+        wait()
+        rerun_report = report_path.with_name(f'{report_path.stem}-rerun{attempt}.json')
+        exit_code = run_windows([*options, *failed], rerun_report)
+        if exit_code == 0:
+            print(f'[隐藏测试] 重跑全部通过，按整机负载造成的计时抖动处理；首轮报告 {report_path}',
+                  flush=True)
+            return 0
+        rerun = json.loads(rerun_report.read_text('utf-8')).get('pytest') or {}
+        still = sorted({row['nodeid'] for row in rerun.get('failures', [])})
+        if exit_code != 1 or rerun.get('exitStatus') != 1 or not still:
+            return exit_code
+        failed = still
     return exit_code
-
 
 if __name__ == '__main__':
     if hasattr(sys.stdout, 'reconfigure'):
