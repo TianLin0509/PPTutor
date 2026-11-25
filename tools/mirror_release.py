@@ -734,14 +734,7 @@ def main() -> int:
     cache = args.cache_dir / f"v{args.version}"
     audit = {"version": args.version, "complete": False, "refreshReason": args.refresh_full}
     try:
-        previous = (json.loads(args.current_manifest.read_text("utf-8"))
-                    if args.current_manifest else {} if args.dry_run else public_manifest())
-        if args.prune_full:
-            if args.dry_run and not args.current_manifest:
-                raise SystemExit("[!] 清理预览需--current-manifest指定离线镜像快照")
-            audit["deleted"] = prune_full(args.prune_full, previous, dry_run=args.dry_run)
-            audit["complete"] = True
-            return 0
+        # 只中转增量块时不读备用服务器上的旧清单：旧清单坏了、读不到也不挡发布（Codex 审查 P2）
         if args.blocks_only:
             items = (collect_from_dir(args.version, args.from_dir, False) if args.from_dir
                      else collect_from_github(args.version, cache, False))
@@ -749,6 +742,14 @@ def main() -> int:
                 check_consistency(items, args.version)
             audit.update(stage_blocks(items))
             print("[done] 增量块已就位（清单未改）")
+            return 0
+        previous = (json.loads(args.current_manifest.read_text("utf-8"))
+                    if args.current_manifest else {} if args.dry_run else public_manifest())
+        if args.prune_full:
+            if args.dry_run and not args.current_manifest:
+                raise SystemExit("[!] 清理预览需--current-manifest指定离线镜像快照")
+            audit["deleted"] = prune_full(args.prune_full, previous, dry_run=args.dry_run)
+            audit["complete"] = True
             return 0
         if not args.dry_run:
             for name in MANIFESTS:
