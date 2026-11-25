@@ -446,8 +446,9 @@ def main():
         return pytest.main(pytest_args)
     report_path = args.report or ROOT / 'artifacts' / f'hidden-tests-{time.time_ns()}.json'
     exit_code = run_windows(pytest_args, report_path, args.self_check_seconds)
-    if exit_code == 1 and args.self_check_seconds is None:
-        return rerun_failed_once(pytest_args, report_path)
+    attempts = int(os.environ.get('PPTDOCTOR_GATE_RERUNS', RERUN_ATTEMPTS))
+    if exit_code == 1 and args.self_check_seconds is None and attempts > 0:
+        return rerun_failed_once(pytest_args, report_path, attempts)
     return exit_code
 
 

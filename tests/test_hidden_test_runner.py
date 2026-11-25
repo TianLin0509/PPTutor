@@ -125,6 +125,7 @@ def test_hidden_runner_preserves_failed_pytest_output_and_progress(tmp_path):
     env.pop('PY_COLORS', None)
     env.pop('NO_COLOR', None)
     env['FORCE_COLOR'] = '3'  # Claude Code's inherited terminal environment.
+    env['PPTDOCTOR_GATE_RERUNS'] = '0'  # 故意失败的用例，不走等机器空闲的重跑
     result = subprocess.run(
         [sys.executable, str(driver)], cwd=ROOT, stdin=subprocess.DEVNULL, env=env,
         capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=240,
