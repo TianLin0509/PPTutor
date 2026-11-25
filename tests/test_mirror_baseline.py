@@ -427,16 +427,193 @@ def test_cleanup_only_removes_explicit_old_zip_after_active_baseline_verificatio
     assert {p: b for p, b in server.files.items() if p.startswith("files/")} == blocks
 
 
-def test_watch_does_not_mistake_partial_publish_for_synced(tmp_path):
+def load_watch():
     spec = importlib.util.spec_from_file_location("mirror_watch_test", mirror.ROOT / "tools/mirror_watch.py")
     watch = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(watch)
-    docs = {n: {"version": "2.1.0"} for n in mirror.MANIFESTS}
-    assert not watch.mirror_is_current(docs, "2.1.0")
-    docs["manifest.json"]["full"] = full()
-    assert watch.mirror_is_current(docs, "2.1.0")
-    docs["manifest-Ocr.json"]["version"] = "2.0.4"
-    assert not watch.mirror_is_current(docs, "2.1.0")
+    return watch
+
+
+def test_watch_finds_newest_prerelease_by_version_not_latest_flag():
+    watch = load_watch()
+    releases = [{"tag_name": "v2.1.9", "draft": False}, {"tag_name": "v2.1.21", "draft": True},
+                {"tag_name": "v2.1.20", "draft": False, "prerelease": True},
+                {"tag_name": "ocr-v1.2.0", "draft": False}, {"tag_name": "v2.1.16", "draft": False}]
+    assert watch.newest_release(releases) == "2.1.20"
+    with pytest.raises(RuntimeError):
+        watch.newest_release([{"tag_name": "v2.1.30", "draft": True}])
+
+
+@pytest.mark.parametrize("state,stage_code,expect_stage,expect_openx", [
+    ({}, 0, True, True),                                             # 新版：先中转块，再传内源
+    ({"staged": "2.1.20"}, 0, False, True),                          # 块已就位：只补内源
+    ({"staged": "2.1.20", "openx_own": "2.1.20"}, 0, False, False),  # 都做过：什么也不做
+    ({}, 1, True, False),                                            # 中转失败：不碰内源，记失败
+])
+def test_watch_never_switches_mirror_manifests(tmp_path, monkeypatch, state, stage_code, expect_stage,
+                                               expect_openx):
+    watch = load_watch()
+    monkeypatch.setattr(watch, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(watch, "STATE", tmp_path / "state.json")
+    monkeypatch.setattr(watch, "LOG", tmp_path / "log.txt")
+    (tmp_path / "state.json").write_text(json.dumps(state), "utf-8")
+    urls, runs, openx = [], [], []
+    monkeypatch.setattr(watch, "get_json", lambda url, timeout=60: urls.append(url) or
+                        [{"tag_name": "v2.1.20", "draft": False, "prerelease": True}])
+    monkeypatch.setattr(watch.subprocess, "run",
+                        lambda cmd, **kw: runs.append(cmd) or SimpleNamespace(returncode=stage_code))
+    real_sync = watch.sync_own_openx
+    monkeypatch.setattr(watch, "OPENX_SYNC", tmp_path / "openx_sync.py")
+    def fake_sync(st, v):
+        if st.get("openx_own") == v:   # 与真函数同一判据：同一版成功过就不再传
+            return real_sync(st, v)
+        openx.append(v)
+        st.update(openx_own=v)
+        return True, ""
+    monkeypatch.setattr(watch, "sync_own_openx", fake_sync)
+    toasts = []
+    monkeypatch.setattr(watch, "notify", lambda title, body: toasts.append(body))
+    monkeypatch.setattr(sys, "argv", ["mirror_watch.py"])
+    assert watch.main() == stage_code
+    assert len(toasts) == (1 if stage_code else 0)   # 中转失败要报上来
+    assert all("latest" not in u for u in urls)
+    assert bool(runs) == expect_stage
+    for cmd in runs:
+        assert cmd[-2:] == ["2.1.20", "--blocks-only"]
+    assert openx == (["2.1.20"] if expect_openx else [])
+    saved = json.loads((tmp_path / "state.json").read_text("utf-8"))
+    assert saved["github"] == "2.1.20"
+    if stage_code:
+        assert saved["fails"] == {"2.1.20": 1} and "staged" not in saved
+
+
+
+def watch_env(tmp_path, monkeypatch, state, latest="2.1.20"):
+    watch = load_watch()
+    monkeypatch.setattr(watch, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(watch, "STATE", tmp_path / "state.json")
+    monkeypatch.setattr(watch, "LOG", tmp_path / "log.txt")
+    (tmp_path / "state.json").write_text(json.dumps(state), "utf-8")
+    monkeypatch.setattr(watch, "get_json", lambda url, timeout=60: [{"tag_name": f"v{latest}", "draft": False,
+                                                                     "prerelease": True}])
+    monkeypatch.setattr(sys, "argv", ["mirror_watch.py"])
+    toasts = []
+    monkeypatch.setattr(watch, "notify", lambda title, body: toasts.append(body))
+    saved = lambda: json.loads((tmp_path / "state.json").read_text("utf-8"))  # noqa: E731
+    return watch, toasts, saved
+
+
+def test_watch_reports_openx_failure_once_and_recovers(tmp_path, monkeypatch):
+    """Codex 审查 P1：内源没发上（失败、退避 pending、出错）要往上报——返回非零、写明原因、弹一次通知；不改用别的渠道。"""
+    watch, toasts, saved = watch_env(tmp_path, monkeypatch, {"staged": "2.1.20", "openx_own": "2.1.19"})
+    results = iter([(False, "同一批 6 小时内同步失败过"), "raise", (True, "")])
+
+    def fake_sync(st, v):
+        r = next(results)
+        if r == "raise":   # 每次现造异常：存着的异常对象会经回溯拖住单实例锁
+            raise RuntimeError("断网")
+        if r[0]:
+            st["openx_own"] = v
+        return r
+    monkeypatch.setattr(watch, "sync_own_openx", fake_sync)
+    monkeypatch.setattr(watch.subprocess, "run", lambda *a, **k: pytest.fail("块已就位，不该再中转"))
+    assert watch.main() == 1
+    assert "没发上内源" in saved()["last_result"] and "6 小时" in saved()["last_result"]
+    assert saved()["openx_own"] == "2.1.19" and len(toasts) == 1
+    assert watch.main() == 1                       # 下一轮还没好：照样非零，但不再重复弹通知
+    assert "断网" in saved()["last_result"] and len(toasts) == 1
+    assert watch.main() == 0
+    assert saved()["openx_own"] == "2.1.20" and "notified" not in saved()
+
+
+def test_watch_never_goes_back_below_completed_version(tmp_path, monkeypatch):
+    watch, toasts, saved = watch_env(tmp_path, monkeypatch, {"staged": "2.1.21", "openx_own": "2.1.21"})
+    monkeypatch.setattr(watch.subprocess, "run", lambda *a, **k: pytest.fail("不该中转旧版"))
+    monkeypatch.setattr(watch, "sync_own_openx", lambda st, v: pytest.fail("不该把旧版发内源"))
+    assert watch.main() == 0
+    assert "不倒退" in saved()["last_result"] and saved()["openx_own"] == "2.1.21" and not toasts
+
+
+_PUB = '"results": [{"version": "ppt-doctor-update-2.1.20", "stage": "published"}]'
+
+
+@pytest.mark.parametrize("out,ok", [
+    ('{"ok": true, "stage": "published", ' + _PUB + '}', True),
+    ('{"ok": true, "stage": "nothing", "note": "组件都已同步过", "releases": 1}', True),
+    ('{"ok": true, "stage": "nothing", "note": "组件都已同步过", "releases": 0}', False),   # 计划没生成：不是同步过
+    ('{"ok": true, "stage": "backoff", "pending": ["ppt-doctor-update-2.1.20"]}', False),
+    ('{"ok": false, "error": "RuntimeError: GitHub 发布信息读不到"}', False),
+    ('{"ok": true, "stage": "published", "results": [{"version": "ppt-doctor-update-2.1.19", "stage": "published"}]}',
+     False),
+    ('{"ok": true, "sec": 9, "stage": "published", ' + _PUB + ', "log": "截断在这里', True),
+    ('{"ok": true, "sec": 9, "stage": "published", "results": [{"version": "ppt-doctor-update-2.1.20", '
+     '"stage": "failed"}], "log": "截断在这里', False),
+    ("PPT Doctor 更新本轮跳过：xxx", False),
+])
+def test_watch_confirms_target_version_reached_openx(out, ok):
+    watch = load_watch()
+    assert watch.openx_confirmed("dl. 预检\n" + out + "\n", "2.1.20")[0] is ok
+
+
+def test_watch_confirms_real_shaped_truncated_openx_result():
+    """真实结果里每版带逐文件上传记录（嵌套对象）；日志太长时整行被截到 8000 字，仍要认出本版已发上。"""
+    watch = load_watch()
+    entry = {"version": "ppt-doctor-update-2.1.20", "stage": "published", "http": 200,
+             "ups": [{"file": "a" * 64, "size": 1, "ok": True}], "release": {"id": 1, "version": "ppt-doctor-update-2.1.20"}}
+    line = json.dumps({"ok": True, "sec": 9, "stage": "published", "results": [entry],
+                       "log": ["dl_ok x"] * 2000}, ensure_ascii=False)[:8000]
+    assert watch.openx_confirmed(line, "2.1.20") == (True, "")
+    assert watch.openx_confirmed(line.replace('"published", "http"', '"failed", "http"'), "2.1.20")[0] is False
+    assert watch.openx_confirmed(line[:60], "2.1.20")[0] is False
+
+
+@pytest.mark.parametrize("out,code,ok", [
+    ('{"ok": true, "stage": "nothing", "note": "组件都已同步过", "releases": 0}', 0, False),
+    ('{"ok": false, "error": "RuntimeError: x"}', 1, False),
+    ('{"ok": true, "stage": "published", ' + _PUB + '}', 0, True),
+])
+def test_watch_real_sync_records_openx_only_when_confirmed(tmp_path, monkeypatch, out, code, ok):
+    watch, _, _ = watch_env(tmp_path, monkeypatch, {})
+    tool = tmp_path / "openx_sync.py"
+    tool.write_text("", "utf-8")
+    monkeypatch.setattr(watch, "OPENX_SYNC", tool)
+    cmds = []
+    monkeypatch.setattr(watch.subprocess, "run", lambda cmd, **k: cmds.append(cmd) or
+                        SimpleNamespace(returncode=code, stdout=out))
+    st = {"openx_own": "2.1.19"}
+    assert watch.sync_own_openx(st, "2.1.20")[0] is ok
+    assert st["openx_own"] == ("2.1.20" if ok else "2.1.19")
+    assert cmds[-1][cmds[-1].index("--doctor-version") + 1] == "2.1.20"
+
+
+def test_blocks_only_does_not_need_old_mirror_manifest(tmp_path, monkeypatch):
+    """Codex 审查 P2：只中转增量块时，备用服务器上的旧清单坏了、读不到也不挡发布。"""
+    src = assets(tmp_path)
+    server = MemoryMirror(monkeypatch, assets(tmp_path, "2.0.4"))
+    monkeypatch.setattr(mirror, "public_manifest", lambda *a, **k: pytest.fail("blocks-only 不该读旧清单"))
+    assert run_main(monkeypatch, tmp_path, src, "--blocks-only") == 0
+    blocks = [p for p in src.iterdir() if mirror._HEX64.fullmatch(p.name)]
+    assert blocks and all(server.files["files/" + p.name] == p.read_bytes() for p in blocks)
+
+def test_blocks_only_uploads_release_blocks_and_never_touches_manifests(tmp_path, monkeypatch):
+    old = assets(tmp_path, "2.0.4")
+    src = assets(tmp_path)
+    server = MemoryMirror(monkeypatch, old)
+    before = {n: server.files[n] for n in mirror.MANIFESTS}
+    assert run_main(monkeypatch, tmp_path, src, "--blocks-only") == 0
+    assert {n: server.files[n] for n in mirror.MANIFESTS} == before
+    blocks = [p for p in src.iterdir() if mirror._HEX64.fullmatch(p.name)]
+    assert blocks and all(server.files["files/" + p.name] == p.read_bytes() for p in blocks)
+    assert not any(e[0] == "replace" and e[1] in mirror.MANIFESTS for e in server.events)
+    events = len(server.events)   # 再跑一次：块都在，不重复上传
+    assert run_main(monkeypatch, tmp_path, src, "--blocks-only") == 0
+    assert not any(e[0] == "replace" for e in server.events[events:])
+
+
+@pytest.mark.parametrize("extra", [["--components"], ["--refresh-full", "runtime-change"], ["--dry-run"]])
+def test_blocks_only_refuses_manifest_or_baseline_options(tmp_path, monkeypatch, extra):
+    with pytest.raises(SystemExit):
+        run_main(monkeypatch, tmp_path, assets(tmp_path), "--blocks-only", *extra)
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows镜像原子替换命令")

@@ -1,6 +1,8 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""发版的唯一入口：给主干当前版本打 vX.Y.Z 标签并推送，GitHub 上的 Release 流水线随即构建、自检、发布。
+"""发版的唯一入口：给主干当前版本打 vX.Y.Z 标签并推送，GitHub 上的 Release 流水线随即构建、自检，
+产物以「预发布、不设为最新」放在 GitHub 作中转；项目所有者电脑上的同步任务再把它发布到公司内源。
+用户只从公司内源更新（AI HUB-H 铁律，2026-11-25）。
 
 谁都可以发版（2026-10-31 起同事也直接维护主干）。本脚本只负责把「发哪一版」钉死：
     ① 主干干净、且与远端完全一致 —— 发出去的就是大家都看得到的那个提交；
@@ -13,7 +15,7 @@
     python scripts/release.py --title "..." --notes "- 修复 xxx" --watch     # 推完等流水线跑完
     python scripts/release.py --check                                          # 只检查能不能发，不打标签
 
-阿里云备用服务器由项目所有者电脑上的同步任务自动转传（tools/mirror_watch.py），发版人不用管。
+转内源由项目所有者电脑上的同步任务自动完成（tools/mirror_watch.py，每 15 分钟；阿里云只放增量块和安装包作中转，不切清单），发版人不用管。
 """
 import argparse
 import json
@@ -104,7 +106,7 @@ def main():
     if r.returncode:
         git("tag", "-d", tag, check=False)
         raise SystemExit(f"✗ 推标签被拒（多半是别人刚发了同一版）：{r.stderr.strip()[:300]}")
-    print(f"✓ 已推送 {tag}。GitHub 正在构建发布（约 30–60 分钟）：")
+    print(f"✓ 已推送 {tag}。GitHub 正在构建（约 10–60 分钟，产物为预发布，仅作中转）；之后同步任务自动发布到公司内源：")
     print(f"  https://github.com/{REPO_SLUG}/actions/workflows/release.yml")
     if a.watch:
         rid = ""
