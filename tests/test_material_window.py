@@ -178,6 +178,7 @@ def test_insert_error_code_shows_inline_fix_and_copy_fallback(qtbot, core, tmp_p
     assert calls == [("team-materials-core.pptx", tab._view[3].item.page)]
     assert tab.warn.isVisibleTo(tab) and "先打开要放素材的 PPT" in tab.warn_text.text()
     assert tab.warn_copy.isVisibleTo(tab) and toasts[-1][1] == "warn"
+    assert tab.warn_open.isVisibleTo(tab) and "改为复制形状" in tab.warn_text.text()
     tab.warn_copy.click()
     _wait_idle(qtbot, tab)
     assert copied == [tab._view[3].item.page] and not tab.warn.isVisibleTo(tab)
@@ -194,6 +195,55 @@ def test_insert_success_toast_names_deck_and_page(qtbot, core, tmp_path, monkeyp
     tab.insert_btn.click()
     _wait_idle(qtbot, tab)
     assert toasts[-1] == ("已插入到「季度汇报.pptx」第 3 页（1 个形状，可编辑，未自动保存）", "ok")
+
+
+def test_copy_failure_falls_back_to_image_and_explains(qtbot, core, tmp_path, monkeypatch):
+    """11-25 田哥反馈「复制失败」：失败要写清原因和下一步，并先退一步复制成图片、给「用 PowerPoint 打开」。"""
+    from PySide6.QtGui import QGuiApplication
+    tab, _ = _tab(qtbot, tmp_path)
+    tab.resize(1200, 820)
+    tab.show()
+    first = tab._view[0]
+    qtbot.waitUntil(lambda: tab.cache.get(first) is not None, timeout=10000)
+    toasts = []
+    tab.toastRequested.connect(lambda m, lv: toasts.append((m, lv)))
+
+    def refuse(path, page):
+        raise ppt_transfer.MaterialTransferError("ppt_unreachable")
+    monkeypatch.setattr(ppt_transfer, "copy_material", refuse)
+    QGuiApplication.clipboard().clear()
+    tab.grid.select(0)
+    tab.copy_btn.click()
+    _wait_idle(qtbot, tab)
+    text = tab.warn_text.text()
+    assert tab.warn.isVisibleTo(tab) and "连不上" in text and "已先改为复制成图片" in text
+    assert not QGuiApplication.clipboard().image().isNull()
+    assert tab.warn_copy.isVisibleTo(tab) and tab.warn_copy.text() == "再试复制形状"
+    assert tab.warn_open.isVisibleTo(tab) and toasts[-1][1] == "warn"
+    opened = []
+    out = tmp_path / "单页.pptx"
+    monkeypatch.setattr(ppt_transfer, "export_material_deck",
+                        lambda path, page, name: (opened.append((Path(path).name, page)), out)[1])
+    import pptx_finder.ui.material_tab as mt
+    monkeypatch.setattr(mt.os, "startfile", lambda p: opened.append(p), raising=False)
+    tab.warn_open.click()
+    _wait_idle(qtbot, tab)
+    assert opened == [("team-materials-core.pptx", first.item.page), str(out)]
+    assert toasts[-1][1] == "ok" and "已打开单页素材" in toasts[-1][0] and not tab.warn.isVisibleTo(tab)
+
+
+def test_unknown_insert_error_is_explained_inline(qtbot, core, tmp_path, monkeypatch):
+    """没有错误码的失败也留在详情栏（原先只闪 1.8 秒 toast，像「没反应」）。"""
+    tab, _ = _tab(qtbot, tmp_path)
+
+    def boom(path, page):
+        raise OSError("磁盘满了")
+    monkeypatch.setattr(ppt_transfer, "insert_material", boom)
+    tab.grid.select(0)
+    tab.insert_btn.click()
+    _wait_idle(qtbot, tab)
+    assert tab.warn.isVisibleTo(tab) and "插入到当前 PPT没完成：磁盘满了" in tab.warn_text.text()
+    assert tab.warn_copy.isVisibleTo(tab) and tab.warn_open.isVisibleTo(tab)
 
 
 def test_busy_error_has_no_copy_offer(qtbot, core, tmp_path, monkeypatch):

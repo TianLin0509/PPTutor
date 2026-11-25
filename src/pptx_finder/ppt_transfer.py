@@ -31,20 +31,46 @@ class PresentationTarget:
     instance_id: int = 0
 
 
+def _stamp(app, pid: int, frame: int):
+    """记下实例所在进程和主窗口。COM 包装对象的属性会转发给 PowerPoint，只能写进实例字典。"""
+    app.__dict__["_pd_pid"] = int(pid)
+    app.__dict__["_pd_frame"] = int(frame)
+    return app
+
+
+def _app_hwnd(app) -> int:
+    """实例主窗口句柄（窗口 Z 序用）。新版 Office 的 Application.HWND 报「找不到成员」，先用发现时记下的。"""
+    frame = getattr(app, "__dict__", {}).get("_pd_frame")
+    return int(frame) if frame else int(app.HWND)
+
+
 def _app_identity(app) -> int:
     """Process identity survives active-window and ROT enumeration changes."""
+    stamped = getattr(app, "__dict__", {})
+    if "_pd_pid" in stamped:          # 0 = 只在 ROT 里见到、进程未知
+        return int(stamped["_pd_pid"])
     import win32process
     return int(win32process.GetWindowThreadProcessId(int(app.HWND))[1])
 
 
 def _find_apps():
-    """WPS also registers PowerPoint's ROT class ID. Inspect all matching entries."""
+    """找出所有可用的 Microsoft PowerPoint 实例，最近在前台的排前面。
+
+    先按窗口找（每个实例都知道进程和主窗口），再看 ROT 补漏（WPS 也登记 PowerPoint 的类 ID，按
+    POWERPNT.EXE 过滤）。2026-11-25 实测（Office 16.0.20625）：Application.HWND 报「找不到成员」，
+    11-22 起按它去重让所有 ROT 条目都被丢掉——PowerPoint 开着也报「请先打开 PowerPoint」，
+    素材复制 / 插入、搜索页复制本页都受影响；且 Office 首次失去焦点前不登记 ROT（KB238610）。
+    """
     import pythoncom
     import win32com.client
-    rot = pythoncom.GetRunningObjectTable()
-    ctx = pythoncom.CreateBindCtx(0)
     apps = []
     seen = set()
+    for pid, frame, app in _window_apps():
+        if pid not in seen:
+            apps.append(_stamp(app, pid, frame))
+            seen.add(pid)
+    rot = pythoncom.GetRunningObjectTable()
+    ctx = pythoncom.CreateBindCtx(0)
     for moniker in rot.EnumRunning():
         try:
             name = moniker.GetDisplayName(ctx, None)
@@ -53,16 +79,105 @@ def _find_apps():
                 continue
             obj = win32com.client.Dispatch(rot.GetObject(moniker).QueryInterface(pythoncom.IID_IDispatch))
             app = obj if is_app else obj.Application
-            if (Path(str(app.Path)) / "POWERPNT.EXE").is_file():
+            if not (Path(str(app.Path)) / "POWERPNT.EXE").is_file():
+                continue
+            if any(_same_object(app, known) for known in apps):
+                continue
+            try:
                 identity = _app_identity(app)
-                if identity not in seen:
-                    apps.append(win32com.client.gencache.EnsureDispatch(app))
-                    seen.add(identity)
+            except Exception:  # noqa: BLE001  新版 Office 拿不到 HWND：进程未知
+                identity = 0
+            if identity and identity in seen:
+                continue
+            apps.append(_stamp(win32com.client.gencache.EnsureDispatch(app), identity, 0))
+            if identity:
+                seen.add(identity)
         except Exception:
             log.debug("unavailable PowerPoint ROT entry", exc_info=True)
     if not apps:
         raise TransferError("请先在 Microsoft PowerPoint 中打开目标 PPT，再重试。")
     return apps
+
+
+def _deck_names(app) -> set[str]:
+    try:
+        return {os.path.normcase(str(app.Presentations.Item(i).FullName))
+                for i in range(1, int(app.Presentations.Count) + 1)}
+    except Exception:  # noqa: BLE001
+        return set()
+
+
+def _same_object(a, b) -> bool:
+    """ROT 里的 Application 和从窗口拿到的可能不是同一个 COM 对象：
+    先比对象身份，再比打开的文稿（同一份文件只会在一个 PowerPoint 进程里打开）。"""
+    try:
+        import pythoncom
+        if a._oleobj_.QueryInterface(pythoncom.IID_IUnknown) == b._oleobj_.QueryInterface(pythoncom.IID_IUnknown):
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    return bool(_deck_names(a) & _deck_names(b))
+
+
+_OBJID_NATIVEOM = 0xFFFFFFF0
+_WM_GETOBJECT = 0x003D
+
+
+def _window_apps() -> list:
+    """不经 ROT：按 Z 序（前台在先）枚举 PowerPoint 主窗口（PPTFrameClass），向文稿区要原生对象模型。
+
+    返回 [(进程号, 主窗口句柄, Application)]。只读取，不激活、不改动窗口；对方挂起时 3 秒超时跳过。
+    启动页还没开文稿的实例没有文稿区，这里拿不到（ROT 可能补上）。WPS 的窗口类不同，不会混进来。
+    """
+    import pythoncom
+    import win32com.client
+    import win32con
+    import win32gui
+    import win32process
+    frames, out = [], []
+
+    def collect(handle, _):
+        try:
+            if win32gui.GetClassName(handle) == "PPTFrameClass":
+                frames.append(handle)
+        except Exception:  # noqa: BLE001  窗口刚关闭
+            pass
+        return True
+    try:
+        win32gui.EnumWindows(collect, None)
+    except Exception:  # noqa: BLE001
+        log.debug("cannot enumerate PowerPoint windows", exc_info=True)
+        return out
+    for frame in frames:
+        panes = []
+
+        def child(handle, _):
+            try:
+                if win32gui.GetClassName(handle) == "mdiClass":
+                    panes.append(handle)
+            except Exception:  # noqa: BLE001
+                pass
+            return True
+        try:
+            win32gui.EnumChildWindows(frame, child, None)
+            pid = int(win32process.GetWindowThreadProcessId(frame)[1])
+        except Exception:  # noqa: BLE001  窗口刚关闭
+            continue
+        for pane in panes:
+            try:
+                _, lresult = win32gui.SendMessageTimeout(
+                    pane, _WM_GETOBJECT, 0, _OBJID_NATIVEOM, win32con.SMTO_ABORTIFHUNG, 3000)
+                if not lresult:
+                    continue
+                window = win32com.client.Dispatch(
+                    pythoncom.ObjectFromLresult(lresult, pythoncom.IID_IDispatch, 0))
+                app = window.Application
+                if (Path(str(app.Path)) / "POWERPNT.EXE").is_file():
+                    out.append((pid, frame, win32com.client.gencache.EnsureDispatch(app)))
+                    break
+            except Exception:  # noqa: BLE001  正忙 / 弹着对话框 / 权限级别更高
+                log.debug("PowerPoint window has no native object model", exc_info=True)
+    return out
 
 
 def _find_app():
@@ -295,6 +410,9 @@ MATERIAL_ERRORS = {
     "busy": "PowerPoint 正忙，或上一个素材还在处理，稍等几秒再试。",
     "pack_missing": "素材包文件不在了：刷新素材库，或重新获取团队素材。",
     "timeout": "PowerPoint 60 秒没有响应：看看它是否弹出了对话框，处理后再试。",
+    "ppt_unreachable": ("PowerPoint 开着，但 PPT Doctor 连不上它（可能还停在启动页没开文稿、正弹着对话框，"
+                        "或以管理员身份运行）：在 PowerPoint 里打开一份文稿、关掉弹窗后再点。"),
+    "clipboard_busy": "剪贴板正被别的程序占用（截图、翻译或剪贴板工具），稍等几秒再点。",
 }
 #: COM 「对方正忙，稍后再试」类错误
 _BUSY_HRESULTS = {-2147418111, -2147417846, -2147417848}
@@ -322,6 +440,13 @@ def _material_errors():
             hresult = exc.args[0] if isinstance(exc.args[0], int) else None
         if hresult in _BUSY_HRESULTS:
             raise MaterialTransferError("busy") from exc
+        from .renderer import PowerPointSessionBusy
+        if isinstance(exc, PowerPointSessionBusy):
+            # 内部英文原因只进日志；界面给中文原因和下一步。
+            log.warning("material transfer cannot reach PowerPoint: %s", exc)
+            raise MaterialTransferError("ppt_unreachable") from exc
+        if "剪贴板正被" in str(exc) or "Clipboard" in str(getattr(exc, "funcname", "") or ""):
+            raise MaterialTransferError("clipboard_busy") from exc
         raise
 
 
@@ -369,7 +494,7 @@ def _pick_instance(apps):
         return visible[0]
     try:
         order = {h: i for i, h in enumerate(_zorder())}
-        ranks = [order[int(app.HWND)] for app in visible]
+        ranks = [order[_app_hwnd(app)] for app in visible]
     except Exception as exc:  # noqa: BLE001  Z 序读不到 / 某实例不在 Z 序里
         raise MaterialTransferError("no_target_slide", AMBIGUOUS_TARGET) from exc
     return visible[ranks.index(min(ranks))]
@@ -471,3 +596,31 @@ def call_with_timeout(fn, timeout: float = 60.0):
     if "error" in box:
         raise box["error"]
     return box.get("value")
+
+
+def export_material_deck(pack_path: str | Path, slide_index: int, name: str = "素材") -> Path:
+    """不经 PowerPoint COM，把素材包第 slide_index 页另存成一份单页 PPT（兜底：复制 / 插入连不上 PowerPoint 时）。
+
+    存到临时目录，文件名带时间戳避免被已打开的旧副本锁住；返回路径由界面交给系统默认程序打开。
+    """
+    import re
+    import time
+    from pptx import Presentation
+    pack_path = Path(pack_path)
+    if not pack_path.is_file():
+        raise MaterialTransferError("pack_missing")
+    prs = Presentation(str(pack_path))
+    ids = list(prs.slides._sldIdLst)
+    if isinstance(slide_index, bool) or not isinstance(slide_index, int) or not 1 <= slide_index <= len(ids):
+        raise MaterialTransferError("pack_missing", "素材包页数已变化：请刷新素材库。")
+    keep = ids[slide_index - 1]
+    for sid in ids:
+        if sid is not keep:
+            prs.part.drop_rel(sid.rId)
+            prs.slides._sldIdLst.remove(sid)
+    folder = Path(tempfile.gettempdir()) / "PPT Doctor 素材"
+    folder.mkdir(parents=True, exist_ok=True)
+    safe = re.sub(r'[\/:*?"<>|\s]+', "_", name).strip("._")[:40] or "素材"
+    target = folder / f"{safe}-{time.strftime('%H%M%S')}.pptx"
+    prs.save(str(target))
+    return target

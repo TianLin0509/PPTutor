@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
+import os
 from pathlib import Path
 import tempfile
 
@@ -59,7 +60,9 @@ SOURCE_LABEL = {"team": "团队素材包", "builtin": "团队素材（内置精�
 KIND_LABEL = {"shape": "原生形状，可改色、可改文字", "picture": "图片", "mixed": "形状 + 图片，可编辑",
               "": "原生形状，可编辑"}
 #: 这几种失败给「改为复制形状」：用户回 PPT 自己 Ctrl+V 就行
-_OFFER_COPY = {"no_powerpoint", "no_presentation", "read_only", "no_target_slide"}
+_OFFER_COPY = {"no_powerpoint", "no_presentation", "read_only", "no_target_slide", "ppt_unreachable", ""}
+#: 插入失败时还可以「用 PowerPoint 打开这个素材」：没开 / 连不上 PowerPoint、原因不明
+_OFFER_OPEN = {"no_powerpoint", "no_presentation", "read_only", "ppt_unreachable", ""}
 
 
 def resolve_tokens(tokens: dict | None) -> dict:
@@ -498,6 +501,7 @@ class MaterialTabWidget(QWidget):
         self._last_menu = None
         self._personal_bytes = 0
         self._last_error_code = ""
+        self._op_entry = None
         self.tok = resolve_tokens(theme_tokens)
         self._build()
         self.apply_theme(theme_tokens or {})
@@ -799,8 +803,16 @@ class MaterialTabWidget(QWidget):
         self.warn_copy = QPushButton("改为复制形状")
         self.warn_copy.setObjectName("mtSecondary")
         self.warn_copy.clicked.connect(self._copy_shape)
+        # 兜底：不经 COM，把这一页另存成单页 PPT 用默认程序打开，在里面复制
+        self.warn_open = QPushButton("用 PowerPoint 打开这个素材")
+        self.warn_open.setObjectName("mtSecondary")
+        self.warn_open.clicked.connect(self._open_in_powerpoint)
+        warn_row = QHBoxLayout()
+        warn_row.setSpacing(8)
+        warn_row.addWidget(self.warn_copy)
+        warn_row.addWidget(self.warn_open)
         wl.addWidget(self.warn_text)
-        wl.addWidget(self.warn_copy)
+        wl.addLayout(warn_row)
         self.warn.hide()
         lay.addWidget(self.warn)
         self.insert_btn = QPushButton("插入到当前 PPT")
@@ -1410,6 +1422,7 @@ QProgressBar#mtBar::chunk {{ background: {t['accent']}; border-radius: 2px; }}
             return
         if op:
             self._busy_op = True
+            self._op_entry = self._current()
             self._sync_detail()
             self.status.setText(f"正在{label}…")
 
@@ -1447,15 +1460,58 @@ QProgressBar#mtBar::chunk {{ background: {t['accent']}; border-radius: 2px; }}
         task.start()
 
     def _failed(self, label: str, error: str, code: str):
+        """失败一律在详情栏就地写清原因和下一步（不只闪一下 toast），并给兜底按钮。"""
         self._last_error_code = code
         if code:
-            self.warn_text.setText(ppt_transfer.MATERIAL_ERRORS[code] if not error else error)
-            self.warn_copy.setVisible(code in _OFFER_COPY and label != "复制形状")
-            self.warn.show()
-            self.status.setText("")
-            self.toastRequested.emit(self.warn_text.text(), "warn")
+            reason = error or ppt_transfer.MATERIAL_ERRORS[code]
         else:
-            self._toast(f"{label}失败：{error}", "err")
+            reason = f"{label}没完成：{error or '原因不明'}。"
+        lines = [reason]
+        is_copy = label == "复制形状"
+        usable = code != "pack_missing"
+        if is_copy and usable:
+            if self._copy_preview_image():
+                lines.append("已先改为复制成图片（不可编辑），回 PPT 按 Ctrl+V 就能用；"
+                             "要可编辑形状，处理好上面的问题后点「再试复制形状」，或点「用 PowerPoint 打开这个素材」在里面复制。")
+            else:
+                lines.append("要可编辑形状：处理好上面的问题后再试，或点「用 PowerPoint 打开这个素材」在里面复制。")
+        elif label == "插入到当前 PPT" and code in _OFFER_OPEN:
+            lines.append("也可以先「改为复制形状」再到 PPT 里 Ctrl+V，或「用 PowerPoint 打开这个素材」。")
+        self.warn_text.setText("\n".join(lines))
+        self.warn_copy.setText("再试复制形状" if is_copy else "改为复制形状")
+        self.warn_copy.setVisible(usable and (is_copy or (label == "插入到当前 PPT" and code in _OFFER_COPY)))
+        self.warn_open.setVisible(usable and (is_copy or (label == "插入到当前 PPT" and code in _OFFER_OPEN)))
+        self.warn.show()
+        self.status.setText("")
+        self.toastRequested.emit(reason if code else f"{label}失败：{error}", "warn" if code else "err")
+
+    def _copy_preview_image(self) -> bool:
+        e = getattr(self, "_op_entry", None) or self._current()
+        image = self.cache.get(e) if e else None
+        if image is None or image.isNull():
+            return False
+        QGuiApplication.clipboard().setImage(image)
+        return True
+
+    def _open_in_powerpoint(self):
+        e = getattr(self, "_op_entry", None) or self._current()
+        if e is None:
+            return
+        path, page = self._target(e)
+        name = e.name
+        self.warn.hide()
+
+        def work():
+            target = ppt_transfer.export_material_deck(path, page, name)
+            try:
+                os.startfile(str(target))  # noqa: S606  用户点的按钮，系统默认程序打开
+            except OSError as exc:
+                raise RuntimeError(f"这台电脑没有能打开 .pptx 的程序（{exc.strerror or exc}）；"
+                                   f"单页文件已存到 {target}") from exc
+            return target
+        self._run(work, lambda target: self._toast(
+            f"已打开单页素材「{name}」：在里面选中形状 Ctrl+C，再回目标 PPT 按 Ctrl+V（可编辑）。", "ok"),
+            "用 PowerPoint 打开这个素材")
 
     def _target(self, e: Entry) -> tuple[Path, int]:
         if e.source == "mine":
