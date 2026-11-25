@@ -647,6 +647,31 @@ def publish(items: list[Item], baseline: Baseline, cache: Path, *,
         client.close()
 
 
+def stage_blocks(items: list[Item]) -> dict:
+    """只把本版发布页上的增量块放到备用服务器 files/（内容寻址），供公司电脑转传内源时就近下载。
+
+    AI HUB-H 铁律（2026-11-25）：只在公司内源对用户发布，阿里云只作中转。所以这里
+    不传、不改三份清单（manifest*.json），也不动基线整包——备用服务器上对用户可见的「最新版」保持原样。
+    """
+    blocks = [i for i in items if i.remote.startswith("files/")]
+    if not blocks:
+        raise SystemExit("[!] 发布页上没有增量块，版本号对吗？")
+    client = _connect()
+    try:
+        inventory = remote_hashes(client, [i.remote for i in blocks])
+        missing = [i for i in blocks if inventory.get(i.remote, {}).get("sha256") != i.sha256
+                   or inventory.get(i.remote, {}).get("size") != i.size]
+        print(f"[blocks] 共 {len(blocks)} 块，服务器已有 {len(blocks) - len(missing)}，待传 {len(missing)}；清单不动")
+        if missing:
+            upload(missing, client)
+        if verify_public(missing):
+            raise SystemExit("[!] 增量块公网核对失败")
+        return {"complete": True, "blocksOnly": True, "requiredBlocks": len(blocks),
+                "uploaded": [i.remote for i in missing]}
+    finally:
+        client.close()
+
+
 def prune_full(paths: list[str], current: dict, *, dry_run: bool = False) -> list[str]:
     """安装/升级验收后单独运行；仅删除命令中逐一列出的旧ZIP，绝不递归清理。"""
     full = validate_full(current.get("full"))
@@ -684,6 +709,8 @@ def main() -> int:
     ap.add_argument("--components", action="store_true", help="顺带同步 OCR / 公式组件 / 团队素材包")
     ap.add_argument("--dry-run", action="store_true", help="只列出将上传的清单，不连服务器")
     ap.add_argument("--verify-only", action="store_true", help="不上传，只核对公网上的文件")
+    ap.add_argument("--blocks-only", action="store_true",
+                    help="只传本版增量块作内源中转，不传不改清单、不动基线（铁律：只在内源对用户发布）")
     policy = ap.add_mutually_exclusive_group()
     policy.add_argument("--refresh-full", choices=("runtime-change", "missing-baseline", "hub-compat"),
                         help="显式批准更换基线的原因；仅上传本版Full ZIP")
@@ -700,6 +727,9 @@ def main() -> int:
         from pptx_finder import __version__
         args.version = __version__
 
+    if args.blocks_only and (args.prune_full or args.refresh_full or args.baseline_zip
+                             or args.verify_only or args.components or args.dry_run):
+        ap.error("--blocks-only 只传增量块，不和清单/基线/组件相关选项同用")
     version_key(args.version)
     cache = args.cache_dir / f"v{args.version}"
     audit = {"version": args.version, "complete": False, "refreshReason": args.refresh_full}
@@ -711,6 +741,14 @@ def main() -> int:
                 raise SystemExit("[!] 清理预览需--current-manifest指定离线镜像快照")
             audit["deleted"] = prune_full(args.prune_full, previous, dry_run=args.dry_run)
             audit["complete"] = True
+            return 0
+        if args.blocks_only:
+            items = (collect_from_dir(args.version, args.from_dir, False) if args.from_dir
+                     else collect_from_github(args.version, cache, False))
+            if all(i.sha256 for i in items):
+                check_consistency(items, args.version)
+            audit.update(stage_blocks(items))
+            print("[done] 增量块已就位（清单未改）")
             return 0
         if not args.dry_run:
             for name in MANIFESTS:

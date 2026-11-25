@@ -1,14 +1,16 @@
 # -*- coding: utf-8 -*-
-r"""定时任务：发现 GitHub 上有新版本，就自动转传到阿里云备用服务器。
+r"""定时任务：GitHub 上构建出新版本后，自动转到公司内源（PPT Doctor 项目 8214）。
 
-为什么由一台家里电脑来转，而不是服务器自己去 GitHub 拉：2026-10-31 实测服务器从 GitHub
-下载只有约 13 KB/s（6.6 MB 用了 508 秒），一个版本要好几个小时；家里电脑下 GitHub 快、
-传阿里云也走过多次（tools/mirror_release.py）。这样谁发版都不需要服务器密码。
+AI HUB-H 铁律（2026-11-25 田哥定）：只在公司内源对用户发布。GitHub 只负责构建（发成「预发布、
+不设为最新」），阿里云备用服务器只作中转（放增量块和安装包，不再切换三份清单）。
+
+为什么由家里电脑转：服务器和公司电脑直连 GitHub 都很慢（实测十几到几十 KB/s），家里电脑下 GitHub 快、
+传阿里云也稳；公司电脑再从阿里云就近取文件上传内源。
 
 每次运行：
-    ① 查 GitHub 最新正式版（不含草稿 / 预发布）；
-    ② 读备用服务器上的 manifest-Base.json 版本；
-    ③ GitHub 更新 → 调 mirror_release.py <版本> 转传并公网核对；同版本 → 什么都不做。
+    ① 按版本号找 GitHub 上最新的非草稿发布（含预发布）；
+    ② 本版增量块还没放到备用服务器 → 调 mirror_release.py <版本> --blocks-only（清单不动）；
+    ③ 块已就位、内源还没这一版 → openx_stage.py 放安装包，再调 openx_sync.py 上传内源。
 失败不重试轰炸：同一版本连续失败 3 次后停手，等人看日志（状态文件里写着原因）。
 
     uv run --frozen --with paramiko python tools/mirror_watch.py   # 计划任务每 15 分钟跑一次（--frozen：别让本机镜像源配置改写 uv.lock）
@@ -22,14 +24,12 @@ import os
 import subprocess
 import sys
 import time
+import re
 import urllib.request
 from pathlib import Path
 
-from mirror_release import MANIFESTS, validate_full
-
 ROOT = Path(__file__).resolve().parents[1]
 REPO = "TianLin0509/PPTutor"
-MIRROR_MANIFEST = "https://me.lt-stockpartner.tech/pptutor/manifest-Base.json"
 STATE_DIR = Path(os.environ.get("PPTD_MIRROR_STATE", r"D:\VibeData\pptdoctor-mirror-watch"))
 STATE = STATE_DIR / "state.json"
 LOG = STATE_DIR / "mirror-watch.log"
@@ -59,15 +59,16 @@ def vkey(v):
     return tuple(int(x) for x in v.split("."))
 
 
-def mirror_is_current(manifests: dict, latest: str) -> bool:
-    """三渠道都切换成功才算同步；上轮中断需继续，不能只看Base清单。"""
-    try:
-        versions = {manifests[name]["version"] for name in MANIFESTS}
-        full = validate_full(manifests["manifest.json"]["full"])
-        return (len(versions) == 1 and vkey(next(iter(versions))) >= vkey(latest)
-                and vkey(full["version"]) <= vkey(next(iter(versions))))
-    except (KeyError, TypeError, ValueError, SystemExit):
-        return False
+_TAG = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
+
+
+def newest_release(releases) -> str:
+    """按版本号取最新的非草稿发布（含预发布）。GitHub 的「最新」标记不再使用（铁律：不设为最新）。"""
+    versions = [r["tag_name"][1:] for r in releases
+                if not r.get("draft") and _TAG.match(str(r.get("tag_name") or ""))]
+    if not versions:
+        raise RuntimeError("GitHub 上没有可用的版本发布")
+    return max(versions, key=vkey)
 
 
 def load_state():
@@ -118,7 +119,7 @@ def sync_own_openx(st, latest):
                        cwd=ROOT, stdout=f, stderr=subprocess.STDOUT, creationflags=FLAGS,
                        env=dict(os.environ, PYTHONIOENCODING="utf-8"), timeout=1800)
     r = subprocess.run([sys.executable, "-X", "utf8", str(OPENX_SYNC), "--components", "--only", "ppt-doctor-update",
-                        "--project-id", str(OPENX_PROJECT), "--timeout", "3000"],
+                        "--project-id", str(OPENX_PROJECT), "--doctor-version", latest, "--timeout", "3000"],
                        cwd=OPENX_SYNC.parent, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, creationflags=FLAGS,
                        env=env, timeout=3600, text=True, encoding="utf-8", errors="replace")
     with LOG.open("a", encoding="utf-8") as f:
@@ -143,48 +144,46 @@ def main():
         return 0
     st = load_state()
     try:
-        latest = get_json(f"https://api.github.com/repos/{REPO}/releases/latest")["tag_name"].lstrip("v")
-        manifests = {name: get_json(MIRROR_MANIFEST.rsplit("/", 1)[0] + "/" + name)
-                     for name in MANIFESTS}
-        mirror = min((d["version"] for d in manifests.values()), key=vkey)
+        latest = newest_release(get_json(f"https://api.github.com/repos/{REPO}/releases?per_page=30"))
     except Exception as e:  # noqa: BLE001
         st.update(last_result=f"查询失败：{e}")
         save_state(st)
         log(f"查询失败：{e}")
         return 1
-    st.update(github=latest, mirror=mirror)
-    if mirror_is_current(manifests, latest):
-        st.update(last_result="已同步", fails={})
-        try:
-            sync_own_openx(st, latest)
-        except Exception as e:  # noqa: BLE001 内源同步出错不影响备用服务器这条线
-            log(f"内源同步出错：{e}")
+    st["github"] = latest
+    if st.get("staged") != latest:
+        fails = st.get("fails") or {}
+        if fails.get(latest, 0) >= MAX_FAILS:
+            st.update(last_result=f"v{latest} 已连续失败 {MAX_FAILS} 次，停手等人看日志：{LOG}")
+            save_state(st)
+            return 1
+        log(f"发现新版 v{latest}，先把增量块放到备用服务器作中转（清单不动）")
+        st.update(last_result=f"正在中转 v{latest}", started_at=time.strftime("%Y-%m-%d %H:%M:%S"))
         save_state(st)
-        return 0
-    fails = st.get("fails") or {}
-    if fails.get(latest, 0) >= MAX_FAILS:
-        st.update(last_result=f"v{latest} 已连续失败 {MAX_FAILS} 次，停手等人看日志：{LOG}")
-        save_state(st)
-        return 1
-    log(f"发现新版 v{latest}（备用服务器还是 v{mirror}），开始转传")
-    st.update(last_result=f"正在转传 v{latest}", started_at=time.strftime("%Y-%m-%d %H:%M:%S"))
+        start = time.monotonic()
+        with LOG.open("a", encoding="utf-8") as f:
+            r = subprocess.run(["uv", "run", "--frozen", "--with", "paramiko", "python", "tools/mirror_release.py",
+                                latest, "--blocks-only"],
+                               cwd=ROOT, stdout=f, stderr=subprocess.STDOUT, creationflags=FLAGS,
+                               env=dict(os.environ, PYTHONIOENCODING="utf-8"))
+        minutes = (time.monotonic() - start) / 60
+        if r.returncode:
+            fails[latest] = fails.get(latest, 0) + 1
+            log(f"v{latest} 增量块中转失败（第 {fails[latest]} 次），退出码 {r.returncode}")
+            st.update(last_result=f"v{latest} 中转失败（第 {fails[latest]} 次）", fails=fails)
+            save_state(st)
+            return r.returncode
+        log(f"v{latest} 增量块已就位并通过公网核对，用时 {minutes:.1f} 分钟")
+        st.update(staged=latest, fails={})
+    st["last_result"] = f"v{latest} 增量块已就位"
+    try:
+        sync_own_openx(st, latest)
+    except Exception as e:  # noqa: BLE001
+        log(f"内源同步出错：{e}")
+    if st.get("openx_own") == latest:
+        st["last_result"] = "已同步内源"
     save_state(st)
-    start = time.monotonic()
-    with LOG.open("a", encoding="utf-8") as f:
-        r = subprocess.run(["uv", "run", "--frozen", "--with", "paramiko", "python", "tools/mirror_release.py", latest],
-                           cwd=ROOT, stdout=f, stderr=subprocess.STDOUT, creationflags=FLAGS,
-                           env=dict(os.environ, PYTHONIOENCODING="utf-8"))
-    minutes = (time.monotonic() - start) / 60
-    if r.returncode == 0:
-        log(f"v{latest} 转传完成并通过公网核对，用时 {minutes:.1f} 分钟")
-        st.update(mirror=latest, last_result=f"v{latest} 已转传（{minutes:.1f} 分钟）", fails={})
-    else:
-        fails[latest] = fails.get(latest, 0) + 1
-        log(f"v{latest} 转传失败（第 {fails[latest]} 次），退出码 {r.returncode}")
-        st.update(last_result=f"v{latest} 转传失败（第 {fails[latest]} 次）", fails=fails)
-    save_state(st)
-    return r.returncode
-
+    return 0
 
 if __name__ == "__main__":
     sys.exit(main())

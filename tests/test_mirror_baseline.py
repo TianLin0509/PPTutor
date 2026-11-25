@@ -427,16 +427,81 @@ def test_cleanup_only_removes_explicit_old_zip_after_active_baseline_verificatio
     assert {p: b for p, b in server.files.items() if p.startswith("files/")} == blocks
 
 
-def test_watch_does_not_mistake_partial_publish_for_synced(tmp_path):
+def load_watch():
     spec = importlib.util.spec_from_file_location("mirror_watch_test", mirror.ROOT / "tools/mirror_watch.py")
     watch = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(watch)
-    docs = {n: {"version": "2.1.0"} for n in mirror.MANIFESTS}
-    assert not watch.mirror_is_current(docs, "2.1.0")
-    docs["manifest.json"]["full"] = full()
-    assert watch.mirror_is_current(docs, "2.1.0")
-    docs["manifest-Ocr.json"]["version"] = "2.0.4"
-    assert not watch.mirror_is_current(docs, "2.1.0")
+    return watch
+
+
+def test_watch_finds_newest_prerelease_by_version_not_latest_flag():
+    watch = load_watch()
+    releases = [{"tag_name": "v2.1.9", "draft": False}, {"tag_name": "v2.1.21", "draft": True},
+                {"tag_name": "v2.1.20", "draft": False, "prerelease": True},
+                {"tag_name": "ocr-v1.2.0", "draft": False}, {"tag_name": "v2.1.16", "draft": False}]
+    assert watch.newest_release(releases) == "2.1.20"
+    with pytest.raises(RuntimeError):
+        watch.newest_release([{"tag_name": "v2.1.30", "draft": True}])
+
+
+@pytest.mark.parametrize("state,stage_code,expect_stage,expect_openx", [
+    ({}, 0, True, True),                                             # 新版：先中转块，再传内源
+    ({"staged": "2.1.20"}, 0, False, True),                          # 块已就位：只补内源
+    ({"staged": "2.1.20", "openx_own": "2.1.20"}, 0, False, False),  # 都做过：什么也不做
+    ({}, 1, True, False),                                            # 中转失败：不碰内源，记失败
+])
+def test_watch_never_switches_mirror_manifests(tmp_path, monkeypatch, state, stage_code, expect_stage,
+                                               expect_openx):
+    watch = load_watch()
+    monkeypatch.setattr(watch, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(watch, "STATE", tmp_path / "state.json")
+    monkeypatch.setattr(watch, "LOG", tmp_path / "log.txt")
+    (tmp_path / "state.json").write_text(json.dumps(state), "utf-8")
+    urls, runs, openx = [], [], []
+    monkeypatch.setattr(watch, "get_json", lambda url, timeout=60: urls.append(url) or
+                        [{"tag_name": "v2.1.20", "draft": False, "prerelease": True}])
+    monkeypatch.setattr(watch.subprocess, "run",
+                        lambda cmd, **kw: runs.append(cmd) or SimpleNamespace(returncode=stage_code))
+    real_sync = watch.sync_own_openx
+    monkeypatch.setattr(watch, "OPENX_SYNC", tmp_path / "openx_sync.py")   # 不存在 → 真函数直接返回
+    def fake_sync(st, v):
+        if st.get("openx_own") == v:   # 与真函数同一判据：同一版成功过就不再传
+            return real_sync(st, v)
+        openx.append(v)
+        st.update(openx_own=v)
+    monkeypatch.setattr(watch, "sync_own_openx", fake_sync)
+    monkeypatch.setattr(sys, "argv", ["mirror_watch.py"])
+    assert watch.main() == stage_code
+    assert all("latest" not in u for u in urls)
+    assert bool(runs) == expect_stage
+    for cmd in runs:
+        assert cmd[-2:] == ["2.1.20", "--blocks-only"]
+    assert openx == (["2.1.20"] if expect_openx else [])
+    saved = json.loads((tmp_path / "state.json").read_text("utf-8"))
+    assert saved["github"] == "2.1.20"
+    if stage_code:
+        assert saved["fails"] == {"2.1.20": 1} and "staged" not in saved
+
+
+def test_blocks_only_uploads_release_blocks_and_never_touches_manifests(tmp_path, monkeypatch):
+    old = assets(tmp_path, "2.0.4")
+    src = assets(tmp_path)
+    server = MemoryMirror(monkeypatch, old)
+    before = {n: server.files[n] for n in mirror.MANIFESTS}
+    assert run_main(monkeypatch, tmp_path, src, "--blocks-only") == 0
+    assert {n: server.files[n] for n in mirror.MANIFESTS} == before
+    blocks = [p for p in src.iterdir() if mirror._HEX64.fullmatch(p.name)]
+    assert blocks and all(server.files["files/" + p.name] == p.read_bytes() for p in blocks)
+    assert not any(e[0] == "replace" and e[1] in mirror.MANIFESTS for e in server.events)
+    events = len(server.events)   # 再跑一次：块都在，不重复上传
+    assert run_main(monkeypatch, tmp_path, src, "--blocks-only") == 0
+    assert not any(e[0] == "replace" for e in server.events[events:])
+
+
+@pytest.mark.parametrize("extra", [["--components"], ["--refresh-full", "runtime-change"], ["--dry-run"]])
+def test_blocks_only_refuses_manifest_or_baseline_options(tmp_path, monkeypatch, extra):
+    with pytest.raises(SystemExit):
+        run_main(monkeypatch, tmp_path, assets(tmp_path), "--blocks-only", *extra)
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows镜像原子替换命令")

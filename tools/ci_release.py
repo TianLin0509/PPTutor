@@ -7,7 +7,7 @@ r"""发版流水线：构建 → 自检 → 发到 GitHub Release。GitHub Actio
 
     uv run python tools/ci_release.py fetch   --work <目录>      下载组件与上几版清单
     uv run python tools/ci_release.py build   --work <目录>      构建三个更新渠道 + 两个安装包 + 冻结自检
-    uv run python tools/ci_release.py publish --work <目录>      草稿 → 逐个上传核对 → 公开并设为最新
+    uv run python tools/ci_release.py publish --work <目录>      草稿 → 逐个上传核对 → 转为预发布（不设为最新；用户只从内源更新）
 
 一次 PyInstaller 构建 → 三个更新渠道（基础 / 文字识别 / 完整）→ 整包 zip、各渠道清单、
 相对上几版（PREV_COUNT）的增量块；安装包只出基础版与完整版。
@@ -283,7 +283,7 @@ def tag_notes(tag):
 
 def cmd_publish(work: Path, rehearsal=False):
     """rehearsal=True：演练——建一个不公开的草稿 Release、传完全部文件逐个核对，然后删掉草稿。
-    除了「公开并设为最新」这最后一下，和真发布走的是同一段代码（验证流水线本身用）。"""
+    除了最后「转为预发布（不设为最新）」这一下，和真发布走的是同一段代码（验证流水线本身用）。"""
     out = work / "build-out"
     state = json.loads((out / "release-validation.json").read_text("utf-8"))
     assert state["passed"]
@@ -304,7 +304,7 @@ def cmd_publish(work: Path, rehearsal=False):
     files = sorted(p for p in Path(state["release_directory"]).iterdir() if p.is_file() and p.stat().st_size)
     if gh("release", "view", tag, "--repo", REPO, "--json", "isDraft", check=False).returncode:
         pin = ["--target", head] if rehearsal else ["--verify-tag"]
-        gh("release", "create", tag, "--repo", REPO, "--draft", *pin, "--title", title,
+        gh("release", "create", tag, "--repo", REPO, "--draft", "--prerelease", *pin, "--title", title,
            "--notes-file", str(notes_file), "--latest=false")
     url = json.loads(gh("release", "view", tag, "--repo", REPO, "--json", "apiUrl").stdout)["apiUrl"]
     present = {a["name"]: a for a in api(url)["assets"]}
@@ -329,10 +329,13 @@ def cmd_publish(work: Path, rehearsal=False):
         gh("release", "delete", tag, "--repo", REPO, "--yes")   # 草稿没有真标签，不用清
         say(f"演练通过：{len(files)} 个文件上传并逐个核对，草稿已删除")
         return
+    # AI HUB-H 铁律（2026-11-25）：只在公司内源对用户发布。GitHub 只是构建与中转：
+    # 这里发成「预发布、不设为最新」，家里的同步任务按版本号找到它，转到内源。
     gh("release", "edit", tag, "--repo", REPO, "--title", title, "--notes-file", str(notes_file),
-       "--draft=false", "--latest")
-    assert api(f"repos/{REPO}/releases/latest")["tag_name"] == tag
-    say(f"已发布 {tag}：{len(files)} 个文件逐个核对通过")
+       "--draft=false", "--prerelease", "--latest=false")
+    published = api(url)
+    assert published["prerelease"] and not published["draft"], (published["prerelease"], published["draft"])
+    say(f"已上传 {tag}（GitHub 预发布，仅供转内源）：{len(files)} 个文件逐个核对通过")
 
 
 def main(argv=None):
