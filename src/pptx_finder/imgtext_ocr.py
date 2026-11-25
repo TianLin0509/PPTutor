@@ -469,9 +469,16 @@ def install(manifest: dict | None = None, *, progress=None, cancel=None,
                 if first_openx and (used_label == "openx" or (not used_label and candidates and candidates[0][0] == "openx")):
                     from . import openx_recorder, openx_source as _ox
                     comp_kind = first_openx[len(OPENX_BASE):]
+                    rel_ver = f"{_ox.component_prefix(comp_kind)}{version}"
+                    meta = _ox.INDEX.find_meta(rel_ver, archive_name) or {}
                     openx_recorder.record_download_async(
-                        release_version=f"{_ox.component_prefix(comp_kind)}{version}",
-                        file_name=archive_name,
+                        release_version=rel_ver,
+                        file_name=meta.get("file_name") or archive_name,
+                        package_tag=meta.get("package_tag") or "",
+                        project_id=meta.get("project_id"),
+                        release_id=meta.get("release_id"),
+                        package_id=meta.get("package_id"),
+                        url_source=meta.get("url_source"),
                         page_url=_ox.PAGE_URL,
                         kind=f"component:{comp_kind}",
                     )

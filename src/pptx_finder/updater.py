@@ -696,9 +696,16 @@ def download_update(base_url: str, info: UpdateInfo, staging: Path,
                     sample_file = source.package_file.format(version=info.version)
                 elif info.changed:
                     sample_file = str(info.changed[0][1] or "")
+                rel_ver = f"{_ox.RELEASE_PREFIX}{info.version}"
+                meta = _ox.INDEX.find_meta(rel_ver, sample_file) or {}
                 openx_recorder.record_download_async(
-                    release_version=f"{_ox.RELEASE_PREFIX}{info.version}",
-                    file_name=sample_file,
+                    release_version=rel_ver,
+                    file_name=meta.get("file_name") or sample_file,
+                    package_tag=meta.get("package_tag") or "",
+                    project_id=meta.get("project_id"),
+                    release_id=meta.get("release_id"),
+                    package_id=meta.get("package_id"),
+                    url_source=meta.get("url_source"),
                     page_url=_ox.PAGE_URL,
                     kind=f"update-{info.kind}",
                 )

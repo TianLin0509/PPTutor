@@ -121,6 +121,7 @@ class OpenxIndex:
         self._down_until = 0.0
         self.down_reason = ""
         self._details: dict = {}
+        self._pkg_meta: dict = {}
 
     # ---- 网络 ----
     def _get_json(self, url: str, timeout: float) -> dict:
@@ -170,6 +171,8 @@ class OpenxIndex:
         data = self._get_json(f"{self.api}by_id?id={quote(str(rid))}", timeout)
         pkgs = data.get("binaryPackages") if isinstance(data, dict) else None
         files = {}
+        meta = {}
+        rel_ver = str(rec.get("version") or "")
         for p in pkgs if isinstance(pkgs, list) else []:
             if not isinstance(p, dict):
                 continue
@@ -177,9 +180,44 @@ class OpenxIndex:
             name = str(p.get("originalFileName") or "").lower()
             if url and name:
                 files[name] = url
+                meta[name] = {
+                    "project_id": self.project_id,
+                    "release_id": rid,
+                    "release_version": rel_ver,
+                    "package_id": p.get("id"),
+                    "package_tag": str(p.get("tag") or ""),
+                    "url_source": p.get("urlSource"),
+                    "file_name": str(p.get("originalFileName") or ""),
+                }
         with self._lock:
             self._details[rid] = files
+            self._pkg_meta[rid] = meta
         return files
+
+    def find_meta(self, release_version: str = "", file_name: str = "") -> dict | None:
+        """只读查已缓存的附件元数据（project_id / release_id / package_id），不发起额外网络请求。"""
+        rv = str(release_version or "").strip().lower()
+        fk = str(file_name or "").strip().lower()
+        with self._lock:
+            recs = list(self._list or [])
+            pkg_meta = dict(self._pkg_meta)
+        if rv:
+            for rec in recs:
+                if str(rec.get("version") or "").strip().lower() == rv:
+                    m = pkg_meta.get(rec.get("id")) or {}
+                    if fk and fk in m:
+                        return dict(m[fk])
+                    if fk and f"{fk}.000" in m:
+                        return dict(m[f"{fk}.000"])
+                    if m:
+                        return dict(next(iter(m.values())))
+        if fk:
+            for m in pkg_meta.values():
+                if fk in m:
+                    return dict(m[fk])
+                if f"{fk}.000" in m:
+                    return dict(m[f"{fk}.000"])
+        return None
 
     # ---- 查找 ----
     def latest_file(self, name: str, timeout: float = LIST_TIMEOUT,
@@ -258,6 +296,13 @@ class MultiIndex:
             except OpenxUnavailable as e:
                 errors.append(str(e))
         raise OpenxUnavailable(errors[0] if errors else f"内源上没有 {name}")
+
+    def find_meta(self, release_version: str = "", file_name: str = "") -> dict | None:
+        for idx in self.indexes:
+            hit = idx.find_meta(release_version, file_name)
+            if hit:
+                return hit
+        return None
 
 
 def component_prefix(kind: str) -> str:

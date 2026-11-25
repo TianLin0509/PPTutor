@@ -375,6 +375,10 @@ _AUTH_PAGE_STATE_JS = r"""(async () => {
   try { hasToken = !!(localStorage.getItem('token') || sessionStorage.getItem('token')); } catch (_) {}
   const hasLogout = /(?:^|\s|，|,)退出(?:\s|$)/.test(head.slice(0, 500));
   const hasReleases = t.includes('二进制下载') || t.includes('发布时间');
+  const maskVisible = Array.from(document.querySelectorAll('.el-loading-mask')).some(el => {
+    const st = getComputedStyle(el);
+    return st.display !== 'none' && st.visibility !== 'hidden' && Number(st.opacity) > 0.05;
+  });
   let authOk = false;
   if (!errorPage && document.readyState === 'complete') {
     if (hasToken || hasLogout) {
@@ -387,13 +391,103 @@ _AUTH_PAGE_STATE_JS = r"""(async () => {
           if (body && (String(body.code) === '0' || body.code === 200) && body.data) authOk = true;
         }
       } catch (_) {}
+      if (!authOk) {
+        try {
+          const res = await fetch('/openxApi/common/is_login_w3', { credentials: 'include', cache: 'no-store' });
+          if (res && res.ok) {
+            const body = await res.json().catch(() => null);
+            if (body && (String(body.code) === '0' || body.code === 200) && body.data !== false) authOk = true;
+          }
+        } catch (_) {}
+      }
     }
   }
   return {
     host: location.host, pathname: location.pathname, ready: document.readyState,
-    errorPage, netError, hasPassword, hasQr, hasToken, hasLogout, authOk, hasReleases,
+    errorPage, netError, hasPassword, hasQr, hasToken, hasLogout, authOk, hasReleases, maskVisible,
   };
 })()"""
+
+
+def build_api_record_js(target: dict) -> str:
+    """同源轻量接口记录脚本：标准包走 download1（redirect:manual 零流量），外链包走 log1。"""
+    cfg = json.dumps({
+        "projectId": int(target["project_id"]) if target.get("project_id") is not None else None,
+        "releaseId": str(target["release_id"]) if target.get("release_id") is not None else "",
+        "releaseVersion": str(target.get("release_version") or "").strip(),
+        "packageId": str(target["package_id"]) if target.get("package_id") is not None else "",
+        "urlSource": int(target["url_source"]) if target.get("url_source") is not None else None,
+    }, ensure_ascii=False)
+    return f"""(async () => {{
+  const cfg = {cfg};
+  if (!cfg.releaseId || !cfg.packageId) return {{ ok: false, reason: 'missing-ids' }};
+  try {{
+    const authRes = await fetch('/openxApi/common/is_login_w3', {{ credentials: 'include', cache: 'no-store' }});
+    if (authRes && (authRes.status === 401 || authRes.status === 403)) {{
+      return {{ ok: false, needsLogin: true, reason: 'is_login_w3-http-' + authRes.status }};
+    }}
+    if (authRes && authRes.ok) {{
+      const ab = await authRes.json().catch(() => null);
+      if (ab && (String(ab.code) === '401' || ab.data === false)) {{
+        return {{ ok: false, needsLogin: true, reason: 'is_login_w3-unauth' }};
+      }}
+    }}
+  }} catch (_) {{}}
+  if (cfg.urlSource === 0 && cfg.projectId) {{
+    try {{
+      const r = await fetch('/openxApi/report/project_version_download/log1', {{
+        method: 'POST', credentials: 'include', cache: 'no-store',
+        headers: {{ 'content-type': 'application/json' }},
+        body: JSON.stringify({{
+          version: cfg.releaseVersion,
+          releaseId: Number(cfg.releaseId),
+          packageId: Number(cfg.packageId),
+          projectId: Number(cfg.projectId),
+        }}),
+      }});
+      const j = await r.json().catch(() => null);
+      if (r.ok && j && (String(j.code) === '0' || j.code === 200)) {{
+        return {{ ok: true, method: 'api-log1', apiPath: '/openxApi/report/project_version_download/log1', apiReq: 'POST /openxApi/report/project_version_download/log1' }};
+      }}
+      return {{ ok: false, reason: 'api-log1-failed-' + (r ? r.status : 0) }};
+    }} catch (_) {{
+      return {{ ok: false, reason: 'api-log1-err' }};
+    }}
+  }}
+  const ac = new AbortController();
+  const url = '/openxApi/project/release_id/download1?releaseId='
+    + encodeURIComponent(cfg.releaseId)
+    + '&packageId='
+    + encodeURIComponent(cfg.packageId);
+  try {{
+    const r = await fetch(url, {{ credentials: 'include', redirect: 'manual', cache: 'no-store', signal: ac.signal }});
+    const info = {{ status: r.status, type: r.type, apiPath: '/openxApi/project/release_id/download1', apiReq: 'GET /openxApi/project/release_id/download1' }};
+    if (r.type === 'opaqueredirect') {{
+      ac.abort();
+      return {{ ok: true, method: 'api-download1', ...info }};
+    }}
+    if (r.ok) {{
+      const ct = String(r.headers.get('content-type') || '').toLowerCase();
+      const disp = String(r.headers.get('content-disposition') || '').toLowerCase();
+      if (disp.includes('attachment') || (!ct.includes('json') && !ct.includes('text/html'))) {{
+        ac.abort();
+        return {{ ok: true, method: 'api-download1', ...info }};
+      }}
+      if (ct.includes('json')) {{
+        const body = await r.json().catch(() => null);
+        if (body && (String(body.code) === '0' || body.code === 200)) return {{ ok: true, method: 'api-download1', ...info }};
+        return {{ ok: false, reason: 'api-download1-code-' + (body ? body.code : 'invalid') }};
+      }}
+      ac.abort();
+      return {{ ok: false, reason: 'api-download1-html' }};
+    }}
+    ac.abort();
+    if (r.status === 401 || r.status === 403) return {{ ok: false, needsLogin: true, reason: 'api-download1-http-' + r.status }};
+    return {{ ok: false, reason: 'api-download1-http-' + r.status }};
+  }} catch (_) {{
+    return {{ ok: false, reason: 'api-download1-err' }};
+  }}
+}})()"""
 
 _CLICK_LOGIN_JS = r"""(() => {
   for (const el of document.querySelectorAll('a, button, span, div')) {
@@ -422,15 +516,22 @@ _CLICK_NEXT_JS = r"""(() => {
 })()"""
 
 
-def build_locate_js(release_version: str, file_name: str = "", package_tag: str = "") -> str:
+def build_locate_js(release_version: str, file_name: str = "", package_tag: str = "", *, click_direct: bool = False) -> str:
     cfg = json.dumps({
         "releaseVersion": str(release_version or "").strip(),
         "file": str(file_name or "").strip(),
         "packageTag": str(package_tag or "").strip(),
+        "clickDirect": bool(click_direct),
     }, ensure_ascii=False)
     return f"""(() => {{
   const cfg = {cfg};
   const norm = s => String(s || '').replace(/\\s+/g, ' ').trim();
+  const isCopyControl = el => {{
+    if (!el || el.nodeType !== 1) return false;
+    if (el.closest && el.closest('.copy-link, [class*="copy-link"]')) return true;
+    const t = norm(el.innerText || el.textContent);
+    return t === '复制链接' || t === '复制';
+  }};
   const visible = el => {{
     if (!el || el.nodeType !== 1) return false;
     const st = getComputedStyle(el);
@@ -442,6 +543,14 @@ def build_locate_js(release_version: str, file_name: str = "", package_tag: str 
     el.scrollIntoView({{ block: 'center', inline: 'nearest' }});
     const r = el.getBoundingClientRect();
     return {{ x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) }};
+  }};
+  const safeClickPointOf = el => {{
+    el.scrollIntoView({{ block: 'center', inline: 'nearest' }});
+    const r = el.getBoundingClientRect();
+    const maxX = Math.max(8, (window.innerWidth || 800) - 8);
+    const x = Math.min(maxX, Math.round(r.left + Math.min(28, Math.max(4, r.width / 2))));
+    const y = Math.round(r.top + r.height / 2);
+    return {{ x, y }};
   }};
   const findNextBtn = () => {{
     for (const s of ['.btn-next', '[aria-label*="next" i]', '[title*="下一页"]', '.el-pagination .btn-next', '.ant-pagination-next']) {{
@@ -497,8 +606,9 @@ def build_locate_js(release_version: str, file_name: str = "", package_tag: str 
     .find(el => visible(el) && norm(el.innerText || el.textContent) === '二进制下载');
 
   const scoreItem = el => {{
+    if (isCopyControl(el)) return 0;
     const t = norm(el.innerText || el.textContent);
-    if (!t || t.length > 260 || t === '二进制下载' || t === '修改' || t === '删除') return 0;
+    if (!t || t.length > 260 || t === '二进制下载' || t === '修改' || t === '删除' || t === '复制链接') return 0;
     const tl = t.toLowerCase();
     const href = String(el.getAttribute('href') || '').toLowerCase();
     const title = norm(el.getAttribute('title') || '').toLowerCase();
@@ -511,11 +621,12 @@ def build_locate_js(release_version: str, file_name: str = "", package_tag: str 
   }};
   const items = [];
   for (const el of card.querySelectorAll('a, button, span, div, li, p')) {{
-    if (!visible(el) || el === binHeader) continue;
+    if (!visible(el) || el === binHeader || isCopyControl(el)) continue;
     const sc = scoreItem(el);
     if (!sc) continue;
     if (Array.from(el.children || []).some(ch => visible(ch) && scoreItem(ch) >= sc)) continue;
-    items.push({{ el, score: sc, interactive: el.matches('a, button, [role="button"]') ? 1 : 0, len: norm(el.innerText || el.textContent).length }});
+    const dlLink = el.closest && el.closest('li.download-file a.el-link--info');
+    items.push({{ el, score: sc, interactive: dlLink ? 2 : (el.matches('a, button, [role="button"]') ? 1 : 0), len: norm(el.innerText || el.textContent).length }});
   }}
   if (!items.length && binHeader) {{
     return {{ found: false, needsExpand: true, expandPoint: centerOf(binHeader) }};
@@ -524,15 +635,19 @@ def build_locate_js(release_version: str, file_name: str = "", package_tag: str 
 
   items.sort((a, b) => b.score - a.score || b.interactive - a.interactive || a.len - b.len);
   const chosen = items[0];
-  const primaryEl = chosen.el.closest('a, button, [role="button"]') || chosen.el;
-  const primaryPoint = centerOf(primaryEl);
+  const primaryEl = chosen.el.closest('li.download-file a.el-link--info') || chosen.el.closest('a, button, [role="button"]') || chosen.el;
+  const primaryPoint = safeClickPointOf(primaryEl);
+  let domClicked = false;
+  if (cfg.clickDirect && primaryEl && typeof primaryEl.click === 'function') {{
+    try {{ primaryEl.click(); domClicked = true; }} catch (_) {{}}
+  }}
   const altPoints = [];
   const seen = new Set([primaryPoint.x + ',' + primaryPoint.y]);
   const collect = box => {{
     if (!box || box === card) return;
     for (const c of box.querySelectorAll('a, button, [role="button"], svg, i, [class*="download"], [class*="icon"]')) {{
-      if (!visible(c) || c === primaryEl) continue;
-      const pt = centerOf(c);
+      if (!visible(c) || c === primaryEl || isCopyControl(c)) continue;
+      const pt = safeClickPointOf(c);
       const k = pt.x + ',' + pt.y;
       if (seen.has(k) || Math.hypot(pt.x - primaryPoint.x, pt.y - primaryPoint.y) < 8) continue;
       seen.add(k); altPoints.push(pt);
@@ -542,7 +657,7 @@ def build_locate_js(release_version: str, file_name: str = "", package_tag: str 
   const row = chosen.el.closest('li, tr, [class*="item"], [class*="row"], [class*="file"]') || chosen.el.parentElement;
   collect(row);
   if (!altPoints.length && row && row.parentElement && row.parentElement !== card && norm(row.parentElement.innerText || '').length < 320) collect(row.parentElement);
-  return {{ found: true, score: chosen.score, matchedText: norm(chosen.el.innerText || chosen.el.textContent).slice(0, 100), point: primaryPoint, altPoints }};
+  return {{ found: true, score: chosen.score, matchedText: norm(chosen.el.innerText || chosen.el.textContent).slice(0, 100), domClicked, point: primaryPoint, altPoints }};
 }})()"""
 
 
@@ -596,9 +711,10 @@ def default_run_session(target: dict, *, timeout_sec: float = DEFAULT_TIMEOUT_SE
             dl_events.append({"guid": p.get("guid") or "", "url": p.get("url") or ""})
             if click_at:
                 post_click_hit = True
-        elif method == "Target.targetCreated":
-            u = (p.get("targetInfo") or {}).get("url") or ""
-            if click_at and is_download_like_url(u, target_file):
+        elif method in ("Target.targetCreated", "Target.targetInfoChanged"):
+            info = p.get("targetInfo") or {}
+            u = info.get("url") or ""
+            if click_at and (is_download_like_url(u, target_file) or (method == "Target.targetCreated" and info.get("type") == "page" and info.get("openerId"))):
                 post_click_hit = True
         elif method == "Network.requestWillBeSent":
             req = p.get("request") or {}
@@ -697,6 +813,8 @@ def default_run_session(target: dict, *, timeout_sec: float = DEFAULT_TIMEOUT_SE
         error_since = 0.0
         renav = 0
         fail_reason = ""
+        can_try_api = target.get("release_id") is not None and target.get("package_id") is not None
+        api_tried = False
 
         while time.monotonic() < deadline and not ready:
             time.sleep(0.7)
@@ -740,11 +858,43 @@ def default_run_session(target: dict, *, timeout_sec: float = DEFAULT_TIMEOUT_SE
                     fail_reason = "内源下载页未完成实名登录"
                     break
                 continue
+
+            # 优先通路：同源轻量接口直调（零大文件流量、不受分页与加载遮罩影响）
+            if can_try_api and not api_tried:
+                api_tried = True
+                click_at = time.monotonic()
+                api_ev = cdp.send("Runtime.evaluate", {
+                    "expression": build_api_record_js(target),
+                    "returnByValue": True,
+                    "awaitPromise": True,
+                })
+                api_res = (((api_ev.get("result") or {}).get("result") or {}).get("value"))
+                if isinstance(api_res, dict) and api_res.get("ok"):
+                    if api_res.get("apiPath"):
+                        observed_api.add(str(api_res["apiPath"]))
+                    if api_res.get("apiReq"):
+                        observed_req.add(str(api_res["apiReq"]))
+                    return {
+                        "ok": True,
+                        "method": str(api_res.get("method") or "api-download1"),
+                        "matched_text": str(target.get("package_tag") or target_file or ""),
+                        "api_paths": sorted(observed_api)[:12],
+                        "api_requests": sorted(observed_req)[:12],
+                        "took_ms": int((time.monotonic() - started) * 1000),
+                    }
+                if isinstance(api_res, dict) and api_res.get("needsLogin"):
+                    api_tried = False
+                    anon_since = anon_since or time.monotonic()
+                    if not clicked_login:
+                        clicked_login = True
+                        cdp.send("Runtime.evaluate", {"expression": _CLICK_LOGIN_JS, "returnByValue": True})
+                    continue
+
             if "/download" not in str(st.get("pathname") or "").lower():
                 cdp.send("Page.navigate", {"url": page_url})
                 time.sleep(1.0)
                 continue
-            if not st.get("hasReleases"):
+            if not st.get("hasReleases") or st.get("maskVisible"):
                 continue
             ready = True
 
@@ -752,14 +902,16 @@ def default_run_session(target: dict, *, timeout_sec: float = DEFAULT_TIMEOUT_SE
             return {"ok": False, "transient": True, "reason": fail_reason or "内源下载页打开超时", "took_ms": int((time.monotonic() - started) * 1000)}
 
         located = None
-        locate_js = build_locate_js(target.get("release_version", ""), target_file, target.get("package_tag", ""))
+        locate_js = build_locate_js(target.get("release_version", ""), target_file, target.get("package_tag", ""), click_direct=True)
         for page_no in range(1, MAX_PAGES + 1):
             if time.monotonic() >= deadline:
                 break
+            click_at = time.monotonic()
             loc = (((cdp.send("Runtime.evaluate", {"expression": locate_js, "returnByValue": True}).get("result") or {}).get("result") or {}).get("value"))
             if isinstance(loc, dict) and loc.get("needsExpand") and loc.get("expandPoint"):
                 _click_point(cdp, loc["expandPoint"])
                 time.sleep(1.2)
+                click_at = time.monotonic()
                 loc = (((cdp.send("Runtime.evaluate", {"expression": locate_js, "returnByValue": True}).get("result") or {}).get("result") or {}).get("value"))
             if isinstance(loc, dict) and loc.get("found"):
                 located = loc
@@ -774,17 +926,25 @@ def default_run_session(target: dict, *, timeout_sec: float = DEFAULT_TIMEOUT_SE
         if not located or not located.get("point"):
             return {"ok": False, "transient": False, "reason": "内源下载页未找到目标版本或附件", "took_ms": int((time.monotonic() - started) * 1000)}
 
-        points = [located["point"]] + list(located.get("altPoints") or [])
-        for pt in points:
-            click_at = time.monotonic()
-            _click_point(cdp, pt)
+        if located.get("domClicked"):
             wait_until = min(deadline, time.monotonic() + 3.5)
             while time.monotonic() < wait_until and not post_click_hit and not dl_events:
                 if cdp.closed:
                     break
                 time.sleep(0.2)
-            if post_click_hit or dl_events:
-                break
+
+        if not post_click_hit and not dl_events:
+            points = [located["point"]] + list(located.get("altPoints") or [])
+            for pt in points:
+                click_at = time.monotonic()
+                _click_point(cdp, pt)
+                wait_until = min(deadline, time.monotonic() + 3.5)
+                while time.monotonic() < wait_until and not post_click_hit and not dl_events:
+                    if cdp.closed:
+                        break
+                    time.sleep(0.2)
+                if post_click_hit or dl_events:
+                    break
 
         if not post_click_hit and not dl_events:
             return {"ok": False, "transient": True, "reason": "点击附件后未观测到下载请求", "took_ms": int((time.monotonic() - started) * 1000)}
@@ -979,6 +1139,8 @@ class OpenxDownloadRecorder:
                 return {"status": "failed", "reason": reason, "release_version": item["release_version"]}
 
     def record(self, *, release_version: str, file_name: str = "", package_tag: str = "",
+               project_id: int | None = None, release_id: int | str | None = None,
+               package_id: int | str | None = None, url_source: int | None = None,
                page_url: str = "", kind: str = "update", background: bool = True) -> dict[str, Any] | threading.Thread | None:
         """在下载校验成功后记录内源下载量。background=True 时立刻落盘待补记项并在守护线程执行。"""
         if not self.enabled() or self._disposed:
@@ -993,6 +1155,10 @@ class OpenxDownloadRecorder:
             "release_version": rv,
             "file": str(file_name or "").strip(),
             "package_tag": str(package_tag or "").strip(),
+            "project_id": project_id,
+            "release_id": release_id,
+            "package_id": package_id,
+            "url_source": url_source,
             "page_url": url,
             "kind": str(kind or "update").strip(),
             "queued_at": self._clock(),
@@ -1084,6 +1250,8 @@ RECORDER = OpenxDownloadRecorder()
 
 
 def record_download_async(*, release_version: str, file_name: str = "", package_tag: str = "",
+                          project_id: int | None = None, release_id: int | str | None = None,
+                          package_id: int | str | None = None, url_source: int | None = None,
                           page_url: str = "", kind: str = "update") -> None:
     """安全入口：任何异常全部吞掉，绝不影响主流程下载。"""
     try:
@@ -1091,6 +1259,10 @@ def record_download_async(*, release_version: str, file_name: str = "", package_
             release_version=release_version,
             file_name=file_name,
             package_tag=package_tag,
+            project_id=project_id,
+            release_id=release_id,
+            package_id=package_id,
+            url_source=url_source,
             page_url=page_url,
             kind=kind,
             background=True,

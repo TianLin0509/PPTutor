@@ -159,3 +159,60 @@ def test_sanitize_and_download_url_helpers():
     assert openx_recorder.sanitize_api_path("https://example.invalid/a") == ""
     assert openx_recorder.is_download_like_url("https://file.openx.huawei.com/openx-file/abc.zip", "abc.zip") is True
     assert openx_recorder.is_download_like_url("https://openx.huawei.com/openxApi/visitOpenXRecord/saveRecord") is False
+    assert openx_recorder.is_download_like_url("https://openx.huawei.com/openxApi/project/release_id/download1?releaseId=1&packageId=2") is True
+
+    js_dl1 = openx_recorder.build_api_record_js({
+        "project_id": 8214, "release_id": 12001, "release_version": "ppt-doctor-update-2.1.18",
+        "package_id": 55001, "url_source": 1,
+    })
+    assert "/openxApi/project/release_id/download1" in js_dl1
+    assert "redirect: 'manual'" in js_dl1
+    js_log1 = openx_recorder.build_api_record_js({
+        "project_id": 8214, "release_id": 12001, "release_version": "ppt-doctor-update-2.1.18",
+        "package_id": 55001, "url_source": 0,
+    })
+    assert "/openxApi/report/project_version_download/log1" in js_log1
+    js_loc = openx_recorder.build_locate_js("ppt-doctor-update-2.1.18", "abc.zip", click_direct=True)
+    assert "copy-link" in js_loc
+    assert "domClicked" in js_loc
+
+
+def test_openx_index_caches_package_metadata_for_api_recording():
+    class _FakeResp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            self.close()
+
+    class _FakeOpener:
+        def open(self, req, timeout=None):
+            url = req.full_url
+            if "by_project_id" in url:
+                body = {"code": "0", "data": {"records": [{"id": 901, "version": "ppt-doctor-ocr-1.2.0"}]}}
+            else:
+                body = {
+                    "code": "0",
+                    "data": {
+                        "binaryPackages": [
+                            {
+                                "id": 7788,
+                                "originalFileName": "component.zip.000",
+                                "tag": "OCR 组件分片 0",
+                                "urlSource": 1,
+                                "url": "https://file.openx.huawei.com/openx-file/component.zip.000",
+                            },
+                        ],
+                    },
+                }
+            return _FakeResp(json.dumps(body).encode("utf-8"))
+
+    idx = openx_source.OpenxIndex(project_id=8214, opener=_FakeOpener())
+    files = idx.release_files("ppt-doctor-ocr-", "1.2.0")
+    assert "component.zip.000" in files
+    meta = idx.find_meta("ppt-doctor-ocr-1.2.0", "component.zip")
+    assert meta is not None
+    assert meta["project_id"] == 8214
+    assert meta["release_id"] == 901
+    assert meta["package_id"] == 7788
+    assert meta["url_source"] == 1
