@@ -357,12 +357,12 @@ def _gate_report(path, failures, exit_status=1):
 @pytest.mark.parametrize(('failures', 'exit_status', 'rounds', 'expected', 'reruns'), [
     # 第 1 次重跑就过
     (['tests/a.py::t1', 'tests/b.py::t2'], 1, [(0, [])], 0,
-     [['-q', 'tests/a.py::t1', 'tests/b.py::t2']]),
+     [['tests/a.py::t1', 'tests/b.py::t2']]),
     # 第 1 次还剩一条，第 2 次只重跑那一条并通过
     (['tests/a.py::t1', 'tests/b.py::t2'], 1, [(1, ['tests/b.py::t2']), (0, [])], 0,
-     [['-q', 'tests/a.py::t1', 'tests/b.py::t2'], ['-q', 'tests/b.py::t2']]),
+     [['tests/a.py::t1', 'tests/b.py::t2'], ['tests/b.py::t2']]),
     # 单独重跑 3 次都挂：真问题
-    (['tests/a.py::t1'], 1, [(1, ['tests/a.py::t1'])] * 3, 1, [['-q', 'tests/a.py::t1']] * 3),
+    (['tests/a.py::t1'], 1, [(1, ['tests/a.py::t1'])] * 3, 1, [['tests/a.py::t1']] * 3),
     ([f'tests/a.py::t{i}' for i in range(31)], 1, [], 1, []),   # 失败太多：真问题，不重跑
     (['tests/a.py::t1'], None, [], 1, []),                       # 没跑完（崩溃/被杀）：不重跑
 ])
@@ -374,12 +374,15 @@ def test_gate_reruns_failures_until_they_pass(tmp_path, monkeypatch, failures, e
     calls, waits = [], []
 
     def fake_run(args, path, probe=None):
+        assert args == ['-q', '--confcutdir', 'x', 'tests']   # 参数原样传
         code, still = rounds[len(calls)]
-        calls.append((args, path))
+        calls.append((json.loads(Path(os.environ[runner.RERUN_ONLY_ENV]).read_text('utf-8')), path))
         _gate_report(path, still, 1 if code else 0)
         return code
     monkeypatch.setattr(runner, 'run_windows', fake_run)
-    assert runner.rerun_failed_once(['-q', 'tests'], report, wait=lambda: waits.append(1)) == expected
+    assert runner.rerun_failed_once(['-q', '--confcutdir', 'x', 'tests'], report,
+                                    wait=lambda: waits.append(1)) == expected
+    assert runner.RERUN_ONLY_ENV not in os.environ
     assert [c[0] for c in calls] == reruns and len(waits) == len(reruns)
     assert all(c[1] != report for c in calls)   # 重跑另写报告，首轮证据保留
 
@@ -389,3 +392,27 @@ def test_quiet_wait_gives_up_waiting_and_runs(monkeypatch):
     monkeypatch.setattr(runner, 'cpu_busy_percent', lambda: 99)
     monkeypatch.setattr(runner.time, 'sleep', lambda s: None)
     runner.wait_for_quiet_machine(limit=0)   # 到点照跑，不卡死
+
+
+@pytest.mark.skipif(os.name != 'nt', reason='Windows hidden-runner integration')
+def test_hidden_runner_reruns_only_the_flaky_test_with_original_options(tmp_path):
+    probe = tmp_path / 'test_flaky_probe.py'
+    flag = tmp_path / 'ran-once'
+    probe.write_text(
+        'from pathlib import Path\n'
+        f'FLAG = Path({str(flag)!r})\n'
+        'def test_stable():\n    pass\n'
+        'def test_flaky():\n'
+        '    first = not FLAG.exists()\n'
+        '    FLAG.write_text("x")\n'
+        '    assert not first, "first run fails"\n', 'utf-8')
+    report = tmp_path / 'hidden.json'
+    env = dict(os.environ, PPTDOCTOR_GATE_RERUNS='1')
+    result = subprocess.run(
+        [sys.executable, str(ROOT / 'scripts/run_tests_hidden.py'), '--report', str(report), '--',
+         '-q', '-p', 'no:cacheprovider', '--confcutdir', str(tmp_path), str(probe)],
+        cwd=ROOT, stdin=subprocess.DEVNULL, env=env, capture_output=True, text=True,
+        encoding='utf-8', errors='replace', timeout=240, creationflags=subprocess.CREATE_NO_WINDOW)
+    assert result.returncode == 0, result.stdout + result.stderr
+    rerun = json.loads(report.with_name('hidden-rerun1.json').read_text('utf-8'))['pytest']
+    assert rerun['counts'] == {'passed': 1, 'failed': 0, 'skipped': 0}

@@ -257,6 +257,15 @@ class _PytestProgress:
             record['message'] = str(report.longrepr)
         self.emit(**record)
 
+    def pytest_collection_modifyitems(self, config, items):
+        only = os.environ.get(RERUN_ONLY_ENV)
+        if not only:
+            return
+        keep = set(json.loads(Path(only).read_text('utf-8')))
+        selected = [item for item in items if item.nodeid in keep]
+        config.hook.pytest_deselected(items=[item for item in items if item.nodeid not in keep])
+        items[:] = selected
+
     def pytest_sessionfinish(self, session, exitstatus):
         self.emit(event='finish', exitStatus=int(exitstatus))
 
@@ -453,6 +462,7 @@ def main():
 
 
 RERUN_LIMIT = 30
+RERUN_ONLY_ENV = 'PPTDOCTOR_GATE_RERUN_ONLY'
 RERUN_ATTEMPTS = 3
 QUIET_CPU_PERCENT = 60
 QUIET_WAIT_SECONDS = 30 * 60
@@ -503,7 +513,6 @@ def rerun_failed_once(pytest_args, report_path, attempts=RERUN_ATTEMPTS, wait=wa
     failed = sorted({row['nodeid'] for row in progress.get('failures', [])})
     if progress.get('exitStatus') != 1 or not failed or len(failed) > RERUN_LIMIT:
         return 1
-    options = [a for a in pytest_args if a.startswith('-')]
     exit_code = 1
     for attempt in range(1, attempts + 1):
         print(f'[隐藏测试] 第 {attempt}/{attempts} 次单独重跑 {len(failed)} 条：', flush=True)
@@ -511,7 +520,14 @@ def rerun_failed_once(pytest_args, report_path, attempts=RERUN_ATTEMPTS, wait=wa
             print(f'  {nodeid}', flush=True)
         wait()
         rerun_report = report_path.with_name(f'{report_path.stem}-rerun{attempt}.json')
-        exit_code = run_windows([*options, *failed], rerun_report)
+        # 参数原样保留（选项值、路径都不拆），只在收集阶段留下这几条
+        only = rerun_report.with_suffix('.only.json')
+        only.write_text(json.dumps(failed), 'utf-8')
+        os.environ[RERUN_ONLY_ENV] = str(only)
+        try:
+            exit_code = run_windows(pytest_args, rerun_report)
+        finally:
+            os.environ.pop(RERUN_ONLY_ENV, None)
         if exit_code == 0:
             print(f'[隐藏测试] 重跑全部通过，按整机负载造成的计时抖动处理；首轮报告 {report_path}',
                   flush=True)
