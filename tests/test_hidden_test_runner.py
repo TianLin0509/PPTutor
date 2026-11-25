@@ -344,3 +344,24 @@ def test_closed_guard_releases_handle_ownership_before_objects_are_collected():
     # destructor must not close an unrelated handle that reuses the number.
     assert all(int(handle) == 0 for handle in handles)
     guard.close()
+
+
+@pytest.mark.parametrize(('failures', 'exit_status', 'rerun_exit', 'expected', 'rerun_args'), [
+    (['tests/a.py::t1', 'tests/b.py::t2'], 1, 0, 0, ['-q', 'tests/a.py::t1', 'tests/b.py::t2']),
+    (['tests/a.py::t1'], 1, 1, 1, ['-q', 'tests/a.py::t1']),
+    ([f'tests/a.py::t{i}' for i in range(13)], 1, 0, 1, None),   # 失败太多：真问题，不重跑
+    (['tests/a.py::t1'], None, 0, 1, None),                       # 没跑完（崩溃/被杀）：不重跑
+])
+def test_gate_reruns_a_few_failures_once(tmp_path, monkeypatch, failures, exit_status,
+                                         rerun_exit, expected, rerun_args):
+    runner = load_script('run_tests_hidden')
+    report = tmp_path / 'hidden.json'
+    report.write_text(json.dumps({'pytest': {
+        'exitStatus': exit_status,
+        'failures': [{'nodeid': n, 'phase': 'call'} for n in failures]}}), 'utf-8')
+    calls = []
+    monkeypatch.setattr(runner, 'run_windows', lambda args, path, probe=None:
+                        calls.append((args, path)) or rerun_exit)
+    assert runner.rerun_failed_once(['-q', 'tests'], report) == expected
+    assert [c[0] for c in calls] == ([rerun_args] if rerun_args else [])
+    assert all(c[1] != report for c in calls)   # 重跑另写报告，首轮证据保留

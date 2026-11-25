@@ -445,7 +445,35 @@ def main():
         import pytest
         return pytest.main(pytest_args)
     report_path = args.report or ROOT / 'artifacts' / f'hidden-tests-{time.time_ns()}.json'
-    return run_windows(pytest_args, report_path, args.self_check_seconds)
+    exit_code = run_windows(pytest_args, report_path, args.self_check_seconds)
+    if exit_code == 1 and args.self_check_seconds is None:
+        return rerun_failed_once(pytest_args, report_path)
+    return exit_code
+
+
+RERUN_LIMIT = 12
+
+
+def rerun_failed_once(pytest_args, report_path):
+    """全量跑完后只有少数用例失败时，把它们单独再跑一次。
+
+    2026-11-25 合入闸门连续两轮在整机 CPU 90%+ 时各挂 4、6 条计时类用例（两轮不是同一批），
+    单独重跑全部通过，整轮回滚后重跑一次要 80 分钟。可见窗口、崩溃、没跑完都不走这里。
+    """
+    progress = json.loads(report_path.read_text('utf-8')).get('pytest') or {}
+    failed = sorted({row['nodeid'] for row in progress.get('failures', [])})
+    if progress.get('exitStatus') != 1 or not failed or len(failed) > RERUN_LIMIT:
+        return 1
+    options = [a for a in pytest_args if a.startswith('-')]
+    print(f'[隐藏测试] 首轮 {len(failed)} 条失败，单独重跑一次：', flush=True)
+    for nodeid in failed:
+        print(f'  {nodeid}', flush=True)
+    rerun_report = report_path.with_name(report_path.stem + '-rerun.json')
+    exit_code = run_windows([*options, *failed], rerun_report)
+    if exit_code == 0:
+        print(f'[隐藏测试] 重跑 {len(failed)} 条全部通过，按整机负载造成的计时抖动处理；'
+              f'首轮报告 {report_path}', flush=True)
+    return exit_code
 
 
 if __name__ == '__main__':
