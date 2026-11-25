@@ -410,8 +410,7 @@ MATERIAL_ERRORS = {
     "busy": "PowerPoint 正忙，或上一个素材还在处理，稍等几秒再试。",
     "pack_missing": "素材包文件不在了：刷新素材库，或重新获取团队素材。",
     "timeout": "PowerPoint 60 秒没有响应：看看它是否弹出了对话框，处理后再试。",
-    "ppt_unreachable": ("PowerPoint 开着，但 PPT Doctor 连不上它（可能还停在启动页没开文稿、正弹着对话框，"
-                        "或以管理员身份运行）：在 PowerPoint 里打开一份文稿、关掉弹窗后再点。"),
+    "ppt_unreachable": "连不上已打开的 PowerPoint（可能停在启动页、弹着对话框或以管理员身份运行）：打开一份文稿、关掉弹窗后再试。",
     "clipboard_busy": "剪贴板正被别的程序占用（截图、翻译或剪贴板工具），稍等几秒再点。",
 }
 #: COM 「对方正忙，稍后再试」类错误

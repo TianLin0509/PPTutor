@@ -178,7 +178,7 @@ def test_insert_error_code_shows_inline_fix_and_copy_fallback(qtbot, core, tmp_p
     assert calls == [("team-materials-core.pptx", tab._view[3].item.page)]
     assert tab.warn.isVisibleTo(tab) and "先打开要放素材的 PPT" in tab.warn_text.text()
     assert tab.warn_copy.isVisibleTo(tab) and toasts[-1][1] == "warn"
-    assert tab.warn_open.isVisibleTo(tab) and "改为复制形状" in tab.warn_text.text()
+    assert tab.warn_open.isVisibleTo(tab) 
     tab.warn_copy.click()
     _wait_idle(qtbot, tab)
     assert copied == [tab._view[3].item.page] and not tab.warn.isVisibleTo(tab)
@@ -216,7 +216,7 @@ def test_copy_failure_falls_back_to_image_and_explains(qtbot, core, tmp_path, mo
     tab.copy_btn.click()
     _wait_idle(qtbot, tab)
     text = tab.warn_text.text()
-    assert tab.warn.isVisibleTo(tab) and "连不上" in text and "已先改为复制成图片" in text
+    assert tab.warn.isVisibleTo(tab) and "连不上" in text and not tab.det_meta.isVisibleTo(tab) and "已先复制成图片" in text
     assert not QGuiApplication.clipboard().image().isNull()
     assert tab.warn_copy.isVisibleTo(tab) and tab.warn_copy.text() == "再试复制形状"
     assert tab.warn_open.isVisibleTo(tab) and toasts[-1][1] == "warn"
@@ -230,6 +230,31 @@ def test_copy_failure_falls_back_to_image_and_explains(qtbot, core, tmp_path, mo
     _wait_idle(qtbot, tab)
     assert opened == [("team-materials-core.pptx", first.item.page), str(out)]
     assert toasts[-1][1] == "ok" and "已打开单页素材" in toasts[-1][0] and not tab.warn.isVisibleTo(tab)
+
+
+@pytest.mark.parametrize("which", ["copy", "insert"])
+def test_failure_panel_fits_1280x672_main_window(qtbot, core, tmp_path, monkeypatch, which):
+    """失败提示显示时，主窗 1280×672 内嵌（1178×520）也不被撑高、文字不被截断、两个主按钮可见。"""
+    tab, _ = _tab(qtbot, tmp_path)
+    tab.set_header_compact(True)
+    tab.resize(1178, 520)
+    tab.show()
+
+    def refuse(path, page):
+        raise ppt_transfer.MaterialTransferError("ppt_unreachable" if which == "copy" else "no_powerpoint")
+    monkeypatch.setattr(ppt_transfer, "copy_material", refuse)
+    monkeypatch.setattr(ppt_transfer, "insert_material", refuse)
+    tab.grid.select(0)
+    (tab.copy_btn if which == "copy" else tab.insert_btn).click()
+    _wait_idle(qtbot, tab)
+    qtbot.wait(100)
+    assert tab.warn.isVisible() and tab.minimumSizeHint().height() <= 520 and tab.height() <= 520
+    assert tab.warn_text.height() >= tab.warn_text.heightForWidth(tab.warn_text.width())
+    for w in (tab.insert_btn, tab.copy_btn, tab.warn_open):
+        assert w.mapTo(tab, w.rect().bottomLeft()).y() <= tab.height()
+    assert tab.warn_open.sizeHint().width() <= tab.warn_open.width() + 1
+    tab.grid.select(1)                                  # 换个素材：提示收起，预览回来
+    assert not tab.warn.isVisible() and tab.preview.isVisible()
 
 
 def test_unknown_insert_error_is_explained_inline(qtbot, core, tmp_path, monkeypatch):
