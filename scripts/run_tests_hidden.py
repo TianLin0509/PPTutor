@@ -444,6 +444,8 @@ def main():
         finally:
             if progress:
                 progress.close()
+    # 「只重跑这几条」是本进程重跑时临时设给自己的子进程的；从外层继承来的（比如测试里再起一个运行器）不算数
+    os.environ.pop(RERUN_ONLY_ENV, None)
     if args.self_check_seconds is not None:
         if os.name != 'nt':
             parser.error('可见窗口自检仅支持Windows；不可用跳过冒充通过')
@@ -488,8 +490,10 @@ def cpu_busy_percent(sample=2.0):
         return 0
 
 
-def wait_for_quiet_machine(limit=QUIET_WAIT_SECONDS):
-    """等整机忙劲过去再重跑计时类用例；最多等 limit 秒，到点照跑。"""
+def wait_for_quiet_machine(limit=None):
+    """等整机忙劲过去再重跑计时类用例；最多等 limit 秒（默认 30 分钟，PPTDOCTOR_GATE_QUIET_WAIT 可改），到点照跑。"""
+    if limit is None:
+        limit = float(os.environ.get('PPTDOCTOR_GATE_QUIET_WAIT', QUIET_WAIT_SECONDS))
     started = time.monotonic()
     while True:
         busy = cpu_busy_percent()

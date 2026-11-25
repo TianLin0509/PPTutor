@@ -407,12 +407,15 @@ def test_hidden_runner_reruns_only_the_flaky_test_with_original_options(tmp_path
         '    FLAG.write_text("x")\n'
         '    assert not first, "first run fails"\n', 'utf-8')
     report = tmp_path / 'hidden.json'
-    env = dict(os.environ, PPTDOCTOR_GATE_RERUNS='1')
+    # 不等整机空闲（闸门全量时 CPU 常年满，测试里的运行器等下去就超时）；外层重跑设的「只跑这几条」也不能漏进来
+    env = dict(os.environ, PPTDOCTOR_GATE_RERUNS='1', PPTDOCTOR_GATE_QUIET_WAIT='0',
+               PPTDOCTOR_GATE_RERUN_ONLY=str(tmp_path / 'outer-rerun.only.json'))
+    (tmp_path / 'outer-rerun.only.json').write_text(json.dumps(['tests/elsewhere.py::test_x']), 'utf-8')
     result = subprocess.run(
         [sys.executable, str(ROOT / 'scripts/run_tests_hidden.py'), '--report', str(report), '--',
          '-q', '-p', 'no:cacheprovider', '--confcutdir', str(tmp_path), str(probe)],
         cwd=ROOT, stdin=subprocess.DEVNULL, env=env, capture_output=True, text=True,
-        encoding='utf-8', errors='replace', timeout=240, creationflags=subprocess.CREATE_NO_WINDOW)
+        encoding='utf-8', errors='replace', timeout=600, creationflags=subprocess.CREATE_NO_WINDOW)
     assert result.returncode == 0, result.stdout + result.stderr
     rerun = json.loads(report.with_name('hidden-rerun1.json').read_text('utf-8'))['pytest']
     assert rerun['counts'] == {'passed': 1, 'failed': 0, 'skipped': 0}
