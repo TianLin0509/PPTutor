@@ -555,6 +555,18 @@ def test_watch_confirms_target_version_reached_openx(out, ok):
     assert watch.openx_confirmed("dl. 预检\n" + out + "\n", "2.1.20")[0] is ok
 
 
+def test_watch_confirms_real_shaped_truncated_openx_result():
+    """真实结果里每版带逐文件上传记录（嵌套对象）；日志太长时整行被截到 8000 字，仍要认出本版已发上。"""
+    watch = load_watch()
+    entry = {"version": "ppt-doctor-update-2.1.20", "stage": "published", "http": 200,
+             "ups": [{"file": "a" * 64, "size": 1, "ok": True}], "release": {"id": 1, "version": "ppt-doctor-update-2.1.20"}}
+    line = json.dumps({"ok": True, "sec": 9, "stage": "published", "results": [entry],
+                       "log": ["dl_ok x"] * 2000}, ensure_ascii=False)[:8000]
+    assert watch.openx_confirmed(line, "2.1.20") == (True, "")
+    assert watch.openx_confirmed(line.replace('"published", "http"', '"failed", "http"'), "2.1.20")[0] is False
+    assert watch.openx_confirmed(line[:60], "2.1.20")[0] is False
+
+
 @pytest.mark.parametrize("out,code,ok", [
     ('{"ok": true, "stage": "nothing", "note": "组件都已同步过", "releases": 0}', 0, False),
     ('{"ok": false, "error": "RuntimeError: x"}', 1, False),

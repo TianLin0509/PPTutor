@@ -120,9 +120,17 @@ def openx_confirmed(out, latest):
             continue
         try:
             res = json.loads(line)
-        except ValueError:   # 结果行超长会被截到 8000 字，此时按文本找本版那一条
-            hit = re.search(r'\{[^{}]*"version": "' + re.escape(target) + r'"[^{}]*\}', line)
-            ok = line.startswith('{"ok": true') and hit and re.search(r'"stage": "(published|nothing)"', hit.group(0))
+        except ValueError:   # 结果行超长会被截到 8000 字（截掉的是排在后面的日志），单独解析本版那一条
+            entries = []
+            for m in re.finditer(r'"version": "' + re.escape(target) + '"', line):
+                begin = line.rfind("{", 0, m.start())
+                try:
+                    entries.append(json.JSONDecoder().raw_decode(line, begin)[0])
+                except ValueError:
+                    pass
+            ok = line.startswith('{"ok": true') and any(
+                isinstance(x, dict) and x.get("version") == target and x.get("stage") in ("published", "nothing")
+                for x in entries)
             return (True, "") if ok else (False, "内源结果不完整，没找到本版的发布记录")
         if not res.get("ok"):
             return False, str(res.get("error") or res.get("note") or res.get("stage") or "内源同步失败")[:200]
