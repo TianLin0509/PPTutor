@@ -5,6 +5,14 @@ import pytest
 
 from pptx_finder import ppt_transfer as transfer
 
+_REAL_SETTLE = transfer._copy_settled
+
+
+@pytest.fixture(autouse=True)
+def _instant_copy(monkeypatch):
+    """COM 替身的 Copy 不碰真剪贴板：跳过「等剪贴板稳定」，否则每条测试空等超时。"""
+    monkeypatch.setattr(transfer, "_copy_settled", lambda obj, **kw: obj.Copy())
+
 
 def app_with_decks(monkeypatch, decks):
     app = SimpleNamespace(Presentations=SimpleNamespace(Count=len(decks), Item=lambda i: decks[i-1]),
@@ -420,3 +428,21 @@ def test_export_material_deck_keeps_only_the_chosen_page(tmp_path, monkeypatch):
     with pytest.raises(transfer.MaterialTransferError) as info:
         transfer.export_material_deck(pack, 9)
     assert info.value.code == "pack_missing"
+
+
+def test_copy_waits_until_clipboard_holds_native_format(monkeypatch):
+    """大素材 Copy() 返回时剪贴板还没就绪：等序号变化、原生格式出现且稳定后才往下走。"""
+    import win32clipboard
+    state = {"seq": 10, "ticks": 0}
+
+    def seq():
+        state["ticks"] += 1
+        if state["ticks"] == 3:          # 第 3 次查询时 PowerPoint 才把内容放上来
+            state["seq"] = 11
+        return state["seq"]
+    monkeypatch.setattr(win32clipboard, "GetClipboardSequenceNumber", seq)
+    monkeypatch.setattr(win32clipboard, "IsClipboardFormatAvailable", lambda fmt: state["seq"] == 11)
+    copied = []
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    _REAL_SETTLE(SimpleNamespace(Copy=lambda: copied.append(1)), timeout=5)
+    assert copied == [1] and state["ticks"] >= 4

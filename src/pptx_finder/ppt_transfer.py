@@ -366,6 +366,63 @@ def _flush_clipboard_once(win32clipboard):
         win32clipboard.CloseClipboard()
 
 
+def _copy_settled(obj, timeout: float = 10.0, fmt_name: str | None = "Art::GVML ClipFormat"):
+    """Copy() 返回时 PowerPoint 可能还没把内容放上剪贴板（大素材更明显）。
+
+    2026-11-25 实测：整页模板「规划与计划」等大素材 3 次复制 3 次失败——立刻去读剪贴板时
+    原生格式还没到、或 PowerPoint 正在占用。等到剪贴板序号变化、原生格式出现并稳定 0.1 秒再往下走。
+    """
+    import time
+    import win32clipboard
+    fmt = win32clipboard.RegisterClipboardFormat(fmt_name) if fmt_name else 0
+    before = win32clipboard.GetClipboardSequenceNumber()
+    obj.Copy()
+    deadline = time.monotonic() + timeout
+    last = None
+    while time.monotonic() < deadline:
+        seq = win32clipboard.GetClipboardSequenceNumber()
+        if seq != before and (not fmt or win32clipboard.IsClipboardFormatAvailable(fmt)):
+            if seq == last:
+                return
+            last = seq
+        time.sleep(0.1)
+    log.warning("clipboard did not settle within %.0fs after PowerPoint Copy", timeout)
+
+
+def _clipboard_quiet(quiet: float = 0.3, timeout: float = 3.0):
+    """等剪贴板序号连续 quiet 秒不变（PowerPoint 复制大素材后还会陆续改写剪贴板）。"""
+    import time
+    import win32clipboard
+    last, since = win32clipboard.GetClipboardSequenceNumber(), time.monotonic()
+    deadline = since + timeout
+    while time.monotonic() < deadline:
+        time.sleep(0.05)
+        seq = win32clipboard.GetClipboardSequenceNumber()
+        if seq != last:
+            last, since = seq, time.monotonic()
+        elif time.monotonic() - since >= quiet:
+            return
+
+
+def _normalize_settled(normalize, attempts: int = 3):
+    """把 PowerPoint 放上来的原生形状改成「主题色固定」的版本。
+
+    2026-11-25 实测（434 条素材逐条复制）：大素材在我们读剪贴板时，PowerPoint 还在延迟渲染、
+    会关掉我们打开的剪贴板（1418）或再改写一次（序号变化）。先逼它渲染完、等剪贴板安静，
+    改写前发现被改过就重读重来；内容仍是刚复制的这份素材，重读不会重复粘贴任何东西。
+    """
+    import time
+    for attempt in range(attempts):
+        try:
+            flush_clipboard()
+            _clipboard_quiet()
+            return normalize(required=True)
+        except ValueError as exc:
+            if "已被其他程序更改" not in str(exc) or attempt == attempts - 1:
+                raise
+            time.sleep(0.2)
+
+
 @contextmanager
 def _source_snapshot(source: str | Path):
     source = Path(source).resolve(strict=True)
@@ -383,7 +440,7 @@ def copy_slide(source: str | Path, page: int = 1):
             pres = session.open(Path(snapshot))
             if page > int(pres.Slides.Count):
                 raise TransferError("源 PPT 页数已变化，请刷新预览后重新选择。")
-            pres.Slides.Item(page).Copy()
+            _copy_settled(pres.Slides.Item(page), fmt_name=None)   # 整页没有 GVML 格式
             flush_clipboard()
 
 
@@ -397,8 +454,8 @@ def copy_material(source: str | Path, slide_index: int = 1):
         with _source_snapshot(source) as snapshot, temporary_presentations() as session:
             pres = session.open(snapshot)
             shapes = _material_shapes(pres, slide_index)
-            shapes.Range().Copy()
-            normalize_shapes(required=True)
+            _copy_settled(shapes.Range())
+            _normalize_settled(normalize_shapes)
 
 
 # ---------- 团队素材：一键插入当前 PPT（移植自 HUB-H transferMaterial） ----------
@@ -553,7 +610,7 @@ def insert_material(pack_path: str | Path, slide_index: int) -> dict:
             with _source_snapshot(pack_path) as snapshot, temporary_presentations() as session:
                 app, pres, slide = _active_target(_find_apps())
                 source = session.open(snapshot)
-                _material_shapes(source, slide_index).Range().Copy()
+                _copy_settled(_material_shapes(source, slide_index).Range())
                 flush_clipboard()
                 app.StartNewUndoEntry()
                 pasted = slide.Shapes.Paste()

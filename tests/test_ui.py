@@ -2049,89 +2049,21 @@ def test_window_resize_coalesces_expensive_preview_scaling(qtbot, tmp_path):
     qtbot.waitUntil(lambda: calls == ["scale"], timeout=500)
 
 
-def test_completed_scan_discloses_unreadable_folders(qtbot, tmp_path):
+def test_unreadable_folders_are_skipped_silently(qtbot, tmp_path, caplog):
+    """2026-11-25 田哥：「N 个文件夹无权限，可能有遗漏」没有必要，界面不再显示，只记日志。"""
+    import logging
     conn = _index(tmp_path)
     win = MainWindow(conn=conn, render_worker=StubRender(), do_index=False)
     qtbot.addWidget(win)
-
-    win._apply_status_stats(
-        {"unreadable_dirs": 3},
-        {"file_count": 2, "page_count": 4, "type_counts": {".pptx": (2, 2)}},
-    )
-
-    assert not win.status_warn_label.isHidden()
-    assert "3 个文件夹无权限" in win.status_warn_label.text()
-    assert "无权限" not in win.status_label.text()
-
-
-def test_unreadable_zero_hides_status_warn_label(qtbot, tmp_path):
-    conn = _index(tmp_path)
-    win = MainWindow(conn=conn, render_worker=StubRender(), do_index=False)
-    qtbot.addWidget(win)
-
-    win._apply_status_stats(
-        {"unreadable_dirs": 0},
-        {"file_count": 2, "page_count": 4, "type_counts": {".pptx": (2, 2)}},
-    )
-
-    assert win.status_warn_label.isHidden()
-    assert "无权限" not in win.status_label.text()
-
-
-def test_status_warn_label_click_opens_unreadable_dirs_dialog(qtbot, tmp_path):
-    conn = _index(tmp_path)
-    win = MainWindow(conn=conn, render_worker=StubRender(), do_index=False)
-    qtbot.addWidget(win)
-    # 重启后路径来自 db meta（换行拼接字符串）
-    win._apply_status_stats(
-        None,
-        {
-            "file_count": 2, "page_count": 4, "type_counts": {".pptx": (2, 2)},
-            "last_scan_unreadable_dirs": "2",
-            "last_scan_error_paths": "D:/locked/a\nD:/locked/b",
-            "last_scan_error_examples": "D:/locked/a",
-        },
-    )
-
-    class _Press:
-        def type(self):
-            return QEvent.MouseButtonPress
-
-    handled = win.eventFilter(win.status_warn_label, _Press())
-
-    assert handled is True
-    dlg = win._unreadable_dirs_dialog
-    assert dlg is not None
-    assert dlg.windowTitle() == "无权限文件夹"
-    lst = dlg.findChild(QListWidget, "unreadableDirsList")
-    texts = [lst.item(i).text() for i in range(lst.count())]
-    assert texts == ["D:/locked/a", "D:/locked/b"]
-    assert dlg.findChild(QLabel, "unreadableDirsNote") is None  # 全量数据不标注「仅示例」
-    dlg.close()
-
-
-def test_unreadable_dirs_dialog_falls_back_to_examples(qtbot, tmp_path):
-    conn = _index(tmp_path)
-    win = MainWindow(conn=conn, render_worker=StubRender(), do_index=False)
-    qtbot.addWidget(win)
-    # 旧数据没有全量列表：退化为示例并注明「仅示例」
-    win._apply_status_stats(
-        {"unreadable_dirs": 7, "scan_error_examples": ["E:/old/x", "E:/old/y"]},
-        {"file_count": 2, "page_count": 4, "type_counts": {".pptx": (2, 2)}},
-    )
-
-    class _Press:
-        def type(self):
-            return QEvent.MouseButtonPress
-
-    assert win.eventFilter(win.status_warn_label, _Press()) is True
-    dlg = win._unreadable_dirs_dialog
-    lst = dlg.findChild(QListWidget, "unreadableDirsList")
-    texts = [lst.item(i).text() for i in range(lst.count())]
-    assert texts == ["E:/old/x", "E:/old/y"]
-    note = dlg.findChild(QLabel, "unreadableDirsNote")
-    assert note is not None and "仅示例" in note.text()
-    dlg.close()
+    with caplog.at_level(logging.INFO):
+        win._apply_status_stats(
+            {"unreadable_dirs": 3, "scan_error_examples": ["D:/locked/a"]},
+            {"file_count": 2, "page_count": 4, "type_counts": {".pptx": (2, 2)}},
+        )
+    assert not hasattr(win, "status_warn_label")
+    shown = " ".join(w.text() for w in win.status.findChildren(QLabel) if w.isVisibleTo(win))
+    assert "无权限" not in shown and "遗漏" not in shown
+    assert "unreadable folders" in caplog.text
 
 
 def test_shutdown_treats_version_file_ops_as_heavy_background_tasks(qtbot, tmp_path):
