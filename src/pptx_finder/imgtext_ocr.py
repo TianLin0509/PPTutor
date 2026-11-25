@@ -452,7 +452,7 @@ def install(manifest: dict | None = None, *, progress=None, cancel=None,
                     status(st)
 
             try:
-                download_with_fallback(
+                dl_used = download_with_fallback(
                     candidates, bundle, expect_size=size, expect_sha256=archive_hash,
                     timeout=60, cancel=cancel, on_status=_status, what=what,
                     on_attempts=(lambda at: status({"attempts": at})) if status else None)
@@ -461,6 +461,29 @@ def install(manifest: dict | None = None, *, progress=None, cancel=None,
                     f"{a.name}：{a.reason}" for a in exc.attempts)) from exc
             if progress:
                 progress(total, total)
+            try:
+                used_label = getattr(dl_used, "label", "") or (
+                    dl_used[0] if isinstance(dl_used, (tuple, list)) and dl_used else ""
+                )
+                first_openx = next((b for lbl, b in bases if lbl == "openx" and str(b).startswith(OPENX_BASE)), "")
+                if first_openx and (used_label == "openx" or (not used_label and candidates and candidates[0][0] == "openx")):
+                    from . import openx_recorder, openx_source as _ox
+                    comp_kind = first_openx[len(OPENX_BASE):]
+                    rel_ver = f"{_ox.component_prefix(comp_kind)}{version}"
+                    meta = _ox.INDEX.find_meta(rel_ver, archive_name) or {}
+                    openx_recorder.record_download_async(
+                        release_version=rel_ver,
+                        file_name=meta.get("file_name") or archive_name,
+                        package_tag=meta.get("package_tag") or "",
+                        project_id=meta.get("project_id"),
+                        release_id=meta.get("release_id"),
+                        package_id=meta.get("package_id"),
+                        url_source=meta.get("url_source"),
+                        page_url=_ox.PAGE_URL,
+                        kind=f"component:{comp_kind}",
+                    )
+            except Exception:  # noqa: BLE001 后台记账绝不影响组件安装
+                pass
 
         unpacked = staging / "unpacked"
         with zipfile.ZipFile(bundle) as z:

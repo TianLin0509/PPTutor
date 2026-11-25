@@ -184,6 +184,11 @@ class UpdateController(QObject):
             self._parent_bg_tasks = None
         chip.hide()
         chip.clicked.connect(self._on_click)
+        try:
+            from .. import openx_recorder
+            openx_recorder.schedule_resume_pending()
+        except Exception:  # noqa: BLE001
+            pass
 
     # ---------- 线程登记 ----------
     def _track_thread(self, thread, label: str) -> None:
