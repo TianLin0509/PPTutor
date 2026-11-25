@@ -5,6 +5,14 @@ import pytest
 
 from pptx_finder import ppt_transfer as transfer
 
+_REAL_SETTLE = transfer._copy_settled
+
+
+@pytest.fixture(autouse=True)
+def _instant_copy(monkeypatch):
+    """COM 替身的 Copy 不碰真剪贴板：跳过「等剪贴板稳定」，否则每条测试空等超时。"""
+    monkeypatch.setattr(transfer, "_copy_settled", lambda obj, **kw: obj.Copy())
+
 
 def app_with_decks(monkeypatch, decks):
     app = SimpleNamespace(Presentations=SimpleNamespace(Count=len(decks), Item=lambda i: decks[i-1]),
@@ -248,9 +256,10 @@ def test_com_call_rejected_maps_to_busy(monkeypatch, tmp_path):
     assert info.value.code == "busy"
 
 
-def test_material_error_codes_are_the_contract_seven():
+def test_material_error_codes_are_the_contract():
     assert set(transfer.MATERIAL_ERRORS) == {"no_powerpoint", "no_presentation", "read_only",
-                                             "no_target_slide", "busy", "pack_missing", "timeout"}
+                                             "no_target_slide", "busy", "pack_missing", "timeout",
+                                             "ppt_unreachable", "clipboard_busy"}
     with pytest.raises(ValueError):
         transfer.MaterialTransferError("whatever")
 
@@ -308,3 +317,132 @@ def test_uncertain_target_stops_instead_of_falling_back(monkeypatch):
     with pytest.raises(transfer.MaterialTransferError) as info:
         transfer._active_target([Busy(), older])
     assert info.value.code == "busy"
+
+
+# ---------- 2026-11-25 回归：新版 Office 的 Application.HWND 报「找不到成员」 ----------
+class _NoHwndApp:
+    """新版 Office 16（实测 16.0.20625）：读 Application.HWND 抛 DISP_E_MEMBERNOTFOUND。"""
+    def __init__(self, office_dir, decks=()):
+        self.Path = str(office_dir)
+        self.Presentations = SimpleNamespace(Count=len(decks), Item=lambda i: decks[i - 1])
+        self.Windows = SimpleNamespace(Count=len(decks))
+
+    @property
+    def HWND(self):
+        raise RuntimeError((-2147352573, "找不到成员。", None, None))
+
+
+def _fake_com(monkeypatch, rot_apps):
+    import pythoncom
+    import win32com.client
+    from win32com.client import gencache
+
+    class Moniker:
+        def __init__(self, app):
+            self.app = app
+
+        def GetDisplayName(self, ctx, other):
+            return "!{91493441-5A91-11CF-8700-00AA0060263B}"
+
+    class Rot:
+        def EnumRunning(self):
+            return [Moniker(a) for a in rot_apps]
+
+        def GetObject(self, moniker):
+            return SimpleNamespace(QueryInterface=lambda iid: moniker.app)
+    monkeypatch.setattr(pythoncom, "GetRunningObjectTable", lambda: Rot())
+    monkeypatch.setattr(pythoncom, "CreateBindCtx", lambda flags: None)
+    monkeypatch.setattr(win32com.client, "Dispatch", lambda obj: obj)
+    monkeypatch.setattr(gencache, "EnsureDispatch", lambda obj: obj)
+
+
+def test_rot_app_without_hwnd_is_still_found(monkeypatch, tmp_path):
+    """11-22 起按 Application.HWND 去重，新版 Office 下所有 ROT 条目都被丢掉 → PowerPoint 开着也报没开。"""
+    (tmp_path / "POWERPNT.EXE").write_bytes(b"")
+    app = _NoHwndApp(tmp_path)
+    _fake_com(monkeypatch, [app])
+    monkeypatch.setattr(transfer, "_window_apps", lambda: [])
+    assert transfer._find_apps() == [app]
+    assert transfer._app_identity(app) == 0
+
+
+def test_window_discovery_gives_identity_and_dedupes_rot(monkeypatch, tmp_path):
+    """按窗口找到的实例带进程号和主窗口；ROT 里同一进程（打开同一份文稿）的条目不重复。"""
+    (tmp_path / "POWERPNT.EXE").write_bytes(b"")
+    d = SimpleNamespace(FullName="C:/work/汇报.pptx")
+    from_window, from_rot = _NoHwndApp(tmp_path, [d]), _NoHwndApp(tmp_path, [d])
+    _fake_com(monkeypatch, [from_rot])
+    monkeypatch.setattr(transfer, "_window_apps", lambda: [(4321, 777, from_window)])
+    apps = transfer._find_apps()
+    assert apps == [from_window]
+    assert transfer._app_identity(from_window) == 4321 and transfer._app_hwnd(from_window) == 777
+    other = _NoHwndApp(tmp_path, [SimpleNamespace(FullName="C:/work/另一份.pptx")])
+    _fake_com(monkeypatch, [other])
+    assert transfer._find_apps() == [from_window, other]           # 另一个进程不被吞掉
+
+
+def test_zorder_uses_discovered_frame_when_hwnd_unavailable(monkeypatch, tmp_path):
+    def inst(pid, frame, name):
+        app = _NoHwndApp(tmp_path)
+        app.ActiveWindow = SimpleNamespace(Presentation=SimpleNamespace(Name=name, ReadOnly=False),
+                                           View=SimpleNamespace(Slide=SimpleNamespace(SlideIndex=1)))
+        app.Windows = SimpleNamespace(Count=1)
+        return transfer._stamp(app, pid, frame)
+    older, recent = inst(1, 111, "旧窗口.pptx"), inst(2, 222, "正在编辑.pptx")
+    monkeypatch.setattr(transfer, "_zorder", lambda: [999, 222, 111])
+    assert transfer._active_target([older, recent])[1].Name == "正在编辑.pptx"
+
+
+def test_renderer_refusal_maps_to_readable_unreachable(monkeypatch, tmp_path):
+    """连不上用户的 PowerPoint 时，不把内部英文原因甩给用户。"""
+    from pptx_finder.renderer import PowerPointSessionBusy
+    pack = tmp_path / "pack.pptx"
+    pack.write_bytes(b"x")
+
+    @contextmanager
+    def refuse(**kw):
+        raise PowerPointSessionBusy("PowerPoint is already running; refusing to attach the preview renderer")
+        yield
+    monkeypatch.setattr(transfer, "temporary_presentations", refuse)
+    with pytest.raises(transfer.MaterialTransferError) as info:
+        transfer.copy_material(pack, 1)
+    assert info.value.code == "ppt_unreachable" and "PowerPoint" in str(info.value)
+    assert "already running" not in str(info.value)
+
+
+def test_export_material_deck_keeps_only_the_chosen_page(tmp_path, monkeypatch):
+    from pptx import Presentation
+    from pptx.util import Inches
+    prs = Presentation()
+    for i in range(3):
+        slide = prs.slides.add_slide(prs.slide_layouts[6])
+        slide.shapes.add_textbox(Inches(1), Inches(1), Inches(3), Inches(1)).text_frame.text = f"第{i + 1}页素材"
+    pack = tmp_path / "pack.pptx"
+    prs.save(pack)
+    monkeypatch.setattr(transfer.tempfile, "gettempdir", lambda: str(tmp_path))
+    out = transfer.export_material_deck(pack, 2, "箭头/流程:1")
+    assert out.parent.parent == tmp_path and out.suffix == ".pptx" and "/" not in out.name
+    got = Presentation(out)
+    assert len(got.slides) == 1
+    assert got.slides[0].shapes[0].text_frame.text == "第2页素材"
+    with pytest.raises(transfer.MaterialTransferError) as info:
+        transfer.export_material_deck(pack, 9)
+    assert info.value.code == "pack_missing"
+
+
+def test_copy_waits_until_clipboard_holds_native_format(monkeypatch):
+    """大素材 Copy() 返回时剪贴板还没就绪：等序号变化、原生格式出现且稳定后才往下走。"""
+    import win32clipboard
+    state = {"seq": 10, "ticks": 0}
+
+    def seq():
+        state["ticks"] += 1
+        if state["ticks"] == 3:          # 第 3 次查询时 PowerPoint 才把内容放上来
+            state["seq"] = 11
+        return state["seq"]
+    monkeypatch.setattr(win32clipboard, "GetClipboardSequenceNumber", seq)
+    monkeypatch.setattr(win32clipboard, "IsClipboardFormatAvailable", lambda fmt: state["seq"] == 11)
+    copied = []
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    _REAL_SETTLE(SimpleNamespace(Copy=lambda: copied.append(1)), timeout=5)
+    assert copied == [1] and state["ticks"] >= 4

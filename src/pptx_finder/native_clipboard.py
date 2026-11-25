@@ -66,7 +66,11 @@ def opened_clipboard(hwnd=0):
     try:
         yield cb
     finally:
-        cb.CloseClipboard()
+        try:
+            cb.CloseClipboard()
+        except cb.error as exc:   # 已被 Office 关掉（1418）：不要盖住真正的异常
+            if getattr(exc, "winerror", None) != 1418:
+                raise
 
 
 def normalize_shapes(*, required=False) -> int:
@@ -75,14 +79,22 @@ def normalize_shapes(*, required=False) -> int:
     import win32gui
     fmt = cb.RegisterClipboardFormat(FORMAT)
     png_fmt = cb.RegisterClipboardFormat("PNG")
-    with opened_clipboard():
-        sequence = cb.GetClipboardSequenceNumber()
-        if not cb.IsClipboardFormatAvailable(fmt):
-            if required:
-                raise ValueError("PowerPoint 没有提供可编辑的原生对象格式，未改为截图。")
-            return sequence
-        data = cb.GetClipboardData(fmt)
-        png = cb.GetClipboardData(png_fmt) if cb.IsClipboardFormatAvailable(png_fmt) else None
+    for attempt in range(3):
+        try:
+            with opened_clipboard():
+                sequence = cb.GetClipboardSequenceNumber()
+                if not cb.IsClipboardFormatAvailable(fmt):
+                    if required:
+                        raise ValueError("PowerPoint 没有提供可编辑的原生对象格式，未改为截图。")
+                    return sequence
+                data = cb.GetClipboardData(fmt)
+                png = cb.GetClipboardData(png_fmt) if cb.IsClipboardFormatAvailable(png_fmt) else None
+            break
+        except cb.error as exc:
+            # 1418：读延迟渲染格式时 Office 关掉了我们打开的剪贴板；格式已渲染，重读一次即可
+            if getattr(exc, "winerror", None) != 1418 or attempt == 2:
+                raise
+            time.sleep(0.1)
     normalized = freeze_theme_colours(data)
     hwnd = win32gui.CreateWindowEx(0, "STATIC", "PPT Doctor clipboard", 0,
                                   0, 0, 0, 0, -3, 0, 0, None)
