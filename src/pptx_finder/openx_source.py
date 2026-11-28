@@ -30,7 +30,7 @@ PROJECT_IDS = (8214, 7938)  # 8214 = PPT-Doctor 自己的内源项目（11-23 �
 # 由发版流水线每次发布后更新。0 = 该项目还没建索引，只能读列表（列表要登录时如实提示）。
 # 7938 的 hub-index（12787）收录该项目全部非程序版本，含 ppt-doctor-update-*；但识别/公式/素材组件
 # （ppt-doctor-<组件>-*）只发在 8214，所以 8214 必须有自己的索引，组件下载和 8214 的下载量才走得通。
-INDEX_IDS = {8214: 0, 7938: 12787}
+INDEX_IDS = {8214: 12826, 7938: 12787}   # 8214 的索引 11-28 建好
 INDEX_MARK = "#hub-index v1"
 ALLOWED_HOST = "openx.huawei.com"
 RELEASE_PREFIX = "ppt-doctor-update-"
