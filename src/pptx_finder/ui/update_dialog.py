@@ -430,7 +430,9 @@ class UpdateDialog(QDialog):
             rows = attempt_rows(s["attempts"], s["source_names"], True)
         elif phase == "ready":
             self._set_msg(f"新版本已从「{s['ready_source'] or '更新源'}」下载并校验通过。"
-                          "点「立即重启」后约 5 秒完成替换并自动重新打开；替换失败会自动恢复旧版本。",
+                          "点「立即重启」后约 5 秒完成替换并自动重新打开；替换失败会自动恢复旧版本。"
+                          + ("\n已为你同步计入内源社区下载记录，感谢支持 PPT Doctor！"
+                             if s.get("openx_recorded") else ""),
                           "ok")
             rows = attempt_rows(s["attempts"], s["source_names"], False)
         elif phase == "applying":
