@@ -3359,8 +3359,8 @@ class MainWindow(QMainWindow):
         逐条 stat，已经不存在的自然消失。
         """
         totals = {"added": 0, "dirs": 0, "overflowed": False, "hot_folded": []}
+        builder = None
         try:
-            builder = namestore.NameStoreBuilder()
             seen: set[str] = set()
             dirty_keys = {
                 os.path.normcase(os.path.abspath(str(directory))) for directory in dirs
@@ -3377,6 +3377,15 @@ class MainWindow(QMainWindow):
                         baseline = main_store.entries_for_directories(dirs)
                     finally:
                         main_store.close()
+            from ..inventory_overlay import unchanged_overlay
+
+            unchanged = unchanged_overlay(
+                dirs, hot, baseline=baseline, snapshot_at=snapshot_at,
+                full_dir_max=MainWindow._OVERLAY_FULL_DIR_MAX,
+            )
+            if unchanged is not None:
+                return unchanged
+            builder = namestore.NameStoreBuilder()
             # 先把上一版增量层原样搬过来，否则这一轮只保留本批目录的内容，
             # 上一批刚发现的新文件会当场消失
             hot_keys = {key for key, _path, _seq in hot}
@@ -3467,12 +3476,15 @@ class MainWindow(QMainWindow):
             _log.warning("overlay rebuild failed", exc_info=True)
             totals["error"] = f"{type(exc).__name__}: {exc}"
             totals["hot_folded"] = []   # 没写成：热层一条都不能撤
+        finally:
+            if builder is not None:
+                builder.close()
         return totals
 
     def _on_inventory_reconciled(self, payload: object) -> None:
         if not isinstance(payload, dict):
             return
-        if self._all_files_scope():
+        if self._all_files_scope() and not payload.get("unchanged"):
             self._after_name_index_update()
         if bool(payload.get("overflowed")):
             self._inventory_dirs_overflowed = True
@@ -3484,7 +3496,8 @@ class MainWindow(QMainWindow):
         self._inventory_next_due = (
             time.monotonic() + entries / 2000.0 if entries > 20_000 else 0.0
         )
-        if int(payload.get("added", 0)) or int(payload.get("dirs", 0)):
+        if not payload.get("unchanged") and (
+                int(payload.get("added", 0)) or int(payload.get("dirs", 0))):
             self._index_status_cache = None
             self._refresh_status()
 
