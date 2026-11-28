@@ -28,7 +28,8 @@ PROJECT_IDS = (8214, 7938)  # 8214 = PPT-Doctor 自己的内源项目（11-23 �
 # 2026-11-28：内源 11-27 起把版本列表接口（by_project_id）改成必须登录，单个版本详情（by_id）和附件仍匿名可用。
 # 和 AI HUB-H（R55）一样改读「版本索引」发布：描述里「#hub-index v1」一行之后每行「<id> <版本名> [发布时间]」，新的在前，
 # 由发版流水线每次发布后更新。0 = 该项目还没建索引，只能读列表（列表要登录时如实提示）。
-# 7938 的 hub-index（12787）收录该项目全部非程序版本，含 ppt-doctor-update-* 和 ppt-doctor-<组件>-*。
+# 7938 的 hub-index（12787）收录该项目全部非程序版本，含 ppt-doctor-update-*；但识别/公式/素材组件
+# （ppt-doctor-<组件>-*）只发在 8214，所以 8214 必须有自己的索引，组件下载和 8214 的下载量才走得通。
 INDEX_IDS = {8214: 0, 7938: 12787}
 INDEX_MARK = "#hub-index v1"
 ALLOWED_HOST = "openx.huawei.com"
@@ -172,6 +173,7 @@ class OpenxIndex:
         self._list_at = 0.0
         self._down_until = 0.0
         self.down_reason = ""
+        self._down_auth = False
         self._details: dict = {}
         self._pkg_meta: dict = {}
 
@@ -244,7 +246,9 @@ class OpenxIndex:
         with self._lock:
             now = self._clock()
             if now < self._down_until:
-                raise OpenxUnavailable(self.down_reason or "内源连不上（稍后自动重试）")
+                err = OpenxUnavailable(self.down_reason or "内源连不上（稍后自动重试）")
+                err.auth = self._down_auth
+                raise err
             if self._list is not None and now - self._list_at <= LIST_TTL:
                 return self._list
         try:
@@ -253,6 +257,7 @@ class OpenxIndex:
             auth = _is_auth(e)
             with self._lock:
                 self._down_until = self._clock() + UNREACHABLE_TTL
+                self._down_auth = auth
                 self.down_reason = (str(e)[:160] if auth
                                     else f"公司内源连不上：{type(e).__name__}: {str(e)[:80]}")
             err = OpenxUnavailable(self.down_reason)
@@ -262,6 +267,11 @@ class OpenxIndex:
             self._list = [r for r in recs if isinstance(r, dict) and r.get("id") is not None]
             self._list_at = self._clock()
             return self._list
+
+    def clear_down(self) -> None:
+        """用户手动检查时立刻重连，不等 5 分钟「连不上」缓存过期（与 AI HUB-H clearDown 一致）。"""
+        with self._lock:
+            self._down_until = 0.0
 
     def update_releases(self, timeout: float = LIST_TIMEOUT, prefix: str = RELEASE_PREFIX) -> list:
         """某一类版本（默认本产品的更新版本；组件用 ppt-doctor-<组件>-），新到旧。"""
@@ -321,7 +331,7 @@ class OpenxIndex:
                         return dict(m[f"{fk}.000"])
                     if m:
                         return dict(next(iter(m.values())))
-        if fk:
+        elif fk:
             for m in pkg_meta.values():
                 if fk in m:
                     return dict(m[fk])
@@ -373,6 +383,10 @@ class MultiIndex:
 
     def __init__(self, indexes):
         self.indexes = list(indexes)
+
+    def clear_down(self) -> None:
+        for idx in self.indexes:
+            idx.clear_down()
 
     def latest_file(self, name: str, timeout: float = LIST_TIMEOUT,
                     prefix: str = RELEASE_PREFIX) -> tuple[str, str]:

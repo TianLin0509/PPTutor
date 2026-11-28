@@ -186,9 +186,10 @@ class UpdateController(QObject):
         chip.hide()
         chip.clicked.connect(self._on_click)
         self._openx_recorded.connect(lambda _rv: self._ui_alive() and self._notify())
+        self._recorded_cb = self._openx_recorded.emit   # 固定一个回调对象，关窗时才能移除
         try:
             from .. import openx_recorder
-            openx_recorder.RECORDER.add_listener(self._openx_recorded.emit)
+            openx_recorder.RECORDER.add_listener(self._recorded_cb)
             openx_recorder.schedule_resume_pending()
         except Exception:  # noqa: BLE001
             pass
@@ -221,6 +222,11 @@ class UpdateController(QObject):
 
     def shutdown(self, wait_ms: int = 3000) -> None:
         """关窗收尾：停下并等待检查/下载线程（不 terminate）。"""
+        try:
+            from .. import openx_recorder
+            openx_recorder.RECORDER.remove_listener(self._recorded_cb)
+        except Exception:  # noqa: BLE001
+            pass
         dialog = self._dialog
         self._dialog = None
         if dialog is not None:
@@ -321,6 +327,12 @@ class UpdateController(QObject):
         if self._state != "idle":
             return
         self._manual_check = manual
+        if manual:
+            try:
+                from .. import openx_source
+                openx_source.INDEX.clear_down()
+            except Exception:  # noqa: BLE001
+                pass
         self._state = "checking"
         self._check_status = "checking"
         self._check_error = ""

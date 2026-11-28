@@ -167,9 +167,15 @@ def attempt_rows(attempts: list, source_names: list, downloading: bool) -> list:
     return rows
 
 
+def _fail_text(reason) -> str:
+    """原因里已说清（「要求登录」「连不上」）就不再加「连不上：」前缀。"""
+    text = str(reason or "原因未知")
+    return text if ("要求登录" in text or text.startswith("公司内源连不上") or text.startswith("连不上")) else f"连不上：{text}"
+
+
 def check_rows(checks: list) -> list:
     return [(c.get("name", ""), "ok" if c.get("ok") else "failed",
-             f"可用，最新 v{c.get('version')}" if c.get("ok") else f"连不上：{c.get('reason') or '原因未知'}")
+             f"可用，最新 v{c.get('version')}" if c.get("ok") else _fail_text(c.get("reason")))
             for c in checks or []]
 
 

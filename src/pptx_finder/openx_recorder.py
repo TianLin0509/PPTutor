@@ -1076,7 +1076,9 @@ class OpenxDownloadRecorder:
         res = self._execute_once(item, from_pending=from_pending)
         if isinstance(res, dict) and res.get("status") == "recorded" and not res.get("cached"):
             # 2026-11-28：和 AI HUB-H 一样，记上后在更新弹窗里感谢用户；监听方出错不影响记录结果
-            for fn in list(self._listeners):
+            with self._lock:
+                listeners = list(self._listeners)
+            for fn in listeners:
                 try:
                     fn(str(res.get("release_version") or ""))
                 except Exception:  # noqa: BLE001
@@ -1235,14 +1237,16 @@ class OpenxDownloadRecorder:
 
     def add_listener(self, fn: Callable[[str], None]) -> None:
         """记录成功后回调 fn(release_version)（在后台线程里调用）。"""
-        if fn not in self._listeners:
-            self._listeners.append(fn)
+        with self._lock:
+            if fn not in self._listeners:
+                self._listeners.append(fn)
 
     def remove_listener(self, fn: Callable[[str], None]) -> None:
-        try:
-            self._listeners.remove(fn)
-        except ValueError:
-            pass
+        with self._lock:
+            try:
+                self._listeners.remove(fn)
+            except ValueError:
+                pass
 
     def is_recorded(self, release_version: str) -> bool:
         key = self._key(release_version)

@@ -172,3 +172,46 @@ def test_recorder_notifies_listener_once_for_thanks(tmp_path):
     assert rec.is_recorded("ppt-doctor-update-2.1.20") and not rec.is_recorded("ppt-doctor-update-2.1.19")
     rec.record(release_version="ppt-doctor-update-2.1.20", background=False)   # 已记过：不重复感谢
     assert got == ["ppt-doctor-update-2.1.20"]
+
+
+def test_cached_down_keeps_auth_and_manual_check_clears_it():
+    op = Opener(RELS, FILES, list_mode="auth401")
+    ix = _ix(op, index_id=0)
+    with pytest.raises(openx_source.OpenxUnavailable):
+        ix.releases()
+    n = len(op.calls)
+    with pytest.raises(openx_source.OpenxUnavailable) as e:
+        ix.releases()                                   # 5 分钟缓存内：不再请求，但仍标「要求登录」
+    assert e.value.auth is True and len(op.calls) == n
+    openx_source.MultiIndex([ix]).clear_down()          # 手动检查：立刻重连
+    op.list_mode = "ok"
+    assert ix.latest_file("manifest-Base.json")[1] == "2.1.20"
+
+
+def test_find_meta_with_version_miss_does_not_fall_back_to_old_same_named_file():
+    op = Opener([(2, "ppt-doctor-update-2.1.19")], {2: [("aaa", F + "a19")]}, index=[(2, "ppt-doctor-update-2.1.19")])
+    ix = _ix(op)
+    ix.find("aaa")
+    assert ix.find_meta("ppt-doctor-update-2.1.20", "aaa") is None
+    assert ix.find_meta("", "aaa")["release_id"] == 2
+
+
+def test_login_required_hides_external_button_and_says_not_network(monkeypatch):
+    from pptx_finder import updater
+    from pptx_finder.ui.update_dialog import check_rows
+    reason = openx_source.AUTH_TEXT + "（HTTP 401）"
+    assert check_rows([{"name": "公司内源", "ok": False, "reason": reason}])[0][2] == reason
+    assert check_rows([{"name": "GitHub", "ok": False, "reason": "超时"}])[0][2] == "连不上：超时"
+    monkeypatch.setenv("PPTX_FINDER_OPENX", "1")
+    monkeypatch.delenv("PPTX_FINDER_UPDATE_EXTERNAL", raising=False)
+    from pptx_finder import config
+    monkeypatch.setattr(config, "load_ui_settings", lambda: {})
+    monkeypatch.setattr(updater, "is_frozen", lambda: True)
+    monkeypatch.setattr(updater, "local_manifest", lambda: {"version": "2.1.19", "files": {}})
+
+    def fake_fetch(source, timeout=8, response_callback=None):
+        raise openx_source.OpenxUnavailable(reason)
+    monkeypatch.setattr(updater, "fetch_manifest_from", fake_fetch)
+    rep = updater.check_sources("https://me.lt-stockpartner.tech/pptutor")
+    assert rep.best is None and not rep.openx_only_failed            # 不给「改用外网更新源」
+    assert "不是网络问题" in rep.error and "连不上" not in rep.error
