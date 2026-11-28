@@ -297,6 +297,10 @@ class ReportOverlay(QWidget):
         self.setAttribute(Qt.WA_StyledBackground, True)
         self.setAttribute(Qt.WA_DeleteOnClose, True)
         self.setStyleSheet("#reportOverlay{background:rgba(0,0,0,0.42);}")
+        # 浮层是主窗的子控件：不主动接管键盘焦点的话，焦点留在底下的搜索框里，
+        # 打字会改底层搜索词、Esc 会被主窗当成「清空搜索」吃掉（浮层反而关不掉）。
+        self.setFocusPolicy(Qt.StrongFocus)
+        self._focus_before = None
 
         self._card = QFrame()
         self._card.setObjectName("repCard")
@@ -350,8 +354,31 @@ class ReportOverlay(QWidget):
         except RuntimeError:
             return False
 
+    def showEvent(self, event):  # noqa: N802
+        super().showEvent(event)
+        focus = QApplication.focusWidget()
+        if focus is not None and focus is not self and not self.isAncestorOf(focus):
+            self._focus_before = focus
+        self.setFocus(Qt.OtherFocusReason)
+
+    def focusNextPrevChild(self, next_):  # noqa: N802
+        # Tab 只在浮层内部循环，不穿到被遮住的主窗控件上
+        ok = super().focusNextPrevChild(next_)
+        focus = QApplication.focusWidget()
+        if focus is not None and focus is not self and not self.isAncestorOf(focus):
+            self.setFocus(Qt.TabFocusReason)
+        return ok
+
     def closeEvent(self, event):  # noqa: N802
         self._closing = True
+        before = self._focus_before
+        self._focus_before = None
+        if before is not None and _qt_is_valid(before):
+            try:
+                if before.isVisible():
+                    before.setFocus(Qt.OtherFocusReason)  # 关浮层后焦点回到打开前的位置
+            except RuntimeError:
+                pass
         self._switch_token += 1
         self._switch_inflight = None
         try:

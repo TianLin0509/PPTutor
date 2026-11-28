@@ -79,6 +79,9 @@ def _raise_existing_report_overlay(mw) -> bool:
         activate = getattr(ov, "activateWindow", None)
         if callable(activate):
             activate()
+        set_focus = getattr(ov, "setFocus", None)
+        if callable(set_focus):
+            set_focus()  # 已开着的浮层再点「报告」：键盘焦点也要回到浮层上
         return True
     except (RuntimeError, TypeError):
         try:
