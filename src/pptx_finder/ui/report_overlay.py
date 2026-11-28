@@ -9,7 +9,7 @@ from __future__ import annotations
 import html
 from datetime import datetime, timedelta
 
-from PySide6.QtCore import QPoint, QRect, QEasingCurve, Qt, QVariantAnimation
+from PySide6.QtCore import QPoint, QRect, QEasingCurve, Qt, QTimer, QVariantAnimation
 from PySide6.QtGui import QPainter, QPixmap, QRegion
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QFrame, QHBoxLayout, QLabel, QMessageBox, QPushButton,
@@ -385,6 +385,9 @@ class ReportOverlay(QWidget):
             parent = self.parent()
             if parent is not None and getattr(parent, "_stats_overlay", None) is self:
                 parent._stats_overlay = None
+                notify = getattr(parent, "_on_overlay_closed", None)
+                if callable(notify):
+                    QTimer.singleShot(0, notify)  # 关完再让主窗补刷后台攒下的变更
         except RuntimeError:
             pass
         super().closeEvent(event)

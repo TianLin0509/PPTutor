@@ -151,6 +151,7 @@ class UpdateController(QObject):
     - ``check_now()``：手动检查（不受「只自动弹一次」限制，结果显示在弹窗里）。
     - ``pending_version()`` / ``is_unread()``：给入口文案用。
     """
+    _PROMPT_RETRY_MS = 5000  # 浮层开着时推迟自动弹更新窗的重试间隔
 
     state_changed = Signal()
     unread_changed = Signal(bool, str)
@@ -442,6 +443,11 @@ class UpdateController(QObject):
             if not self._prompt_waiting:
                 self._prompt_waiting = True
                 parent.installEventFilter(self)
+            return
+        overlay_active = getattr(parent, "_overlay_active", None)
+        if callable(overlay_active) and overlay_active():
+            # 正开着胶片报告等整窗浮层（常见于演示）：别把更新窗盖上去，稍后再看
+            QTimer.singleShot(self._PROMPT_RETRY_MS, self._maybe_prompt_once)
             return
         _write_setting(**{_PROMPTED_KEY: version})
         self.open_dialog(mark_seen=False)

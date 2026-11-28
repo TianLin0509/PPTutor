@@ -1149,6 +1149,7 @@ class MainWindow(QMainWindow):
         self._debounce.timeout.connect(self._on_debounce_timeout)
         # 后台重搜被推迟时置位：用户不在搜索页就只记一笔，回到搜索页再刷
         self._search_stale = False
+        self._passive_search = False  # 为真时本次 _do_search 是后台被动重搜（不切页）
         self._search_slow_hint_timer = QTimer(self)
         self._search_slow_hint_timer.setSingleShot(True)
         self._search_slow_hint_timer.setInterval(self._SEARCH_SLOW_HINT_MS)
@@ -2038,6 +2039,11 @@ class MainWindow(QMainWindow):
     def _open_report_from_rail(self) -> None:
         """rail「报告」：打开胶片报告浮层（逻辑全在 stats_entry，盖主窗语义不变）。"""
         from . import stats_entry
+        if self._debounce.isActive():
+            # 刚敲完词就点「报告」：作废在途防抖，免得报告还在生成时被拽去搜索页
+            self._debounce.stop()
+            if self.search_box.text().strip():
+                self._search_stale = True
         stats_entry._open_report(self)
 
     def _version_feature_enabled(self) -> bool:
@@ -2138,7 +2144,10 @@ class MainWindow(QMainWindow):
             self.search_box.setFocus(Qt.OtherFocusReason)
 
     def _overlay_active(self) -> bool:
-        """主窗上盖着胶片报告 / 欢迎页这类整窗浮层时为真：后台事件不许抢它的焦点。"""
+        """主窗上盖着（或马上要盖上）胶片报告 / 欢迎页这类整窗浮层时为真：
+        后台事件不许切页、不许抢它的焦点。报告在后台生成期间也算。"""
+        if getattr(self, "_stats_report_loading", False):
+            return True
         for name in ("_stats_overlay", "_welcome"):
             ov = getattr(self, name, None)
             if ov is None:
@@ -2183,6 +2192,9 @@ class MainWindow(QMainWindow):
                     ov.close()  # 热键 / Ctrl+L = 要搜索：别把光标塞进被浮层盖住的输入框
             except RuntimeError:
                 pass
+        if self._current_page_key() not in ("search", "dashboard"):
+            # 素材 / 健康 / 版本页的页头不放搜索框：先回到能看见搜索框的页再聚焦
+            self._switch_page("search" if self.search_box.text().strip() else "dashboard")
         self.search_box.setFocus()
         self.search_box.selectAll()
         self.show_history_popup()
@@ -2578,7 +2590,7 @@ class MainWindow(QMainWindow):
             # 离开期间攒下的后台变更：回到搜索页这一刻补一次（文本未变 → 保留选中）
             self._search_stale = False
             if self.search_box.text().strip():
-                self._do_search(user=False)
+                self._run_passive_search()
         if key == "health":
             win = self._health_page_win
             if win is not None:
@@ -2815,7 +2827,7 @@ class MainWindow(QMainWindow):
         if self.search_box.text().strip():
             self._search_stale = True
         else:
-            self._do_search(user=False)  # 清空搜索词不切页，照常回到「最近修改」
+            self._run_passive_search()  # 清空搜索词不切页，照常回到「最近修改」
 
     def _refresh_search_passive(self) -> None:
         """后台被动重搜（文件变动 / 索引完成 / 回收站同步 / 设置切换 / 排序补跑）。
@@ -2825,10 +2837,27 @@ class MainWindow(QMainWindow):
         """
         if self._closing:
             return
-        if self._current_page_key() != "search":
+        if self._current_page_key() != "search" or self._overlay_active():
+            # 浮层盖着搜索页时也不重建列表 / 预览：演示中不在浮层背后闪，关浮层再补
             self._search_stale = True
             return
-        self._do_search(user=False)
+        self._run_passive_search()
+
+    def _run_passive_search(self) -> None:
+        """以后台口径跑一次 _do_search（不切页、不抢焦点）；保持 _do_search 无参可调。"""
+        self._passive_search = True
+        try:
+            self._do_search()
+        finally:
+            self._passive_search = False
+
+    def _on_overlay_closed(self) -> None:
+        """整窗浮层关掉后：停在搜索页且攒了后台变更，就静默补刷一次。"""
+        if self._closing or self._overlay_active():
+            return
+        if (getattr(self, "_search_stale", False) and self._current_page_key() == "search"
+                and self.search_box.text().strip()):
+            self._run_passive_search()
 
     # ---------- 列表 / 仪表盘首屏切换 ----------
     def _show_dashboard(self, *, force_refresh: bool = False) -> None:
@@ -3646,11 +3675,12 @@ class MainWindow(QMainWindow):
         self._last_user_input_ts = time.monotonic()
         self._sort_refresh_pending = False
 
-    def _do_search(self, *_signal_args, user: bool = True) -> None:
-        """执行一次搜索。user=True（默认，也是按钮 / 回车 / 下拉等信号直连的口径）
-        表示用户显式发起，有词就切到搜索页；user=False 是后台被动重搜，绝不切页。"""
+    def _do_search(self, *_signal_args) -> None:
+        """执行一次搜索。默认（按钮 / 回车 / 下拉等信号直连）= 用户显式发起，有词就切到
+        搜索页；经 _run_passive_search 调用时是后台被动重搜，绝不切页。"""
         if self._closing:
             return
+        user = not getattr(self, "_passive_search", False)
         if (not user and self.search_box.text().strip()
                 and self._current_page_key() != "search"):
             # 被动重搜只服务于正摆在眼前的搜索页；人不在就记脏，回来再刷（不动任何界面状态）

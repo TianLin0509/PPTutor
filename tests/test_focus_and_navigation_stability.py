@@ -184,7 +184,8 @@ def test_report_overlay_takes_focus_and_esc_keeps_query(win, qtbot):
     assert win._current_page_key() == "dashboard"
 
 
-def test_report_over_search_page_refreshes_in_place(win, qtbot):
+def test_report_over_search_page_defers_refresh_until_closed(win, qtbot):
+    """浮层盖着搜索页时后台变更只记脏（不在浮层背后重建列表），关浮层后补刷一次。"""
     _search_ai(win, qtbot)
     stats_entry._open_report_sync(win)
     ov = win._stats_overlay
@@ -192,12 +193,65 @@ def test_report_over_search_page_refreshes_in_place(win, qtbot):
     _unthrottle(win)
     win._after_live_index()
     win._do_live_refresh()
-    assert win._search_seq == seq + 1      # 搜索页在浮层底下就地刷新
+    assert win._search_seq == seq and win._search_stale
     focus = QApplication.focusWidget()
     assert focus is ov or ov.isAncestorOf(focus)
     qtbot.keyClick(focus, Qt.Key_Escape)
-    qtbot.waitUntil(lambda: getattr(win, "_stats_overlay", None) is None, timeout=2000)
+    qtbot.waitUntil(lambda: win._search_seq == seq + 1, timeout=2000)
     assert win.search_box.text() == "AI"
+    assert win._current_page_key() == "search"
+    assert not win._search_stale
+
+
+def test_report_click_cancels_pending_debounce_while_report_builds(win, qtbot, monkeypatch):
+    """敲完词 <280ms 点「报告」：报告还在后台生成（浮层没出来）时，防抖到点也不许切页。"""
+    win._switch_page("dashboard")
+    win.search_box.setFocus()
+    qtbot.keyClicks(win.search_box, "AI")
+    assert win._debounce.isActive()
+    started = []
+    monkeypatch.setattr(stats_entry, "_open_report",
+                        lambda mw: (started.append(1), setattr(mw, "_stats_report_loading", True)))
+    qtbot.mouseClick(win.rail_report_btn, Qt.LeftButton)
+    assert started == [1] and not win._debounce.isActive()
+    win._debounce.start()  # 就算还有别的输入防抖到点，报告生成期间也不切页
+    qtbot.wait(win._debounce.interval() + 200)
+    assert win._current_page_key() == "dashboard"
+    win._stats_report_loading = False
+
+
+@pytest.mark.parametrize("page,query,expected", [
+    ("material", "AI", "search"), ("health", "", "dashboard"), ("version", "AI", "search")])
+def test_ctrl_l_on_pages_without_search_box_goes_back_and_focuses(win, qtbot, page, query, expected):
+    win.search_box.setText(query)
+    win._debounce.stop()
+    win._switch_page(page)
+    assert not win.search_box.isVisible()
+    win.focus_search()
+    assert win._current_page_key() == expected
+    qtbot.waitUntil(lambda: QApplication.focusWidget() is win.search_box, timeout=2000)
+    assert win.search_box.selectedText() == query
+
+
+def test_update_auto_prompt_waits_while_report_open(win, qtbot, monkeypatch):
+    from pptx_finder.ui import update_ui
+    opened = []
+    ctl = update_ui.UpdateController.__new__(update_ui.UpdateController)
+    monkeypatch.setattr(update_ui.UpdateController, "pending_version", lambda self: "9.9.9")
+    monkeypatch.setattr(update_ui.UpdateController, "_dialog_parent", lambda self: win)
+    monkeypatch.setattr(update_ui.UpdateController, "open_dialog",
+                        lambda self, mark_seen=True: opened.append(mark_seen))
+    monkeypatch.setattr(update_ui, "_read_setting", lambda key: "")
+    monkeypatch.setattr(update_ui, "_write_setting", lambda **kw: None)
+    monkeypatch.setattr(update_ui.UpdateController, "_PROMPT_RETRY_MS", 50)
+    QObject.__init__(ctl)
+    ctl._state, ctl._manual_check, ctl._auto_prompt, ctl._prompt_waiting = "available", False, True, False
+    stats_entry._open_report_sync(win)
+    ctl._maybe_prompt_once()
+    qtbot.wait(150)
+    assert opened == []                    # 浮层开着：不弹
+    win._stats_overlay.close()
+    qtbot.waitUntil(lambda: opened == [False], timeout=2000)
 
 
 def test_reopen_report_refocuses_overlay(win, qtbot):
