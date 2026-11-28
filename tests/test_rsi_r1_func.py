@@ -30,6 +30,7 @@ def test_imports_use_independent_copy():
 @pytest.mark.parametrize("event", ["full", "live", "hot", "reconcile"])
 @pytest.mark.parametrize("all_files", [False, True])
 def test_index_events_refresh_current_query(win, monkeypatch, event, all_files):
+    win._switch_page("search")  # 后台重搜只刷正在看的搜索页（其他页只记脏，见 test_focus_and_navigation_stability）
     win.search_box.setText("原有查询")
     win._debounce.stop()
     monkeypatch.setattr(win, "_all_files_scope", lambda: all_files)

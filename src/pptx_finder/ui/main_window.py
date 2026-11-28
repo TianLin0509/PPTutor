@@ -1146,7 +1146,10 @@ class MainWindow(QMainWindow):
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
         self._debounce.setInterval(280)
-        self._debounce.timeout.connect(self._do_search)
+        self._debounce.timeout.connect(self._on_debounce_timeout)
+        # 后台重搜被推迟时置位：用户不在搜索页就只记一笔，回到搜索页再刷
+        self._search_stale = False
+        self._passive_search = False  # 为真时本次 _do_search 是后台被动重搜（不切页）
         self._search_slow_hint_timer = QTimer(self)
         self._search_slow_hint_timer.setSingleShot(True)
         self._search_slow_hint_timer.setInterval(self._SEARCH_SLOW_HINT_MS)
@@ -1799,7 +1802,7 @@ class MainWindow(QMainWindow):
         for key, label, tip, _icon in self._RAIL_PAGES:
             btn = self._mk_rail_btn(label, tip)
             btn.setCheckable(True)
-            btn.clicked.connect(lambda _checked=False, k=key: self._switch_page(k))
+            btn.clicked.connect(lambda _checked=False, k=key: self._on_rail_page_clicked(k))
             lay.addWidget(btn, 0, Qt.AlignHCenter)
             self._rail_page_btns[key] = btn
         self.rail_material_btn = self._rail_page_btns["material"]
@@ -2036,6 +2039,10 @@ class MainWindow(QMainWindow):
     def _open_report_from_rail(self) -> None:
         """rail「报告」：打开胶片报告浮层（逻辑全在 stats_entry，盖主窗语义不变）。"""
         from . import stats_entry
+        if self._debounce.isActive():
+            # 刚敲完词（或刚清空词）就点「报告」：作废在途防抖并记脏，免得报告还在生成时被拽去搜索页
+            self._debounce.stop()
+            self._search_stale = True
         stats_entry._open_report(self)
 
     def _version_feature_enabled(self) -> bool:
@@ -2131,8 +2138,38 @@ class MainWindow(QMainWindow):
     def _restore_search_focus(self) -> None:
         if (not self._closing and self.facet_panel.isHidden()
                 and self._current_page_key() in ("search", "dashboard")
+                and not self._overlay_active()
                 and not self._other_input_has_focus()):
             self.search_box.setFocus(Qt.OtherFocusReason)
+
+    def _overlay_active(self) -> bool:
+        """主窗上盖着（或马上要盖上）胶片报告 / 欢迎页这类整窗浮层时为真：
+        后台事件不许切页、不许抢它的焦点。报告在后台生成期间也算。"""
+        if getattr(self, "_stats_report_loading", False):
+            return True
+        for name in ("_stats_overlay", "_welcome"):
+            ov = getattr(self, name, None)
+            if ov is None:
+                continue
+            try:
+                if ov.isVisible() and not getattr(ov, "_closing", False):
+                    return True
+            except RuntimeError:  # 浮层已被 Qt 回收
+                continue
+        return False
+
+    def _in_overlay(self, widget) -> bool:
+        """widget 是否落在当前可见的整窗浮层里（浮层自己处理按键，主窗不越俎代庖）。"""
+        if widget is None or not self._overlay_active():
+            return False
+        for name in ("_stats_overlay", "_welcome"):
+            ov = getattr(self, name, None)
+            try:
+                if ov is not None and (widget is ov or ov.isAncestorOf(widget)):
+                    return True
+            except (RuntimeError, TypeError):
+                continue
+        return False
 
     def _other_input_has_focus(self, widget=None) -> bool:
         widget = widget if widget is not None else QApplication.focusWidget()
@@ -2147,6 +2184,16 @@ class MainWindow(QMainWindow):
         同时让变更流水账马上追平一轮：用户此刻最在乎刚存的文件能不能搜到。
         setFocus 产生的 FocusIn 不再自动弹历史（见 eventFilter），这里显式补一次。"""
         self._wake_change_feed()
+        ov = getattr(self, "_stats_overlay", None)
+        if ov is not None:
+            try:
+                if ov.isVisible():
+                    ov.close()  # 热键 / Ctrl+L = 要搜索：别把光标塞进被浮层盖住的输入框
+            except RuntimeError:
+                pass
+        if self._current_page_key() not in ("search", "dashboard"):
+            # 素材 / 健康 / 版本页的页头不放搜索框：先回到能看见搜索框的页再聚焦
+            self._switch_page("search" if self.search_box.text().strip() else "dashboard")
         self.search_box.setFocus()
         self.search_box.selectAll()
         self.show_history_popup()
@@ -2538,6 +2585,10 @@ class MainWindow(QMainWindow):
                 self._update_query_hint(self.search_box.text().strip())
             else:
                 hint.hide()
+        if key == "search" and getattr(self, "_search_stale", False) and not getattr(self, "_closing", False):
+            # 离开期间攒下的后台变更或被作废的清空防抖：回到搜索页这一刻补一次
+            self._search_stale = False
+            self._run_passive_search()
         if key == "health":
             win = self._health_page_win
             if win is not None:
@@ -2737,6 +2788,73 @@ class MainWindow(QMainWindow):
             else:
                 items.append(("内源更新", "ok", "当前已是最新", "检查", self._open_update_center))
         win.set_diagnostics(items, copy_fn=lambda: self.open_settings_page("健康诊断"))
+
+    def _on_rail_page_clicked(self, key: str) -> None:
+        """导航轨点页：这是用户显式选页，选了哪页就稳稳停在哪页。
+
+        - 还没到点的输入防抖作废（否则 280ms 后 _do_search 会把人拽回搜索页），只记脏；
+        - 离开搜索页时把键盘焦点从搜索框移到目标页：导航按钮是 TabFocus，不移的话
+          焦点黏在框里，方向键 / 回车仍会被当成「进结果列表」而切回搜索页。
+        """
+        if key != "search" and self._debounce.isActive():
+            self._debounce.stop()
+            self._search_stale = True
+        self._switch_page(key)
+        if key != "search" and self._current_page_key() == key:
+            self._move_focus_to_page(key)
+
+    def _move_focus_to_page(self, key: str) -> None:
+        page = getattr(self, "_pages", {}).get(key)
+        if page is None or self._overlay_active():
+            return
+        focus = QApplication.focusWidget()
+        if focus is not None and focus is not self.search_box and page.isAncestorOf(focus):
+            return  # 焦点已经在目标页里（例如素材页自己的输入框），不动
+        if page.focusPolicy() == Qt.NoFocus:
+            page.setFocusPolicy(Qt.ClickFocus)
+        page.setFocus(Qt.OtherFocusReason)
+
+    def _on_debounce_timeout(self) -> None:
+        """输入防抖到点：只有搜索框还摆在用户眼前（搜索 / 概览页、无浮层）才切去搜索。"""
+        if self._closing:
+            return
+        if self._current_page_key() in ("search", "dashboard") and not self._overlay_active():
+            self._do_search()
+            return
+        if self.search_box.text().strip():
+            self._search_stale = True
+        else:
+            self._run_passive_search()  # 清空搜索词不切页，照常回到「最近修改」
+
+    def _refresh_search_passive(self) -> None:
+        """后台被动重搜（文件变动 / 索引完成 / 回收站同步 / 设置切换 / 排序补跑）。
+
+        只在用户正看着搜索页时就地刷新；人在概览、素材、健康、版本页时绝不切页，
+        只记脏，等用户自己回到搜索页再补一次。浮层盖在搜索页上时就地刷新但不碰焦点。
+        """
+        if self._closing:
+            return
+        if self._current_page_key() != "search" or self._overlay_active():
+            # 浮层盖着搜索页时也不重建列表 / 预览：演示中不在浮层背后闪，关浮层再补
+            self._search_stale = True
+            return
+        self._run_passive_search()
+
+    def _run_passive_search(self) -> None:
+        """以后台口径跑一次 _do_search（不切页、不抢焦点）；保持 _do_search 无参可调。"""
+        self._passive_search = True
+        try:
+            self._do_search()
+        finally:
+            self._passive_search = False
+
+    def _on_overlay_closed(self) -> None:
+        """整窗浮层关掉后：停在搜索页且攒了后台变更，就静默补刷一次。"""
+        if self._closing or self._overlay_active():
+            return
+        if getattr(self, "_search_stale", False) and self._current_page_key() == "search":
+            self._search_stale = False
+            self._run_passive_search()
 
     # ---------- 列表 / 仪表盘首屏切换 ----------
     def _show_dashboard(self, *, force_refresh: bool = False) -> None:
@@ -3218,7 +3336,7 @@ class MainWindow(QMainWindow):
             self._purge_inventory_rows()
         if docs_changed or all_files_changed:
             if self.search_box.text().strip():
-                self._do_search()
+                self._refresh_search_passive()
             else:
                 self._show_recent(recent_force_refresh=True)
             self._refresh_status()
@@ -3359,8 +3477,8 @@ class MainWindow(QMainWindow):
         逐条 stat，已经不存在的自然消失。
         """
         totals = {"added": 0, "dirs": 0, "overflowed": False, "hot_folded": []}
+        builder = None
         try:
-            builder = namestore.NameStoreBuilder()
             seen: set[str] = set()
             dirty_keys = {
                 os.path.normcase(os.path.abspath(str(directory))) for directory in dirs
@@ -3377,6 +3495,19 @@ class MainWindow(QMainWindow):
                         baseline = main_store.entries_for_directories(dirs)
                     finally:
                         main_store.close()
+            from ..inventory_overlay import unchanged_overlay
+
+            try:
+                unchanged = unchanged_overlay(
+                    dirs, hot, baseline=baseline, snapshot_at=snapshot_at,
+                    full_dir_max=MainWindow._OVERLAY_FULL_DIR_MAX,
+                )
+            except Exception:  # noqa: BLE001 快路径任何异常回退原全量重建，绝不静默跳过更新
+                _log.debug("unchanged_overlay check failed; falling back to rebuild", exc_info=True)
+                unchanged = None
+            if unchanged is not None:
+                return unchanged
+            builder = namestore.NameStoreBuilder()
             # 先把上一版增量层原样搬过来，否则这一轮只保留本批目录的内容，
             # 上一批刚发现的新文件会当场消失
             hot_keys = {key for key, _path, _seq in hot}
@@ -3467,12 +3598,15 @@ class MainWindow(QMainWindow):
             _log.warning("overlay rebuild failed", exc_info=True)
             totals["error"] = f"{type(exc).__name__}: {exc}"
             totals["hot_folded"] = []   # 没写成：热层一条都不能撤
+        finally:
+            if builder is not None:
+                builder.close()
         return totals
 
     def _on_inventory_reconciled(self, payload: object) -> None:
         if not isinstance(payload, dict):
             return
-        if self._all_files_scope():
+        if self._all_files_scope() and not payload.get("unchanged"):
             self._after_name_index_update()
         if bool(payload.get("overflowed")):
             self._inventory_dirs_overflowed = True
@@ -3484,7 +3618,8 @@ class MainWindow(QMainWindow):
         self._inventory_next_due = (
             time.monotonic() + entries / 2000.0 if entries > 20_000 else 0.0
         )
-        if int(payload.get("added", 0)) or int(payload.get("dirs", 0)):
+        if not payload.get("unchanged") and (
+                int(payload.get("added", 0)) or int(payload.get("dirs", 0))):
             self._index_status_cache = None
             self._refresh_status()
 
@@ -3554,10 +3689,19 @@ class MainWindow(QMainWindow):
         self._last_user_input_ts = time.monotonic()
         self._sort_refresh_pending = False
 
-    def _do_search(self) -> None:
+    def _do_search(self, *_signal_args) -> None:
+        """执行一次搜索。默认（按钮 / 回车 / 下拉等信号直连）= 用户显式发起，有词就切到
+        搜索页；经 _run_passive_search 调用时是后台被动重搜，绝不切页。"""
         if self._closing:
             return
+        user = not getattr(self, "_passive_search", False)
+        if (not user and self.search_box.text().strip()
+                and self._current_page_key() != "search"):
+            # 被动重搜只服务于正摆在眼前的搜索页；人不在就记脏，回来再刷（不动任何界面状态）
+            self._search_stale = True
+            return
         self._debounce.stop()
+        self._search_stale = False
         self._history_hint_timer.stop()
         self._history_hint_pending_query = ""
         if hasattr(self, "_history_hint"):
@@ -3586,7 +3730,8 @@ class MainWindow(QMainWindow):
             return
         self._recent_load_token += 1
         self._showing_recent = False
-        self._show_list()  # 有搜索词 → 显示结果列表区（隐藏仪表盘首屏）
+        if user:
+            self._show_list()  # 用户发起且有搜索词 → 显示结果列表区（隐藏仪表盘首屏）
         if self._search_worker is not None:
             self._show_search_pending(query)
             request_args = (
@@ -3740,7 +3885,7 @@ class MainWindow(QMainWindow):
         self._finish_search(query, list(results or []), elapsed_ms)
         if self._sort_refresh_pending and self.search_box.text().strip():
             self._sort_refresh_pending = False
-            QTimer.singleShot(0, self._do_search)
+            QTimer.singleShot(0, self._refresh_search_passive)
         # 索引统计不是搜索收口的一部分；缓存缺失时才补一次后台读取。
         if self._index_status_cache is None:
             self._refresh_status()
@@ -4387,7 +4532,7 @@ class MainWindow(QMainWindow):
         self._recent_cache_at = 0.0
         self._refresh_status({"indexed": 0, "deleted": deleted})
         if self.search_box.text().strip():
-            self._do_search()
+            self._refresh_search_passive()  # 人在健康页清理：不许被拽回搜索页
         elif self._showing_recent:
             self._show_recent(dashboard_force_refresh=True, recent_force_refresh=True)
         elif getattr(self, "dashboard", None) is not None:
@@ -6323,6 +6468,7 @@ class MainWindow(QMainWindow):
             self._restore_search_focus()
         if (et == QEvent.KeyPress and ev.key() == Qt.Key_Escape
                 and isinstance(obj, QWidget)
+                and not self._in_overlay(obj)
                 and (obj.window() is self or obj.window() is getattr(self, "facet_panel", None))):
             if not self.facet_panel.isHidden():
                 self.facet_panel.hide()
@@ -7425,7 +7571,7 @@ class MainWindow(QMainWindow):
             self._last_bg_research_ts = now
             self._live_refresh_pending = False
         if query:
-            self._do_search()
+            self._refresh_search_passive()
         elif refreshes_dashboard:
             self._show_recent(dashboard_force_refresh=True, recent_force_refresh=True)  # 空搜索停在仪表盘 → 新文件并入后刷新统计
 

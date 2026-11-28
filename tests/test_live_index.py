@@ -1108,6 +1108,7 @@ def test_live_refresh_throttles_background_research(qtbot, monkeypatch, tmp_path
     """F1：后台重搜最小间隔 15s——窗口内延迟，但 dirty 尾刷新不能丢。"""
     win = MainWindow(conn=_index(tmp_path), render_worker=StubRender(), thumb_worker=StubThumb(), do_index=False)
     qtbot.addWidget(win)
+    win._switch_page("search")  # 测的是搜索页上的后台重搜节流
     win.search_box.setText("昇腾")
     searches = []
     monkeypatch.setattr(win, "_do_search", lambda: searches.append(1))
@@ -1129,6 +1130,7 @@ def test_live_refresh_waits_for_user_input_grace(qtbot, monkeypatch, tmp_path):
     """F1：用户 5s 内刚改过查询词时后台重搜不抢跑；宽限过后放行。"""
     win = MainWindow(conn=_index(tmp_path), render_worker=StubRender(), thumb_worker=StubThumb(), do_index=False)
     qtbot.addWidget(win)
+    win._switch_page("search")  # 测的是搜索页上的后台重搜节流
     searches = []
     monkeypatch.setattr(win, "_do_search", lambda: searches.append(1))
     win.search_box.setText("昇腾")   # textChanged 打点 _last_user_input_ts = now
@@ -1148,6 +1150,7 @@ def test_live_refresh_trailing_edge_runs_without_another_watcher_event(
     """最后一次事件落在节流窗内，也必须由同一个 timer 在窗口结束后补跑。"""
     win = MainWindow(conn=_index(tmp_path), render_worker=StubRender(), thumb_worker=StubThumb(), do_index=False)
     qtbot.addWidget(win)
+    win._switch_page("search")  # 测的是搜索页上的后台重搜节流
     win.search_box.setText("昇腾")
     # setText 会排一次 280ms 后的真实搜索；闸门满载时它还没跑完，实时刷新会正确地「等搜索结束再补」，
     # 本用例就超时了（2026-11-22 两次闸门复现）。这里只测节流尾沿，先撤掉这次输入搜索。
