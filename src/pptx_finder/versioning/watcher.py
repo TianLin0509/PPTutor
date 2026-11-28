@@ -142,14 +142,16 @@ class _Handler(FileSystemEventHandler):
             except Exception:  # noqa: BLE001 盘点是尽力而为
                 pass
 
-    def name_changed(self, path: str) -> None:
+    def name_changed(self, path: str) -> bool:
         """某个文件/目录刚出现或改过：文件名热层逐条收下（Everything 式，见 hot_names.py）。"""
         cb = self._on_name_changed
         if cb is not None:
             try:
                 cb(path)
+                return True
             except Exception:  # noqa: BLE001 文件名层是尽力而为，绝不能拖垮 watcher
                 pass
+        return False
 
     def _trigger(self, path: str) -> None:
         if os.path.basename(path).startswith("~$"):
@@ -185,17 +187,30 @@ class _Handler(FileSystemEventHandler):
                 attempt,
             )
             self._timers[path] = pending
-            self._arm_wake_timer_locked()
+            self._arm_wake_timer_locked(pending.deadline)
 
-    def _arm_wake_timer_locked(self) -> None:
-        active = [entry for entry in self._timers.values() if not entry.cancelled]
-        if not active or self._stopped:
+    def _arm_wake_timer_locked(self, new_deadline: float | None = None) -> None:
+        if self._stopped or not self._timers:
             if self._wake_timer is not None:
                 self._wake_timer.cancel()
             self._wake_timer = None
             self._wake_deadline = 0.0
             return
-        deadline = min(entry.deadline for entry in active)
+        if new_deadline is None:
+            # Only the wake/drain path needs to find the next outstanding batch.
+            active = [entry.deadline for entry in self._timers.values() if not entry.cancelled]
+            if not active:
+                if self._wake_timer is not None:
+                    self._wake_timer.cancel()
+                self._wake_timer = None
+                self._wake_deadline = 0.0
+                return
+            deadline = min(active)
+        else:
+            # Insertion knows its deadline. An existing earlier wake remains
+            # safe even when that file was rescheduled: drain rechecks deadlines.
+            # Avoid scanning every pending save for every new filesystem event.
+            deadline = new_deadline
         # A timer already due no later than the new earliest entry can service
         # the whole batch. Reusing it is what turns 1,000 saves into one thread.
         if self._wake_timer is not None and self._wake_deadline <= deadline + 0.001:

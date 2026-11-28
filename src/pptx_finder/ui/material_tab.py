@@ -12,6 +12,7 @@ PowerPoint；只有「插入到当前 PPT」「复制形状」「收藏一份到
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections import OrderedDict
 import logging
 import os
 from pathlib import Path
@@ -123,13 +124,37 @@ class Entry:
 
 # ---------------------------------------------------------------- 缩略图缓存
 class ThumbCache:
+    # Keep decoded originals at full resolution. Only the current viewport and
+    # detail selection may exceed this budget; previously visited pages cannot.
+    MAX_BYTES = 64 * 1024 * 1024
+    MAX_IMAGES = 256
+    MAX_MISSING = 512
+
     def __init__(self, library: mat.MaterialLibrary):
         self.library = library
-        self._images: dict[str, QImage] = {}
-        self._missing: set[str] = set()
+        self._images: OrderedDict[str, QImage] = OrderedDict()
+        self._missing: OrderedDict[str, None] = OrderedDict()
+        self._pinned: set[str] = set()
+        self._bytes = 0
 
     def get(self, entry: Entry) -> QImage | None:
-        return self._images.get(entry.key)
+        image = self._images.get(entry.key)
+        if image is not None:
+            self._images.move_to_end(entry.key)
+        return image
+
+    def set_pinned(self, keys: set[str]) -> None:
+        self._pinned = keys
+        self._trim()
+
+    def _trim(self) -> None:
+        for key in list(self._images):
+            if self._bytes <= self.MAX_BYTES and len(self._images) <= self.MAX_IMAGES:
+                break
+            if key not in self._pinned:
+                self._bytes -= self._images.pop(key).sizeInBytes()
+        while len(self._missing) > self.MAX_MISSING:
+            self._missing.popitem(last=False)
 
     def needs(self, entry: Entry) -> bool:
         return entry.key not in self._images and entry.key not in self._missing
@@ -153,13 +178,22 @@ class ThumbCache:
     def store(self, decoded: dict):
         for key, image in decoded.items():
             if image is None:
-                self._missing.add(key)
+                self._missing[key] = None
+                self._missing.move_to_end(key)
             else:
+                old = self._images.pop(key, None)
+                if old is not None:
+                    self._bytes -= old.sizeInBytes()
                 self._images[key] = image
+                self._bytes += image.sizeInBytes()
+                self._missing.pop(key, None)
+        self._trim()
 
     def clear(self):
         self._images.clear()
         self._missing.clear()
+        self._pinned.clear()
+        self._bytes = 0
 
 
 # ---------------------------------------------------------------- 网格
@@ -498,6 +532,7 @@ class MaterialTabWidget(QWidget):
         self._user_collapsed = False
         self._loaded = False
         self._load_gen = 0
+        self._decode_pending: set[tuple[int, str]] = set()
         self._last_menu = None
         self._personal_bytes = 0
         self._last_error_code = ""
@@ -1217,16 +1252,26 @@ QProgressBar#mtBar::chunk {{ background: {t['accent']}; border-radius: 2px; }}
     def _decode_visible(self):
         if self._closing:
             return
-        todo = [self._view[i] for i in self.grid.visible_range() if self.cache.needs(self._view[i])]
-        if self.grid.selected >= 0 and self.cache.needs(self._view[self.grid.selected]):
-            todo.append(self._view[self.grid.selected])
+        gen = self._load_gen
+        visible = [self._view[i] for i in self.grid.visible_range()]
+        if 0 <= self.grid.selected < len(self._view):
+            visible.append(self._view[self.grid.selected])
+        self.cache.set_pinned({entry.key for entry in visible})
+        # Paging, selection and resize can request the same viewport before a
+        # worker returns. Each key gets only one decode per library generation.
+        todo = list({entry.key: entry for entry in visible
+                     if self.cache.needs(entry)
+                     and (gen, entry.key) not in self._decode_pending}.values())
         if not todo:
             return
+        pending = {(gen, entry.key) for entry in todo}
+        self._decode_pending.update(pending)
         task = BackgroundTask(lambda: self.cache.decode(todo), "material-thumbs", self)
         self._tasks.append(task)
 
         def done(decoded):
-            if self._closing:
+            self._decode_pending.difference_update(pending)
+            if self._closing or gen != self._load_gen:
                 return
             if isinstance(decoded, dict):
                 self.cache.store(decoded)

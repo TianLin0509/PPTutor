@@ -22,7 +22,7 @@ import logging
 import os
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Callable, Iterable
 
 from watchdog.events import (
@@ -43,6 +43,7 @@ MAX_CHUNKS_PER_POLL = 64
 SAVE_STATE_SEC = 30.0
 DIR_CACHE_MAX = 20_000
 FILE_CACHE_MAX = 20_000
+PATH_CACHE_MAX = 20_000
 #: 一个新挪进来的目录树最多展开多少项。超过就交给全量校准，别在后台线程里遍历半个盘。
 SUBTREE_WALK_LIMIT = 50_000
 #: 对账一次最多核对多少行：最坏情形是某个顶层目录下的全部已知文件
@@ -56,6 +57,10 @@ _RENAME_NEW = usn.USN_REASON_RENAME_NEW_NAME
 _DELETE = usn.USN_REASON_FILE_DELETE
 _CREATE = usn.USN_REASON_FILE_CREATE
 _IS_DIR = usn.FILE_ATTRIBUTE_DIRECTORY
+_DATA_CHANGE = (usn.USN_REASON_DATA_OVERWRITE | usn.USN_REASON_DATA_EXTEND
+                | usn.USN_REASON_DATA_TRUNCATION)
+# ReasonMask filters records, not the returned reason bits; DATA|CLOSE is common.
+_CLOSE = 0x80000000
 
 #: known_rows(目录, 是否含子目录) → [(路径, 字节数, 修改时间)]：索引里已知的内容文件
 KnownRows = Callable[[str, bool], Iterable[tuple[str, int, float]]]
@@ -91,7 +96,7 @@ def save_state(path: str, state: dict) -> None:
 
 class _Volume:
     __slots__ = (
-        "journal", "root", "journal_id", "cursor", "dirs", "files", "pending_moves",
+        "journal", "root", "journal_id", "cursor", "dirs", "files", "paths", "pending_moves",
         "pending_dir_moves", "records", "losses", "caught_up_at", "safe_cursor", "history",
     )
 
@@ -101,9 +106,11 @@ class _Volume:
         self.journal_id = 0
         self.cursor = 0
         # 父目录编号 → 路径；None 表示这个目录被排除（或已不存在），子文件一律不看
-        self.dirs: dict[int, str | None] = {}
-        # 内容文件编号 → 上次看到的路径；删除和改名时用来知道它原来叫什么
-        self.files: dict[int, str] = {}
+        self.dirs: OrderedDict[int, str | None] = OrderedDict()
+        # 内容文件身份专用；非内容日志 churn 不能挤掉版本历史的改名配对依据。
+        self.files: OrderedDict[int, str] = OrderedDict()
+        # 所有扩展名的近期路径；DATA_* 可复用，结构变化仍重新核实。
+        self.paths: OrderedDict[int, str] = OrderedDict()
         # 只看到改名前半截（旧名）的文件：编号 → 旧父目录编号，等下一块的后半截
         self.pending_moves: dict[int, int] = {}
         # 目录改名前半截：编号 → (旧路径或 None, 旧父目录路径或 None)
@@ -282,6 +289,8 @@ class UsnFeed:
         vol.safe_cursor = info.next_usn
         vol.history.clear()
         vol.dirs.clear()
+        vol.files.clear()
+        vol.paths.clear()
         vol.pending_moves.clear()
         vol.pending_dir_moves.clear()
         self._state_dirty = True
@@ -326,7 +335,7 @@ class UsnFeed:
         if path is not None and self._handler.skip_directory(path):
             path = None
         if len(cache) >= DIR_CACHE_MAX:
-            cache.clear()
+            cache.popitem(last=False)
         cache[dir_id] = path
         return path
 
@@ -370,16 +379,19 @@ class UsnFeed:
     def _process_files(self, vol: _Volume, files: dict[int, list[int]]) -> None:
         handler = self._handler
         known_cache = vol.files
+        path_cache = vol.paths
         check_dirs: set[str] = set()
         arrivals: list[tuple[str, int, str]] = []   # (新路径, 编号, 旧目录)
         other_dirs: set[str] = set()
         for fid, (reason, parent, old_parent) in files.items():
+            pure_data = bool(reason & _DATA_CHANGE) and not reason & ~(_DATA_CHANGE | _CLOSE)
             parent_path = self._dir_path(vol, parent)
             if reason & _DELETE:
                 if parent_path:
                     check_dirs.add(parent_path)
                     other_dirs.add(parent_path)
                 known = known_cache.pop(fid, None)
+                path_cache.pop(fid, None)
                 if known is not None:
                     check_dirs.add(os.path.dirname(known))
                 continue
@@ -389,8 +401,26 @@ class UsnFeed:
                 if len(vol.pending_moves) > 1000:
                     vol.pending_moves.clear()
                 continue
-            path = vol.journal.path_for(fid)
+            previous = known_cache.get(fid)
+            cached_path = path_cache.get(fid)
+            # DATA_* does not change a name. Reusing the same file/parent pair
+            # avoids OpenFileById + GetFinalPathNameByHandle on every poll while
+            # still delivering every metadata/content event to the hot index.
+            # Create/rename/unknown reasons must resolve the current native path.
+            path = None
+            if (cached_path is not None and parent_path is not None
+                    and pure_data
+                    and os.path.normcase(os.path.dirname(cached_path))
+                    == os.path.normcase(parent_path)):
+                path = cached_path
+            if path is None:
+                path = vol.journal.path_for(fid)
+                # Failed lookup cannot be reused for DATA handling, but its old
+                # content identity can still pair a later successful rename.
+                path_cache.pop(fid, None)
             if path is None or handler.skip_path(path):
+                if path is not None:
+                    known_cache.pop(fid, None)  # Confirmed move into an excluded location.
                 # 被挪到了看不见的地方（或已经又被删）：旧位置要对账
                 old_dir = self._dir_path(vol, old_parent) if old_parent else None
                 if old_dir:
@@ -399,14 +429,17 @@ class UsnFeed:
                 if parent_path:
                     other_dirs.add(parent_path)
                 continue
+            if fid not in path_cache and len(path_cache) >= PATH_CACHE_MAX:
+                path_cache.popitem(last=False)
+            path_cache[fid] = path
             # Everything 式逐条记账：文件名层直接收下这一个路径，不等整目录重列
             name_changed = getattr(handler, "name_changed", None)
+            name_recorded = False
             if name_changed is not None:
-                name_changed(path)
+                name_recorded = name_changed(path) is True
             if handler.is_content_path(path):
-                previous = known_cache.get(fid)
-                if len(known_cache) >= FILE_CACHE_MAX:
-                    known_cache.clear()
+                if fid not in known_cache and len(known_cache) >= FILE_CACHE_MAX:
+                    known_cache.popitem(last=False)
                 known_cache[fid] = path
                 if reason & (_RENAME_OLD | _RENAME_NEW):
                     old_dir = self._dir_path(vol, old_parent) if old_parent else None
@@ -422,7 +455,14 @@ class UsnFeed:
                 else:
                     handler.on_modified(FileModifiedEvent(path))
             else:
-                other_dirs.add(os.path.dirname(path))
+                known_cache.pop(fid, None)  # Confirmed non-content destination.
+                # The hot layer already refreshes this exact file's size/mtime.
+                # Ordinary log writes do not change directory membership, so
+                # avoid rebuilding the entire overlay for the same hot paths.
+                # Missing/failed callbacks and every structural reason retain
+                # directory reconciliation as before.
+                if not (pure_data and name_recorded):
+                    other_dirs.add(os.path.dirname(path))
                 if reason & _RENAME_OLD:
                     old_dir = self._dir_path(vol, old_parent) if old_parent else None
                     if old_dir:
@@ -503,6 +543,7 @@ class UsnFeed:
                 # 目录改名：它和所有子目录缓存的路径都失效了，整张表清掉最简单也最稳
                 cache.clear()
                 vol.files.clear()
+                vol.paths.clear()
                 new = self._dir_path(vol, fid)
                 if new and getattr(handler, "name_changed", None) is not None:
                     handler.name_changed(new)
