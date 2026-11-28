@@ -286,3 +286,18 @@ def test_ctrl_l_closes_report_and_focuses_search(win, qtbot):
     win.focus_search()
     qtbot.waitUntil(lambda: getattr(win, "_stats_overlay", None) is None, timeout=2000)
     assert QApplication.focusWidget() is win.search_box
+
+
+def test_clear_query_then_switch_before_debounce_refreshes_recent_on_return(win, qtbot):
+    """清空搜索词后 280ms 内切走，再回到搜索页时应恢复「最近修改」，不残留旧查询结果。"""
+    _search_ai(win, qtbot)
+    assert not win._showing_recent
+    win.search_box.setText("")              # 触发防抖，尚未到 280ms
+    assert win._debounce.isActive()
+    _click_rail(win, qtbot, "health")
+    assert not win._debounce.isActive()
+    assert win._search_stale
+    _click_rail(win, qtbot, "search")
+    assert win._current_page_key() == "search"
+    assert not win._search_stale
+    assert win._showing_recent

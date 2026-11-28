@@ -1055,6 +1055,7 @@ QProgressBar#mtBar::chunk {{ background: {t['accent']}; border-radius: 2px; }}
         self._all = entries
         self._loaded = True
         self.cache.clear()
+        self._decode_pending.clear()
         self._build_categories()
         self._refresh_status()
         self._apply_filter()

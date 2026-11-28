@@ -2040,10 +2040,9 @@ class MainWindow(QMainWindow):
         """rail「报告」：打开胶片报告浮层（逻辑全在 stats_entry，盖主窗语义不变）。"""
         from . import stats_entry
         if self._debounce.isActive():
-            # 刚敲完词就点「报告」：作废在途防抖，免得报告还在生成时被拽去搜索页
+            # 刚敲完词（或刚清空词）就点「报告」：作废在途防抖并记脏，免得报告还在生成时被拽去搜索页
             self._debounce.stop()
-            if self.search_box.text().strip():
-                self._search_stale = True
+            self._search_stale = True
         stats_entry._open_report(self)
 
     def _version_feature_enabled(self) -> bool:
@@ -2587,10 +2586,9 @@ class MainWindow(QMainWindow):
             else:
                 hint.hide()
         if key == "search" and getattr(self, "_search_stale", False) and not getattr(self, "_closing", False):
-            # 离开期间攒下的后台变更：回到搜索页这一刻补一次（文本未变 → 保留选中）
+            # 离开期间攒下的后台变更或被作废的清空防抖：回到搜索页这一刻补一次
             self._search_stale = False
-            if self.search_box.text().strip():
-                self._run_passive_search()
+            self._run_passive_search()
         if key == "health":
             win = self._health_page_win
             if win is not None:
@@ -2800,8 +2798,7 @@ class MainWindow(QMainWindow):
         """
         if key != "search" and self._debounce.isActive():
             self._debounce.stop()
-            if self.search_box.text().strip():
-                self._search_stale = True
+            self._search_stale = True
         self._switch_page(key)
         if key != "search" and self._current_page_key() == key:
             self._move_focus_to_page(key)
@@ -2855,8 +2852,8 @@ class MainWindow(QMainWindow):
         """整窗浮层关掉后：停在搜索页且攒了后台变更，就静默补刷一次。"""
         if self._closing or self._overlay_active():
             return
-        if (getattr(self, "_search_stale", False) and self._current_page_key() == "search"
-                and self.search_box.text().strip()):
+        if getattr(self, "_search_stale", False) and self._current_page_key() == "search":
+            self._search_stale = False
             self._run_passive_search()
 
     # ---------- 列表 / 仪表盘首屏切换 ----------
@@ -3500,10 +3497,14 @@ class MainWindow(QMainWindow):
                         main_store.close()
             from ..inventory_overlay import unchanged_overlay
 
-            unchanged = unchanged_overlay(
-                dirs, hot, baseline=baseline, snapshot_at=snapshot_at,
-                full_dir_max=MainWindow._OVERLAY_FULL_DIR_MAX,
-            )
+            try:
+                unchanged = unchanged_overlay(
+                    dirs, hot, baseline=baseline, snapshot_at=snapshot_at,
+                    full_dir_max=MainWindow._OVERLAY_FULL_DIR_MAX,
+                )
+            except Exception:  # noqa: BLE001 快路径任何异常回退原全量重建，绝不静默跳过更新
+                _log.debug("unchanged_overlay check failed; falling back to rebuild", exc_info=True)
+                unchanged = None
             if unchanged is not None:
                 return unchanged
             builder = namestore.NameStoreBuilder()

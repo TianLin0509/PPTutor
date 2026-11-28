@@ -86,3 +86,21 @@ def test_overlay_builder_is_closed_after_write_failure(tmp_path, monkeypatch):
     result = MainWindow._reconcile_inventory_dirs_sync((str(docs),))
     assert result.get("error")
     assert len(closed) == 1
+
+
+def test_unchanged_overlay_exception_falls_back_to_full_rebuild(tmp_path, monkeypatch):
+    """快路径若意外抛异常，必须回退到原全量重建，绝不静默跳过更新。"""
+    from pptx_finder import inventory_overlay
+    docs, target, _ = seed(tmp_path, monkeypatch)
+    target.write_bytes(b"fallback payload content")
+    monkeypatch.setattr(
+        inventory_overlay,
+        "unchanged_overlay",
+        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    result = MainWindow._reconcile_inventory_dirs_sync((str(docs),))
+    assert not result.get("error")
+    assert not result.get("unchanged")
+    with namestore.open_store(namestore.OVERLAY) as store:
+        found = store.entries_for_directories((str(docs),))
+        assert found[os.path.normcase(str(target))][2] == len(b"fallback payload content")
