@@ -277,3 +277,25 @@ def test_openx_unreachable_offers_one_click_external(qtbot, fresh_settings, monk
     monkeypatch.setattr(type(ctl), "start_check", lambda self, manual=False: started.append(manual))
     dlg.btn_external.click()
     assert openx_source.external_allowed(True) is True and started == [True]
+
+
+def test_ready_dialog_thanks_user_after_openx_download_recorded(qtbot, fresh_settings, monkeypatch):
+    """2026-11-28：和 AI HUB-H 一样，下载量记上后在「已就绪」弹窗里感谢用户；没记上不显示。"""
+    from pptx_finder import openx_recorder
+    parent = QWidget()
+    qtbot.addWidget(parent)
+    ctl, chip = _ctl(qtbot, parent)
+    info = _info()
+    dlg = UpdateDialog(ctl, parent)
+    qtbot.addWidget(dlg)
+    ctl._report = _report(info)
+    ctl._info, ctl._state, ctl._ready_source = info, "ready", "公司内源"
+    recorded = set()
+    monkeypatch.setattr(openx_recorder.RECORDER, "is_recorded", lambda rv: rv in recorded)
+    dlg.refresh()
+    assert "感谢支持" not in dlg.msg.text()
+    recorded.add("ppt-doctor-update-2.0.0")
+    with qtbot.waitSignal(ctl.state_changed, timeout=2000):
+        ctl._openx_recorded.emit("ppt-doctor-update-2.0.0")   # 记录器在后台线程回调 → 界面刷新
+    assert "已为你同步计入内源社区下载记录，感谢支持 PPT Doctor！" in dlg.msg.text()
+    _shot(dlg, "09-就绪-感谢计入下载量")

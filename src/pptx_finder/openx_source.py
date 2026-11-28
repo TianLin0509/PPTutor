@@ -25,6 +25,13 @@ from urllib.parse import quote, urlparse
 API = "https://openx.huawei.com/openxApi/project/version/release/query/"
 PROJECT_ID = 7938          # AI-Hub-Huawei（11-23 先挂在这里）
 PROJECT_IDS = (8214, 7938)  # 8214 = PPT-Doctor 自己的内源项目（11-23 审核通过），优先；两边都发
+# 2026-11-28：内源 11-27 起把版本列表接口（by_project_id）改成必须登录，单个版本详情（by_id）和附件仍匿名可用。
+# 和 AI HUB-H（R55）一样改读「版本索引」发布：描述里「#hub-index v1」一行之后每行「<id> <版本名> [发布时间]」，新的在前，
+# 由发版流水线每次发布后更新。0 = 该项目还没建索引，只能读列表（列表要登录时如实提示）。
+# 7938 的 hub-index（12787）收录该项目全部非程序版本，含 ppt-doctor-update-*；但识别/公式/素材组件
+# （ppt-doctor-<组件>-*）只发在 8214，所以 8214 必须有自己的索引，组件下载和 8214 的下载量才走得通。
+INDEX_IDS = {8214: 12826, 7938: 12787}   # 8214 的索引 11-28 建好
+INDEX_MARK = "#hub-index v1"
 ALLOWED_HOST = "openx.huawei.com"
 RELEASE_PREFIX = "ppt-doctor-update-"
 
@@ -36,7 +43,50 @@ MAX_DETAIL_QUERIES = 8      # 找一个块最多再查几个没缓存过的版�
 
 
 class OpenxUnavailable(RuntimeError):
-    """内源连不上 / 没有这份文件。"""
+    """内源连不上 / 没有这份文件。auth=True 表示内源要求登录（不是网络问题）。"""
+
+    auth = False
+
+
+AUTH_TEXT = "公司内源的版本列表现在要求登录（不是网络问题）"
+
+
+def _is_auth(e: BaseException) -> bool:
+    return bool(getattr(e, "auth", False))
+
+
+def _auth_error(text: str) -> OpenxUnavailable:
+    err = OpenxUnavailable(text)
+    err.auth = True
+    return err
+
+
+def _is_offline(e: BaseException) -> bool:
+    """断网 / DNS 失败 / 超时：公司外的常态。索引读不到就直接按离线处理，不再白等一次列表。"""
+    import socket as _socket
+    import urllib.error as _ue
+    if isinstance(e, (_socket.timeout, TimeoutError, ConnectionError)):
+        return True
+    return isinstance(e, _ue.URLError) and not isinstance(e, _ue.HTTPError)
+
+
+def parse_index(text) -> list:
+    """版本索引描述 → [{id, version, releaseTime}]（新的在前）；格式不对返回空表。版本名可以带空格。"""
+    lines = str(text or "").replace("\r", "").split("\n")
+    marks = [l.strip() for l in lines]
+    if INDEX_MARK not in marks:
+        return []
+    out = []
+    for line in lines[marks.index(INDEX_MARK) + 1:]:
+        m = re.match(r"^\s*(\d+)\s+(.+?)\s*$", line)
+        if not m:
+            continue
+        rest = m.group(2)
+        t = re.search(r"\s(\d{4}-\d{2}-\d{2}(?:[T ][\d:.]+)?(?:Z|[+-]\d{2}:?\d{2})?)$", rest)
+        ver, when = (rest[:t.start()].strip(), t.group(1)) if t else (rest.strip(), "")
+        if ver:
+            out.append({"id": int(m.group(1)), "version": ver, "releaseTime": when})
+    return out
 
 
 PAGE_URL = "https://openx.huawei.com/PPT-Doctor/download"   # 内源下载页（手动下载安装包用）
@@ -110,9 +160,12 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 class OpenxIndex:
     """版本列表与各版本附件的缓存。一个进程一份（模块级 INDEX），线程安全。"""
 
-    def __init__(self, api: str = API, project_id: int = PROJECT_ID, opener=None, clock=time.monotonic):
+    def __init__(self, api: str = API, project_id: int = PROJECT_ID, opener=None, clock=time.monotonic,
+                 index_id: int | None = None):
         self.api = api
         self.project_id = project_id
+        self.index_id = int((INDEX_IDS.get(project_id, 0) if index_id is None else index_id) or 0)
+        self.index_mode = False
         self._opener = opener
         self._clock = clock
         self._lock = threading.Lock()
@@ -120,41 +173,105 @@ class OpenxIndex:
         self._list_at = 0.0
         self._down_until = 0.0
         self.down_reason = ""
+        self._down_auth = False
         self._details: dict = {}
         self._pkg_meta: dict = {}
 
     # ---- 网络 ----
     def _get_json(self, url: str, timeout: float) -> dict:
         opener = self._opener or urllib.request.build_opener(_NoRedirect)
+        import urllib.error as _ue
         req = urllib.request.Request(url, headers={"Cache-Control": "no-cache", "User-Agent": "PPT-Doctor-updater"})
-        with opener.open(req, timeout=timeout) as r:
-            body = json.loads(r.read(4 * 1024 * 1024).decode("utf-8-sig"))
+        try:
+            with opener.open(req, timeout=timeout) as r:
+                raw = r.read(4 * 1024 * 1024)
+        except _ue.HTTPError as e:
+            # 401/403 且回的是内源自己的 JSON 才算「要求登录」；公司代理拦截页是 HTML 403，照常按 HTTP 错误处理
+            ctype = str((e.headers or {}).get("Content-Type", "") or "").lower()
+            if e.code in (401, 403) and "json" in ctype:
+                raise _auth_error(f"{AUTH_TEXT}（HTTP {e.code}）") from e
+            raise
+        body = json.loads(raw.decode("utf-8-sig"))
+        if isinstance(body, dict) and str(body.get("code")) in ("401", "403"):
+            raise _auth_error(f"{AUTH_TEXT}（{body.get('message') or body.get('code')}）")
         if not isinstance(body, dict) or str(body.get("code")) != "0" or not body.get("data"):
             raise OpenxUnavailable("内源返回内容不对")
         return body["data"]
+
+    def _list_records(self, timeout: float) -> list:
+        data = self._get_json(f"{self.api}by_project_id?projectId={self.project_id}"
+                              f"&currentPage=1&pageSize={LIST_PAGE_SIZE}", timeout)
+        recs = data.get("records")
+        if not isinstance(recs, list):
+            raise OpenxUnavailable("内源版本列表格式不对")
+        return recs
+
+    def _index_records(self, timeout: float) -> list:
+        data = self._get_json(f"{self.api}by_id?id={quote(str(self.index_id))}", timeout)
+        recs = parse_index(data.get("description") if isinstance(data, dict) else "")
+        if not recs:
+            raise OpenxUnavailable("内源版本索引格式不对")
+        return recs
+
+    def _fetch_records(self, timeout: float) -> list:
+        """索引优先（与 AI HUB-H R55 一致）：
+        1. 索引读到了：里面有本产品的更新版本就用它；一条都没有（防索引没跟上）再试一次列表，列表不行仍按索引；
+        2. 读索引断网 / 超时：直接按连不上处理，不再白等列表；
+        3. 读索引其他失败（格式不对、要登录），或该项目还没建索引：读列表。"""
+        self.index_mode = False
+        if not self.index_id:
+            return self._list_records(timeout)
+        try:
+            recs = self._index_records(timeout)
+        except Exception as e:  # noqa: BLE001
+            if _is_offline(e):
+                raise
+            index_err = e
+        else:
+            if not any(str(r.get("version", "")).startswith(RELEASE_PREFIX) for r in recs):
+                try:
+                    return self._list_records(timeout)
+                except Exception:  # noqa: BLE001 列表要登录 / 失败就以索引为准
+                    pass
+            self.index_mode = True
+            return recs
+        try:
+            return self._list_records(timeout)
+        except Exception as e:  # noqa: BLE001
+            if _is_auth(e) and not _is_auth(index_err):
+                raise _auth_error(f"{e}；版本索引也没读到：{str(index_err)[:80]}") from e
+            raise
 
     def releases(self, timeout: float = LIST_TIMEOUT) -> list:
         with self._lock:
             now = self._clock()
             if now < self._down_until:
-                raise OpenxUnavailable(self.down_reason or "内源连不上（稍后自动重试）")
+                err = OpenxUnavailable(self.down_reason or "内源连不上（稍后自动重试）")
+                err.auth = self._down_auth
+                raise err
             if self._list is not None and now - self._list_at <= LIST_TTL:
                 return self._list
         try:
-            data = self._get_json(f"{self.api}by_project_id?projectId={self.project_id}"
-                                  f"&currentPage=1&pageSize={LIST_PAGE_SIZE}", timeout)
-            recs = data.get("records")
-            if not isinstance(recs, list):
-                raise OpenxUnavailable("内源版本列表格式不对")
+            recs = self._fetch_records(timeout)
         except Exception as e:  # noqa: BLE001 公司外多半 DNS 失败 / 超时
+            auth = _is_auth(e)
             with self._lock:
                 self._down_until = self._clock() + UNREACHABLE_TTL
-                self.down_reason = f"公司内源连不上：{type(e).__name__}: {str(e)[:80]}"
-            raise OpenxUnavailable(self.down_reason) from e
+                self._down_auth = auth
+                self.down_reason = (str(e)[:160] if auth
+                                    else f"公司内源连不上：{type(e).__name__}: {str(e)[:80]}")
+            err = OpenxUnavailable(self.down_reason)
+            err.auth = auth
+            raise err from e
         with self._lock:
             self._list = [r for r in recs if isinstance(r, dict) and r.get("id") is not None]
             self._list_at = self._clock()
             return self._list
+
+    def clear_down(self) -> None:
+        """用户手动检查时立刻重连，不等 5 分钟「连不上」缓存过期（与 AI HUB-H clearDown 一致）。"""
+        with self._lock:
+            self._down_until = 0.0
 
     def update_releases(self, timeout: float = LIST_TIMEOUT, prefix: str = RELEASE_PREFIX) -> list:
         """某一类版本（默认本产品的更新版本；组件用 ppt-doctor-<组件>-），新到旧。"""
@@ -169,10 +286,13 @@ class OpenxIndex:
         if hit is not None:
             return hit
         data = self._get_json(f"{self.api}by_id?id={quote(str(rid))}", timeout)
+        rel_ver = str(rec.get("version") or "")
+        got_ver = str(data.get("version") or "").strip() if isinstance(data, dict) else ""
+        if got_ver and rel_ver and got_ver != rel_ver.strip():
+            data = {}   # 索引里的编号填错（读回来的版本名对不上）：当这一版不存在，不会装错版本
         pkgs = data.get("binaryPackages") if isinstance(data, dict) else None
         files = {}
         meta = {}
-        rel_ver = str(rec.get("version") or "")
         for p in pkgs if isinstance(pkgs, list) else []:
             if not isinstance(p, dict):
                 continue
@@ -211,7 +331,7 @@ class OpenxIndex:
                         return dict(m[f"{fk}.000"])
                     if m:
                         return dict(next(iter(m.values())))
-        if fk:
+        elif fk:
             for m in pkg_meta.values():
                 if fk in m:
                     return dict(m[fk])
@@ -263,6 +383,10 @@ class MultiIndex:
 
     def __init__(self, indexes):
         self.indexes = list(indexes)
+
+    def clear_down(self) -> None:
+        for idx in self.indexes:
+            idx.clear_down()
 
     def latest_file(self, name: str, timeout: float = LIST_TIMEOUT,
                     prefix: str = RELEASE_PREFIX) -> tuple[str, str]:

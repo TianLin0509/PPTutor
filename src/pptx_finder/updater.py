@@ -1073,10 +1073,16 @@ def check_sources(
         best.checks = checks
     report = CheckReport(best=best, checks=checks, current=str(local.get("version", "")))
     if report.all_failed:
+        from .openx_source import AUTH_TEXT
         if not external and checks and all(c.label == "openx" for c in checks):
-            report.openx_only_failed = True
-            report.error = ("连不上公司内源（" + checks[0].reason + "）。在公司网络里请稍后重试；"
-                            "在公司外，可点「改用外网更新源」从 GitHub / 备用服务器更新。")
+            # 要求登录不是网络问题：不给「改用外网更新源」按钮
+            report.openx_only_failed = AUTH_TEXT not in checks[0].reason
+            if AUTH_TEXT in checks[0].reason:
+                # 2026-11-28：内源要求登录不是网络问题，别让用户去查网络
+                report.error = (checks[0].reason + "。请稍后重试；急用可到内源 PPT-Doctor 下载页手动下载安装包，覆盖安装不丢设置。")
+            else:
+                report.error = ("连不上公司内源（" + checks[0].reason + "）。在公司网络里请稍后重试；"
+                                "在公司外，可点「改用外网更新源」从 GitHub / 备用服务器更新。")
         else:
             report.error = "所有更新源都连不上：" + "；".join(f"{c.name}：{c.reason}" for c in checks)
     return report

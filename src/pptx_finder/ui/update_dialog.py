@@ -167,9 +167,15 @@ def attempt_rows(attempts: list, source_names: list, downloading: bool) -> list:
     return rows
 
 
+def _fail_text(reason) -> str:
+    """原因里已说清（「要求登录」「连不上」）就不再加「连不上：」前缀。"""
+    text = str(reason or "原因未知")
+    return text if ("要求登录" in text or text.startswith("公司内源连不上") or text.startswith("连不上")) else f"连不上：{text}"
+
+
 def check_rows(checks: list) -> list:
     return [(c.get("name", ""), "ok" if c.get("ok") else "failed",
-             f"可用，最新 v{c.get('version')}" if c.get("ok") else f"连不上：{c.get('reason') or '原因未知'}")
+             f"可用，最新 v{c.get('version')}" if c.get("ok") else _fail_text(c.get("reason")))
             for c in checks or []]
 
 
@@ -430,7 +436,9 @@ class UpdateDialog(QDialog):
             rows = attempt_rows(s["attempts"], s["source_names"], True)
         elif phase == "ready":
             self._set_msg(f"新版本已从「{s['ready_source'] or '更新源'}」下载并校验通过。"
-                          "点「立即重启」后约 5 秒完成替换并自动重新打开；替换失败会自动恢复旧版本。",
+                          "点「立即重启」后约 5 秒完成替换并自动重新打开；替换失败会自动恢复旧版本。"
+                          + ("\n已为你同步计入内源社区下载记录，感谢支持 PPT Doctor！"
+                             if s.get("openx_recorded") else ""),
                           "ok")
             rows = attempt_rows(s["attempts"], s["source_names"], False)
         elif phase == "applying":

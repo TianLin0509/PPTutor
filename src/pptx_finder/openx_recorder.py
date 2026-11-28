@@ -1000,6 +1000,7 @@ class OpenxDownloadRecorder:
         self._lock = threading.Lock()
         self._exec_lock = threading.Lock()
         self._disposed = False
+        self._listeners: list[Callable[[str], None]] = []
         self._resume_timer: threading.Timer | None = None
 
     def _state_file(self) -> Path:
@@ -1072,6 +1073,19 @@ class OpenxDownloadRecorder:
         store["pending_queue"] = [x for x in store.get("pending_queue") or [] if self._key(x.get("release_version", "")) != key]
 
     def _execute(self, item: dict, *, from_pending: bool = False) -> dict[str, Any]:
+        res = self._execute_once(item, from_pending=from_pending)
+        if isinstance(res, dict) and res.get("status") == "recorded" and not res.get("cached"):
+            # 2026-11-28：和 AI HUB-H 一样，记上后在更新弹窗里感谢用户；监听方出错不影响记录结果
+            with self._lock:
+                listeners = list(self._listeners)
+            for fn in listeners:
+                try:
+                    fn(str(res.get("release_version") or ""))
+                except Exception:  # noqa: BLE001
+                    pass
+        return res
+
+    def _execute_once(self, item: dict, *, from_pending: bool = False) -> dict[str, Any]:
         key = self._key(item.get("release_version", ""))
         if not key or not self.enabled() or self._disposed:
             return {"status": "skipped", "release_version": item.get("release_version", "")}
@@ -1220,6 +1234,26 @@ class OpenxDownloadRecorder:
         timer.start()
         self._resume_timer = timer
         return timer
+
+    def add_listener(self, fn: Callable[[str], None]) -> None:
+        """记录成功后回调 fn(release_version)（在后台线程里调用）。"""
+        with self._lock:
+            if fn not in self._listeners:
+                self._listeners.append(fn)
+
+    def remove_listener(self, fn: Callable[[str], None]) -> None:
+        with self._lock:
+            try:
+                self._listeners.remove(fn)
+            except ValueError:
+                pass
+
+    def is_recorded(self, release_version: str) -> bool:
+        key = self._key(release_version)
+        if not key:
+            return False
+        with self._lock:
+            return key in (self._load().get("recorded") or {})
 
     def diagnostics(self) -> dict[str, Any]:
         with self._lock:

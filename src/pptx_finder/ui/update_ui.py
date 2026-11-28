@@ -154,6 +154,7 @@ class UpdateController(QObject):
 
     state_changed = Signal()
     unread_changed = Signal(bool, str)
+    _openx_recorded = Signal(str)   # 后台线程记上内源下载量 → 回到界面线程刷新（感谢提示）
 
     def __init__(self, chip, base_url: str, quit_fn, parent=None, *, auto_prompt: bool = True):
         super().__init__(parent)
@@ -184,8 +185,11 @@ class UpdateController(QObject):
             self._parent_bg_tasks = None
         chip.hide()
         chip.clicked.connect(self._on_click)
+        self._openx_recorded.connect(lambda _rv: self._ui_alive() and self._notify())
+        self._recorded_cb = self._openx_recorded.emit   # 固定一个回调对象，关窗时才能移除
         try:
             from .. import openx_recorder
+            openx_recorder.RECORDER.add_listener(self._recorded_cb)
             openx_recorder.schedule_resume_pending()
         except Exception:  # noqa: BLE001
             pass
@@ -218,6 +222,11 @@ class UpdateController(QObject):
 
     def shutdown(self, wait_ms: int = 3000) -> None:
         """关窗收尾：停下并等待检查/下载线程（不 terminate）。"""
+        try:
+            from .. import openx_recorder
+            openx_recorder.RECORDER.remove_listener(self._recorded_cb)
+        except Exception:  # noqa: BLE001
+            pass
         dialog = self._dialog
         self._dialog = None
         if dialog is not None:
@@ -286,6 +295,7 @@ class UpdateController(QObject):
             "apply_failed": self._apply_failed and self._state == "error",
             "openx_only_failed": bool(getattr(report, "openx_only_failed", False))
             and self.phase() == "error" and info is None,
+            "openx_recorded": self.phase() == "ready" and _openx_recorded(getattr(info, "version", "")),
         }
 
     def pending_version(self) -> str:
@@ -317,6 +327,12 @@ class UpdateController(QObject):
         if self._state != "idle":
             return
         self._manual_check = manual
+        if manual:
+            try:
+                from .. import openx_source
+                openx_source.INDEX.clear_down()
+            except Exception:  # noqa: BLE001
+                pass
         self._state = "checking"
         self._check_status = "checking"
         self._check_error = ""
@@ -677,6 +693,17 @@ def _write_setting(**changes) -> None:
 def _release_page() -> str:
     from ..openx_source import release_page
     return release_page(updater.is_frozen())
+
+
+def _openx_recorded(version: str) -> bool:
+    """这一版的下载是否已计入内源社区下载记录（和 AI HUB-H 一样，记上了就在弹窗里感谢用户）。"""
+    if not version:
+        return False
+    try:
+        from .. import openx_recorder, openx_source
+        return openx_recorder.RECORDER.is_recorded(f"{openx_source.RELEASE_PREFIX}{version}")
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _friendly_error(msg: str) -> str:
